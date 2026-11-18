@@ -39,6 +39,7 @@ Tunables (flag, else env var)
   --port       / CCSBX_HOST_PORT    host stub port on 127.0.0.1 (default 18080)
   --state      / CCSBX_STATE        per-run homes and the shared /work (default spike/.state)
   -n                                rounds (default 10)
+  --runtime    / CCSBX_RUNTIME      docker --runtime for the sandbox arms, e.g. runsc (default: docker's, runc)
   --settle     / CCSBX_SETTLE       pause between ready and typing, excluded from answer (default 0.3)
 """
 import argparse, json, os, re, shlex, shutil, signal, statistics as st, subprocess as sp, sys, time
@@ -58,6 +59,7 @@ def cfg():
     p.add_argument("cmd", choices=["setup", "run", "summary", "teardown"])
     p.add_argument("arg", nargs="?", help="run: comma-separated arms; summary: results file")
     p.add_argument("-n", type=int, default=10)
+    p.add_argument("--runtime", default=os.environ.get("CCSBX_RUNTIME", ""), help="docker runtime, e.g. runsc (gVisor)")
     p.add_argument("--settle", type=float, default=float(os.environ.get("CCSBX_SETTLE", 0.3)))
     p.add_argument("--claude-bin", default=os.environ.get("CCSBX_CLAUDE_BIN") or os.path.realpath(Path.home() / ".local/bin/claude"))
     p.add_argument("--image", default=os.environ.get("CCSBX_IMAGE", "python:3.12-slim"))
@@ -83,7 +85,7 @@ def seed_home(a, home: Path, workdir: str):
 
 
 def docker_mounts(a, home):
-    return ["-v", f"{home}:/home/agent", "-v", f"{a.state / 'work'}:/work", "-w", "/work",
+    return (["--runtime", a.runtime] if a.runtime else []) + ["-v", f"{home}:/home/agent", "-v", f"{a.state / 'work'}:/work", "-w", "/work",
             "-v", f"{a.claude_bin}:/usr/local/bin/claude:ro"]
 
 

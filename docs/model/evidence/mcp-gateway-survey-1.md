@@ -1,3 +1,5 @@
+[Index](../../README.md) › [Unified model](../../unified-model.md) › [MCP gateway](../mcp-gateway.md) › mcp-gateway-survey-1
+
 # MCP gateway survey 1 (2026-11-18)
 
 Scope: gateways fronting ALL MCP servers for sandboxed coding agents (no internet, placeholder creds).

@@ -1,3 +1,5 @@
+[Index](README.md) › Inputs › cc-flow-on-kubernetes
+
 CC Flow · proposal 68 · 6 November 2026 · design only, nothing built
 
 # CC Flow on Kubernetes

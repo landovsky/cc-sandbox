@@ -9,6 +9,8 @@ inputs: unified-session-model.md (v1), model/{mcp-gateway (A), permissions (B), 
   coding-harness-control-surfaces.md, dotfiles cc-flow/docs/proposed-changes/68-node-settings.md, 69-decision-surface.md
 ---
 
+[Index](README.md) › Unified model
+
 # Unified model
 
 **In one line.** A session is a tree address (`<tree>:<node>/g<gen>`) that CC Flow places on a
@@ -111,23 +113,23 @@ worktree. The MCP door, ccgrant, ccf-hostd and the relay hold nothing that works
 
 | Component | Area | Buy / build | Why | Replaces / extends today's |
 |---|---|---|---|---|
-| CC Flow (tree, ❓, managers, arming, placement, `deliver`, session registry) | E | **build** (keep) | nothing ships it; it is the product | cc-tree, extended with `Host:`/`Harness:`/`Grants:` and a LaunchSpec |
-| tmux (lifecycle host + CLI surface) | D | **buy** tmux 3.4 (hp) | ~150 `tmux()` calls, `capture-pane`, `attach -r` | same, unchanged |
-| `ccsbx run` (fence launcher, JWT mint) | v1, A, E | **build** on **docker 29.9** (+ gVisor later) | 0.17 s over a plain start; docker is already on hp | v1 `spike/bench.py` |
-| Harness adapter (`cc_tree_harness.py`) | E | **build** thin; borrow ACP vocabulary | no pretended parity across harnesses | Claude specifics spread through cc_tree.py |
-| ccf-hostd (hook bridge + agent door + context writer + inbox writer) | v1, E, C | **build** | the fence's only path to CC Flow; one mount and one tailer (E4 says the same) | sb-hook / cc-tree-hook.sh writing directly |
-| `ccf` MCP server (one verb table) | A, C, E | **build** | `ccf-coop` + `ccflow` merged (A and C agree) | `/cc-task`, `ccmsg` shell calls inside the session |
-| Hub (`ccf-hub` SQLite inbox, receipts, signing, scoped directory) | C | **build**; **SQLite** solo, **Postgres** company | no product signs, scopes or tenants | session-bus (Elixir) → presence and routing only, in shadow |
-| In-fence relay (~100 lines) | C | **build** on Claude Code native messaging | host↔container sockets don't connect [documented] | v1 item 4b socket mount (superseded) |
-| ccgrant (PDP, grant store, revocation) | B | **buy cedar-go 1.9.3** + **build** the store | forbid-wins = ceilings; offline; provable in CI | AUTONOMY prose, deploy-scope |
-| MCP door | A | **buy agentgateway OSS 1.7.0** | claim-based identity, filtered `tools/list`, ExtMCP hook, stdio | per-project `mcpServers` with tokens in `~/.claude` |
-| ccmg-policy (ExtMCP hook: ccgrant, pinning, redaction) | A | **build** (Go, zero deps) | policy stays ours so the door stays swappable | none |
+| CC Flow (tree, ❓, managers, arming, placement, `deliver`, session registry) | [E](model/orchestration.md) | **build** (keep) | nothing ships it; it is the product | cc-tree, extended with `Host:`/`Harness:`/`Grants:` and a LaunchSpec |
+| tmux (lifecycle host + CLI surface) | [D](model/surfaces.md) | **buy** tmux 3.4 (hp) | ~150 `tmux()` calls, `capture-pane`, `attach -r` | same, unchanged |
+| `ccsbx run` (fence launcher, JWT mint) | v1, [A](model/mcp-gateway.md), [E](model/orchestration.md) | **build** on **docker 29.9** (+ gVisor later) | 0.17 s over a plain start; docker is already on hp | v1 `spike/bench.py` |
+| Harness adapter (`cc_tree_harness.py`) | [E](model/orchestration.md) | **build** thin; borrow ACP vocabulary | no pretended parity across harnesses | Claude specifics spread through cc_tree.py |
+| ccf-hostd (hook bridge + agent door + context writer + inbox writer) | v1, [E](model/orchestration.md), [C](model/cooperation.md) | **build** | the fence's only path to CC Flow; one mount and one tailer (E4 says the same) | sb-hook / cc-tree-hook.sh writing directly |
+| `ccf` MCP server (one verb table) | [A](model/mcp-gateway.md), [C](model/cooperation.md), [E](model/orchestration.md) | **build** | `ccf-coop` + `ccflow` merged (A and C agree) | `/cc-task`, `ccmsg` shell calls inside the session |
+| Hub (`ccf-hub` SQLite inbox, receipts, signing, scoped directory) | [C](model/cooperation.md) | **build**; **SQLite** solo, **Postgres** company | no product signs, scopes or tenants | session-bus (Elixir) → presence and routing only, in shadow |
+| In-fence relay (~100 lines) | [C](model/cooperation.md) | **build** on Claude Code native messaging | host↔container sockets don't connect [documented] | v1 item 4b socket mount (superseded) |
+| ccgrant (PDP, grant store, revocation) | [B](model/permissions.md) | **buy cedar-go 1.9.3** + **build** the store | forbid-wins = ceilings; offline; provable in CI | AUTONOMY prose, deploy-scope |
+| MCP door | [A](model/mcp-gateway.md) | **buy agentgateway OSS 1.7.0** | claim-based identity, filtered `tools/list`, ExtMCP hook, stdio | per-project `mcpServers` with tokens in `~/.claude` |
+| ccmg-policy (ExtMCP hook: ccgrant, pinning, redaction) | [A](model/mcp-gateway.md) | **build** (Go, zero deps) | policy stays ours so the door stays swappable | none |
 | ccsp-model | v1, doc 68 | **build** (extend) | redaction + key pinning are live; needs injection | ccsp (redacts only today) |
-| ccsp-egress (static routes, GitHub App, OAuth client, path-aware git route) | A, B | **build** | nothing OSS holds refresh tokens without a paid tier or bad CVEs | gh OAuth / PATs in shells |
-| cc-tree-web: roster, screen view, send box, decision cards + passkey | D, B | **build** (keep) | ~150 lines on today's page; no product fits | web Tree (header auth only) |
-| Notifications | D | **buy** Telegram inline keyboard (have it) + Web Push | low tier one tap, the rest deep links | notify-tomas-telegram, msg-router |
-| Knowledge notes + FTS5 index | C | **build** thin; **Graphiti** as an index | git is the truth with scoped writes | per-project memory, `/learn` → Graphiti |
-| Timing (schedules, verify days) | E | **keep tschedule**; Temporal at a client | ~70 timers don't need a cluster | same |
+| ccsp-egress (static routes, GitHub App, OAuth client, path-aware git route) | [A](model/mcp-gateway.md), [B](model/permissions.md) | **build** | nothing OSS holds refresh tokens without a paid tier or bad CVEs | gh OAuth / PATs in shells |
+| cc-tree-web: roster, screen view, send box, decision cards + passkey | [D](model/surfaces.md), [B](model/permissions.md) | **build** (keep) | ~150 lines on today's page; no product fits | web Tree (header auth only) |
+| Notifications | [D](model/surfaces.md) | **buy** Telegram inline keyboard (have it) + Web Push | low tier one tap, the rest deep links | notify-tomas-telegram, msg-router |
+| Knowledge notes + FTS5 index | [C](model/cooperation.md) | **build** thin; **Graphiti** as an index | git is the truth with scoped writes | per-project memory, `/learn` → Graphiti |
+| Timing (schedules, verify days) | [E](model/orchestration.md) | **keep tschedule**; Temporal at a client | ~70 timers don't need a cluster | same |
 
 ## 3. Recommended third party (consolidated)
 

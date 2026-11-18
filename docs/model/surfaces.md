@@ -11,6 +11,8 @@ inputs: docs/unified-session-model.md, docs/cc-flow-on-kubernetes.md, docs/codin
 evidence: model/evidence/surfaces-web-terminals.md, model/evidence/surfaces-mux-dashboards-push.md
 ---
 
+[Index](../README.md) › [Unified model](../unified-model.md) › Surfaces
+
 # D. Surfaces
 
 **In one line.** Keep tmux as the lifecycle host and the CLI surface on `local` and `sandbox`.
@@ -271,3 +273,7 @@ it can also approve grants safely; with D6 it tells you when to look.
 - **Unified model rule 2 ("the tmux pane is the handle on every host").** Agreed. This doc adds
   that the *screen* is read from that pane, so the screen view inherits the rule for free on
   local and sandbox.
+
+---
+
+Related: [MCP gateway](mcp-gateway.md), [Permissions](permissions.md), [Cooperation](cooperation.md), [Orchestration](orchestration.md). Evidence: [surfaces-mux-dashboards-push](evidence/surfaces-mux-dashboards-push.md), [surfaces-web-terminals](evidence/surfaces-web-terminals.md).

@@ -8,6 +8,8 @@ inputs: docs/cc-flow-on-kubernetes.md (summary of proposal 68), docs/coding-harn
   doc 68 in full (git c84519e, branch origin/ccr-01d780c1-6ozocn, not on main), doc 69 (c0cabab)
 ---
 
+[Index](README.md) › [Unified model](unified-model.md) › v1 session model
+
 # Unified session model
 
 > **Merged (2026-11-18):** areas A–E corrected parts of this doc. The current picture, conflicts and

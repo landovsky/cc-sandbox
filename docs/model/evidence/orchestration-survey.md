@@ -1,3 +1,5 @@
+[Index](../../README.md) › [Unified model](../../unified-model.md) › [Orchestration](../orchestration.md) › orchestration-survey
+
 # Orchestration survey: outside tools vs CC Flow / cc-tree (as of 2026-11-18)
 
 Method: web search plus page fetches on 2026-11-18, no installs. Tags: **[D]** documented (vendor docs or

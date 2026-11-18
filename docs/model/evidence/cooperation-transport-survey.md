@@ -5,6 +5,8 @@ date: 2026-11-18
 provenance: Sonnet subagent, web search and fetch only; context given: hub jobs, tree shape, invariants, tiers; no repo access, no external models
 ---
 
+[Index](../../README.md) › [Unified model](../../unified-model.md) › [Cooperation](../cooperation.md) › cooperation-transport-survey
+
 # Session-hub transport survey (as of 2026-11-18)
 Tags: [D] documented in primary source, [R] reported by secondary source/blog, [I] my inference.
 Scores 1-5. Fit solo = ~120 live interactive tmux sessions, one dev. Fit 500 = multi-tenant company.

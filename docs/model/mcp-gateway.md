@@ -13,6 +13,8 @@ evidence: evidence/mcp-gateway-survey-1.md (Docker, ContextForge, Microsoft, age
   external models were used.
 ---
 
+[Index](../README.md) › [Unified model](../unified-model.md) › MCP gateway
+
 # A. MCP server gateway
 
 **In one line.** Sandboxed sessions reach MCP servers only through one gateway on the host, the **MCP door**.
@@ -253,3 +255,7 @@ launches, stops or resumes anything.
 ¹ The README in `~/git/cc-secret-proxy` says "nothing installed or live yet". Unified §4 observed hp's
 managed settings pinning `ANTHROPIC_BASE_URL` to ccsp, and the ccsp hook guards `/etc/claude-code` on hp. So
 the pin is live on hp and the README is stale.
+
+---
+
+Related: [Permissions](permissions.md), [Cooperation](cooperation.md), [Surfaces](surfaces.md), [Orchestration](orchestration.md). Evidence: [mcp-gateway-survey-1](evidence/mcp-gateway-survey-1.md), [mcp-gateway-survey-2](evidence/mcp-gateway-survey-2.md).

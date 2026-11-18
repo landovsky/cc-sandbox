@@ -1,3 +1,5 @@
+[Index](../../README.md) › [Unified model](../../unified-model.md) › [Surfaces](../surfaces.md) › surfaces-mux-dashboards-push
+
 # Surfaces: multiplexers, dashboards, push (state as of 2026-11-18)
 
 Tags: **[doc]** = vendor/official docs or API read this session; **[rep]** = third-party report/blog/search

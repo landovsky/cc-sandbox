@@ -1,3 +1,5 @@
+[Index](README.md) › Inputs › coding-harness-control-surfaces
+
 # Coding harness control surfaces
 
 Nov 18, 2026 · @Tomáš Landovský

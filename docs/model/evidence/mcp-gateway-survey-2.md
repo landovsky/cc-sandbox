@@ -1,3 +1,5 @@
+[Index](../../README.md) › [Unified model](../../unified-model.md) › [MCP gateway](../mcp-gateway.md) › mcp-gateway-survey-2
+
 # MCP gateway survey 2 (researched 2026-11-18)
 
 Scope: gateways for "agent in no-internet/no-credential sandbox -> one gateway -> all MCP servers".

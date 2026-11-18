@@ -11,6 +11,8 @@ inputs: docs/unified-session-model.md, docs/cc-flow-on-kubernetes.md (doc 68 sum
 evidence: model/evidence/orchestration-survey.md (outside orchestrators, sources, scores)
 ---
 
+[Index](../README.md) › [Unified model](../unified-model.md) › Orchestration
+
 # E. Orchestration: CC Flow as the orchestrator
 
 **In one line.** CC Flow keeps everything that decides **which session runs for which task,
@@ -248,3 +250,7 @@ Neighbours' docs (A–D) weren't published when this was written; only evidence 
 2. **#2s5y E-2: where `Host:` and `Harness:` are set.** Rec: on the milestone, inherited by its tasks, applied at the next fresh start.
 3. **#2sfs E-3: Temporal.** Rec: not for solo; consider it at the first client cell.
 4. **#65cb E-4: hosted cloud agents as a host tier.** Rec: keep a slot for the adapter in the design and build it for the first client.
+
+---
+
+Related: [MCP gateway](mcp-gateway.md), [Permissions](permissions.md), [Cooperation](cooperation.md), [Surfaces](surfaces.md). Evidence: [orchestration-survey](evidence/orchestration-survey.md).

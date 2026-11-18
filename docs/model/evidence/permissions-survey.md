@@ -1,3 +1,5 @@
+[Index](../../README.md) › [Unified model](../../unified-model.md) › [Permissions](../permissions.md) › permissions-survey
+
 # Permissions / authz survey for agent grants (evidence)
 
 Date of research: 2026-11-18. Web only, read-only. Tags: [documented] vendor docs/repo page fetched;

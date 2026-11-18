@@ -10,6 +10,8 @@ inputs: docs/unified-session-model.md, docs/cc-flow-on-kubernetes.md, doc 68 in 
 evidence: docs/model/evidence/permissions-survey.md (web survey, 2026-11-18)
 ---
 
+[Index](../README.md) › [Unified model](../unified-model.md) › Permissions
+
 # B. Permission grants for agents
 
 **In one line.** A grant is a signed, expiring record "subject may do action on resource,
@@ -230,3 +232,7 @@ on top of unified items 1–3 and E4. **First real enforcement**: B7's git route
 2. **B-2 Milestone grant TTL cap** (#6dvg). (1) 30 d (rec). (2) 7 d as in doc 68. Tasks stay at 7 d and sessions at 24 h in both options.
 3. **B-3 `local` tier** (#6a6q). (1) Run grants there as recorded, unenforced consent, labelled on every card, with the audit flagging approvals made from agent process trees (rec). (2) Refuse any non-auto grant on `local`, so asking moves the work to `sandbox`. (3) Wait for host-uid.
 4. **B-4 Autonomy prose → grants** (#4srd). (1) After B2, convert the 11 `AUTONOMY:` blocks into profiles and node grants. You review each one, and the prose stays as the rationale (rec). (2) Leave them as prose.
+
+---
+
+Related: [MCP gateway](mcp-gateway.md), [Cooperation](cooperation.md), [Surfaces](surfaces.md), [Orchestration](orchestration.md). Evidence: [permissions-survey](evidence/permissions-survey.md).

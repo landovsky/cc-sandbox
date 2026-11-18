@@ -9,6 +9,8 @@ inputs: docs/unified-session-model.md, docs/cc-flow-on-kubernetes.md, docs/codin
   model/orchestration.md and model/surfaces.md (as of 23:17), evidence/cooperation-*.md
 ---
 
+[Index](../README.md) › [Unified model](../unified-model.md) › Cooperation
+
 # C. Inter-agent cooperation
 
 **In one line.** Cooperation has two planes. **Messages** are short-lived, go through the hub
@@ -297,3 +299,7 @@ to be reconciled by the integrator (F, #6gqx). B, D and E were read at 23:17–2
 4. **#43ax C-4 Where the durable inbox lives (solo)**: a Python `ccf-hub` module beside cc-tree with the
    Elixir hub in shadow, then retired (rec, doc 68's "hub module in tree-core"), or a SQLite inbox
    added to the Elixir session-bus.
+
+---
+
+Related: [MCP gateway](mcp-gateway.md), [Permissions](permissions.md), [Surfaces](surfaces.md), [Orchestration](orchestration.md). Evidence: [cooperation-memory-survey](evidence/cooperation-memory-survey.md), [cooperation-transport-survey](evidence/cooperation-transport-survey.md).

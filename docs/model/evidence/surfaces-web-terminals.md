@@ -1,3 +1,5 @@
+[Index](../../README.md) › [Unified model](../../unified-model.md) › [Surfaces](../surfaces.md) › surfaces-web-terminals
+
 # Web-attach surfaces for agent terminal sessions (as of 2026-11-18)
 
 Tags: **[doc]** vendor docs/README/API, **[rep]** reported (blogs/search summaries), **[inf]** my inference.

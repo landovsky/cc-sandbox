@@ -1,0 +1,3 @@
+spike/.state/
+spike/results/*.log
+__pycache__/

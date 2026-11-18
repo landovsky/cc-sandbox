@@ -10,6 +10,9 @@ inputs: docs/cc-flow-on-kubernetes.md (summary of proposal 68), docs/coding-harn
 
 # Unified session model
 
+> **Merged (2026-11-18):** areas A–E corrected parts of this doc. The current picture, conflicts and
+> build list are in [unified-model.md](unified-model.md); the notes below mark what was superseded.
+
 **In one line.** The k8s doc says *where* a session runs and what fences it. The harness doc
 says *how* CC Flow drives it. They meet at one object, the **session**: a task address
 (`<tree>:<node>`) that has one **host** (where it runs) and one **harness adapter** (how it is
@@ -63,6 +66,9 @@ Rules that hold on every host:
 4. **Observation goes one way**: hooks write to a spool the host reads, and the transcript is read
    from the mounted home. Nothing inside the fence calls into tmux or the tree.
 
+> *Superseded in part:* rule 3 now reads "upstream credentials only in ccsp-model and ccsp-egress; the MCP
+> door holds none" and the rules grew to 12 (unified-model.md §1).
+
 ### The seam, corrected
 
 Doc 68/69 name `cc_tree.py`'s single `tmux()` function as the seam. That holds for **pods**, where
@@ -82,6 +88,9 @@ So the session-host adapter has two layers:
 | send | native inbox socket, else send-keys | send-keys (verified); native socket once `/tmp/cc-socks` is mounted out | sidecar delivery |
 | observe | hooks → `sb-hook`/cc-events; transcript in `~/.claude` | hooks → spool file in a mount; transcript in the mounted home | sidecar spool |
 | stop | `/exit`, pane dies | `/exit`, the container leaves with `--rm`, the home volume stays | drain protocol |
+
+> *Superseded:* the sandbox `send` row. Host↔container sockets don't connect (cooperation.md K2), so an in-fence relay
+> posts to the container's own socket (unified-model.md §4 rows 3 and 34, build U22).
 
 ## 2. Where the two docs conflict, and a recommendation for each
 
@@ -121,6 +130,10 @@ Order matters; each step is useful alone. ✅ = exists today.
 | 5 | **model path with no secret inside**: a gateway container on the internal network plus the default bridge, forwarding to `api.anthropic.com` and adding the credential (ccsp today redacts only, it does not inject) | S | a real `say hi` gets an answer; a grep of the container's env, home and `/proc` finds no token | blocked on ❓ 2; until then the stub (✅) |
 | 6 | **egress**: none. `--internal` network, the work stays in the mounted worktree; the host commits and pushes | — | `curl https://example.com` fails inside | ✅ (spike network) |
 | 7 | **resume**: `claude! -N <ref> -r <sid>` into the same home volume and cwd | XS | a fresh-started sandbox session resumes its transcript | — |
+
+> *Superseded:* item 4b won't work (cooperation.md K2: host↔container sockets don't connect; the live path is
+> `/run/user/<uid>/cc-socks`). Replaced by C4, the in-fence relay (unified-model.md U22). Item 3's single `/run/ccf` mount is split
+> into `out/` (rw) and `in/` (ro), and items 1–7 are folded into U1–U7 there.
 
 **Minimum for "launch one sandboxed agent from cc-tree"**: 1 + 2 (S + XS), using the stub or a
 real credential. With 3 it looks like any other tab. With 5 it does real work.

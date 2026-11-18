@@ -246,6 +246,8 @@ it can also approve grants safely; with D6 it tells you when to look.
 
 **CONFLICTS**
 
+> Merged and resolved (or turned into ❓) in [unified-model.md §4](../unified-model.md#4-conflicts); build items renumbered in §5.
+
 - **Doc 68 Q4 (phone): "screen view only after G1; before G1, SSH into hp's tmux."** I disagree
   on timing. On local and sandbox the pane is a host pane, so D2 + D3 are about 150 lines on top
   of what cc-tree-web already has, and they are **narrower** than an SSH shell as Tomas on the

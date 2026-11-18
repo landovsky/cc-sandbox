@@ -191,6 +191,8 @@ on top of unified items 1–3 and E4. **First real enforcement**: B7's git route
 
 **CONFLICTS**
 
+> Merged and resolved (or turned into ❓) in [unified-model.md §4](../unified-model.md#4-conflicts); build items renumbered in §5.
+
 - **Doc 68 `AccessPolicy` YAML → Cedar.** Doc 68 (25 §2.3) has its own `autoApprove / deny /
   requireHuman / stepUp / limits` YAML and a grant controller that reads it. I keep the
   `AccessRequest` contract, the tiers and the anti-pattern tests as they are. I replace the YAML

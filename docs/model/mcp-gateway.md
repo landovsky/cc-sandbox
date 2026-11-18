@@ -216,6 +216,8 @@ launches, stops or resumes anything.
    bump.
 
 **CONFLICTS**
+
+> Merged and resolved (or turned into ❓) in [unified-model.md §4](../unified-model.md#4-conflicts); build items renumbered in §5.
 - **Doc 68 Q21 ("agentgateway only for MCP delegation", company tier).** I adopt agentgateway **as the MCP door
   from the solo sandbox tier**, because B's per-tool grants need an MCP-aware enforcer and ccsp isn't one.
   Credentials stay out of it, consistent with doc 68's warning about its token store.

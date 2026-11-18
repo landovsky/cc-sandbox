@@ -228,6 +228,8 @@ Minimum for "sandboxed workers do real tree work": E1 + E3 + E4 (XS + S + S) on 
 
 **CONFLICTS**
 
+> Merged and resolved (or turned into ❓) in [unified-model.md §4](../unified-model.md#4-conflicts); build items renumbered in §5.
+
 Neighbours' docs (A–D) weren't published when this was written; only evidence files exist. I'll check again before the integrator merges.
 
 | # | With | Conflict | Position |

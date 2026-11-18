@@ -269,6 +269,8 @@ repos or encrypted blobs with key deletion (memory survey §8).
 
 **CONFLICTS**
 
+> Merged and resolved (or turned into ❓) in [unified-model.md §4](../unified-model.md#4-conflicts); build items renumbered in §5.
+
 | # | With | Conflict | Position |
 |---|---|---|---|
 | K1 | doc 68 K7 / §1.4 (company messages = NATS JetStream per tenant) | Jepsen found acknowledged-write loss on 2.12.1 with issues still open; receipts and authz are hub code anyway; Tomas's messaging-hub already runs the Postgres event log + outbox pattern | **Postgres as the system of record**; NATS optional on top for fan-out or regions. ❓ C-1 |

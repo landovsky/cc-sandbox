@@ -198,11 +198,12 @@ check per tmux 3.4]. Screen data does **not** go through the hub: the host's sur
 returns a decision:
 ```
 Card {request_id, address, gen, scope (host:port | route | mcp server), tier: low|medium|high,
-      why, provenance: owner|agent|untrusted, ttl, scopeHash, expires_at}
-Decision {request_id, scopeHash, verdict: approve|deny, ttl, approver: human:<login>,
-          channel: web|tree-view|telegram, nonce, proof: {kind: header|otp|webauthn, assertion}}
+      subjects: [session|task|milestone] (narrowest preselected), why (labelled agent text),
+      provenance: owner|agent|untrusted, ttl, scopeHash, expires_at}
+Decision {request_id, scopeHash, decision: approve|deny, narrowed_to?, subject, ttl, approver: human:<login>,
+          channel: web|tree-view|telegram, nonce, sig, proof: {kind: header|otp|webauthn, assertion}}
 ```
-B verifies `proof` against the tier (a `header` proof is refused for medium and high). Surfaces
+Field names follow `permissions.md` §4 `grant.decide`; `proof` is this doc's addition. B verifies `proof` against the tier (a `header` proof is refused for medium and high). Surfaces
 render `provenance: untrusted` in red and never offer one-tap approve for it.
 
 **→ A. MCP gateway**: two cases reach a human. (1) **OAuth connect** for an MCP server (the
@@ -258,6 +259,11 @@ it can also approve grants safely; with D6 it tells you when to look.
   `approver, channel, nonce, proof` (doc 68's AccessRequest contract already names approver,
   channel, nonce, signature). Without `proof` B can't tell a passkey approval from a forged
   header. Not editing E's doc; flagged for the integrator.
+- **permissions.md §4 (D row): WebAuthn step-up "for `high`"**. Doc 68 §5.2 puts medium on
+  "web, Mac; Telegram only with a one-time code", and B's own T6 notes the answer path is reachable
+  by every local agent. A header-signed decision for medium is forgeable from loopback on hp, so I
+  ask for a passkey (web) or an OTP (Telegram) on **medium** too; low stays header + nonce + tap,
+  and only for fenced requesters. Flagged, B's doc not edited.
 - **Doc 24 (RC primary, web terminal fallback).** Superseded by doc 68 and this doc: RC gone, no
   browser terminal by default; the text screen view is the vendor-neutral way in.
 - **Unified model rule 2 ("the tmux pane is the handle on every host").** Agreed. This doc adds

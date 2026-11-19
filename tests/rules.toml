@@ -332,50 +332,50 @@ where = "mac"
 id = "git-hooks-off"
 title = "host git runs with hooks disabled"
 suite = "git"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/gitroute TestHooksOffAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestHooksOffBlock"
 invariants = [12]
-backends = ["docker"]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-dotgit-redirect"
 title = "a .git redirect in the worktree is not followed"
 suite = "git"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/gitroute TestDotgitRedirectAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestDotgitRedirectBlock"
 invariants = [12]
-backends = ["docker"]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-gitattributes-filter"
 title = "a gitattributes filter does not run on the host"
 suite = "git"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/gitroute TestGitattributesFilterAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestGitattributesFilterBlock"
 invariants = [12]
-backends = ["docker"]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-submodule-ignored"
 title = "a submodule in the worktree is ignored by host git"
 suite = "git"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/gitroute TestSubmoduleIgnoredAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestSubmoduleIgnoredBlock"
 invariants = [12]
-backends = ["docker"]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-steering-flag"
 title = "a steering flag (-c, --exec-path) from the fence is refused"
 suite = "git"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagBlock"
 invariants = [12]
-backends = ["docker"]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]

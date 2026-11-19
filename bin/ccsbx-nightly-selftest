@@ -1,0 +1,167 @@
+#!/usr/bin/env python3
+"""ccsbx-nightly-selftest: the nightly allow/block run and its morning table (plan §3 P6).
+
+Runs the legs of one machine set, keeps the result of the night as JSON, and prints (or sends) ONE
+table of at most 70 columns: a row per leg, and under it the name of every red test, so a forced
+red twin is in the morning message by name.  Results of a direct-mode run are "not evidence".
+
+Recipes:
+  ccsbx-nightly-selftest --dry-run                 list the legs and their commands, run nothing
+  ccsbx-nightly-selftest                           run set hp, print the table, keep the JSON
+  ccsbx-nightly-selftest --send                    ...and send it: notify-tomas-telegram devops --pre
+  ccsbx-nightly-selftest --set k8s                 the hp -> future-two leg (fence@k8s)
+  ccsbx-nightly-selftest --set mac                 the Mac leg (run it from the Mac's own schedule)
+  ccsbx-nightly-selftest --leg 'unit=ccsbx selftest --backend unit --json'   replace/add a leg
+  ccsbx-nightly-selftest --last                    reprint the table of the last run, run nothing
+Scheduling (not installed by this tool): etc/nightly-selftest.jobs.yaml, a tschedule jobs file.
+
+A leg is a shell command that prints `ccsbx selftest --json` on stdout.  The command
+`skip:<reason>` is a leg that cannot run yet (shown as skip, never as ok).  A leg whose output is
+not that JSON is "broken" and counts as red: infrastructure that fails to run must never look green.
+
+Exit: 0 every leg green or skipped; 1 something red or broken; 2 usage.
+Tunables: --set --leg --out --ccsbx --timeout --bot --notify; CCSBX_NIGHTLY_OUT, CCSBX_BIN.
+"""
+import argparse
+import datetime
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+WIDTH = 70
+
+
+def default_legs(ccsbx):
+    st = f"{ccsbx} selftest --json"
+    return {
+        "hp": {
+            "unit": f"{st} --backend unit",
+            "fence@docker": f"{st} --backend docker --suites fence,outbox,settings,keys,git",
+            "doors": f"{st} --backend docker --suites doors,approvals",
+            "xmachine": f"{st} --backend docker --suites msg",
+            "live-hi": "skip:needs the model door (gate M)",
+        },
+        "k8s": {"fence@k8s": "skip:needs future-two (gate M)"},
+        "mac": {"unit": f"{st} --backend unit --where mac"},
+    }
+
+
+def run_leg(cmd, timeout):
+    """-> dict(status, pass, fail, pend, ms, red[], note). Never raises."""
+    if cmd.startswith("skip:"):
+        return {"status": "skip", "pass": 0, "fail": 0, "pend": 0, "ms": 0, "red": [], "note": cmd[5:]}
+    t0 = datetime.datetime.now()
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout, cwd=str(HERE))
+        rc, out, err = p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        rc, out, err = 124, "", f"timeout after {timeout}s"
+    ms = int((datetime.datetime.now() - t0).total_seconds() * 1000)
+    try:
+        rep = json.loads(out)
+        results = rep["results"]
+    except (ValueError, KeyError, TypeError):
+        note = " ".join((err or out or f"rc={rc}").split())[-60:]
+        return {"status": "broken", "pass": 0, "fail": 0, "pend": 0, "ms": ms, "red": [], "note": note}
+    red = [f"T:{r['id']} ({r['twin']})" for r in results if r.get("status") == "fail"]
+    red += [f"table: {p_}" for p_ in rep.get("problems") or []]
+    return {"status": "red" if red else "ok", "ms": ms, "red": red, "evidence": bool(rep.get("evidence")),
+            "pass": sum(r.get("status") == "pass" for r in results),
+            "fail": len(red),
+            "pend": sum(r.get("status") == "pending" for r in results),
+            "note": "" if not (rc != 0 and not red) else f"rc={rc}"}
+
+
+def clip(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: max(n - 1, 0)] + "…"
+
+
+def table(run):
+    L = [f"nightly selftest {run['date']} set={run['set']} on {run['machine']}",
+         f"{'leg':<14}{'state':<8}{'pass':>5}{'fail':>5}{'pend':>5}{'sec':>6}",
+         "-" * 43]
+    for name, r in run["legs"].items():
+        L.append(f"{clip(name, 13):<14}{r['status']:<8}{r['pass']:>5}{r['fail']:>5}{r['pend']:>5}{r['ms'] // 1000:>6}")
+        if r["status"] in ("skip", "broken") and r.get("note"):
+            L.append("  " + clip(r["note"], WIDTH - 2))
+        for t in r["red"][:8]:
+            L.append("  " + clip(f"! {t}", WIDTH - 2))
+        if len(r["red"]) > 8:
+            L.append(f"  ! +{len(r['red']) - 8} more")
+    green = all(r["status"] in ("ok", "skip") for r in run["legs"].values())
+    L.append("-" * 43)
+    L.append("ALL GREEN" if green else "RED: see the ! lines")
+    if not run["evidence"]:
+        L.append("NOT EVIDENCE: direct mode, invariant 14 waived")
+    return "\n".join(L)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ccsbx-nightly-selftest", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    a = ap.add_argument
+    a("--set", dest="set", default="hp", help="leg set: hp | k8s | mac (default hp)")
+    a("--leg", action="append", default=[], metavar="NAME=CMD", help="add or replace a leg (repeatable)")
+    a("--ccsbx", default=os.environ.get("CCSBX_BIN") or str(HERE / "bin" / "ccsbx"), help="the ccsbx binary")
+    a("--out", default=os.environ.get("CCSBX_NIGHTLY_OUT", "~/.local/state/ccsbx/nightly"),
+      help="where the night's JSON is kept (<date>-<set>.json + latest-<set>.json)")
+    a("--timeout", type=int, default=1800, help="seconds allowed per leg")
+    a("--bot", default="devops", help="Telegram bot for --send")
+    a("--send", action="store_true", help="send the table: notify-tomas-telegram <bot> --pre")
+    a("--last", action="store_true", help="reprint the last run's table and run nothing")
+    a("--dry-run", action="store_true", help="list the legs and commands, run nothing")
+    args = ap.parse_args(argv)
+
+    out = Path(os.path.expanduser(args.out))
+    if args.last:
+        try:
+            run = json.loads((out / f"latest-{args.set}.json").read_text())
+        except (OSError, ValueError):
+            print(f"ccsbx-nightly-selftest: no previous run for set {args.set} in {out}", file=sys.stderr)
+            return 2
+        print(table(run))
+        return 0 if all(r["status"] in ("ok", "skip") for r in run["legs"].values()) else 1
+
+    sets = default_legs(args.ccsbx)
+    if args.set not in sets:
+        print(f"ccsbx-nightly-selftest: unknown set {args.set!r} (known: {', '.join(sets)})", file=sys.stderr)
+        return 2
+    legs = dict(sets[args.set])
+    for spec in args.leg:
+        if "=" not in spec:
+            print(f"ccsbx-nightly-selftest: --leg wants NAME=CMD, got {spec!r}", file=sys.stderr)
+            return 2
+        k, v = spec.split("=", 1)
+        legs[k] = v
+    if args.dry_run:
+        for k, v in legs.items():
+            print(f"{k:<14} {v}")
+        print("dry run: nothing was run")
+        return 0
+
+    run = {"date": datetime.datetime.now().strftime("%Y-%m-%d"), "set": args.set,
+           "machine": os.uname().nodename, "legs": {}, "evidence": True}
+    for k, v in legs.items():
+        run["legs"][k] = run_leg(v, args.timeout)
+        if run["legs"][k]["status"] in ("ok", "red") and not run["legs"][k].get("evidence"):
+            run["evidence"] = False
+    if all(r["status"] == "skip" for r in run["legs"].values()):
+        run["evidence"] = False
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"{run['date']}-{args.set}.json").write_text(json.dumps(run, indent=1))
+    (out / f"latest-{args.set}.json").write_text(json.dumps(run, indent=1))
+    tbl = table(run)
+    print(tbl)
+    if args.send:
+        p = subprocess.run(["notify-tomas-telegram", args.bot, "--pre", tbl], capture_output=True, text=True)
+        if p.returncode != 0:
+            print(f"warning: send failed (rc={p.returncode}): {p.stderr.strip()[:200]}", file=sys.stderr)
+    return 0 if all(r["status"] in ("ok", "skip") for r in run["legs"].values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

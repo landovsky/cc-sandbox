@@ -1,0 +1,38 @@
+# tschedule jobs for the nightly allow/block run (plan §3 P6). NOT registered by anything in this
+# repo: copy it to the machine's jobs.yaml (or `tschedule register`) at the deploy gate.
+# The schedule is the plan's: hp 02:30, hp -> future-two 02:45, the Mac 03:00 if it is awake.
+# --send posts one --pre table to the devops bot; a red leg exits 1, so on_failure fires as well.
+version: 1
+project: cc-sandbox-nightly
+
+jobs:
+  nightly-selftest-hp:
+    description: Allow/block rule table on hp (unit, fence@docker, doors, xmachine, one live say hi)
+    schedule: "30 2 * * *"
+    command: bin/ccsbx-nightly-selftest --set hp --send
+    working_dir: /home/tomas/git/cc-sandbox
+    timeout: 3600
+    on_failure: notify
+    retries: 0
+    tags: [cc-sandbox, nightly, selftest]
+
+  nightly-selftest-k8s:
+    description: fence@k8s from hp against future-two
+    schedule: "45 2 * * *"
+    command: bin/ccsbx-nightly-selftest --set k8s --send
+    working_dir: /home/tomas/git/cc-sandbox
+    timeout: 3600
+    on_failure: notify
+    retries: 0
+    tags: [cc-sandbox, nightly, selftest]
+
+  # Mac only: copy this job to the Mac's jobs.yaml, not hp's.
+  nightly-selftest-mac:
+    description: Allow/block rule table on the Mac, if it is awake
+    schedule: "0 3 * * *"
+    command: bin/ccsbx-nightly-selftest --set mac --send
+    working_dir: ~/git/cc-sandbox
+    timeout: 3600
+    on_failure: notify
+    retries: 0
+    tags: [cc-sandbox, nightly, selftest, mac]

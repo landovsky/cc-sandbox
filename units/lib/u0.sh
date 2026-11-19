@@ -10,7 +10,7 @@
 u0_binaries() {
   step "U0 binaries (root-owned, not writable by tomas)"
   for f in ccsbx-root ccsbx-hostd ccsbx-signer ccsbx; do
-    [ -f "$BIN_DIR/$f" ] || note "MISSING $BIN_DIR/$f: install will refuse until it is built (make build)"
+    [ -f "$BIN_DIR/$f" ] || note "MISSING $BIN_DIR/$f: install will refuse until it is built (a linux build of each + SHA256SUMS in --bin-dir; see --help)"
   done
   cmd install -d -o root -g root -m 0755 "$LIBEXEC" /etc/ccsbx
   cmd install -o root -g root -m 0755 "$BIN_DIR/ccsbx-root" /usr/local/sbin/ccsbx-root

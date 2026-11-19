@@ -92,7 +92,7 @@ eval_gates() {
   if [ -n "${CCSBX_P15_CMD:-}" ]; then m="$(eval "$CCSBX_P15_CMD" 2>&1)" || gate "P15 open: ${m:-$CCSBX_P15_CMD failed}"
   else m="$(default_p15 2>&1)" || gate "P15 open: $(head -1 <<<"$m") (run units/p15 status)"; fi
   for f in ccsbx-root ccsbx-hostd ccsbx-signer ccsbx; do [ -f "$BIN_DIR/$f" ] || missing+=" $f"; done
-  [ -z "$missing" ] || gate "binaries missing in $BIN_DIR:$missing (make build)"
+  [ -z "$missing" ] || gate "binaries missing in $BIN_DIR:$missing (a linux build of each + SHA256SUMS in --bin-dir; see --help)"
   if [ -z "$missing" ]; then
     if [ ! -f "$BIN_DIR/SHA256SUMS" ]; then gate "no $BIN_DIR/SHA256SUMS"
     elif ! (cd "$BIN_DIR" && sha256sum --quiet -c SHA256SUMS >/dev/null 2>&1); then gate "binaries do not match SHA256SUMS"; fi

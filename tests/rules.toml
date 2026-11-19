@@ -334,7 +334,7 @@ title = "host git runs with hooks disabled"
 suite = "git"
 allow = "tests/twin-go.sh ./internal/gitroute TestHooksOffAllow"
 block = "tests/twin-go.sh ./internal/gitroute TestHooksOffBlock"
-invariants = [12]
+invariants = [24, 25]
 backends = ["unit"]
 where = "hp"
 
@@ -344,7 +344,7 @@ title = "a .git redirect in the worktree is not followed"
 suite = "git"
 allow = "tests/twin-go.sh ./internal/gitroute TestDotgitRedirectAllow"
 block = "tests/twin-go.sh ./internal/gitroute TestDotgitRedirectBlock"
-invariants = [12]
+invariants = [24, 25]
 backends = ["unit"]
 where = "hp"
 
@@ -354,7 +354,7 @@ title = "a gitattributes filter does not run on the host"
 suite = "git"
 allow = "tests/twin-go.sh ./internal/gitroute TestGitattributesFilterAllow"
 block = "tests/twin-go.sh ./internal/gitroute TestGitattributesFilterBlock"
-invariants = [12]
+invariants = [24, 25]
 backends = ["unit"]
 where = "hp"
 
@@ -364,7 +364,7 @@ title = "a submodule in the worktree is ignored by host git"
 suite = "git"
 allow = "tests/twin-go.sh ./internal/gitroute TestSubmoduleIgnoredAllow"
 block = "tests/twin-go.sh ./internal/gitroute TestSubmoduleIgnoredBlock"
-invariants = [12]
+invariants = [24, 25]
 backends = ["unit"]
 where = "hp"
 
@@ -374,7 +374,7 @@ title = "a steering flag (-c, --exec-path) from the fence is refused"
 suite = "git"
 allow = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagAllow"
 block = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagBlock"
-invariants = [12]
+invariants = [24, 25]
 backends = ["unit"]
 where = "hp"
 
@@ -382,9 +382,9 @@ where = "hp"
 id = "fence-cannot-commit"
 title = "the fence cannot commit; commits go through the outbox"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
+allow = "tests/fence-test.sh fence-cannot-commit allow"
+block = "tests/fence-test.sh fence-cannot-commit block"
+invariants = [24, 25]
 backends = ["docker"]
 where = "hp"
 
@@ -957,3 +957,13 @@ block = "tests/resume-test.sh block"
 invariants = [25]
 backends = ["docker"]
 where = "hp"
+
+[[rule]]
+id = "git-args-allowlist"
+title = "host git runs only allowlisted read flags by exact name (no -F, --pathspec-from-file, branch -f, symbolic-ref, cat-file --filters, abbreviations); the gitdir must be host-owned with no info/attributes; renames can't hide a steering file"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestArgsAllowlistAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestArgsAllowlistBlock"
+invariants = [24, 25]
+backends = ["unit"]
+where = "any"

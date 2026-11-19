@@ -11,15 +11,18 @@ import (
 // never trusted for the next session (invariant 25), so a commit touching one is flagged.
 // Patterns are path.Match globs against the full path and the base name; "dir/" matches a tree.
 var steeringPatterns = []string{
-	"CLAUDE.md", "AGENTS.md", "GEMINI.md", ".mcp.json", ".gitattributes", ".gitmodules",
-	".pre-commit-config.yaml", "lefthook.yml", ".envrc",
-	".claude/", ".cursor/", ".github/", ".githooks/", ".husky/", ".devcontainer/",
+	"CLAUDE.md", "CLAUDE.local.md", "AGENTS.md", "GEMINI.md", ".mcp.json", ".gitattributes", ".gitmodules",
+	".cursorrules", ".windsurfrules", ".clinerules", ".pre-commit-config.yaml", "lefthook.yml", ".envrc",
+	"mise.toml", ".mise.toml", ".tool-versions", ".npmrc",
+	".claude/", ".cursor/", ".github/", ".githooks/", ".husky/", ".devcontainer/", ".vscode/",
 }
 
-// IsSteering reports whether a repo-relative path is a steering file.
+// IsSteering reports whether a repo-relative path is a steering file. Matching ignores case: on a
+// case-insensitive filesystem (macOS default) claude.md IS CLAUDE.md.
 func IsSteering(p string) bool {
-	p = strings.TrimPrefix(path.Clean(p), "./")
+	p = strings.ToLower(strings.TrimPrefix(path.Clean(p), "./"))
 	for _, pat := range steeringPatterns {
+		pat = strings.ToLower(pat)
 		if strings.HasSuffix(pat, "/") {
 			// the tree may sit at the root or in a subdirectory (e.g. a package's .claude/)
 			if strings.HasPrefix(p, pat) || strings.Contains(p, "/"+pat) {
@@ -27,7 +30,7 @@ func IsSteering(p string) bool {
 			}
 			continue
 		}
-		if ok, _ := path.Match(pat, path.Base(p)); ok {
+		if path.Base(p) == pat {
 			return true
 		}
 	}

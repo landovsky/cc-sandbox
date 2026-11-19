@@ -2,7 +2,7 @@
 # Docker-backend twins for tests/rules.toml (U1b). Direct mode: results are NOT EVIDENCE.
 #
 #   tests/fence-test.sh <rule> <allow|block>
-#   rules: fence-flags no-internet no-dns-exfil outbox-per-gen
+#   rules: fence-flags no-internet no-dns-exfil outbox-per-gen fence-cannot-commit
 #   tests/fence-test.sh --help
 #
 # Environment (all optional):
@@ -24,7 +24,9 @@ STATE=$(mktemp -d)
 mkdir -p /var/tmp/ccsbx-hello
 PIDS=()
 # Files the fence wrote (uid 10001) can't be removed by the host user: sweep them from a container.
-rmstate() { docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"; }
+rmstate() {
+  for d in $(cat "$STATE/trash" 2>/dev/null); do case "$d" in /var/tmp/ccsbx-cc-*) docker run --rm --user 0 -v "$d:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$d";; esac; done
+  docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"; }
 cleanup() {
   docker rm -f "ccsbx-canary-$$" >/dev/null 2>&1   # first: a connected peer blocks the network removal
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
@@ -187,6 +189,35 @@ outbox-per-gen/block)
   echo "$seen" | head -1 | grep -qx 0 || fail "a new session's out/ is not empty: $seen"
   echo "$seen" | tail -1 | grep -qx 0 || fail "another outbox is visible in the fence: $seen"
   ok "per-generation outbox, rerun refused, new session starts empty";;
+
+fence-cannot-commit/allow|fence-cannot-commit/block)
+  # A real linked worktree: the host-owned gitdir sits outside it. The fence sees the gitdir
+  # read-only, so host-side reads still work (allow) and nothing in the fence can change it (block).
+  # The git shim that turns `git commit` into an outbox request lives in the fence image (U1a, not
+  # built yet); if the image has git, a real `git commit` is also tried.
+  base=$(mktemp -d /var/tmp/ccsbx-cc-XXXXXX); echo "$base" >> "$STATE/trash"
+  git init -q -b main "$base/repo" && git -C "$base/repo" -c user.name=t -c user.email=t@t commit -q --allow-empty -m i && git -C "$base/repo" worktree add -q "$base/wt" -b w || fail "git setup"
+  gd="$base/repo/.git/worktrees/wt"
+  spec=$(sed "s|/var/tmp/ccsbx-hello|$base/wt|;s/lid-hello-1/lid-cc-$$/;s/cc-sandbox:hello/cc-sandbox:cc-$$/" tests/specs/hello.json)
+  sid=$(printf '%s' "$spec" | "$BIN" start --state "$STATE" --machine hp-ubuntu --worktree-root /var/tmp --launcher none --spec - --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["sid"])') || fail "start"
+  echo "$sid" >> "$STATE/sids"
+  before=$(find "$base/repo/.git" -type f -printf '%p %T@ %s\n' | sort | md5sum)
+  if [ "$TWIN" = allow ]; then
+    out=$(fence "$sid" sh -c "cat $gd/HEAD; ls $gd/gitdir") || fail "run"
+    echo "$out" | grep -q 'ref: refs/heads/w' || fail "the fence cannot read its gitdir: $out"
+    ok "the fence reads its gitdir (read-only)"
+  else
+    out=$(fence "$sid" sh -c "
+      touch $gd/pwned 2>&1; echo 'x' >> $gd/HEAD 2>&1; mkdir $gd/zz 2>&1; rm $gd/HEAD 2>&1
+      echo 'gitdir: /etc' > $base/wt/.git 2>&1
+      if command -v git >/dev/null; then cd $base/wt && git -c user.name=a -c user.email=a@a commit --allow-empty -m evil 2>&1; fi
+      true") || fail "run"
+    [ "$(echo "$out" | grep -c 'Read-only file system')" -ge 3 ] || fail "writes to the gitdir were not all refused: $out"
+    after=$(find "$base/repo/.git" -type f -printf '%p %T@ %s\n' | sort | md5sum)
+    [ "$before" = "$after" ] || fail "the host gitdir changed while the fence ran"
+    [ "$(git -C "$base/repo" rev-list --all --count)" = 1 ] || fail "a commit appeared in the host repo"
+    ok "the host gitdir is byte-and-mtime identical after the fence tried to write it"
+  fi;;
 
 *) echo "unknown rule/twin: $RULE/$TWIN"; exit 2;;
 esac

@@ -8,6 +8,7 @@ import (
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/gitroute"
+	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
 func steeringCheckCmd() *cli.Command {
@@ -24,6 +25,7 @@ func steeringCheckCmd() *cli.Command {
 		Setup: func(f *cli.Flags) {
 			f.String("worktree", ".", "worktree to check")
 			f.String("gitdir", "", "host-owned gitdir (default <worktree>/.git, developer-repo mode: the agent can write that one)")
+			f.String("state", defaultState(), "daemon state dir; a worktree named by a session record is never read through its own .git")
 			f.String("base", "main", "base ref; files changed since the merge base with HEAD are checked")
 		},
 		Run: func(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
@@ -35,6 +37,10 @@ func steeringCheckCmd() *cli.Command {
 			}
 			r := &gitroute.Runner{GitDir: get("gitdir"), Worktree: wt}
 			if r.GitDir == "" {
+				if sid, fenced := start.SessionForWorkdir(get("state"), wt); fenced {
+					fmt.Fprintf(stderr, "ccsbx steering-check: %s is the worktree of session %s; its .git is agent-writable, so pass the host-owned --gitdir\n", wt, sid)
+					return cli.ExitRefused
+				}
 				r.GitDir, r.AllowGitDirInWorktree = filepath.Join(wt, ".git"), true
 				if st, err := os.Stat(r.GitDir); err != nil || !st.IsDir() {
 					fmt.Fprintln(stderr, "ccsbx steering-check: no .git directory; pass --gitdir (a linked worktree's gitdir is not found automatically)")

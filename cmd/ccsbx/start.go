@@ -13,9 +13,15 @@ import (
 )
 
 // stateFlags are shared by `start` and `run`: both must see the same state directory.
+// defaultState is the daemon state directory unless --state or CCSBX_STATE says otherwise.
+func defaultState() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "ccsbx")
+}
+
 func stateFlags(f *cli.Flags) {
 	home, _ := os.UserHomeDir()
-	f.String("state", filepath.Join(home, ".local", "state", "ccsbx"), "daemon state directory (session records, lock)")
+	f.String("state", defaultState(), "daemon state directory (session records, lock)")
 	f.String("profiles", "profiles", "directory of <name>.json profiles")
 	f.String("machine", hostname(), "this machine's name; a spec for another machine is refused")
 	f.String("worktree-root", home, "every worktree must be strictly inside this directory (symlinks resolved); hidden dirs of it are refused when it is the home")

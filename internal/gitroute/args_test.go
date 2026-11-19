@@ -156,3 +156,21 @@ func TestSymlinksInWorktreeDoNotLeakHostFiles(t *testing.T) {
 		t.Fatalf("a symlink target's content ended up in a commit: %q", out)
 	}
 }
+
+// H1-N2: a SHA-256 repository has a different empty tree; the attribute source must follow the
+// repo's object format, or every host git command on it fails.
+func TestSHA256Repo(t *testing.T) {
+	root := t.TempDir()
+	gd, wt := filepath.Join(root, "host.git"), filepath.Join(root, "wt")
+	os.Mkdir(wt, 0o755)
+	sh(t, root, "git", "init", "-q", "--object-format=sha256", "--separate-git-dir", gd, wt)
+	r := &Runner{GitDir: gd, Worktree: wt}
+	write(t, wt, "a.txt", "a\n")
+	write(t, wt, ".gitattributes", "* filter=evil\n")
+	if _, err := r.Commit("s", "sha256"); err != nil {
+		t.Fatalf("host git failed on a SHA-256 repo: %v", err)
+	}
+	if out, err := r.Run("log", "--oneline"); err != nil || !strings.Contains(out, "sha256") {
+		t.Fatalf("%q %v", out, err)
+	}
+}

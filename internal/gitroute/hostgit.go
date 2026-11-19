@@ -27,8 +27,11 @@ import (
 	"syscall"
 )
 
-// emptyTree is git's well-known empty tree (SHA-1 repos).
-const emptyTree = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+// The well-known empty trees, per object format.
+const (
+	emptyTreeSHA1   = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+	emptyTreeSHA256 = "6ef19b41225c5369f1c104d45d8d85efa9b057b53b14b4b9b939dd74decc5321"
+)
 
 // Runner runs hardened git against one host-owned gitdir and one worktree.
 type Runner struct {
@@ -40,6 +43,23 @@ type Runner struct {
 	Git                   string // git binary, default /usr/bin/git, else git from PATH
 	Author, Email         string // commit identity; default "ccsbx" / "ccsbx@localhost"
 	Path                  string // PATH for git's own helpers, default /usr/bin:/bin
+	empty                 string // cached empty-tree id for this repo's object format
+}
+
+// emptyTree is the empty tree of this repository's object format (SHA-1 or SHA-256), asked of git
+// once with a clean environment. An unreadable answer falls back to SHA-1, which fails closed
+// (git rejects a tree id that does not exist) rather than running with attributes enabled.
+func (r *Runner) emptyTree() string {
+	if r.empty != "" {
+		return r.empty
+	}
+	r.empty = emptyTreeSHA1
+	c := exec.Command(r.git(), "--git-dir="+r.GitDir, "rev-parse", "--show-object-format")
+	c.Env = []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME=/nonexistent", "PATH=/usr/bin:/bin"}
+	if out, err := c.Output(); err == nil && strings.TrimSpace(string(out)) == "sha256" {
+		r.empty = emptyTreeSHA256
+	}
+	return r.empty
 }
 
 // ErrRefused is returned for a verb or flag the host will not run.
@@ -95,7 +115,7 @@ func (r *Runner) Env() []string {
 		"GIT_ATTR_NOSYSTEM=1",
 		// Attributes come from the empty tree, so a worktree .gitattributes can't select a filter
 		// or diff driver that the host's own config happens to define (git-lfs, say).
-		"GIT_ATTR_SOURCE=" + emptyTree,
+		"GIT_ATTR_SOURCE=" + r.emptyTree(),
 		"GIT_EXTERNAL_DIFF=/bin/false",
 		"GIT_ASKPASS=/bin/false",
 		"GIT_SSH_COMMAND=/bin/false",

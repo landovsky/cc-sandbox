@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/start"
@@ -61,6 +62,8 @@ func startCmd() *cli.Command {
 			f.String("image", "ccsbx-fence:dev", "fence image recorded in the pin and run by the pane")
 			f.String("cc-version", "", "Claude Code version recorded in the pin")
 			f.String("tmux-socket", "ccsbx", "tmux -L socket name for panes")
+			f.String("launcher", "tmux", "tmux: run the pane; none: write the record only (tests run 'ccsbx run --sid' themselves)")
+			f.String("run-cmd", "", "command the pane runs in the fence instead of claude, space-separated (tests, debugging)")
 			f.Int("max-live", 8, "machine_full above this many live sessions")
 			f.Int("max-per-hour", 20, "rate_capped above this many starts per caller per hour")
 		},
@@ -90,8 +93,19 @@ func runStart(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	d.Image, d.CCVersion, d.Socket = get("image"), get("cc-version"), get("tmux-socket")
 	fmt.Sscanf(get("max-live"), "%d", &d.MaxLive)
 	fmt.Sscanf(get("max-per-hour"), "%d", &d.MaxPerHour)
-	d.Launcher = &start.TmuxLauncher{Exe: d.Exe, Socket: get("tmux-socket"),
-		Env: []string{"--state", d.StateDir, "--profiles", d.ProfilesDir, "--machine", d.Machine, "--image", d.Image, "--root", d.Root}}
+	env := []string{"--state", d.StateDir, "--profiles", d.ProfilesDir, "--machine", d.Machine, "--image", d.Image, "--root", d.Root}
+	if c := strings.Fields(get("run-cmd")); len(c) > 0 {
+		env = append(append(env, "--"), c...)
+	}
+	switch get("launcher") {
+	case "tmux":
+		d.Launcher = &start.TmuxLauncher{Exe: d.Exe, Socket: get("tmux-socket"), Env: env}
+	case "none":
+		d.Launcher = start.NoLauncher{}
+	default:
+		fmt.Fprintf(stderr, "ccsbx start: --launcher must be tmux or none, got %q\n", get("launcher"))
+		return cli.ExitUsage
+	}
 
 	spec, err := start.ParseSpec(in)
 	var rep *start.StartReply

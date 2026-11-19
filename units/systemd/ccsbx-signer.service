@@ -1,0 +1,35 @@
+# ccsbx-signer.service (U0b). The ONLY process that can read the machine key. It exposes
+# sign(token_claims) on a unix socket and nothing else, so hostd never holds the key.
+# The flags below are the design; the signer's Go code (U0b/U5) must accept exactly these.
+[Unit]
+Description=ccsbx signer (machine key; sign(token_claims) only)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=ccsbx-keys
+Group=ccsbx-keys
+ExecStart=/usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --socket /run/ccsbx-signer/sign.sock --socket-group ccsbx
+RuntimeDirectory=ccsbx-signer
+RuntimeDirectoryMode=0750
+Restart=on-failure
+RestartSec=2
+# hardening: it reads its own key directory, writes nothing else, talks to nobody
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

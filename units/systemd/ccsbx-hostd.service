@@ -1,0 +1,34 @@
+# ccsbx-hostd.service (U3a/U0). The per-machine daemon: journal, stamping, start API on :7480.
+# It runs as uid ccsbx, can reach the signer's socket (group ccsbx) but never the key directory,
+# and reaches docker only through `sudo -n /usr/local/sbin/ccsbx-root <verb>`.
+# Flags are the design; hostd's Go code must accept exactly these.
+[Unit]
+Description=ccsbx hostd (journal, stamping, start API)
+After=network-online.target ccsbx-signer.service
+Wants=network-online.target
+Requires=ccsbx-signer.service
+
+[Service]
+Type=simple
+User=ccsbx
+Group=ccsbx
+ExecStart=/usr/local/libexec/ccsbx/ccsbx-hostd --state /var/lib/ccsbx --signer /run/ccsbx-signer/sign.sock --listen :7480
+StateDirectory=ccsbx
+StateDirectoryMode=0750
+RuntimeDirectory=ccsbx
+RuntimeDirectoryMode=0755
+Restart=on-failure
+RestartSec=2
+# NoNewPrivileges must stay OFF: hostd calls sudo for ccsbx-root. Everything else is closed.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/ccsbx /run/ccsbx
+
+[Install]
+WantedBy=multi-user.target

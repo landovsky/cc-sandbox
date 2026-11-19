@@ -265,3 +265,6 @@ func parse(tok string, ring Keyring) (*Claims, error) {
 	}
 	return &c, nil
 }
+
+// B64 exposes the base64url (unpadded) codec used on the wire, for the forwarder.
+func B64() *base64.Encoding { return b64 }

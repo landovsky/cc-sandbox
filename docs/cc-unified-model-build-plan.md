@@ -677,6 +677,198 @@ Nothing that takes 5 minutes or less unlocks the doors or future-two tonight. Th
 SHARED merges (R3), the ACL paste (R4) and gate M. The age key (R10b, 2 min with sudo) only helps
 the k3s side's K8 work tomorrow.
 
+### 7.5 Root and other blockers
+
+Every piece and every R-step, with what blocks it. Written from the plan only, with no probes of
+the host. **Root?** takes one of three values:
+- **yes**: the piece itself does a root operation;
+- **dep X**: the piece needs root only because X does;
+- **no**: no root needed.
+
+**Without root** says what happens if Tomas doesn't supply it. "Direct" means the piece runs as
+tomas with `CCSBX_ROOT=direct`; invariant 14 is waived and its fence results are not evidence.
+**Other blocker** names the real blocker when it isn't root: SHARED (a SHARED go, R3/M1), ACL
+(R4), 🔑 (a key or account from Tomas), k3s (the k3s side's work), gate (a human gate for a live
+deploy, Q6).
+
+| Id | Piece | Root? | Why (operation) | How Tomas unblocks it (min) | Without root | Other blocker |
+|---|---|---|---|---|---|---|
+| **Phase 0** | | | | | | |
+| P0 | revert tags | no | — | — | runs | — |
+| S0 | standalone suite | no | — | — | runs | — |
+| P1 | repo skeleton | no | — | — | runs | — |
+| U19a | test harness | no | — | — | runs | — |
+| P14 | hp docker/sudo inventory | no | read-only listing (`docker ps` works through the group) | — | runs | — |
+| NB1 | preflight | no | its checks only read | — | runs | — |
+| NB2 | night runbook + milestone | no | — | — | runs | Arm! (R16) |
+| NB3 | night report | no | — | — | runs | — |
+| NB4 | night auto-start after the reboot | no | a tschedule user job | — | runs, but it's only useful after the R10 reboot | C13 |
+| M7 | ACL requirements for K5 | no | — | — | runs | — |
+| O1 | gitops.md | no | — | — | runs | K7 review (k3s) |
+| O7 | ops procedures doc | no | — | — | runs | — |
+| K1 | namespaces + Flux | no (cluster, not host root) | — | merge the k3s PR (R3, 5) | — | **SHARED** |
+| K2 | placement | no | — | — | — | k3s |
+| K3 | quota, limits, default-deny | no | — | merge the PR (R3) | — | **SHARED** |
+| K4 | SOPS + operator exposure + egress NetPol | no | — | merge the PR (R3) | — | **SHARED**, ACL, M8 |
+| K5 | ACL draft | no | — | paste it in the admin console (R4, 10) | — | **ACL** |
+| K6 | CPU fix + node alerts | no | — | — | — | k3s |
+| K7 | gitops review | no | — | — | — | k3s |
+| K8 | launcher RBAC + kubeconfig | **dep R10b** | the kubeconfig is SOPS-encrypted to the age key of uid `ccsbx-keys` | R10b (2) | k3s can't encrypt it to us, so F2–F5 are blocked | **SHARED**, k3s |
+| K9 | emptyDir worktrees | no | — | — | — | k3s |
+| K10 | ghcr pull secret | no | — | R19 token | — | k3s, 🔑 R19 |
+| K11 | Pod Security + VAP | no | — | merge the PR (R3) | — | **SHARED** (cluster-scoped) |
+| K13 | hostd PVC | no | — | — | — | k3s (requested) |
+| Q13 | k3s secrets-encryption | no (root on the k3s server node, done by k3s) | server config | k3s side; Tomas's go | — | k3s, SHARED; needed before R5b's Secret |
+| **Phase A** | | | | | | |
+| U1a | fence image | no | — | — | built locally; no ghcr | 🔑 R19 for ghcr only |
+| U1b | `ccsbx run` docker backend | **dep U0** for its final form | `ccsbx-root` and root-owned `/var/lib/ccsbx` | R10 (45) | direct: tomas runs docker and owns the outbox dirs; invariant 14 waived | — |
+| U5 | session token | **dep U0b** for the production key | the key lives under uid `ccsbx-keys` behind the signer | R10 (45) | dev key file readable by tomas: any hp agent can mint tokens, so doors must not trust it in production | — |
+| P2 | forwarder | no | — | — | runs (direct) | — |
+| U2 | start call | **dep U0** | panes in `tmux -L ccsbx` under uid `ccsbx` (useradd) | R10 (45) | panes run as tomas: any hp agent can type into a fenced pane (SEC-16 open) | — |
+| U7 | resume | no | — | — | runs | — |
+| U17 | settings compile | no | — | — | runs | — |
+| H1 | host git | no | — | — | runs | — |
+| P15 | replacements for hp's docker/sudo users | the code: no; taking runners out of the docker group: **yes** (part of R10) | group change | R10 | the code runs; the group change waits | — |
+| I0 | installers | writing them: no; running `install` = R10 | — | R10 | `plan` and `check` run; `install` waits | — |
+| U0 | `ccsbx-root` + hp root cleanup | **yes** | sudoers edits, a root-owned wrapper in `/usr/local/sbin`, `gpasswd -d` (docker, lxd), `snap remove lxd`, `chown root` on sops, **reboot** | R10: `sudo units/install-linux.sh install --yes`, then `sudo reboot` (45) | everything stays direct; invariants 12 and 14 don't hold on hp; F2, F5, M9 and NB5 are blocked | P14, P15, B9 first |
+| U0b | host keys + signer | **yes** | `useradd ccsbx-keys`, 0600 key files, a signer system unit | R10 (in the same install) | see U5: dev key only; blocks M9 and F2 | — |
+| NB5 | `ccsbx-deploy` helper | **yes** | one sudoers line | R10c (2) | every redeploy of a root-owned binary waits for Tomas each morning | U0 |
+| **Phase B** | | | | | | |
+| U3a | hostd v1 | **dep U0** | uid `ccsbx`, root-owned outbox paths | R10 (45) | direct as tomas; `T:outbox-host-write-refused` stays red; invariant 14 waived | — |
+| U3b | local delivery | **dep C0b** for native delivery | see C0b | R10 | send-keys only (the doc 1 baseline) | — |
+| C0a | nested attach spike | no | — | — | runs | — |
+| C0b | native inbox spike | **yes** | opening another uid's `/proc/<pid>/root` needs root (via `ccsbx-root`) | R10 | spike deferred; send-keys fallback | — |
+| C0c | hook parity spike | no | — | — | runs | — |
+| M3 | journal replay | no | — | — | runs | — |
+| M4 | verb queue + lease | no | — | — | runs | — |
+| M2a | daemon on the tailnet | **yes** (hp) | `ufw allow` 7480 on the tailnet interface; on the Mac, a firewall allow (admin) | R10 (in I0), or one `sudo ufw` line (1) | the daemon is local-only; every cross-machine leg is skipped | **ACL** (R4) |
+| M2c | remote start | **dep M2a** | — | as M2a | skipped | ACL |
+| M9 | trusted-key list | **dep U0b** | real machine keys | R10 | dev keys only | M8 (OWN PR) |
+| **Phase C** | | | | | | |
+| M8 | manifests | no | — | — | written; not applied | k3s review, K1–K4, K10 |
+| M1 | doors live | no | — | merge at gate M (15) | — | **SHARED**, 🔑 R5/R7/R5b, Q13 |
+| U4s | subscription spike | no | — | `claude setup-token` (R5b, 5) | — | 🔑 R5b |
+| U4 | model door | no | — | — | — | M1, 🔑 R5, R5b |
+| C18 | model stub | no | — | — | local mode runs | — |
+| U15 | egress routes | no | — | GitHub App (R7, 15) + testbed (R8, 3) | — | M1, 🔑 R7, R8 |
+| U15b | package mirrors | no | — | — | — | U15 |
+| U16 | git route | no | — | — | — | U15 |
+| O2 | Loki dashboard | no | — | — | — | M1, k3s |
+| O3 | watchdog | no | — | — | — | M1 |
+| O4 | Console cap | no | — | set the Console limit (R5) | — | 🔑 R5 |
+| **Phase D** | | | | | | |
+| F2 | k8s backend | **dep U0b + R10b** | the launcher kubeconfig lives under `ccsbx-keys` | R10b (2) + R10 (45) | could run with the kubeconfig readable by tomas, but then any hp agent gets pods/exec; **not recommended** | **SHARED** K2/K3/K8/K9/K11 |
+| F3 | sidecar | dep F2 | — | — | blocked | B6c, F2 |
+| F4 | in-cluster hostd | no host root | — | — | — | K13, F3 |
+| F5 | attach | **dep U0** | `ccsbx-root attach` | R10 | blocked | F2 |
+| **Phase E** | | | | | | |
+| C1 | placement | no | — | — | runs against the direct daemon | gate for the live cc-tree deploy |
+| C2 | attach windows | no | — | — | runs | gate |
+| C3 | client layer | no | — | — | runs | H2 |
+| C4a | follow --write | no | — | — | runs | gate |
+| C4c | follow --read | no | — | — | runs | gate |
+| C5 | ccf MCP | no | — | — | runs | — |
+| C6 | verb writer | no | — | — | runs | gate |
+| C7 | `/cc-task` in the fence | no | — | — | runs | — |
+| C8 | checkpoints, briefs | no | — | — | runs | gate |
+| C8b | steering flag | no | — | — | runs | — |
+| C9a | health from events | no | — | — | runs | — |
+| C9b | steering through the daemon | no | — | — | runs | — |
+| C22 | Check: in a fence | no | — | — | runs (direct) | — |
+| **Phase F** | | | | | | |
+| B6a | readers send auth | no | — | — | built + tested | gate (live deploy) |
+| B6b | fail-closed hub auth | no | — | — | built + tested | gate (flag flip) |
+| B6c | per-principal hub creds | no | — | — | built + tested | gate; M9 |
+| B2 | structured `/deliver` | no | — | — | runs | gate |
+| B3 | signed stamps | no | — | — | runs | gate |
+| B10 | downlinks | no | — | — | runs | gate |
+| B11 | hub HTTP surface | no | — | — | runs | gate |
+| B1 | daemon bus client | no | — | — | runs | — |
+| B5 | fenced presence | no | — | — | runs | gate |
+| B7 | ACL for the hub | no | — | R4 (10) | — | **ACL** |
+| B9 | hub without docker | no | a systemd `--user` unit (needs lingering, which tomas's user timers suggest is already on) | — | runs on a spare port | gate (switch the live hub) |
+| M2b | cross-machine messages | **dep M2a** | — | as M2a | hp ↔ Mac legs skipped | ACL |
+| M2d | direct fallback | **dep M2a** | — | as M2a | skipped | ACL |
+| C10 | scope rule | no | — | — | runs | — |
+| C11 | deliver via daemon | no | — | — | runs | — |
+| C12 | remote start + worktree | dep M2c, F5 | — | R10 | skipped | ACL, SHARED |
+| C4b | multi-machine follow | dep M2a | — | as M2a | one machine only | ACL |
+| M14 | three machines in CC Flow | dep F5 | — | R10 | Mac + hp only | SHARED |
+| C13 | cockpit up/down | no | — | — | runs | — |
+| C24 | web asks daemons | dep C12 | — | — | partly | — |
+| C14 | hp → Mac attach | **yes (Mac)** | Remote Login on the Mac | System Settings → Sharing → Remote Login, key-only (2) | Mac panes open only from the Mac | — |
+| C15 | queued-verb rules | no | — | — | runs | — |
+| C16 | manager starts with the cockpit down | dep M2c | — | as M2a | same machine only | ACL |
+| C23 | questions without the cockpit | no (cross-machine: dep M2a) | — | — | same machine only | — |
+| M5 | portable cockpit | dep C12/M14 | — | R10 + M2a | partly | ACL, SHARED |
+| **Phase G** | | | | | | |
+| P7 | solo approval | no | — | — | — | M1, U15 |
+| C17 | grant cards | no | — | — | — | P7 |
+| **Phase H** | | | | | | |
+| U19b | allow/block catalogue | no | — | — | grows | — |
+| H2 | pins + candidate channel | **dep U0** (the channel is enforced by `ccsbx-root`) | — | R10 | pins checked in user space only | K11 (VAP) |
+| O6 | harness bump | no | — | — | runs | — |
+| P6 | nightly selftest | no | — | — | runs (direct legs) | — |
+| C19 | e2e per hook point | no | — | — | runs (stub) | R22 |
+| C20 | cockpit-kill test | dep M2a, F2 for steps with B and step 6 | — | R10 | hp-only steps | ACL, SHARED |
+| C21 | nightly e2e | no | — | — | runs | — |
+| O5 | rotation recipes | dep M9, K8 | — | — | recipes written | — |
+| I1 | installer for other owners | yes, on a **test VM**, not Tom's machines | — | — | — | — |
+| **Phase J** (next milestone) | | | | | | |
+| U6 | tool door | no | — | — | — | SHARED, k3s |
+| U8–U10 | grant store, ccgrant | no | — | — | — | #55ca |
+| U11 | ccmg-policy | no | — | — | — | U6 |
+| U12 | multi-surface approvals | no | — | — | — | P7 |
+| U13 | passkey page | no | — | register a passkey | — | 🔑 |
+| U14 | tool-door redaction | no | — | — | — | U11 |
+| G1 | grant plan | no | — | — | — | U12, U13 |
+| U18 | AUTONOMY → profiles | no | — | review | — | 🔑 (Tomas review) |
+| U31 | Telegram low tier + push | no | — | — | — | U13 |
+| K12 | k3s CI | no | — | merge (SHARED) | — | SHARED |
+| **Tomas's steps** | | | | | | |
+| R1 | ❓s answered | no | — | done | — | — |
+| R2 | k3s scope + amendments | no | — | k3s | — | k3s |
+| R3 | SHARED merges | no | — | review + merge (20) | — | **SHARED** |
+| R4 | ACL paste + Mac firewall | the Mac firewall: admin | socketfilterfw | admin console (10) | — | **ACL** |
+| R5 | API key + Console cap | no | — | Console (10) | — | 🔑 |
+| R5b | subscription setup-token | no | — | `claude setup-token` + SOPS (5) | — | 🔑 |
+| R6 | window info | no | — | — | — | — |
+| R7 | GitHub App | no | — | github.com (15) | — | 🔑 |
+| R8 | testbed repo | no | — | `gh repo create` + protection (3) | — | 🔑 |
+| R9 | pharmacy token rotation | no | — | pharmacy side (10) | — | — |
+| R10 | hp root install + cleanup + reboot | **yes** | as U0, U0b, I0, P15, M2a | (45) | as U0 | P14, P15, B9 |
+| R10b | `ccsbx-keys` uid + age key | **yes** | `useradd`, a key file under that uid | the R10b command (2) | blocks K8 → F2–F5 | — |
+| R10c | deploy-helper sudoers | **yes** | sudoers | `visudo -f` (2) | see NB5 | — |
+| R10d | Mac root install | **yes (Mac)** | `_ccsbx` user, LaunchDaemon signer | `sudo units/install-mac.sh install --yes` (10) | Mac legs run direct, or are skipped | — |
+| R11 | future-two up | no | — | unlock if it rebooted (2) | — | — |
+| R12 | Mac kubectl session | no | — | optional (10) | — | K8 (ops SA) |
+| R13 | Mac awake + Docker Desktop | **yes (Mac)** | `pmset` | `sudo pmset -c sleep 0 disksleep 0 powernap 0` (5) | Mac legs skipped | — |
+| R14 | permission modes + deny list | no | — | review (3) | — | — |
+| R15 | Telegram | no | — | — | — | — |
+| R16 | Arm! | no | — | type `Arm!` (1) | — | — |
+| R17 | no docker restart at night | **yes** | `apt-mark hold` | `sudo apt-mark hold docker-ce containerd.io` (1) | an apt run could restart docker under the night's fences | — |
+| R18 | push access | no | — | — | — | — |
+| R19 | ghcr push/pull | no | — | Actions permission + a `read:packages` token (10) | — | 🔑 |
+| R20 | overnight PR review | no | — | k3s reviewer session | — | k3s |
+| R21 | LIVE-TOOLS | no | — | done (Q6) | — | — |
+| R22 | scratch e2e tree | no | — | one command (1) | — | — |
+| — | lxd removal (the accidental install) | **yes** | `snap remove`, disabling a system socket | `sudo snap remove lxd && sudo systemctl disable --now lxd-installer.socket` (1) | an extra root path on hp stays open | — |
+
+**In short:**
+- **Pieces that need root themselves:** U0, U0b, NB5, C0b and M2a on hp; C14 on the Mac. P15's
+  group change and I0's `install` are part of R10.
+- **Tomas's root steps:** R10 (45 min with the reboot), R10b, R10c and R17 on hp; R10d and R13 on
+  the Mac; the lxd removal.
+- **Pieces that need root only through a dependency:** U1b and U5 (final form), U2, U3a, U3b,
+  M2c, M9, F2, F3, F5, H2, M2b, M2d, C4b, C12, C16, C20, M14, M5, C24, O5, K8.
+- **The real non-root blockers:** SHARED goes (K1, K3, K4, K11, M1), the ACL paste (K5, B7, R4),
+  keys (R5, R5b, R7, R8, R19), k3s work (K2, K6–K10, K13, Q13), and the human gate for live
+  deploys of cc-tree and session-bus changes.
+- **Without any root at all,** everything in phases 0, A, B, E, F and H can be **built and tested
+  in direct mode on hp alone**, with invariant 14 waived. What can't run: future-two (F*),
+  anything cross-machine through the daemon port, and the final forms of the key and pane
+  protections.
+
 ## 8. Cockpit-down behaviour and the cockpit-kill test (C20)
 
 | While the cockpit is down | Behaviour | When it's back |

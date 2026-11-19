@@ -29,7 +29,7 @@ It serves only session tokens whose profile starts "e2e-" and whose billing is
 Scripts: a user message containing E2E:<name> selects a row of the fixed catalog
 (--print-catalog). Names select; they never carry arguments.
 
-Flags (each also CCSBX_STUB_<NAME>):
+Flags: (each also CCSBX_STUB_<NAME>)
   --listen ADDR      loopback host:port                      (required)
   --key-file FILE    dev key whose public half verifies tokens (default $CCSBX_KEY_FILE)
   --aud NAME         audience the token must list            (default ccsbx-model)

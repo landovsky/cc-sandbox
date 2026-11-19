@@ -66,8 +66,12 @@ func New(cfg Config) (*Forwarder, error) {
 	if len(cfg.Doors) == 0 {
 		return nil, errors.New("fwd: no doors configured")
 	}
-	if cfg.Rules == nil {
-		cfg.Rules = DefaultRules
+	if cfg.Rules == nil { // built-in allowlist, limited to the doors this session has
+		for _, r := range DefaultRules {
+			if _, ok := cfg.Doors[r.Door]; ok {
+				cfg.Rules = append(cfg.Rules, r)
+			}
+		}
 	}
 	if err := ValidateRules(cfg.Rules, cfg.Doors); err != nil {
 		return nil, err

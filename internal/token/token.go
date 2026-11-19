@@ -130,11 +130,19 @@ func KeyFromSeed(seed []byte) (*Key, error) {
 // it if absent. Direct mode only: under gate M the key lives behind the signer.
 // A key file that other users can read is refused.
 func LoadOrCreateKeyFile(path string) (*Key, error) {
+	return loadKeyFile(path, true)
+}
+
+// LoadKeyFile reads an existing dev key file and never creates one. Verifiers
+// use it, so a typo in the path can't silently mint a new, empty trust root.
+func LoadKeyFile(path string) (*Key, error) { return loadKeyFile(path, false) }
+
+func loadKeyFile(path string, create bool) (*Key, error) {
 	if path == "" {
 		return nil, errors.New("token: no key file (set CCSBX_KEY_FILE or --key-file)")
 	}
 	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) {
+	if create && errors.Is(err, os.ErrNotExist) {
 		seed := make([]byte, ed25519.SeedSize)
 		if _, err := rand.Read(seed); err != nil {
 			return nil, err

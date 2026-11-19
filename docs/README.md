@@ -4,15 +4,16 @@
 
 One picture of how sandboxed agent sessions are placed, fenced, granted access, connected and shown. Start with the unified model v2 (four docs). Open the area docs only for the detail behind a section.
 
-**Open decisions:** the ❓ nodes and the open N items are in [the working log](cc-unified-model-log.md#decisions--nodes-updated).
+**Open decisions:** the ❓ nodes for the build are in [the build plan §12](cc-unified-model-build-plan.md#12-open-decisions--nodes-under-cc-sandbox326q); older ones are in [the working log](cc-unified-model-log.md#decisions--nodes-updated).
 
 ## Reading order
 
-1. The unified model, **v2.2** (current). Read these first, in order:
+1. The unified model, **v2.3** (current). Read these first, in order:
    1. [cc-unified-model.md](cc-unified-model.md): the threats, the security contract and its invariants.
    2. [cc-unified-model-tiers.md](cc-unified-model-tiers.md): what solo, friends and company each add, machines, third party.
    3. [cc-unified-model-cc-flow.md](cc-unified-model-cc-flow.md): CC Flow as a client (the portable cockpit).
-   4. [cc-unified-model-log.md](cc-unified-model-log.md): changes per version, open items, decisions, conflicts, the build list.
+   4. [cc-unified-model-log.md](cc-unified-model-log.md): changes per version, open items, decisions, conflicts, the old build list.
+   5. [cc-unified-model-build-plan.md](cc-unified-model-build-plan.md): the whole build, phased, with owners, acceptance tests, the nightly prerequisites, the Accept list, risks, the review panel's findings and the ❓ list.
    - [unified-model.md](unified-model.md): **v1, superseded** by the four docs above. Kept for the history the area docs link to.
 2. The five area docs (inputs to v1) (each one names its own ❓ nodes):
    - [model/mcp-gateway.md](model/mcp-gateway.md) (A): how agents reach MCP servers through one door with no MCP credential inside the fence.

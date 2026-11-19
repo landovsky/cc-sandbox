@@ -1,7 +1,7 @@
 ---
 type: log
 status: working
-version: 2.2
+version: 2.3
 title: "Agent fence: working log (changes, conflicts, decisions, build list)"
 task: ai-tooling:#6gqx
 date: 2026-11-19
@@ -10,9 +10,44 @@ supersedes: unified-model.md v1 §4–§6
 
 [Index](README.md) › Unified model › 4. Working log
 
-**Docs:** [1 · contract](cc-unified-model.md) · [2 · tiers](cc-unified-model-tiers.md) · [3 · CC Flow as a client](cc-unified-model-cc-flow.md) · **4 · working log**
+**Docs:** [1 · contract](cc-unified-model.md) · [2 · tiers](cc-unified-model-tiers.md) · [3 · CC Flow as a client](cc-unified-model-cc-flow.md) · **4 · working log** · [5 · build plan](cc-unified-model-build-plan.md)
 
 # Working log
+
+## v2.2 → v2.3 (the build plan and its review panel, 2026-11-19)
+
+The phased plan is [doc 5, the build plan](cc-unified-model-build-plan.md) (cc-sandbox:#326q). It
+was drafted by three planners, then reviewed by a panel of three. These are the model changes it
+made; its §11 says which panel findings were accepted and which were rejected.
+
+- **future-two runs fences and doors as k3s pods** (Tom: "Pods, not docker"). The doors sit in
+  their own namespace, `cc-sandbox-doors`, so the launcher's RBAC can't reach their Secrets.
+  Invariant 12 gains a cluster clause. N9 is closed.
+- **The token never enters the fence.** A per-session forwarder (or the pod sidecar) holds it,
+  together with a per-generation key. Doors check proof of possession, so a copied token is
+  useless. The same key signs message stamps. Doc 1 §3 and §4 are updated.
+- **Messages:** the daemon goes to the other daemon via the session-bus hub. The daemon stamps
+  and signs, and the bus only routes (doc 1 §7). The hub is a door (invariant 4) with
+  per-principal credentials and fail-closed auth. If the hub is down, daemons deliver directly.
+  The hub stays on the hp. Signed stamps are no longer descoped.
+- **Doors in a cluster:** a session listener that never trusts identity headers, plus an owner
+  listener reached only through the Tailscale proxy (invariant 27).
+- **Low-tier approvals at solo** (amends N5). The owner's identity plus a one-time code sent to
+  the phone, because an owner device isn't a human (invariant 5).
+- **No Tailscale SSH anywhere** (amends N7 and N10). Starts go through the target machine's
+  daemon API. Attach uses OpenSSH, or `kubectl exec` through the hp's root wrapper for
+  future-two pods.
+- **The daemon mints generations** and refuses a second live generation of a node. The scope
+  rule names the manager by node.
+- **New known limitations:**
+  - the hub as a single point of failure for cross-machine messages (with a direct fallback);
+  - an owner device is not a human;
+  - Mac stamps are `fenced-mac`.
+- **Renamed:** doc 4's `K1` ("fence host on future-two") becomes **F1**, which is dropped. Its id
+  clashed with the k3s team's K1–K11. The pod path is F2–F5 in doc 5.
+- **Found during review** (outside the model, but blocking it): hp already has root paths for
+  tomas (NOPASSWD sudo on docker, apt-get, dokku and a tomas-writable sops; the docker and lxd
+  groups). Doc 5 ❓ Q7 fixes them at the morning gate.
 
 ## v2.1 → v2.2 (Tom's cockpit rules, 2026-11-19)
 
@@ -82,7 +117,7 @@ supersedes: unified-model.md v1 §4–§6
 
 ## New in v2
 
-These are open, with no ❓ node yet.
+Status in v2.3: all of these are ❓ nodes under cc-sandbox:#326q (doc 5 §12).
 
 - **N1 · Rename `ccf-hostd`** to a neutral name (for example `ccsbx-hostd`), and the same for
   any `ccf-` platform piece. Only CC Flow's own MCP server keeps `ccf`.
@@ -94,23 +129,28 @@ These are open, with no ❓ node yet.
 - **N4 · The policy at friends** is "a simple grant list" on embedded Cedar (#55ca), and
   "full policy" at company means the analyser-proven profiles plus a shared store. *Confirm
   that this matches what the criteria meant by "simple".*
-- **N5 · Grants at solo** are static config with no ask tier (unlisted = forbidden). *Confirm.*
+- **N5 · Grants at solo** are static config with no ask tier (unlisted = forbidden). *Amended in
+  v2.3:* a low-tier ask exists at solo (doc 5 P7, ❓ Q10).
 - **N6 · The session token at solo.** Each machine's launcher signs its tokens, and the central
   doors trust a list of machine keys. *Follows from the central doors. Confirm.*
 - **N7 · Remote sessions in CC Flow.** The pane on the cockpit machine attaches to a session on
-  another machine over Tailscale SSH. *Mechanism to be settled in the first slice.*
+  another machine over Tailscale SSH. *Amended in v2.3:* no Tailscale SSH. Attach uses OpenSSH,
+  or `ccsbx attach` on the hp for future-two pods (❓ Q14, Q17).
 - **N9 · `future-two` as the third machine.** *Decided:* Tom picked `future-two` (Hetzner Robot,
-  Xeon E3-1275V6 4C/8T, 64 GB ECC, a `pool=shared` k3s worker, LUKS). *Still open* (the manager
-  is discussing them with devops):
+  Xeon E3-1275V6 4C/8T, 64 GB ECC, a `pool=shared` k3s worker, LUKS). *Decided in v2.3:* pods,
+  doors as pods too, pinned there for the pilot (❓ Q1). The original question was:
   - whether its sessions run as **docker on the host** beside k3s, or as **k3s pods**;
   - whether the **central doors** (M1) run on it too, or on another Hetzner server.
-- **N10 · A manager starts workers without CC Flow.** *Proposal.* The manager's `start` goes to
+- **N10 · A manager starts workers without CC Flow.** *Amended in v2.3:* an unfenced manager's
+  `cc-tree start` calls the target daemon directly (no Tailscale SSH); fenced sessions can't
+  start sessions in this milestone (❓ Q17). *Original proposal:* The manager's `start` goes to
   the daemon on its machine, which calls the target machine's launcher directly over Tailscale
   SSH with a profile already approved for that node. The new session shows up as an event, and
   CC Flow records the node from it, live or on replay. Rate cap (≤ 3/min) moves to the daemon.
   *Confirm, or keep `start` in CC Flow and accept that managers can't start workers while it's down.*
 - **N8 · Unfenced agents on the Mac** can reach the Docker Desktop socket. Accept it as a
-  limitation, or run no unfenced agents on the Mac.
+  limitation, or run no unfenced agents on the Mac. *v2.3 recommendation:* accept it, cap the Mac
+  key at `mac-max`, and mark Mac stamps `fenced-mac` (❓ Q17).
 
 ## Decisions (❓ nodes), updated
 
@@ -197,6 +237,10 @@ The nodes and recommendations are unchanged unless the v2 note says otherwise.
 
 ## Build list by tier
 
+**Superseded by [doc 5, the build plan](cc-unified-model-build-plan.md)** (v2.3). Doc 5 has the
+phases, owners, acceptance tests and nightly prerequisites. The list below is kept for its ids,
+and doc 5 reuses them.
+
 Sizes: XS < ½ day, S ≈ 1–2 days, M ≈ a week. 🔑 = Tom's action, # = root on hp.
 
 **First slice (hand this to the builder first).** CC Flow, running on the Mac, starts a session
@@ -230,7 +274,7 @@ its branch through the Hetzner egress door.
 | M4 | **verb queue**: tree verbs queued in order while the cockpit is down, delivered when it's back | S | U3 |
 | M5 | **portable cockpit**: CC Flow starts on the Mac or the hp with no config change and resumes from M3 | S | M2, M3 |
 | M6 | **manager start without CC Flow** (N10, proposal): daemon → target launcher, CC Flow records it from the event | S | M2, M3, N10 |
-| K1 | **fence host on `future-two`** (N9): docker beside k3s, bridge range and iptables checked against flannel, kubelet reservations, host keys; or the fence as a pod, if N9 picks pods | S # | N9, U0b |
+| F1 (was K1, dropped in v2.3: pods) | **fence host on `future-two`** (N9): docker beside k3s, bridge range and iptables checked against flannel, kubelet reservations, host keys; or the fence as a pod, if N9 picks pods | S # | N9, U0b |
 | U4 | model door: credential injection, billing per session (API key first, subscription stub) | S 🔑 | M1, U5 |
 | U7 | resume into the same volume | XS | U2 |
 | U15 | egress door: static routes, GitHub App | S 🔑 | M1, U5, #46tt |

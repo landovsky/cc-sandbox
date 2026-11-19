@@ -1,7 +1,7 @@
 ---
 type: design
 status: draft
-version: 2.2
+version: 2.3
 title: "Agent fence: threat model and security contract"
 task: ai-tooling:#6gqx (parent ai-tooling:#62b5, milestone ai-tooling:#6rrd)
 date: 2026-11-19
@@ -11,7 +11,7 @@ criteria: https://claude.ai/artifact/RRRnre4PXDo4wwWVj1zGQL
 
 [Index](README.md) › Unified model › 1. Security contract
 
-**Docs:** **1 · contract** · [2 · tiers](cc-unified-model-tiers.md) · [3 · CC Flow as a client](cc-unified-model-cc-flow.md) · [4 · working log](cc-unified-model-log.md)
+**Docs:** **1 · contract** · [2 · tiers](cc-unified-model-tiers.md) · [3 · CC Flow as a client](cc-unified-model-cc-flow.md) · [4 · working log](cc-unified-model-log.md) · [5 · build plan](cc-unified-model-build-plan.md)
 
 # Security contract
 
@@ -123,8 +123,9 @@ flowchart LR
   subgraph FENCE["fence (container, no secret)"]
     AG["agent harness"]
     OUT[/"outbox (rw)"/]
-    IN[/"inbox + token (ro)"/]
+    IN[/"inbox (ro)"/]
   end
+  FWD["forwarder (per session)<br/>holds the token + its key"]
   subgraph HOST["outside every fence: the machine, or a central door host over Tailscale"]
     L["launcher (per machine)<br/>mints identity 🔑"]
     MD["model door 🔑<br/>(ccsp-model)"]
@@ -135,8 +136,10 @@ flowchart LR
     AP["approval page<br/>🔑 verifies proofs"]
   end
   L --> FENCE
-  AG -- placeholder --> MD --> LLM[(provider)]
-  AG -- session token --> TD --> ED --> UP[(GitHub, SaaS)]
+  AG --> FWD
+  FWD -- token + proof --> MD --> LLM[(provider)]
+  FWD -- token + proof --> TD --> ED --> UP[(GitHub, SaaS)]
+  SD -- signed stamp --> HUB["message hub (a door)"] --> SD2["other machine's daemon"]
   OUT --> SD
   SD --> IN
   TD & ED & SD -- check --> P
@@ -158,7 +161,13 @@ outside the fence:
 | Model door | session token | model credentials 🔑 |
 | Tool door | session token (`aud`, `exp`, `gen`) | nothing that works outside |
 | Egress door | session token | upstream credentials 🔑 |
-| Session daemon | **which outbox** the file landed in | nothing |
+| Session daemon | **which outbox** the file landed in | nothing (signing goes through a separate signer) |
+| Message hub (a door, v2.3) | the principal's own hub credential, plus the sender's signed stamp | nothing that works outside |
+
+**The token never enters the fence** (v2.3). A per-session forwarder outside the fence (a
+container next to it, or the pod's sidecar) holds the token and a per-generation key whose public
+half is in the token. Every door call carries a proof made with that key, so a copied token is
+useless. The same key signs the session's message stamps, with a separate domain prefix.
 
 The source IP is logged but not trusted, because container IPs get reused after exit and every
 session on a machine shares one address on the private network.
@@ -174,10 +183,12 @@ login and an API key). The launcher picks one per session and records it (invari
    bearers, signing keys and the host's agent config. The host home is never mounted.
 3. **Enforcement is outside the fence.** In-fence hooks and deny lists are speed bumps only.
 4. **One way out per channel:** the model through the model door, tools through the tool door,
-   git and HTTP through the egress door, and requests and messages through the session daemon.
-   There's no other egress. The host commits and pushes.
-5. **Only a human with a proof widens a grant.** Proofs are tiered: a header for low risk, a
-   passkey or OTP for medium, a passkey for high.
+   git and HTTP through the egress door, requests through the session daemon, and messages
+   through the session daemon and the message hub, which is a door like the others. There's no
+   other egress. The host commits and pushes.
+5. **Only a human with a proof widens a grant.** Proofs are tiered: for low risk, the owner's
+   private-network identity plus a one-time code sent to the owner's phone (an owner device
+   alone isn't proof of a human, v2.3); a passkey or OTP for medium; a passkey for high.
 6. **Authority never travels as text.** No message, manager or service account approves anything.
 7. **Forbid wins, and ceilings come before prompts.** The auto tier runs before any ask.
 8. **Irreversible means ask or forbid,** using labels the user supplies.
@@ -188,6 +199,8 @@ login and an API key). The launcher picks one per session and records it (invari
 12. **Host keys live under a dedicated uid** that no session runs as, fenced or not, and they're
     never mounted. That covers the model and upstream credentials, each machine's token signing
     key and the decision-verification keys, on every machine and on the central door host.
+    **In a cluster** (v2.3), a key is a Secret mounted only into its own door pod, in a namespace
+    that no launcher or session credential can reach.
 13. **Unfenced sessions are outside the contract.** Their consent is recorded but not enforced,
     and they're labelled that way everywhere.
 14. **No agent runs as a user who controls the container runtime.** Membership of the docker
@@ -213,9 +226,13 @@ login and an API key). The launcher picks one per session and records it (invari
 26. **The harness version and image are pinned.** They're never auto-updated, and they change
     only after the allow/block tests pass on the new version.
 27. **Central doors are reachable only over the private network** (Tailscale), and they accept
-    only tokens signed by a known machine key.
+    only tokens signed by a known machine key, within that key's scope (which machines and
+    profiles it may sign for). **In a cluster** (v2.3), fence pods reach only a door's session
+    listener, which never takes identity from headers; owner actions (decisions) go to a separate
+    listener reachable only through the private-network proxy.
 28. **Cockpit down loses visibility, never progress.** If the cockpit is down or unreachable,
-    sessions work as usual and message each other daemon to daemon. Nothing a session needs
+    sessions work as usual and message each other through their daemons (via the hub, or daemon
+    to daemon if the hub is down). Nothing a session needs
     goes through the cockpit: the message scope rule is fixed per session at launch, each
     session daemon keeps its events and replays them when the cockpit reconnects, and requests
     meant for the cockpit are queued by the daemon and delivered later. Steering means driving
@@ -247,7 +264,8 @@ bundle, and the vocabulary of resources and actions with a risk tier for each.
 
 ## 7. Agent-to-agent rules
 
-These are part of the core contract even though the message hub is descoped.
+These are part of the core contract. The durable hub is descoped; the solo tier routes through
+the existing message bus (session-bus) as a carrier only (v2.3).
 
 - **Authority never travels as text** (invariant 6). Every action is checked against the acting
   session's own grants.
@@ -258,17 +276,22 @@ These are part of the core contract even though the message hub is descoped.
 - **Left:** a highly privileged agent can still be persuaded to misuse grants it already holds.
   That's prompt injection from a colleague, and the stamp is a signal to the model, not a lock.
 
-**Minimal path (no hub).**
+**Solo path (v2.3): daemon to daemon via the hub; the daemon stamps and signs; the bus routes only.**
 1. The agent writes a request into its outbox.
-2. The session daemon stamps the sender from that outbox and checks the scope rule (for
-   example, a worker may message only its own manager). The rule is fixed per session at launch
-   and kept by the daemon, so checking it needs no outside service.
-3. The daemon delivers the message straight into the receiving session's terminal (tmux
-   send-keys at the solo tier). If the receiver is on another machine, the daemon hands the
-   message to that machine's daemon directly over the private network, which checks it again
-   and delivers it. No cockpit is on the path (invariant 28).
+2. The session daemon (or the pod's sidecar) stamps the sender from that outbox and checks the
+   scope rule (for example, a worker may message its own manager, named by node, not by
+   session). The rule is fixed per session at launch and kept by the daemon, so checking it
+   needs no outside service.
+3. Same machine: the daemon delivers straight into the receiving session (its native inbox
+   where that works, else tmux send-keys). Other machine: the daemon signs the stamp with the
+   session's per-generation key and hands the message to the message hub, which authenticates
+   the daemon, rejects unsigned messages that claim to be fenced, and routes it to the target
+   machine's daemon. That daemon verifies the signature, checks the scope again and delivers.
+   If the hub is down, daemons deliver to each other directly over the private network. No
+   cockpit is on the path (invariant 28).
+4. Unfenced sessions keep using the bus directly. Their messages arrive marked `trust: unfenced`.
 
-Delivery isn't durable, and that's accepted. The durable hub, signed envelopes and in-fence relay
+Delivery isn't durable, and that's accepted. The durable hub on Postgres and the in-fence relay
 are descoped (§9).
 
 ## 8. Company documents (Google Drive, Notion)
@@ -298,10 +321,19 @@ are descoped (§9).
 - **A central door is a single point of failure.** If the central door host is down, every
   session on every machine loses the model (invariant 16's exception).
 - **Mac hosts.** Docker on a Mac runs in a VM, and its socket belongs to the user. Invariant 14
-  can't hold there, so an unfenced agent on the Mac can control the container runtime.
+  can't hold there, so an unfenced agent on the Mac can control the container runtime, read a
+  forwarder's token and write a fence's outbox. Mac stamps are therefore marked
+  `trust: fenced-mac` (weaker), and the Mac's key is capped to a small profile at every door.
+- **The message hub is a single point of failure for cross-machine messages** (v2.3). It runs on
+  one machine (the hp). If it's down, daemons fall back to delivering to each other directly;
+  if the hp itself is down, its sessions, the hub and pod creation on the cluster go with it.
+- **An owner device is not a human.** Any unfenced agent on the owner's machines passes a
+  "this device is the owner's" check, so even a low-tier proof needs a second factor an agent
+  can't read (a code sent to the owner's phone, v2.3).
 
 **Descoped:** listed here, not designed:
-- **Agent-to-agent cooperation** (the durable hub, signed envelopes, the in-fence relay). It's a
+- **Agent-to-agent cooperation** (the durable hub, the in-fence relay). Signed stamps are no
+  longer descoped: they're in solo (v2.3). It's a
   feature, not a control for the four threats. The minimal path in §7 covers the solo tier.
 - **Shared knowledge notes and Graphiti.** They belong to the orchestrator's world.
 - **Other harnesses** (a Codex adapter and so on). Claude Code only at first.

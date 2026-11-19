@@ -71,12 +71,10 @@ the only way out for the model, git and packages.
   `artifacts/tailscale-config.json`).
 - **Namespace defaults** (per k3s review 2026-11-20): the default ServiceAccount carries
   `imagePullSecrets: ghcr-pull`; `cc-sandbox` has a quota of 40Gi memory, 20 pods and 0 PVCs
-  (so the hostd's PVC is not here: the plan puts hostd in the doors namespace, `_GAP:_` confirm the PVC's namespace; see §7).
+  (so the hostd's PVC is not here: it is in `cc-sandbox-doors`, per k3s 2026-11-20; see §7).
 - **hp-ubuntu** is not a k3s node. It runs the docker fences, `ccsbx-hostd :7480` (uid `ccsbx`),
   `ccsbx-root` (the only sudo target), the `ccsbx-keys` uid with the machine key, the signer, tmux
-  server `-L ccsbx`, and the session-bus hub `:4011`. How hp reaches the cluster: `_GAP:_ plan §0
-  says read-only; not re-verified here, and which port is open to the cluster is a k3s fact to
-  copy in after their next review.`
+  server `-L ccsbx`, and the session-bus hub `:4011`. How hp reaches the cluster: over the tailnet to the k3s control plane on port 6443, through the existing admin grant in the Tailscale policy; the launcher kubeconfig uses it (per k3s 2026-11-20). The address is deliberately not written here: this repo is public.
 - **The Mac** (optional, Q12): Docker Desktop fences, `_ccsbx` signer, hostd. Not required by any gate.
 - **Worktrees on future-two** are `emptyDir` with a size limit (ephemeral: push early).
 - Full picture: plan §1 and §5.
@@ -154,8 +152,7 @@ the only way out for the model, git and packages.
 
 The hostd journal lives on a PVC, so this app is **stateful**.
 
-- **What exists:** the PVC `ccsbx-hostd-journal` (5Gi, local-path, on future-two), Bound (per k3s
-  review 2026-11-20). The journal is pruned 14 days after the cursor passes it; cockpit requests
+- **What exists:** the PVC `ccsbx-hostd-journal` in `cc-sandbox-doors` (5Gi, local-path, on future-two), Bound (verified live, per k3s 2026-11-20). The journal is pruned 14 days after the cursor passes it; cockpit requests
   are never pruned.
 - _GAP: the PVC is not backed up, and local-path storage lives on one node's disk. Decide: back it
   up (where, how often, encrypted with what), or record "not backed up on purpose, rebuilt from X"

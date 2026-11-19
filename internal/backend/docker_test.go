@@ -256,3 +256,39 @@ func TestWorkdirNotInHiddenHomeDirs(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// S2 argv: the sweep runs as root, but with no network, a read-only root and only the capabilities
+// it needs, and mounts nothing but the home and the quarantine.
+func TestSweepArgs(t *testing.T) {
+	a := spec(t).SweepArgs()
+	for _, want := range [][]string{{"--network", "none"}, {"--read-only"}, {"--cap-drop", "ALL"}, {"--security-opt", "no-new-privileges"}} {
+		if !has(a, want...) {
+			t.Errorf("missing %v", want)
+		}
+	}
+	mounts := 0
+	for _, x := range a {
+		if x == "--mount" {
+			mounts++
+		}
+	}
+	if mounts != 2 {
+		t.Errorf("%d mounts, want home and quarantine only", mounts)
+	}
+	for _, keep := range []string{".claude/projects", ".claude", ".claude/"} {
+		for _, x := range a {
+			if x == keep {
+				t.Errorf("%s would be swept: resume needs the transcript store", keep)
+			}
+		}
+	}
+	if !has(a, ".claude/CLAUDE.md") || !has(a, ".bashrc") {
+		t.Error("steering files are not in the sweep list")
+	}
+}
+
+func TestMovedParsesSweepOutput(t *testing.T) {
+	if m := moved("moved .bashrc\nnoise\nmoved .claude/CLAUDE.md\n"); len(m) != 2 || m[1] != ".claude/CLAUDE.md" {
+		t.Fatal(m)
+	}
+}

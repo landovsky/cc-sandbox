@@ -60,7 +60,10 @@ func (s Spec) HomeDir() string {
 
 // NetworkArgs creates the per-generation internal network: no route out, no gateway.
 func (s Spec) NetworkArgs() []string {
-	return []string{"network", "create", "--internal", "--label", "ccsbx.sid=" + s.Sid, "--label", "ccsbx.gen=" + strconv.Itoa(s.Gen), s.Network()}
+	// inhibit_ipv4: the host gets no address on the bridge, so a host service listening on a
+	// wildcard address can't be reached at "the gateway" (that address is on-link, and no default
+	// route doesn't cover it). Peers on the same network still talk to each other over L2.
+	return []string{"network", "create", "--internal", "-o", "com.docker.network.bridge.inhibit_ipv4=true", "--label", "ccsbx.sid=" + s.Sid, "--label", "ccsbx.gen=" + strconv.Itoa(s.Gen), s.Network()}
 }
 
 // RunArgs is the fixed `docker run` argv. Nothing in it comes from the agent. The flags are the
@@ -123,6 +126,9 @@ func (s Spec) Prepare() error {
 	}
 	if err := os.Mkdir(g, 0o700); err != nil { // fails if it exists: one outbox per generation
 		return fmt.Errorf("generation dir %s: %w", g, err)
+	}
+	if err := s.prepareQuarantine(); err != nil {
+		return err
 	}
 	for _, d := range []string{"out", "in", "managed"} {
 		p := filepath.Join(g, d)

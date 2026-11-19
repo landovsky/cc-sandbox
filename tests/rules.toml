@@ -947,3 +947,13 @@ block = "tests/twin-go.sh ./internal/backend TestWorkdirNotInHiddenHomeDirs"
 invariants = [2]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "home-steering-not-carried"
+title = "agent-written steering files in the per-node home (CLAUDE.md, commands, hooks, shell rc) are moved to a host-side quarantine before the next generation; the transcript store stays so resume works"
+suite = "fence"
+allow = "tests/resume-test.sh allow"
+block = "tests/resume-test.sh block"
+invariants = [25]
+backends = ["docker"]
+where = "hp"

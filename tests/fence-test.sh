@@ -95,18 +95,35 @@ no-internet/allow)
   ok "fence reaches a peer on its own network ($ip)";;
 
 no-internet/block)
+  # Public addresses, the default bridge, AND the host's own address on the fence's internal bridge:
+  # that one is on-link, so "no default route" doesn't cover it. Every port a host service listens
+  # on at the wildcard address is probed there, plus the ones the platform will use (22, 7480, 4011).
   sid=$(new_session nib) || fail "start"
-  out=$(fence "$sid" $PY "
+  fence_bg "$sid" sleep 40
+  net=ccsbx-net-$sid-g1
+  # the host's address on the bridge is the first address of the subnet (with inhibit_ipv4 docker
+  # reports no gateway, but a host that did have an address would have this one)
+  subnet=$(docker network inspect "$net" --format '{{(index .IPAM.Config 0).Subnet}}')
+  gw=$(python3 -c "import ipaddress,sys;print(next(ipaddress.ip_network(sys.argv[1]).hosts()))" "$subnet") || fail "no subnet for $net"
+  ports=$( { ss -ltnH 2>/dev/null | awk '{print $4}' | grep -E '^(0\.0\.0\.0|\[::\]|\*):[0-9]+$' | sed 's/.*://' ; echo 22; echo 7480; echo 4011; } | sort -un | tr '\n' ',')
+  out=$(docker exec "ccsbx-$sid-g1" $PY "
 import socket
 for host in ('1.1.1.1','8.8.8.8','172.17.0.1','100.100.100.100'):
     try:
         socket.create_connection((host,443),3).close(); print('REACHED',host)
     except OSError as e: print('blocked',host)
+reached=[]
+for port in [int(p) for p in '$ports'.split(',') if p]:
+    try:
+        socket.create_connection(('$gw',port),1.5).close(); reached.append(port)
+    except OSError: pass
+print('gateway-$gw-reachable-ports', reached)
 print('default-route', any(l.split()[1]=='00000000' for l in open('/proc/net/route').read().splitlines()[1:]))
-") || fail "run failed"
+") || fail "exec failed"
   echo "$out" | grep -q REACHED && fail "reached the outside: $out"
   echo "$out" | grep -q 'default-route False' || fail "a default route exists: $out"
-  ok "no route out, nothing reachable: $(echo $out | tr '\n' ' ')";;
+  echo "$out" | grep -q "reachable-ports \[\]" || fail "the host answers on the fence's own bridge address: $out"
+  ok "no route out, host's bridge address $gw answers on none of: $ports";;
 
 no-dns-exfil/allow)
   # Names on the fence's own network still resolve through docker's embedded DNS: the forwarder is addressed as 'fwd'.
@@ -143,7 +160,13 @@ for n in ('exfil-$$.canary.invalid','secret-data-$$.example.com'):
   log=$(docker logs "ccsbx-canary-$$" 2>&1)
   [ -z "$log" ] || fail "canary saw queries: $log"
   grep -q 'nameserver 127.0.0.1\|nameserver 127.0.0.11' <(docker exec "ccsbx-$sid-g1" cat /etc/resolv.conf) || fail "resolv.conf unexpected: $(docker exec ccsbx-$sid-g1 cat /etc/resolv.conf)"
-  ok "lookups failed, canary log empty";;
+  # The canary can't see a mutation that removes --dns (docker's internal networks don't forward at
+  # all on a fixed engine), so assert the flag and the engine version directly.
+  dns=$(docker inspect "ccsbx-$sid-g1" --format '{{json .HostConfig.Dns}}')
+  [ "$dns" = '["127.0.0.1"]' ] || fail "the fence's --dns is $dns, want [\"127.0.0.1\"] (no resolver)"
+  major=$(docker version --format '{{.Server.Version}}' | cut -d. -f1)
+  [ "${major:-0}" -ge 26 ] || fail "docker engine $major.x < 26: CVE-2024-29018 let internal networks forward DNS queries out"
+  ok "lookups failed, canary log empty, --dns 127.0.0.1, engine >= 26";;
 
 outbox-per-gen/allow)
   sid=$(new_session og) || fail "start"

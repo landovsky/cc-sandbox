@@ -134,3 +134,54 @@ func (r *Root) ListDir(rel string, max int) (names []string, more bool, err erro
 	}
 	return names, true, nil
 }
+
+// ReadRange reads at most max bytes of rel starting at off, under the same rules as ReadFile
+// (regular, one link, fence-owned, no symlink) but with NO size cap on the file itself: it is
+// for append-only streams (events.jsonl) read in bounded chunks. It returns the bytes and the
+// file's size at fstat time.
+func (r *Root) ReadRange(rel string, off int64, max int, lim Limits) ([]byte, int64, error) {
+	fd, err := openBeneath(r.fd, rel, syscall.O_RDONLY)
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EXDEV) {
+			return nil, 0, ErrUnsafePath
+		}
+		return nil, 0, err
+	}
+	defer syscall.Close(fd)
+	var st syscall.Stat_t
+	if err := syscall.Fstat(fd, &st); err != nil {
+		return nil, 0, err
+	}
+	if st.Mode&syscall.S_IFMT != syscall.S_IFREG {
+		return nil, 0, ErrNotRegular
+	}
+	if uint64(st.Nlink) != 1 {
+		return nil, 0, ErrHardlink
+	}
+	if int(st.Uid) != lim.Uid {
+		return nil, 0, ErrOwner
+	}
+	if off >= st.Size {
+		return nil, st.Size, nil
+	}
+	n := int64(max)
+	if st.Size-off < n {
+		n = st.Size - off
+	}
+	buf := make([]byte, n)
+	got := 0
+	for got < len(buf) {
+		m, err := syscall.Pread(fd, buf[got:], off+int64(got))
+		if err == syscall.EINTR {
+			continue
+		}
+		if err != nil {
+			return nil, 0, err
+		}
+		if m == 0 {
+			break
+		}
+		got += m
+	}
+	return buf[:got], st.Size, nil
+}

@@ -19,8 +19,11 @@ package hostd
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -68,17 +71,20 @@ var Types = map[string]bool{
 
 // Config holds every tunable (all reachable as ccsbx-hostd flags / CCSBX_* env vars).
 type Config struct {
-	StateDir string
-	FenceUID int     // owner uid required of every outbox file
-	MaxBytes int64   // per request file
-	Rate     float64 // requests per second per outbox
-	Burst    int     // bucket size per outbox
-	MaxList  int     // names read per outbox per scan
-	MaxTotal int     // requests per generation in its lifetime; beyond: shed silently
-	ShedRefs int     // refusal replies written per scan once the bucket is empty
-	Handler  Handler // nil: every known type is answered error/not_built
-	Now      func() time.Time
-	Logf     func(format string, args ...any)
+	StateDir         string
+	FenceUID         int     // owner uid required of every outbox file
+	MaxBytes         int64   // per request file
+	Rate             float64 // requests per second per outbox
+	Burst            int     // bucket size per outbox
+	MaxList          int     // names read per outbox per scan
+	MaxTotal         int     // requests per generation in its lifetime; beyond: shed silently
+	ShedRefs         int     // refusal replies written per scan once the bucket is empty
+	Handler          Handler // nil: every known type is answered error/not_built
+	Journal          Journal // nil: events.jsonl is not ingested (U3a alone)
+	MaxEventsPerScan int     // events taken from one outbox per scan
+	MaxEventLine     int     // bytes per events.jsonl line; longer lines are dropped
+	Now              func() time.Time
+	Logf             func(format string, args ...any)
 }
 
 // Defaults fills the zero values.
@@ -103,6 +109,12 @@ func (c *Config) Defaults() {
 	}
 	if c.ShedRefs == 0 {
 		c.ShedRefs = 20
+	}
+	if c.MaxEventsPerScan == 0 {
+		c.MaxEventsPerScan = 500
+	}
+	if c.MaxEventLine == 0 {
+		c.MaxEventLine = 4096
 	}
 	if c.Now == nil {
 		c.Now = time.Now
@@ -130,19 +142,23 @@ type outbox struct {
 	total    int
 	overflow bool
 	drained  bool
+	state    genState
+	stateOK  bool
 }
 
 // Hostd is the watcher. Scan is one pass; Run loops it.
 type Hostd struct {
-	Cfg   Config
-	mu    sync.Mutex
-	boxes map[string]*outbox
-	start *start.Daemon
+	Cfg       Config
+	mu        sync.Mutex
+	boxes     map[string]*outbox
+	start     *start.Daemon
+	epochDone bool
+	done      map[string]bool // generations drained for good (their box is freed)
 }
 
 func New(cfg Config) *Hostd {
 	cfg.Defaults()
-	return &Hostd{Cfg: cfg, boxes: map[string]*outbox{}, start: &start.Daemon{StateDir: cfg.StateDir}}
+	return &Hostd{Cfg: cfg, boxes: map[string]*outbox{}, done: map[string]bool{}, start: &start.Daemon{StateDir: cfg.StateDir}}
 }
 
 var (
@@ -158,9 +174,13 @@ func (h *Hostd) Scan() Stats {
 	defer h.mu.Unlock()
 	st := Stats{Reasons: map[string]int{}}
 	sess, _ := filepath.Glob(filepath.Join(h.Cfg.StateDir, "s", "s*", "g*"))
+	h.checkEpoch(sess)
 	for _, gdir := range sess {
 		sid, gen := filepath.Base(filepath.Dir(gdir)), filepath.Base(gdir)
 		if !sidRe.MatchString(sid) || !genRe.MatchString(gen) {
+			continue
+		}
+		if h.done[gdir] {
 			continue
 		}
 		_, closedErr := os.Stat(filepath.Join(gdir, "CLOSED"))
@@ -170,19 +190,32 @@ func (h *Hostd) Scan() Stats {
 			h.loadLedger(gdir, box)
 			h.boxes[gdir] = box
 		}
-		if box.drained {
-			continue
+		rec, err := h.start.Load(sid)
+		if err != nil {
+			st.Reasons["unknown_session"]++
+			continue // no record: nothing to stamp from; the files stay for a later pass
 		}
-		h.scanOne(gdir, sid, gen, box, &st)
-		if closedErr == nil {
-			box.drained = true
-			box.seen = nil
+		var genN int
+		fmt.Sscanf(gen, "g%d", &genN)
+		// A generation that is not the record's live one speaks for nobody: its requests are
+		// answered `stale` and never reach a handler, whether or not it left a CLOSED marker
+		// (a SIGKILLed `ccsbx run` leaves none). One pass drains it, then it is forgotten.
+		stale := genN != rec.Gen || rec.Ended != nil
+		h.loadState(gdir, box)
+		h.lifecycle(gdir, rec, box, "session.start")
+		h.scanOne(gdir, sid, gen, rec, box, stale, &st)
+		h.ingestEvents(gdir, rec, gen, box, &st)
+		if closedErr == nil || stale {
+			h.ingestEvents(gdir, rec, gen, box, &st) // the final drain
+			h.lifecycle(gdir, rec, box, "session.end")
+			h.done[gdir] = true
+			delete(h.boxes, gdir)
 		}
 	}
 	return st
 }
 
-func (h *Hostd) scanOne(gdir, sid, gen string, box *outbox, st *Stats) {
+func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, stale bool, st *Stats) {
 	root, err := OpenRoot(filepath.Join(gdir, "out"))
 	if err != nil {
 		return
@@ -194,11 +227,6 @@ func (h *Hostd) scanOne(gdir, sid, gen string, box *outbox, st *Stats) {
 			st.Reasons["requests_dir_"+classify(err)]++
 		}
 		return
-	}
-	rec, err := h.start.Load(sid)
-	if err != nil {
-		st.Reasons["unknown_session"]++
-		return // no record: nothing to stamp from; the files stay for a later pass
 	}
 	var genN int
 	fmt.Sscanf(gen, "g%d", &genN)
@@ -243,6 +271,15 @@ func (h *Hostd) scanOne(gdir, sid, gen string, box *outbox, st *Stats) {
 			}
 			continue
 		}
+		if stale {
+			box.seen[n] = 0
+			id := ulid.New()
+			h.ledger(gdir, n, 0, id, "refused:stale")
+			h.reply(gdir, Reply{Rid: rid, ID: id, Status: "stale", Result: map[string]string{"code": "stale_generation"}})
+			st.Refused++
+			st.Reasons["stale"]++
+			continue
+		}
 		box.tokens--
 		id := ulid.New()
 		data, ino, err := root.ReadFile("requests/"+n, Limits{Uid: h.Cfg.FenceUID, Max: h.Cfg.MaxBytes})
@@ -255,10 +292,8 @@ func (h *Hostd) scanOne(gdir, sid, gen string, box *outbox, st *Stats) {
 			h.reply(gdir, Reply{Rid: rid, ID: id, Status: "refused", Result: map[string]string{"code": code}})
 			continue
 		}
-		var head struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(data, &head) != nil || !json.Valid(data) {
+		typ, terr := strictType(data)
+		if terr != nil {
 			box.seen[n] = ino
 			h.ledger(gdir, n, ino, id, "refused:bad_json")
 			st.Refused++
@@ -266,7 +301,7 @@ func (h *Hostd) scanOne(gdir, sid, gen string, box *outbox, st *Stats) {
 			h.reply(gdir, Reply{Rid: rid, ID: id, Status: "refused", Result: map[string]string{"code": "bad_json"}})
 			continue
 		}
-		if !Types[head.Type] {
+		if !Types[typ] {
 			box.seen[n] = ino
 			h.ledger(gdir, n, ino, id, "refused:unknown_type")
 			st.Refused++
@@ -276,10 +311,20 @@ func (h *Hostd) scanOne(gdir, sid, gen string, box *outbox, st *Stats) {
 		}
 		req := Request{
 			ID: id, Rid: rid, Sid: sid, Gen: genN, Label: rec.Spec.Label, FullID: rec.Reply.ID,
-			Type: head.Type, Received: now.UTC(), Body: json.RawMessage(data),
+			Type: typ, Received: now.UTC(), Body: json.RawMessage(data),
+		}
+		// Write-ahead: the ledger is the only thing that stops a replay after a restart (the
+		// daemon cannot delete outbox files). If it cannot be written the handler does not run
+		// and the file stays unseen, to be retried when the disk is back.
+		if err := h.ledger(gdir, n, ino, id, "accepted"); err != nil {
+			box.total--
+			box.tokens++
+			st.Reasons["ledger_io_error"]++
+			h.Cfg.Logf("hostd: ledger write failed (%v); request not handled", err)
+			h.reply(gdir, Reply{Rid: rid, ID: id, Status: "error", Result: map[string]string{"code": "io_error"}})
+			continue
 		}
 		box.seen[n] = ino
-		h.ledger(gdir, n, ino, id, "accepted")
 		st.Accepted++
 		rep := h.Cfg.Handler(req)
 		rep.Rid, rep.ID = rid, id
@@ -337,19 +382,68 @@ func (h *Hostd) ledgerPath(gdir string) string {
 	return filepath.Join(h.Cfg.StateDir, "hostd", "ledger", filepath.Base(filepath.Dir(gdir))+"-"+filepath.Base(gdir)+".jsonl")
 }
 
-func (h *Hostd) ledger(gdir, name string, ino uint64, id, result string) {
+// ledger appends one line. Only "accepted" entries are fsynced (they guard against a replay);
+// refusals and shed entries are best-effort, a replay of those is harmless.
+func (h *Hostd) ledger(gdir, name string, ino uint64, id, result string) error {
 	p := h.ledgerPath(gdir)
-	if os.MkdirAll(filepath.Dir(p), 0o700) != nil {
-		return
+	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
+		return err
 	}
 	f, err := os.OpenFile(p, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 	if err != nil {
-		return
+		return err
 	}
-	defer f.Close()
 	b, _ := json.Marshal(ledgerRec{name, ino, id, result})
-	f.Write(append(b, '\n'))
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	if result == "accepted" {
+		if err := f.Sync(); err != nil {
+			f.Close()
+			return err
+		}
+	}
+	return f.Close()
 }
+
+// strictType returns the request's "type", refusing anything where the top-level keys are not
+// unique: Go keeps the last duplicate, other readers keep the first, and the body is passed
+// on raw, so a duplicate "type" could show a handler a different type than the one validated.
+func strictType(data []byte) (string, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return "", errBadJSON
+	}
+	seen := map[string]bool{}
+	typ := ""
+	for dec.More() {
+		kt, err := dec.Token()
+		k, ok := kt.(string)
+		if err != nil || !ok || seen[k] {
+			return "", errBadJSON
+		}
+		seen[k] = true
+		var raw json.RawMessage
+		if err := dec.Decode(&raw); err != nil {
+			return "", errBadJSON
+		}
+		if k == "type" {
+			if json.Unmarshal(raw, &typ) != nil {
+				return "", errBadJSON
+			}
+		}
+	}
+	if t, err := dec.Token(); err != nil || t != json.Delim('}') {
+		return "", errBadJSON
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return "", errBadJSON
+	}
+	return typ, nil
+}
+
+var errBadJSON = errors.New("bad_json")
 
 func (h *Hostd) loadLedger(gdir string, box *outbox) {
 	f, err := os.Open(h.ledgerPath(gdir))

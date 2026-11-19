@@ -188,3 +188,45 @@ block = "tests/twin-go.sh ./internal/msg TestMsgNoCockpitBlock"
 invariants = [8]
 backends = ["unit"]
 where = "hp"
+
+# ---- review fixes (U3a) and M3 (journal). Direct mode: not evidence. ----
+
+[[rule]]
+id = "outbox-stale-generation"
+title = "a request from an old or ended generation is answered stale and never stamped with the live generation's identity"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxStaleGenerationAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxStaleGenerationBlock"
+invariants = [1, 9, 15]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "ledger-fail-closed"
+title = "if the request ledger can't be written the handler does not run, so a restart can't replay under a new ULID"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestLedgerFailClosedAllow"
+block = "tests/twin-go.sh ./internal/hostd TestLedgerFailClosedBlock"
+invariants = [20]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "journal-durable"
+title = "an acknowledged journal event survives a crash; a torn tail leaves no gap and no duplicate"
+suite = "verbs"
+allow = "tests/twin-go.sh ./internal/journal TestJournalDurableAllow"
+block = "tests/twin-go.sh ./internal/journal TestJournalDurableBlock"
+invariants = [28]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "epoch-reset-reingest"
+title = "after a journal wipe (new epoch) outboxes are re-read: events, lifecycle and unreplied requests come back, answered ones don't run twice"
+suite = "verbs"
+allow = "tests/twin-go.sh ./internal/hostd TestEpochResetReingestAllow"
+block = "tests/twin-go.sh ./internal/hostd TestEpochResetReingestBlock"
+invariants = [28]
+backends = ["unit"]
+where = "hp"

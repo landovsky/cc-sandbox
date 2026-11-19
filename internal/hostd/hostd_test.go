@@ -403,3 +403,105 @@ func TestOutboxHostWriteRefusedBlock(t *testing.T) {
 		t.Fatalf("direct mode: the host user can write the outbox (%s); the split needs root (gate M)", p)
 	}
 }
+
+// ---- review fixes (U3a-M1, S1, N3) ----------------------------------------------------------
+
+// setRecordGen rewrites the fixture's session record, as a resume (U7) or an end would.
+func (f *fixture) setRecord(mut func(*start.Record)) {
+	f.t.Helper()
+	p := filepath.Join(f.state, "sessions", sid+".json")
+	b, _ := os.ReadFile(p)
+	var rec start.Record
+	json.Unmarshal(b, &rec)
+	mut(&rec)
+	b, _ = json.Marshal(rec)
+	os.WriteFile(p, b, 0o600)
+}
+
+// T:outbox-stale-generation
+// context: gen 1's `ccsbx run` was SIGKILLed (no CLOSED marker) and the session resumed as gen 2.
+// A request still written into g1/out must not be stamped with gen 2's identity.
+func TestOutboxStaleGenerationAllow(t *testing.T) {
+	f := newFixture(t, nil)
+	f.setRecord(func(r *start.Record) { r.Gen = 2; r.Reply.ID = "tomas/hp/" + sid + "/g2" })
+	g2 := filepath.Join(f.state, "s", sid, "g2", "out", "requests")
+	os.MkdirAll(g2, 0o755)
+	os.WriteFile(filepath.Join(g2, "live.json"), []byte(`{"type":"ccf.mark"}`), 0o644)
+	f.h.Scan()
+	if len(f.got) != 1 || f.got[0].Gen != 2 || f.got[0].FullID != "tomas/hp/"+sid+"/g2" {
+		t.Fatalf("the live generation's request: %+v", f.got)
+	}
+}
+
+func TestOutboxStaleGenerationBlock(t *testing.T) {
+	f := newFixture(t, nil)
+	f.setRecord(func(r *start.Record) { r.Gen = 2; r.Reply.ID = "tomas/hp/" + sid + "/g2" })
+	f.req("old.json", `{"type":"git.push"}`) // written into g1/out by the dead generation
+	st := f.h.Scan()
+	if len(f.got) != 0 || st.Accepted != 0 {
+		t.Fatalf("old generation acted under gen 2's identity: %+v", f.got)
+	}
+	if r, ok := f.reply("old"); !ok || r.Status != "stale" {
+		t.Fatalf("reply %+v", r)
+	}
+	// A request that shows up in the dead generation later is not picked up either.
+	f.req("later.json", `{"type":"git.push"}`)
+	f.h.Scan()
+	if len(f.got) != 0 {
+		t.Fatal("a drained stale generation was scanned again")
+	}
+}
+
+// context: the session ended (record has Ended); whatever its outbox still holds is stale.
+func TestRequestsOfAnEndedSessionAreStale(t *testing.T) {
+	f := newFixture(t, nil)
+	f.setRecord(func(r *start.Record) { now := time.Now(); r.Ended = &now })
+	f.req("r.json", `{"type":"grant.request"}`)
+	f.h.Scan()
+	if r, _ := f.reply("r"); len(f.got) != 0 || r.Status != "stale" {
+		t.Fatalf("%+v %+v", f.got, r)
+	}
+}
+
+// T:ledger-fail-closed
+// context: the ledger is what stops a restart from running a request twice under a new ULID.
+// While it can't be written, the handler must not run; when the disk is back, the request is
+// handled exactly once.
+func TestLedgerFailClosedAllow(t *testing.T) { TestStampFromOutboxAllow(t) }
+
+func TestLedgerFailClosedBlock(t *testing.T) {
+	f := newFixture(t, nil)
+	ld := filepath.Join(f.state, "hostd", "ledger")
+	os.MkdirAll(ld, 0o700)
+	os.Chmod(ld, 0o500) // no new files: the ledger append fails
+	defer os.Chmod(ld, 0o700)
+	if os.WriteFile(filepath.Join(ld, "probe"), nil, 0o600) == nil {
+		t.Skip("running as a user that ignores directory permissions")
+	}
+	f.req("r1.json", `{"type":"git.push"}`)
+	st := f.h.Scan()
+	if len(f.got) != 0 || st.Reasons["ledger_io_error"] != 1 {
+		t.Fatalf("handled without a ledger entry: %+v %v", f.got, st.Reasons)
+	}
+	if r, _ := f.reply("r1"); r.Status != "error" {
+		t.Fatalf("reply %+v", r)
+	}
+	os.Chmod(ld, 0o700)
+	f.h.Scan()
+	New(f.h.Cfg).Scan() // and a restart
+	if len(f.got) != 1 {
+		t.Fatalf("after the disk came back it ran %d times", len(f.got))
+	}
+}
+
+// context: Go's json keeps the LAST duplicate key; another reader of the raw body may keep the
+// first. A request whose top-level keys repeat is refused, so everyone sees one type.
+func TestDuplicateTopLevelKeysAreRefused(t *testing.T) {
+	f := newFixture(t, nil)
+	f.req("dup.json", `{"type":"ccf.outcome","text":"x","type":"git.push"}`)
+	f.req("nested.json", `{"type":"ccf.mark","body":{"a":1,"a":2}}`) // nested duplicates are the handler's data
+	f.h.Scan()
+	if f.code("dup") != "refused:bad_json" || len(f.got) != 1 || f.got[0].Rid != "nested" {
+		t.Fatalf("%s %+v", f.code("dup"), f.got)
+	}
+}

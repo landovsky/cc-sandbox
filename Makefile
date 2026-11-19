@@ -1,0 +1,28 @@
+# ccsbx build. Every tunable is a make variable: `make GO=/path/to/go test`.
+#   make vet     go vet + the zero-modules check (no go.sum allowed)
+#   make test    vet + unit tests (HOME is a tmpdir)
+#   make build   static binary into bin/ccsbx for this machine, plus a cross-compile check
+#   make dist    linux/darwin x amd64/arm64 into dist/
+GO      ?= $(HOME)/.local/go/bin/go
+VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
+LDFLAGS  = -s -w -X main.version=$(VERSION)
+TARGETS ?= linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
+
+.PHONY: vet test build dist
+vet:
+	@test ! -e go.sum || (echo "go.sum present: ccsbx must have zero third-party modules" && exit 1)
+	$(GO) vet ./...
+
+test: vet
+	HOME=$$(mktemp -d) $(GO) test ./...
+
+build:
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/ccsbx ./cmd/ccsbx
+	@for t in $(TARGETS); do \
+	  CGO_ENABLED=0 GOOS=$${t%/*} GOARCH=$${t#*/} $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o /dev/null ./cmd/ccsbx || exit 1; \
+	done
+
+dist:
+	@for t in $(TARGETS); do \
+	  CGO_ENABLED=0 GOOS=$${t%/*} GOARCH=$${t#*/} $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/ccsbx-$${t%/*}-$${t#*/} ./cmd/ccsbx || exit 1; \
+	done

@@ -1,0 +1,14 @@
+# Security-critical paths need Tomas's review (plan §2). Overnight work on these stays a PR.
+/internal/fwd/          @landovsky
+/internal/token/        @landovsky
+/internal/signer/       @landovsky
+/internal/hostd/        @landovsky
+/internal/door/         @landovsky
+/internal/gitroute/     @landovsky
+/internal/approval/     @landovsky
+/cmd/ccsbx-root/        @landovsky
+/cmd/ccsbx-signer/      @landovsky
+/cmd/ccsbx-hostd/       @landovsky
+/units/                 @landovsky
+/.github/CODEOWNERS     @landovsky
+/.claude/settings.json  @landovsky

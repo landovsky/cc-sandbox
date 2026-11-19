@@ -1,0 +1,10 @@
+{
+  "name": "dev-default",
+  "machines": ["hp-ubuntu"],
+  "billing": ["api", "stub"],
+  "memory_mb": 4096,
+  "pids": 512,
+  "deny": [],
+  "mode": "bypassPermissions",
+  "e2e": false
+}

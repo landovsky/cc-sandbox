@@ -27,6 +27,19 @@
    `units/install-linux.sh check` and `bin/ccsbx-preflight --morning --post-M1`.
 4. Rollback: `sudo units/install-linux.sh uninstall --yes` (restores the backup it took).
 
+## The reboot and the containers with restart policy `no`
+
+The install ends with a reboot. These containers have restart policy `no`, so **they stay down
+after it** (`docker ps -a` on 2026-11-20):
+
+| Container | What it is | Recommendation |
+|---|---|---|
+| `messaging-hub-db-1` | postgres :54329 for messaging-hub dev | `docker update --restart unless-stopped messaging-hub-db-1` before the install |
+| `redis-5ctq`, `redis-4s6w`, `redis-644w`, `redis-6y56`, `redis-zl` | per-worktree test redis | drop with their worktrees, or `docker update --restart unless-stopped` |
+| `redis-zl-review`, `link-shortener-pg` | already exited | `docker rm` |
+
+After the group change only password sudo can start them (`sudo docker start <name>`).
+
 ## Already true on hp (read-only probes tonight)
 
 - `ccsbx-keys` exists and `/var/lib/ccsbx-keys/age.key` is unreadable to tomas (R10b is done).

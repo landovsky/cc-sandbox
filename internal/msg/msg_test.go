@@ -262,3 +262,7 @@ func TestUndeliverableWhenThePaneIsGone(t *testing.T) {
 		t.Fatalf("%+v", res)
 	}
 }
+
+// T:msg-in-scope block twin: even an in-scope message is only what the daemon stamped: the
+// text can't forge a second stamp or type control sequences.
+func TestMsgInScopeBlock(t *testing.T) { TestTextCannotForgeAStampOrTypeControlSequences(t) }

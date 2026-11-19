@@ -4,6 +4,8 @@
 /internal/start/        @landovsky
 /tests/fence-test.sh    @landovsky
 /tests/rules.toml       @landovsky
+/cmd/ccsbx/steering.go  @landovsky
+/internal/gitroute/     @landovsky
 /internal/token/        @landovsky
 /internal/signer/       @landovsky
 /internal/hostd/        @landovsky

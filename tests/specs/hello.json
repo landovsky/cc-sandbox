@@ -1,0 +1,7 @@
+{"v":1,"request_id":"lid-hello-1","owner":"tomas","machine":"hp-ubuntu","label":"cc-sandbox:hello",
+ "realm":"production","resume":null,"harness":"claude","harness_args":["--model","sonnet"],
+ "workdir":{"path":"/tmp"},
+ "profile":"dev-default","billing":"stub",
+ "msg_scope":{"manager":{"node":"cc-sandbox:2f3e"},"peers":[],"reply_window_s":86400},
+ "client":{"lid":"lid-hello-1","role":"worker"},
+ "brief":{"text":"say hi"}}

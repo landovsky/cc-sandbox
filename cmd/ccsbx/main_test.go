@@ -27,7 +27,7 @@ func TestEverySubcommandHelpRunsNothing(t *testing.T) {
 // A command whose piece has not landed must not look like it worked.
 func TestUnbuiltCommandIsNotSuccess(t *testing.T) {
 	var out, errb bytes.Buffer
-	if code := app().Main([]string{"start"}, &out, &errb); code != exitNotBuilt {
+	if code := app().Main([]string{"steering-check"}, &out, &errb); code != exitNotBuilt {
 		t.Fatalf("exit %d, want %d", code, exitNotBuilt)
 	}
 }

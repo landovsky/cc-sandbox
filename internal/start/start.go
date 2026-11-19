@@ -1,0 +1,268 @@
+package start
+
+import (
+	"crypto/rand"
+	"encoding/base32"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/landovsky/cc-sandbox/internal/profile"
+)
+
+// Launcher starts and probes the pane. Production: tmux (TmuxLauncher). Tests: a fake.
+type Launcher interface {
+	Launch(rec *Record) error
+	Alive(sid string) bool
+}
+
+// Record is what the daemon keeps per session; `ccsbx run --sid` reads it back, so the values
+// the run uses are the ones the daemon minted and checked, not whatever the caller passes.
+type Record struct {
+	Sid       string     `json:"sid"`
+	Gen       int        `json:"gen"`
+	Label     string     `json:"label"`
+	RequestID string     `json:"request_id"`
+	Uid       int        `json:"uid"` // the caller, from the OS
+	Started   time.Time  `json:"started"`
+	Ended     *time.Time `json:"ended,omitempty"`
+	Spec      LaunchSpec `json:"spec"`
+	Reply     StartReply `json:"reply"`
+}
+
+// Daemon holds the policy knobs and the state directory.
+type Daemon struct {
+	StateDir    string
+	ProfilesDir string
+	Machine     string // this machine's name; a spec for another machine is refused
+	Uid         int    // the caller's uid (from the OS, never from the spec)
+	Image       string // fence image reference recorded in the pin
+	CCVersion   string
+	MaxLive     int // machine_full above this many live sessions
+	MaxPerHour  int // rate_capped above this many starts by one caller in an hour
+	Backend     string
+	Socket      string // tmux -L name for the attach command; default ccsbx
+	Root        string // "direct" tonight
+	Launcher    Launcher
+	Now         func() time.Time
+	// Exe is the ccsbx binary the pane runs ("run --sid ...").
+	Exe string
+}
+
+func (d *Daemon) now() time.Time {
+	if d.Now != nil {
+		return d.Now()
+	}
+	return time.Now()
+}
+
+func (d *Daemon) path(parts ...string) string {
+	return filepath.Join(append([]string{d.StateDir}, parts...)...)
+}
+
+// Start applies policy and launches. It returns the StartReply, or a *Refusal for policy.
+// Every refusal happens before anything is created, so a refused start leaves no trace.
+func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
+	if err := os.MkdirAll(d.path("sessions"), 0o700); err != nil {
+		return nil, err
+	}
+	unlock, err := d.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
+	recs, err := d.records()
+	if err != nil {
+		return nil, err
+	}
+
+	// Idempotent per (caller, request_id): a retry gets the same reply and starts nothing.
+	for _, r := range recs {
+		if r.Uid == d.Uid && r.RequestID == s.RequestID {
+			rep := r.Reply
+			return &rep, nil
+		}
+	}
+
+	if s.Machine != d.Machine {
+		return nil, refuse(WrongMachine, "spec is for %s, this is %s (the pane lives on the session's machine)", s.Machine, d.Machine)
+	}
+	if s.Resume != nil {
+		return nil, refuse(NotBuilt, "resume is U7")
+	}
+	if s.Workdir.Path == "" || s.Workdir.Repo != "" {
+		return nil, refuse(NotBuilt, "only workdir.path is supported (repo/base/branch needs the git route, H1)")
+	}
+	if !filepath.IsAbs(s.Workdir.Path) {
+		return nil, refuse(BadSpec, "workdir.path must be absolute")
+	}
+	if st, err := os.Stat(s.Workdir.Path); err != nil || !st.IsDir() {
+		return nil, refuse(BadSpec, "workdir.path %s is not a directory", s.Workdir.Path)
+	}
+
+	p, err := profile.Load(d.ProfilesDir, s.Profile)
+	if err != nil {
+		return nil, refuse(ProfileNotApproved, "profile %q: %v", s.Profile, err)
+	}
+	machineOK, billingOK := p.Allows(d.Machine, s.Billing)
+	if !machineOK {
+		return nil, refuse(ProfileNotApproved, "profile %s is not approved for %s", p.Name, d.Machine)
+	}
+	// Invariant 18: the launcher picks the billing mode and records it; there is no default.
+	if s.Billing == "" {
+		return nil, refuse(BillingUnavailable, "billing is required (api|subscription|stub)")
+	}
+	if !billingOK {
+		return nil, refuse(BillingUnavailable, "profile %s does not allow billing %q", p.Name, s.Billing)
+	}
+
+	live, started := 0, 0
+	for _, r := range recs {
+		if r.Ended == nil && d.Launcher.Alive(r.Sid) {
+			live++
+			if r.Spec.Label == s.Label {
+				return nil, refuse(AlreadyRunning, "%s already_running on %s (sid %s)", s.Label, d.Machine, r.Sid)
+			}
+		} else if r.Ended == nil {
+			d.markEnded(r) // the pane is gone: a stale record must not block the label
+		}
+		if r.Uid == d.Uid && d.now().Sub(r.Started) < time.Hour {
+			started++
+		}
+	}
+	if d.MaxPerHour > 0 && started >= d.MaxPerHour {
+		return nil, refuse(RateCapped, "%d starts in the last hour (cap %d)", started, d.MaxPerHour)
+	}
+	if d.MaxLive > 0 && live >= d.MaxLive {
+		return nil, refuse(MachineFull, "%d live sessions (cap %d)", live, d.MaxLive)
+	}
+
+	sid, err := mintSid()
+	if err != nil {
+		return nil, err
+	}
+	rec := &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s}
+	rec.Reply = StartReply{
+		V: 1, Sid: sid, Gen: 1, ID: fmt.Sprintf("%s/%s/%s/g%d", s.Owner, d.Machine, sid, 1), Backend: d.Backend,
+		Pin:     Pin{CC: orUnpinned(d.CCVersion), Image: orUnpinned(d.Image), Channel: "dev"},
+		Attach:  Attach{Local: []string{"tmux", "-L", orDefault(d.Socket, "ccsbx"), "attach", "-t", sid}, Remote: []string{"ssh", "-t", d.Machine, "ccsbx", "attach", sid}},
+		Journal: Journal{Epoch: d.epoch(), Seq: len(recs)},
+		NotEv:   d.Root != "helper",
+	}
+	// Write the record before launching: `ccsbx run --sid` reads it.
+	if err := d.save(rec); err != nil {
+		return nil, err
+	}
+	if err := d.Launcher.Launch(rec); err != nil {
+		// Remove, not mark ended: a retry with this request_id must not be answered with the
+		// reply of a session that never started.
+		_ = os.Remove(d.path("sessions", rec.Sid+".json"))
+		return nil, fmt.Errorf("launch %s: %w", sid, err)
+	}
+	rep := rec.Reply
+	return &rep, nil
+}
+
+// Load reads one record, for `ccsbx run --sid`.
+func (d *Daemon) Load(sid string) (*Record, error) {
+	if !sidRe.MatchString(sid) {
+		return nil, fmt.Errorf("sid %q is not valid", sid)
+	}
+	b, err := os.ReadFile(d.path("sessions", sid+".json"))
+	if err != nil {
+		return nil, err
+	}
+	var r Record
+	return &r, json.Unmarshal(b, &r)
+}
+
+func orUnpinned(s string) string {
+	if s == "" {
+		return "unpinned"
+	}
+	return s
+}
+
+func (d *Daemon) lock() (func(), error) {
+	f, err := os.OpenFile(d.path("lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+}
+
+func (d *Daemon) records() ([]*Record, error) {
+	ents, err := os.ReadDir(d.path("sessions"))
+	if err != nil {
+		return nil, err
+	}
+	var out []*Record
+	for _, e := range ents {
+		if !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		r, err := d.Load(strings.TrimSuffix(e.Name(), ".json"))
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, nil
+}
+
+func (d *Daemon) save(r *Record) error {
+	b, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := d.path("sessions", r.Sid+".json.tmp")
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, d.path("sessions", r.Sid+".json"))
+}
+
+func (d *Daemon) markEnded(r *Record) {
+	t := d.now().UTC()
+	r.Ended = &t
+	_ = d.save(r)
+}
+
+// epoch is stable per state directory, so journal readers can tell a wiped state from a restart.
+func (d *Daemon) epoch() string {
+	p := d.path("epoch")
+	if b, err := os.ReadFile(p); err == nil && len(b) >= 8 {
+		return strings.TrimSpace(string(b))
+	}
+	var raw [4]byte
+	_, _ = rand.Read(raw[:])
+	e := fmt.Sprintf("e%x", raw)
+	_ = os.WriteFile(p, []byte(e+"\n"), 0o600)
+	return e
+}
+
+var enc = base32.NewEncoding("0123456789abcdefghjkmnpqrstvwxyz").WithPadding(base32.NoPadding)
+
+func mintSid() (string, error) {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", err
+	}
+	return "s" + enc.EncodeToString(b[:]), nil
+}
+
+func orDefault(s, def string) string {
+	if s == "" {
+		return def
+	}
+	return s
+}

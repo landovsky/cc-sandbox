@@ -42,16 +42,7 @@ func app() *cli.App {
 				},
 				Run: notBuilt("U1b"),
 			},
-			{
-				Name:    "start",
-				Summary: "start a session from a LaunchSpec (U2)",
-				Recipes: "  ccsbx start --spec tests/specs/hello.json --json\n  cat spec.json | ccsbx start --spec -",
-				Setup: func(f *cli.Flags) {
-					f.String("spec", "-", "LaunchSpec JSON file, or - for stdin")
-					f.Bool("json", false, "print the StartReply as JSON")
-				},
-				Run: notBuilt("U2"),
-			},
+			startCmd(),
 			selftestCmd(),
 			settingsCmd(),
 			{

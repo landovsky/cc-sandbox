@@ -36,3 +36,16 @@ jobs:
     on_failure: notify
     retries: 0
     tags: [cc-sandbox, nightly, selftest, mac]
+
+  # C21: the nightly e2e after the selftests. Runs `make e2e` (includes e2e/00-standalone and S0
+  # once it exists) in the e2e realm and sends the table. Needs C20 for the cockpit-kill leg (not
+  # part of e2e/run yet). Not registered by this repo; copy at the deploy gate.
+  nightly-e2e-hp:
+    description: Nightly e2e on hp (stub model, e2e realm, scratch tree repo) with a Telegram table
+    schedule: "15 3 * * *"
+    command: bin/ccsbx-nightly-e2e --send
+    working_dir: /home/tomas/git/cc-sandbox
+    timeout: 3600
+    on_failure: notify
+    retries: 0
+    tags: [cc-sandbox, nightly, e2e]

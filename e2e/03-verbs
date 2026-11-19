@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# e2e/03-verbs — hook point 3: tree verbs land on the session's own node and nowhere else (plan §9 item 4).
+# Real tonight: the unfenced verbs on a scratch tree (what the fenced writer must reproduce) and the
+# stub's catalog contract. Skipped: everything from inside a fence.
+. "$(dirname "$0")/lib.sh"; e2e_init
+cc-tree init e2e "E2E scratch" >/dev/null 2>&1
+a="$(cc-tree add e2e:root --no-derive --title "verbs A" "node a" | awk '/^e2e:/{print $1;exit}')"
+b="$(cc-tree add e2e:root --no-derive --title "verbs B" "node b" | awk '/^e2e:/{print $1;exit}')"
+cc-tree describe "$a" --outcome "RAN only-on-a" >/dev/null 2>&1
+t="$CC_TREE_REPO/e2e/tree.md"
+grep -q "only-on-a" "$t" && ok "an outcome written for node A is recorded" || bad "outcome recorded on A"
+awk -v b="${b#e2e:}" '$0 ~ "n:"b {f=1; next} f && /^ *- \[/ {f=0} f' "$t" | grep -q "only-on-a" \
+  && bad "an outcome for A must not appear under B (a verb names only its own node)" \
+  || ok "an outcome for A does not appear under node B: the baseline a fenced verb writer must keep"
+if have_stub; then
+  "$CCSBX" stub --print-catalog 2>/dev/null | grep -q outcome \
+    && ok "the stub's fixed catalog has the 'outcome' script that e2e/03 drives with 'E2E:outcome'" \
+    || bad "stub catalog has an outcome script" "$("$CCSBX" stub --print-catalog 2>&1 | head -5)"
+else skip "the stub's catalog has the 'outcome' script" "C18 (stream B, branch n1-b) is not on main yet"; fi
+skip "outcome, question, subtask, checkpoint, rename, mark, done land on the session's own node (say E2E:outcome in a fence)" "needs C5 (ccf MCP) + C6 (verb writer) + fence image"
+skip "no verb can name another node; Tomas-only verbs are refused from the fence" "needs C5, C7"
+skip "replays are exact across a journal reset and a crash mid-verb" "needs C6 + M4 (verb queue)"
+skip "stale verbs are dropped (older than a human commit, on a moved node, after rename-tree)" "needs C15"

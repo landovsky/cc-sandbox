@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# e2e/04-msg — hook point 4: messaging (plan §9 item 5). Real tonight: ccmsg with the hub down.
+. "$(dirname "$0")/lib.sh"; e2e_init
+port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
+out="$(SB_HUB="127.0.0.1:$port" ccmsg e2e:nobody "ping" 2>&1)"; rc=$?
+[ $rc -eq 4 ] && ok "ccmsg with the hub unreachable exits 4 (hub unreachable) instead of pretending to deliver" || bad "ccmsg exits 4 with the hub down" "rc=$rc $out"
+grep -qi "refusing to send" <<<"$out" && ok "it says it refuses to send, so a sender never believes a lost message was delivered" || bad "ccmsg says it refuses to send" "$out"
+skip "fenced <-> unfenced manager and fenced <-> fenced on one machine" "needs M2a/U3b + fence image"
+skip "across machines via the hub; directly with the hub down" "needs M2b, M2d (second machine)"
+skip "an out-of-scope send is refused" "needs C10 (scope rule)"
+skip "an unsigned 'fenced' claim is rejected at the hub" "needs B6b hub auth deployed in a test hub (stream C, not merged)"
+skip "an unfenced ccmsg arrives as 'trust: unfenced'" "needs C11"
+skip "a relay credential can't join, track or send as another session" "needs M2a"
+skip "ccq lists fenced sessions with no output lines" "needs C4a + fenced sessions on the hub"

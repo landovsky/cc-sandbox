@@ -325,6 +325,10 @@ are descoped (§9).
   agent burns money. API-key sessions are bounded only by the hard monthly cap on the key.
   Subscription sessions are bounded only by the plan's own usage limits, so a runaway fenced
   session can use up the owner's own window. The doors keep no budgets.
+- **Open web fetch** (v2.4, accepted for now). The fence's web-fetch route goes to any public
+  host, so it's an exfiltration channel: data can go out in a URL to any host. Together with
+  private code and untrusted input, that's the lethal trifecta. Each fetch is logged per
+  session. The planned fix is a per-profile host allowlist.
 - **The subscription token is a long-lived credential** (v2.4). It lasts a year, isn't capped,
   and revoking it isn't a documented API. Only the model door holds it. The consumer terms on
   intermediating subscription credentials are read as allowing the owner's own door for the

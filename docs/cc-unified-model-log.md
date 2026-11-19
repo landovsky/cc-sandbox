@@ -26,6 +26,7 @@ supersedes: unified-model.md v1 §4–§6
 - **Revert tags** before the first change to a live tool (doc 5 P0), and an **ops procedures
   doc** for every manual procedure (doc 5 O7).
 - **Night 1 starts tonight** without the day prep (doc 5 §7.4).
+- **Web fetch is open for now** (Q19, Tomas): a logged route to any public host, listed as a known limitation in doc 1 §9. The planned fix is a per-profile allowlist. Web search goes through the model door.
 
 ## v2.2 → v2.3 (the build plan and its review panel, 2026-11-19)
 

@@ -194,13 +194,100 @@ func TestStart(t *testing.T) {
 		}
 	})
 
-	t.Run("resume and repo workdirs are refused as not built, not half-done", func(t *testing.T) {
+	t.Run("a repo workdir is refused as not built, not half-done", func(t *testing.T) {
 		d, _ := newDaemon(t)
-		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Resume = &Resume{Sid: "s123456"} })); code(err) != NotBuilt {
-			t.Fatal(err)
-		}
 		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Workdir = Workdir{Repo: "github.com/x/y"} })); code(err) != NotBuilt {
 			t.Fatal(err)
+		}
+	})
+}
+
+// U7: a resume is the same session, one generation later.
+func TestResume(t *testing.T) {
+	first := func(t *testing.T) (*Daemon, *fakeLauncher, *StartReply) {
+		d, fl := newDaemon(t)
+		rep, err := d.Start(spec(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fl.alive[rep.Sid] = false // the g1 pane has exited
+		return d, fl, rep
+	}
+	res := func(sid string, mod func(*LaunchSpec)) *LaunchSpec {
+		return spec(func(s *LaunchSpec) {
+			s.RequestID, s.Resume = "rid-resume", &Resume{Sid: sid}
+			if mod != nil {
+				mod(s)
+			}
+		})
+	}
+
+	t.Run("resume keeps the sid and bumps the generation, so the home and transcript carry over", func(t *testing.T) {
+		d, _, a := first(t)
+		b, err := d.Start(res(a.Sid, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Sid != a.Sid || b.Gen != 2 || b.ID != "tomas/hp-ubuntu/"+a.Sid+"/g2" {
+			t.Fatalf("%+v", b)
+		}
+		rec, _ := d.Load(a.Sid)
+		if rec.Gen != 2 {
+			t.Fatalf("record gen %d", rec.Gen)
+		}
+	})
+
+	t.Run("a session still running can't be resumed: two generations would share one home", func(t *testing.T) {
+		d, fl := newDaemon(t)
+		a, _ := d.Start(spec(nil))
+		fl.alive[a.Sid] = true
+		if _, err := d.Start(res(a.Sid, nil)); code(err) != AlreadyRunning {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("resume under a different label is refused: the label names the node", func(t *testing.T) {
+		d, _, a := first(t)
+		if _, err := d.Start(res(a.Sid, func(s *LaunchSpec) { s.Label = "other:node" })); code(err) != BadSpec {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("resume from another worktree is refused: the transcript is keyed by cwd", func(t *testing.T) {
+		d, _, a := first(t)
+		other := t.TempDir()
+		if _, err := d.Start(res(a.Sid, func(s *LaunchSpec) { s.Workdir.Path = other })); code(err) != BadSpec {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("an unknown or malformed sid is refused", func(t *testing.T) {
+		d, _, _ := first(t)
+		for _, sid := range []string{"s000000000", "../x", ""} {
+			if _, err := d.Start(res(sid, nil)); code(err) != BadSpec {
+				t.Errorf("%q: %v", sid, err)
+			}
+		}
+	})
+
+	t.Run("a retry of the gen-1 request after a resume must not start a new session", func(t *testing.T) {
+		d, fl, a := first(t)
+		d.Start(res(a.Sid, nil))
+		fl.alive[a.Sid] = false
+		before := fl.launch
+		if _, err := d.Start(spec(nil)); err == nil || fl.launch != before {
+			t.Fatalf("err=%v launches %d->%d", err, before, fl.launch)
+		}
+	})
+
+	t.Run("a resume whose launch fails leaves the session at its old generation", func(t *testing.T) {
+		d, _, a := first(t)
+		d.Launcher = &failLauncher{fakeLauncher{alive: map[string]bool{}}}
+		if _, err := d.Start(res(a.Sid, nil)); err == nil {
+			t.Fatal("expected failure")
+		}
+		if rec, _ := d.Load(a.Sid); rec.Gen != 1 {
+			t.Fatalf("gen %d", rec.Gen)
 		}
 	})
 }

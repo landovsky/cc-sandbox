@@ -23,6 +23,8 @@ docker image inspect "$IMG" >/dev/null 2>&1 || { echo "FAIL: image $IMG not pres
 STATE=$(mktemp -d)
 mkdir -p /var/tmp
 PIDS=()
+# Files the fence wrote (uid 10001) can't be removed by the host user: sweep them from a container.
+rmstate() { docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"; }
 cleanup() {
   docker rm -f "ccsbx-canary-$$" >/dev/null 2>&1   # first: a connected peer blocks the network removal
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
@@ -32,7 +34,7 @@ cleanup() {
     docker network rm "ccsbx-net-$s-g1" >/dev/null 2>&1
     docker network inspect "ccsbx-net-$s-g1" >/dev/null 2>&1 && echo "WARN: network ccsbx-net-$s-g1 left behind" >&2
   done
-  rm -rf "$STATE"
+  rmstate
 }
 trap cleanup EXIT
 

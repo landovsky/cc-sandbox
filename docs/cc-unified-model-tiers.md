@@ -1,7 +1,7 @@
 ---
 type: design
 status: draft
-version: 2.1
+version: 2.2
 title: "Agent fence: tier profiles"
 task: ai-tooling:#6gqx
 date: 2026-11-19
@@ -10,12 +10,12 @@ supersedes: unified-model.md v1 §1 tiers, §2 components, §3 third party
 
 [Index](README.md) › Unified model › 2. Tiers
 
-**Docs:** [1 · contract](unified-model.md) · **2 · tiers** · [3 · CC Flow as a client](unified-model-cc-flow.md) · [4 · working log](unified-model-log.md)
+**Docs:** [1 · contract](cc-unified-model.md) · **2 · tiers** · [3 · CC Flow as a client](cc-unified-model-cc-flow.md) · [4 · working log](cc-unified-model-log.md)
 
 # Tier profiles
 
 Each tier lists only what it **adds** to the tier below and which threat (T1–T4 in
-[doc 1](unified-model.md#1-threats)) each addition covers. The contract and its invariants are
+[doc 1](cc-unified-model.md#1-threats)) each addition covers. The contract and its invariants are
 the same at every tier; only the enforcement gets stronger. **Solo can be built and understood
 on its own**, before any higher-tier component exists.
 
@@ -33,7 +33,9 @@ group (14, which can't hold on a Mac; see doc 1 §9).
 
 ## Solo: about 3 components, on one or several machines
 
-For: one owner on their own machines. **Tom's first build:** the Mac, the hp, and spare Hetzner capacity.
+For: one owner on their own machines. **Tom's first build:** three machines that run sessions:
+the Mac, the hp, and one Hetzner server that's already a k3s node (which one is open, see the
+log N9). The cockpit runs on the Mac or the hp.
 
 | Adds | Covers | Build / buy |
 |---|---|---|
@@ -47,10 +49,21 @@ For: one owner on their own machines. **Tom's first build:** the Mac, the hp, an
   failure (doc 1 §9).
 - **Each machine runs only the fence.** That's the launcher, the session daemon and the image,
   plus the host-key and docker-group hardening.
-- **Steering from one place.** The client (CC Flow, for Tom) runs on one machine and starts
-  sessions on the others over Tailscale SSH. Each machine's session daemon sends events back to
-  the client the same way. A message to a session on another machine goes to that machine's
-  daemon, which checks it and delivers it.
+- **A portable cockpit.** The cockpit (CC Flow, for Tom) runs on whichever machine Tom is at,
+  the Mac or the hp, and moving it is just starting it on the other one. It starts sessions on
+  any machine over Tailscale SSH and subscribes to every daemon's events. Nothing in the
+  platform names a cockpit machine.
+- **Cockpit down loses visibility, never progress** (doc 1, invariant 28). Each daemon:
+  - delivers messages to other machines' daemons directly, checking the scope rule it was
+    given at launch;
+  - keeps its event journal and replays it from the cockpit's last-seen position on reconnect;
+  - queues requests meant for the cockpit (tree verbs) and delivers them in order later.
+- **A fence host that's also a k3s node.** k3s has its own containerd, so docker runs beside
+  it, not inside it. Keep docker off k3s's networks: pin docker's bridge range outside the pod
+  and service CIDRs, check that docker's iptables rules (it sets FORWARD to DROP) don't break
+  flannel traffic, and reserve CPU and memory for the kubelet so sessions can't starve pods. Fences never use the
+  k3s socket. If the same server is also the central door host, the door uid and the session
+  users are separate, and the doors listen only on the Tailscale address (invariant 27).
 
 **Billing per session.** Tom's development work uses the Claude subscription, and ops work
 (chatbot evaluation, pharmacy ops) uses an API key. Whether the model door may hold a
@@ -58,7 +71,7 @@ subscription login is open (#6f24). Until it's answered, subscription sessions r
 on a stub, and API-key sessions run fenced.
 
 - **Grants at this tier** are static per-session config that the owner writes on the
-  steering machine. No ask tier yet: anything not allowed is forbidden.
+  machine the cockpit runs on. No ask tier yet: anything not allowed is forbidden.
 - **MCP at this tier.** No tool door in the first build. Remote MCP servers, if needed, are plain
   HTTPS routes in the egress door with an injected token, with no per-tool filtering.
 - **Leaves open:** T3 beyond the git rules (no ask tier), T4 beyond reach limits (no trifecta

@@ -1,7 +1,7 @@
 ---
 type: log
 status: working
-version: 2.1
+version: 2.2
 title: "Agent fence: working log (changes, conflicts, decisions, build list)"
 task: ai-tooling:#6gqx
 date: 2026-11-19
@@ -10,9 +10,29 @@ supersedes: unified-model.md v1 §4–§6
 
 [Index](README.md) › Unified model › 4. Working log
 
-**Docs:** [1 · contract](unified-model.md) · [2 · tiers](unified-model-tiers.md) · [3 · CC Flow as a client](unified-model-cc-flow.md) · **4 · working log**
+**Docs:** [1 · contract](cc-unified-model.md) · [2 · tiers](cc-unified-model-tiers.md) · [3 · CC Flow as a client](cc-unified-model-cc-flow.md) · **4 · working log**
 
 # Working log
+
+## v2.1 → v2.2 (Tom's cockpit rules, 2026-11-19)
+
+- **Cockpit down = only visibility lost, never progress.** New invariant 28 (doc 1). Steering
+  means driving sessions through CC Flow, nothing more. Gaps in v2.1 closed:
+  - **Messaging:** the scope rule is fixed per session at launch and kept by the daemon (it no
+    longer comes from CC Flow), and cross-machine messages go daemon to daemon (doc 1 §7).
+  - **Events:** each daemon keeps an event journal and replays it when the cockpit reconnects.
+  - **Tree verbs** (`done`, `outcome`, `checkpoint`…): the daemon queues them while CC Flow is
+    down and delivers them in order later.
+  - **A manager starting workers** no longer needs CC Flow: *proposal* N10.
+  - Doc 3's caveat "nobody steers them until it's back" is reworded.
+- **The cockpit is portable.** It runs on the Mac or the hp. "CC Flow on the Mac" and "the
+  steering machine" are gone; nothing in the platform names a cockpit machine.
+- **A third machine:** one Hetzner server already joined to the k3s cluster runs sessions next to
+  the Mac and the hp. Which one is open (N9). Doc 2 has a short note on a fence host that's also
+  a k3s node (docker beside k3s, and the door host on the same server).
+- **New known limitation:** a message to a machine that's down is dropped (doc 1 §9).
+- **Links fixed:** the v2 docs linked to `unified-model*.md` (the v1 file). They now link to
+  `cc-unified-model*.md`, and the index points at v2.
 
 ## v2 → v2.1 (call, 2026-11-19)
 
@@ -76,8 +96,22 @@ These are open, with no ❓ node yet.
 - **N5 · Grants at solo** are static config with no ask tier (unlisted = forbidden). *Confirm.*
 - **N6 · The session token at solo.** Each machine's launcher signs its tokens, and the central
   doors trust a list of machine keys. *Follows from the central doors. Confirm.*
-- **N7 · Remote sessions in CC Flow.** The pane on the steering machine attaches to a session on
+- **N7 · Remote sessions in CC Flow.** The pane on the cockpit machine attaches to a session on
   another machine over Tailscale SSH. *Mechanism to be settled in the first slice.*
+- **N9 · Which Hetzner k3s node runs sessions** (from `~/git/k3s/docs/HARDWARE-INVENTORY.md`, 2026-11-16). *Open, Tom picks.*
+  - `future-one`: i7-8700 6C/12T, 64 GB, 2×477 GB RAID-1. Koperníci's own, `pool=shared` worker,
+    tainted, only promtail and the planned ARC CI runners. LUKS (reboot needs a dropbear unlock).
+  - `future-two`: Xeon E3-1275V6 4C/8T, 64 GB ECC, 2×894 GB RAID-1. Koperníci's own,
+    `pool=shared` worker, only promtail so far, but likely the CNPG Postgres primary later. LUKS too.
+  - Not candidates as they stand: `k3s` (the only control plane, 8 GB), and `pharmacy-db`,
+    `pharmacy-web`, `hriste-hot`, `hriste-cold` (paid for by clients and running their workloads).
+  - Also open: whether the same server is the central door host (M1), which v2.1 put on
+    "spare Hetzner capacity".
+- **N10 · A manager starts workers without CC Flow.** *Proposal.* The manager's `start` goes to
+  the daemon on its machine, which calls the target machine's launcher directly over Tailscale
+  SSH with a profile already approved for that node. The new session shows up as an event, and
+  CC Flow records the node from it, live or on replay. Rate cap (≤ 3/min) moves to the daemon.
+  *Confirm, or keep `start` in CC Flow and accept that managers can't start workers while it's down.*
 - **N8 · Unfenced agents on the Mac** can reach the Docker Desktop socket. Accept it as a
   limitation, or run no unfenced agents on the Mac.
 
@@ -168,16 +202,18 @@ The nodes and recommendations are unchanged unless the v2 note says otherwise.
 
 Sizes: XS < ½ day, S ≈ 1–2 days, M ≈ a week. 🔑 = Tom's action, # = root on hp.
 
-**First slice (hand this to the builder first).** CC Flow on the Mac starts a session on the
-hp. It runs fenced, talks to the model through the Hetzner model door on an API key, and pushes
+**First slice (hand this to the builder first).** CC Flow, running on the Mac, starts a session
+on the hp. It runs fenced, talks to the model through the Hetzner model door on an API key, and pushes
 its branch through the Hetzner egress door.
 - **Works when:**
   - a real `say hi` answers;
   - a grep of the container's env, home and `/proc` finds no token;
   - the push lands on a branch, and a force-push is refused;
   - a token copied into another container gets 401;
-  - the session's events show up in the tree on the Mac.
-- **Pieces:** U0, U0b, U1, U2, U3, U4, U5, U15, U16, M1 and M2, plus H1 and H2 as soon as U1 exists.
+  - the session's events show up in the tree on the Mac;
+  - with CC Flow stopped, the session finishes its task and calls `done`; when CC Flow starts
+    again (on the Mac or the hp), the missed events and the `done` show up in the tree.
+- **Pieces:** U0, U0b, U1, U2, U3, U4, U5, U15, U16, M1, M2, M3 and M4, plus H1 and H2 as soon as U1 exists.
 
 **Solo**
 
@@ -192,7 +228,12 @@ its branch through the Hetzner egress door.
 | H1 | **host git with hooks disabled**, and agent-written steering files flagged in the commit | S | U3 |
 | H2 | **harness and image pin + update gate**: a new version is used only after U19 passes | S | U1, U19 |
 | M1 | **central doors on Hetzner**: model and egress doors under their own uid, reachable only over Tailscale | S # | U0b |
-| M2 | **remote launch and events**: start over Tailscale SSH, events back to the steering machine, cross-machine messages to the target daemon | M | U2, U3 |
+| M2 | **remote launch and events**: start over Tailscale SSH, events to whichever machine the cockpit is on, cross-machine messages daemon to daemon with the scope rule fixed at launch | M | U2, U3 |
+| M3 | **event journal + replay**: each daemon keeps its events and replays from the cockpit's last-seen position on reconnect | S | U3 |
+| M4 | **verb queue**: tree verbs queued in order while the cockpit is down, delivered when it's back | S | U3 |
+| M5 | **portable cockpit**: CC Flow starts on the Mac or the hp with no config change and resumes from M3 | S | M2, M3 |
+| M6 | **manager start without CC Flow** (N10, proposal): daemon → target launcher, CC Flow records it from the event | S | M2, M3, N10 |
+| K1 | **fence host on the chosen k3s node** (N9): docker beside k3s, bridge range and iptables checked against flannel, kubelet reservations, host keys | S # | N9, U0b |
 | U4 | model door: credential injection, billing per session (API key first, subscription stub) | S 🔑 | M1, U5 |
 | U7 | resume into the same volume | XS | U2 |
 | U15 | egress door: static routes, GitHub App | S 🔑 | M1, U5, #46tt |

@@ -1,7 +1,7 @@
 ---
 type: design
 status: draft
-version: 2.1
+version: 2.2
 title: "Agent fence: threat model and security contract"
 task: ai-tooling:#6gqx (parent ai-tooling:#62b5, milestone ai-tooling:#6rrd)
 date: 2026-11-19
@@ -11,7 +11,7 @@ criteria: https://claude.ai/artifact/RRRnre4PXDo4wwWVj1zGQL
 
 [Index](README.md) › Unified model › 1. Security contract
 
-**Docs:** **1 · contract** · [2 · tiers](unified-model-tiers.md) · [3 · CC Flow as a client](unified-model-cc-flow.md) · [4 · working log](unified-model-log.md)
+**Docs:** **1 · contract** · [2 · tiers](cc-unified-model-tiers.md) · [3 · CC Flow as a client](cc-unified-model-cc-flow.md) · [4 · working log](cc-unified-model-log.md)
 
 # Security contract
 
@@ -21,7 +21,7 @@ outside the fence, never from text the agent wrote, and checks it against **gran
 human with a proof that an agent can't make can widen a grant.
 
 This doc names no orchestrator. Whatever starts sessions (a script, CC Flow, a CI job) is a
-client of the contract. [Doc 2](unified-model-tiers.md) says which components each tier adds.
+client of the contract. [Doc 2](cc-unified-model-tiers.md) says which components each tier adds.
 
 ## 1. Threats
 
@@ -107,7 +107,9 @@ Untrusted text, such as a web page, an issue, a tool result or another agent's m
 - **Fence.** The container the agent runs in: no secret, one worktree, network only to the doors.
 - **Door.** A process outside every fence that carries one kind of traffic out and enforces policy on it.
   It runs on the session's machine or on a central door host reached over a private network.
-- **Machine.** A computer that runs fences. One owner can have several, steered from one place.
+- **Machine.** A computer that runs fences. One owner can have several.
+- **Cockpit.** The client that shows sessions and steers them (CC Flow, for Tom). It can run on
+  any of the owner's machines. It's for visibility and steering only: no session needs it to work (invariant 28).
 - **Grant.** A permission for one session or profile, which expires at the enforcer.
 - **Ceiling.** The most a session may ever be granted without a new decision.
 - **Proof.** A signature only the human can make (a passkey, or an OTP for medium risk).
@@ -212,6 +214,12 @@ login and an API key). The launcher picks one per session and records it (invari
     only after the allow/block tests pass on the new version.
 27. **Central doors are reachable only over the private network** (Tailscale), and they accept
     only tokens signed by a known machine key.
+28. **Cockpit down loses visibility, never progress.** If the cockpit is down or unreachable,
+    sessions work as usual and message each other daemon to daemon. Nothing a session needs
+    goes through the cockpit: the message scope rule is fixed per session at launch, each
+    session daemon keeps its events and replays them when the cockpit reconnects, and requests
+    meant for the cockpit are queued by the daemon and delivered later. Steering means driving
+    sessions through the cockpit, nothing more.
 
 ## 6. Grants and approvals
 
@@ -253,9 +261,12 @@ These are part of the core contract even though the message hub is descoped.
 **Minimal path (no hub).**
 1. The agent writes a request into its outbox.
 2. The session daemon stamps the sender from that outbox and checks the scope rule (for
-   example, a worker may message only its own manager).
+   example, a worker may message only its own manager). The rule is fixed per session at launch
+   and kept by the daemon, so checking it needs no outside service.
 3. The daemon delivers the message straight into the receiving session's terminal (tmux
-   send-keys at the solo tier).
+   send-keys at the solo tier). If the receiver is on another machine, the daemon hands the
+   message to that machine's daemon directly over the private network, which checks it again
+   and delivers it. No cockpit is on the path (invariant 28).
 
 Delivery isn't durable, and that's accepted. The durable hub, signed envelopes and in-fence relay
 are descoped (§9).
@@ -282,6 +293,8 @@ are descoped (§9).
 - **Runaway cost.** A looping agent burns money. The only control is the hard cap on the model key.
 - **Stolen phone or surface.** Approvals stay passkey-protected, but the device can read screens
   and notifications.
+- **Undelivered messages are lost.** Because delivery isn't durable, a message to a machine
+  that's down is dropped and the sender is told. Events and cockpit requests are kept (invariant 28); messages aren't.
 - **A central door is a single point of failure.** If the central door host is down, every
   session on every machine loses the model (invariant 16's exception).
 - **Mac hosts.** Docker on a Mac runs in a VM, and its socket belongs to the user. Invariant 14

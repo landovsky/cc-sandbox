@@ -230,3 +230,15 @@ block = "tests/twin-go.sh ./internal/hostd TestEpochResetReingestBlock"
 invariants = [28]
 backends = ["unit"]
 where = "hp"
+
+# ---- review fixes for U3b: never type into a pane that is not at its prompt ----
+
+[[rule]]
+id = "msg-not-into-menu"
+title = "a message is typed only into a pane at its input prompt; a menu (permission prompt, question) is never answered by a stamp's keystrokes"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestMsgNotIntoMenuAllow"
+block = "tests/twin-go.sh ./internal/msg TestMsgNotIntoMenuBlock"
+invariants = [5, 6]
+backends = ["unit"]
+where = "hp"

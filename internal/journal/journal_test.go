@@ -263,3 +263,52 @@ func TestConcurrentAppendsStayGapless(t *testing.T) {
 		}
 	}
 }
+
+// ---- idle: when may a message be typed into a pane? --------------------------------------------
+
+func hook(typ string) Event {
+	return Event{Sid: "s1", Gen: 1, Src: "fence", Type: typ, Data: json.RawMessage(`{}`)}
+}
+
+// context: Claude Code can sit in a menu (a permission prompt, a question, a plan approval).
+// Only a finished turn (hook.Stop as the last word) means "at the input prompt".
+func TestIdleOnlyAfterStopAndNotWhileATurnRuns(t *testing.T) {
+	s := open(t, t.TempDir())
+	if _, ok := s.IdleSince("s1"); ok {
+		t.Fatal("a session we have heard nothing from is not idle (it may be at a trust dialog)")
+	}
+	s.Append(hook("hook.UserPromptSubmit"))
+	if _, ok := s.IdleSince("s1"); ok {
+		t.Fatal("mid-turn is not idle")
+	}
+	s.Append(hook("hook.Notification")) // "needs your permission": a menu is up
+	if _, ok := s.IdleSince("s1"); ok {
+		t.Fatal("a permission notification is not idle")
+	}
+	s.Append(hook("hook.Stop"))
+	if _, ok := s.IdleSince("s1"); !ok {
+		t.Fatal("after Stop it is idle")
+	}
+	s.Append(hook("hook.UserPromptSubmit"))
+	if _, ok := s.IdleSince("s1"); ok {
+		t.Fatal("a new prompt makes it busy again")
+	}
+}
+
+// context: the daemon restarts while a worker is idle; idle must survive, and a host-sourced
+// event must never count (only the fence's own hooks say what its pane shows).
+func TestIdleSurvivesRestartAndIgnoresHostEvents(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	s.Append(hook("hook.Stop"))
+	s.Append(Event{Sid: "s1", Src: "host", Type: "session.end"})
+	s.Close()
+	s2 := open(t, dir)
+	if _, ok := s2.IdleSince("s1"); !ok {
+		t.Fatal("idle lost on restart")
+	}
+	s2.Append(Event{Sid: "s2", Src: "host", Type: "hook.Stop"})
+	if _, ok := s2.IdleSince("s2"); ok {
+		t.Fatal("a host event was taken for the fence's word")
+	}
+}

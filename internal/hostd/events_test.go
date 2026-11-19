@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/landovsky/cc-sandbox/internal/journal"
+	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
 func (f *fixture) withJournal(dir string) *journal.Store {
@@ -187,4 +188,41 @@ func TestEpochResetReingestBlock(t *testing.T) {
 		t.Fatal("no reply for the re-ingested request")
 	}
 	_ = json.Marshal
+}
+
+// ---- review fixes (U3b-N2, N3) ---------------------------------------------------------------
+
+// context: an old generation that is still running keeps writing hook events; they must not
+// show up under the node as if the live generation said them.
+func TestStaleGenerationsEventsAreNotJournaled(t *testing.T) {
+	f := newFixture(t, nil)
+	j := f.withJournal(t.TempDir())
+	f.setRecord(func(r *start.Record) { r.Gen = 2; r.Reply.ID = "tomas/hp/" + sid + "/g2" })
+	f.appendEvents(`{"type":"hook.Stop","data":{}}` + "\n")
+	f.h.Scan()
+	for _, e := range func() []journal.Record { r, _ := j.After(0, "", "", 0); return r }() {
+		if e.Src == "fence" {
+			t.Fatalf("a dead generation's hook event was journaled: %+v", e)
+		}
+	}
+}
+
+// context: after a journal reset a request that had no reply is handled again; it must keep the
+// id it had, so whatever it reached downstream can dedupe the repeat.
+func TestReingestedRequestKeepsItsFirstUlid(t *testing.T) {
+	f := newFixture(t, nil)
+	jd := t.TempDir()
+	j := f.withJournal(jd)
+	f.req("lost.json", `{"type":"msg.send"}`)
+	f.h.Scan()
+	first := f.got[0].ID
+	os.Remove(filepath.Join(f.g, "in", "replies", "lost.json"))
+	j.Close()
+	os.RemoveAll(jd)
+	f.got = nil
+	f.withJournal(jd)
+	New(f.h.Cfg).Scan()
+	if len(f.got) != 1 || f.got[0].ID != first {
+		t.Fatalf("first %s again %+v", first, f.got)
+	}
 }

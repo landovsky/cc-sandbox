@@ -22,6 +22,7 @@ package verbq
 import (
 	"bufio"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -252,7 +253,7 @@ func (q *Queue) Acquire(realm, holder, token string, steal bool) (Lease, error) 
 	l := r.lease
 	live := l != nil && l.Expires.After(now)
 	switch {
-	case live && l.Holder == holder && token != "" && l.Token == token:
+	case live && l.Holder == holder && token != "" && tokEq(l.Token, token):
 		l.Expires = now.Add(q.TTL)
 		return *l, nil
 	case live && !steal:
@@ -272,7 +273,7 @@ func (q *Queue) Release(realm, token string) error {
 	if err != nil {
 		return err
 	}
-	if r.lease == nil || r.lease.Token != token {
+	if r.lease == nil || !tokEq(r.lease.Token, token) {
 		return ErrLeaseLost
 	}
 	r.lease = nil
@@ -280,7 +281,7 @@ func (q *Queue) Release(realm, token string) error {
 }
 
 func (q *Queue) holds(r *realmQ, token string) bool {
-	return r.lease != nil && token != "" && r.lease.Token == token && r.lease.Expires.After(q.now())
+	return r.lease != nil && token != "" && tokEq(r.lease.Token, token) && r.lease.Expires.After(q.now())
 }
 
 // Pull returns pending requests for the lease holder: at most one per session (its oldest),
@@ -397,3 +398,6 @@ func (q *Queue) Close() {
 		r.f.Close()
 	}
 }
+
+// tokEq compares lease tokens in constant time.
+func tokEq(a, b string) bool { return subtle.ConstantTimeCompare([]byte(a), []byte(b)) == 1 }

@@ -5,17 +5,25 @@
 //	  1. scope: the sender may reach its manager (resolved BY NODE to the live session at send
 //	     time, so a rolled manager still receives), its Talk: peers, and whoever messaged it in
 //	     this generation within reply_window_s (reply-to-sender). Anything else: refused: scope.
-//	  2. stamp: "[MSG from <bus-id> · <label> · fenced] <text>" — built by the daemon from the
-//	     session record. The text is one line of printable characters, so it can neither forge a
-//	     second stamp nor type control sequences into the target.
-//	  3. deliver: native inbox where C0b passes (not built: C0b needs root), else tmux send-keys
-//	     (the only way on the Mac).
-//	  4. receipt: appended to <state>/msg/receipts.jsonl (ids and statuses, never the text) and
-//	     returned to the sender.
+//	     Only sessions of the sender's own realm are reachable.
+//	  2. rate: at most PairMax messages per PairWindow per (sender, target); more: rate_capped.
+//	  3. idle: a message is typed ONLY into a pane that is at its input prompt (the journal's
+//	     last hook event for the session is Stop). Otherwise it waits in a bounded queue and is
+//	     delivered by Pump when the turn ends. Typing into a pane that shows a menu (a
+//	     permission prompt, a question, a plan approval) would answer the menu with the stamp's
+//	     keystrokes. The native inbox (C0b, needs root) is the way around this; until then idle
+//	     gating is the rule. "Unknown" is never idle.
+//	  4. stamp: "[MSG from <bus-id> · <label> · fenced · #<boundary>] <text> ‹end #<boundary>›".
+//	     The stamp is built by the daemon from the session record; the boundary is random per
+//	     message, so text cannot carry a valid second stamp; and the text itself is one line
+//	     of printable characters with [ ] · ‹ › and a trailing backslash removed.
+//	  5. deliver: tmux paste-buffer -p (bracketed paste when the app asked for it), then Enter.
+//	  6. receipt: kept in memory and appended to <state>/msg/receipts.jsonl (ids and statuses,
+//	     never the text).
 //
-// Owner-device deliveries (ccsbx deliver, the local socket) are stamped
-// "trust: unfenced (owner device)" and skip the scope rule: the owner may write to anyone. They
-// are never stamped "human".
+// Owner deliveries (`ccsbx deliver`, the daemon's unix socket) are stamped
+// "trust: unfenced (owner device)" and skip the scope rule, but not the idle rule. They are
+// never stamped "human".
 //
 // No cc-tree, no hub, no network: a same-machine message needs only this package and tmux
 // (T:msg-no-cockpit).
@@ -23,6 +31,8 @@ package msg
 
 import (
 	"bufio"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -50,11 +60,11 @@ type Scope struct {
 
 // Session is what the router knows of one session.
 type Session struct {
-	Sid, Label, BusID string
-	Gen               int
-	Scope             Scope
-	Live              bool
-	Started           time.Time
+	Sid, Label, BusID, Realm string
+	Gen                      int
+	Scope                    Scope
+	Live                     bool
+	Started                  time.Time
 }
 
 // Directory lists sessions. Production: the daemon's records plus tmux liveness.
@@ -63,19 +73,47 @@ type Directory interface{ Sessions() ([]Session, error) }
 // Deliverer types a line into a session's pane.
 type Deliverer interface{ Deliver(sid, line string) error }
 
+// Idler says whether a session's pane is at its input prompt, and since when. nil: never.
+type Idler interface {
+	IdleSince(sid string) (time.Time, bool)
+}
+
+// Origin says where the final result of a queued message goes (the sender's inbox).
+type Origin struct {
+	Sid string `json:"sid"`
+	Gen int    `json:"gen"`
+	Rid string `json:"rid"`
+	ID  string `json:"id"` // the daemon's ULID for the request
+}
+
 // Router applies the scope rule and delivers.
 type Router struct {
 	Dir      Directory
 	Out      Deliverer
+	Idle     Idler
 	StateDir string
 	Now      func() time.Time
-	mu       sync.Mutex
+
+	PairMax        int           // messages per PairWindow per (sender, target); default 6
+	PairWindow     time.Duration // default 1 minute
+	PendingMax     int           // queued messages per target node; default 20
+	PendingTTL     time.Duration // a queued message older than this is dropped as expired; default 1h
+	MaxReplyWindow time.Duration // receipts older than this are forgotten; default 7 days
+
+	mu        sync.Mutex
+	loaded    bool
+	rcpts     []Receipt
+	pending   []pendingItem
+	delivered map[string]time.Time
+	pairs     map[string][]time.Time
+	// Errs counts state writes that failed (receipts, the pending file): visible, never silent.
+	Errs int
 }
 
 // Result is the receipt returned to the sender (as the reply's result).
 type Result struct {
-	Status  string `json:"status"`         // ok | refused | error
-	Code    string `json:"code,omitempty"` // scope | no_live_session | bad_request | undeliverable
+	Status  string `json:"status"`         // ok | queued | refused | error
+	Code    string `json:"code,omitempty"` // scope | no_live_session | bad_request | undeliverable | target_busy | rate_capped | queue_full | expired
 	Receipt string `json:"receipt,omitempty"`
 	To      string `json:"to,omitempty"` // the sid it was delivered to
 }
@@ -97,15 +135,44 @@ func (r *Router) now() time.Time {
 	return time.Now()
 }
 
+func (r *Router) cfg() {
+	if r.PairMax == 0 {
+		r.PairMax = 6
+	}
+	if r.PairWindow == 0 {
+		r.PairWindow = time.Minute
+	}
+	if r.PendingMax == 0 {
+		r.PendingMax = 20
+	}
+	if r.PendingTTL == 0 {
+		r.PendingTTL = time.Hour
+	}
+	if r.MaxReplyWindow == 0 {
+		r.MaxReplyWindow = 7 * 24 * time.Hour
+	}
+	if r.delivered == nil {
+		r.delivered = map[string]time.Time{}
+		r.pairs = map[string][]time.Time{}
+	}
+}
+
 // Send handles one msg.send or msg.reply from the fenced session `from`.
-func (r *Router) Send(from Session, body []byte) Result {
+func (r *Router) Send(from Session, body []byte) Result { return r.SendWith(from, body, Origin{}) }
+
+// SendWith is Send with the place the final result of a queued message goes.
+func (r *Router) SendWith(from Session, body []byte, o Origin) Result {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cfg()
+	r.load()
 	var b sendBody
 	if json.Unmarshal(body, &b) != nil || strings.TrimSpace(b.Text) == "" || (b.To.Node == "" && b.To.BusID == "") {
-		return r.receipt(from.Sid, "", Result{Status: "refused", Code: "bad_request"})
+		return r.receipt(from.Sid, 0, "", Result{Status: "refused", Code: "bad_request"})
 	}
 	all, err := r.Dir.Sessions()
 	if err != nil {
-		return r.receipt(from.Sid, "", Result{Status: "error", Code: "undeliverable"})
+		return r.receipt(from.Sid, 0, "", Result{Status: "error", Code: "undeliverable"})
 	}
 	// Re-read the sender from the directory: scope comes from the record, not from the request.
 	var sender *Session
@@ -115,58 +182,136 @@ func (r *Router) Send(from Session, body []byte) Result {
 		}
 	}
 	if sender == nil {
-		return r.receipt(from.Sid, "", Result{Status: "refused", Code: "scope"})
+		return r.receipt(from.Sid, 0, "", Result{Status: "refused", Code: "scope"})
 	}
-	target := resolve(all, b.To.Node, b.To.BusID)
+	target := resolve(all, sender.Realm, b.To.Node, b.To.BusID)
 	if target == nil {
 		// Not live. Whether it would have been in scope decides what we may say about it.
-		if !r.nodeInScope(*sender, b.To.Node) {
-			return r.receipt(sender.Sid, "", Result{Status: "refused", Code: "scope"})
+		if !nodeInScope(*sender, b.To.Node) {
+			return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "refused", Code: "scope"})
 		}
-		return r.receipt(sender.Sid, "", Result{Status: "error", Code: "no_live_session"})
+		return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "no_live_session"})
 	}
 	if target.Sid == sender.Sid || !r.inScope(*sender, *target) {
-		return r.receipt(sender.Sid, target.Sid, Result{Status: "refused", Code: "scope"})
+		return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "refused", Code: "scope"})
 	}
-	line := fmt.Sprintf("[MSG from %s · %s · fenced] %s", clean(sender.BusID, 80), clean(sender.Label, 120), clean(b.Text, MaxText))
-	if err := r.Out.Deliver(target.Sid, line); err != nil {
-		return r.receipt(sender.Sid, target.Sid, Result{Status: "error", Code: "undeliverable"})
+	if !r.pairOK(sender.Sid, target.Sid) {
+		return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "refused", Code: "rate_capped"})
 	}
-	return r.receipt(sender.Sid, target.Sid, Result{Status: "ok", To: target.Sid})
+	if !r.ready(target.Sid) {
+		if r.queued(target.Label) >= r.PendingMax {
+			return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "refused", Code: "queue_full"})
+		}
+		r.pending = append(r.pending, pendingItem{ID: ulid.New(), Queued: r.now().UTC(), FromSid: sender.Sid, ToNode: target.Label,
+			Realm: sender.Realm, Text: b.Text, Origin: o})
+		r.savePending()
+		return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "queued", Code: "target_busy"})
+	}
+	return r.deliverFenced(*sender, *target, b.Text)
 }
 
-// DeliverOwner is a delivery from the owner's device (the CLI or the local socket). The
-// target is a sid, node or bus id; the stamp says unfenced, never human.
-func (r *Router) DeliverOwner(who, to, text string) Result {
+func (r *Router) deliverFenced(sender, target Session, text string) Result {
+	line := stampFenced(sender, text)
+	if err := r.Out.Deliver(target.Sid, line); err != nil {
+		return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "error", Code: "undeliverable"})
+	}
+	r.delivered[target.Sid] = r.now()
+	return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "ok", To: target.Sid})
+}
+
+// DeliverOwner is a delivery from the owner's device (the daemon's unix socket). The target is
+// a sid, node or bus id; the stamp says unfenced, never human. A target that is not at its
+// prompt is refused (target_busy), or, with queue, held until it is.
+func (r *Router) DeliverOwner(who, to, text string, queue bool) Result {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cfg()
+	r.load()
 	all, err := r.Dir.Sessions()
 	if err != nil {
 		return Result{Status: "error", Code: "undeliverable"}
 	}
-	target := resolve(all, to, to)
-	if target == nil {
-		for i := range all {
-			if all[i].Sid == to && all[i].Live {
-				target = &all[i]
-			}
+	var target *Session
+	for i := range all {
+		if all[i].Live && all[i].Sid == to {
+			target = &all[i]
 		}
 	}
+	if target == nil {
+		target = resolve(all, "", to, to)
+	}
 	if target == nil || strings.TrimSpace(text) == "" {
-		return r.receipt("owner", "", Result{Status: "error", Code: "no_live_session"})
+		return r.receipt("owner", 0, "", Result{Status: "error", Code: "no_live_session"})
 	}
-	line := fmt.Sprintf("[MSG from %s · trust: unfenced (owner device)] %s", clean(who, 80), clean(text, MaxText))
-	if err := r.Out.Deliver(target.Sid, line); err != nil {
-		return r.receipt("owner", target.Sid, Result{Status: "error", Code: "undeliverable"})
+	if !r.ready(target.Sid) {
+		if !queue {
+			return r.receipt("owner", 0, target.Sid, Result{Status: "refused", Code: "target_busy"})
+		}
+		if r.queued(target.Label) >= r.PendingMax {
+			return r.receipt("owner", 0, target.Sid, Result{Status: "refused", Code: "queue_full"})
+		}
+		r.pending = append(r.pending, pendingItem{ID: ulid.New(), Queued: r.now().UTC(), Owner: true, FromLabel: ident(who, 64),
+			ToNode: target.Label, Realm: target.Realm, Text: text})
+		r.savePending()
+		return r.receipt("owner", 0, target.Sid, Result{Status: "queued", Code: "target_busy"})
 	}
-	return r.receipt("owner", target.Sid, Result{Status: "ok", To: target.Sid})
+	return r.deliverOwner(ident(who, 64), *target, text)
 }
 
-// resolve finds the LIVE session for a node (or bus id). When a node has several live sessions
-// (a roll in progress) the newest wins.
-func resolve(all []Session, node, bus string) *Session {
+func (r *Router) deliverOwner(who string, target Session, text string) Result {
+	b := boundary()
+	line := fmt.Sprintf("[MSG from %s · trust: unfenced (owner device) · #%s] %s ‹end #%s›", who, b, flat(text, MaxText), b)
+	if err := r.Out.Deliver(target.Sid, line); err != nil {
+		return r.receipt("owner", 0, target.Sid, Result{Status: "error", Code: "undeliverable"})
+	}
+	r.delivered[target.Sid] = r.now()
+	return r.receipt("owner", 0, target.Sid, Result{Status: "ok", To: target.Sid})
+}
+
+// Idle reports whether the session is at its input prompt right now: the fence reported Stop,
+// and nothing has been typed into it since.
+// IdleNow reports whether the session is at its input prompt right now.
+func (r *Router) IdleNow(sid string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cfg()
+	return r.ready(sid)
+}
+
+func (r *Router) ready(sid string) bool {
+	if r.Idle == nil {
+		return false
+	}
+	since, ok := r.Idle.IdleSince(sid)
+	if !ok {
+		return false
+	}
+	return since.After(r.delivered[sid])
+}
+
+func (r *Router) pairOK(from, to string) bool {
+	k, now := from+">"+to, r.now()
+	var keep []time.Time
+	for _, t := range r.pairs[k] {
+		if now.Sub(t) < r.PairWindow {
+			keep = append(keep, t)
+		}
+	}
+	if len(keep) >= r.PairMax {
+		r.pairs[k] = keep
+		return false
+	}
+	r.pairs[k] = append(keep, now)
+	return true
+}
+
+// resolve finds the LIVE session for a node (or bus id) in the sender's realm. When a node has
+// several live sessions (a roll in progress) the newest wins. realm "" means any (the owner).
+func resolve(all []Session, realm, node, bus string) *Session {
 	var best *Session
 	for i := range all {
 		s := &all[i]
-		if !s.Live {
+		if !s.Live || (realm != "" && s.Realm != realm) {
 			continue
 		}
 		if (node != "" && s.Label == node) || (bus != "" && s.BusID == bus) {
@@ -178,7 +323,10 @@ func resolve(all []Session, node, bus string) *Session {
 	return best
 }
 
-func (r *Router) nodeInScope(from Session, node string) bool {
+// Resolve returns the live session for a label (the daemon's GET /v1/resolve).
+func Resolve(all []Session, label string) *Session { return resolve(all, "", label, "") }
+
+func nodeInScope(from Session, node string) bool {
 	if node == "" {
 		return false
 	}
@@ -194,7 +342,7 @@ func (r *Router) nodeInScope(from Session, node string) bool {
 }
 
 func (r *Router) inScope(from, to Session) bool {
-	if r.nodeInScope(from, to.Label) {
+	if nodeInScope(from, to.Label) {
 		return true
 	}
 	// reply-to-sender: the target messaged us in this generation, recently enough.
@@ -202,7 +350,10 @@ func (r *Router) inScope(from, to Session) bool {
 	if win <= 0 {
 		return false
 	}
-	for _, rc := range r.receipts() {
+	if win > r.MaxReplyWindow {
+		win = r.MaxReplyWindow
+	}
+	for _, rc := range r.rcpts {
 		if rc.Status == "ok" && rc.To == from.Sid && rc.From == to.Sid && rc.FromGen == to.Gen &&
 			r.now().Sub(rc.TS) <= win && !rc.TS.Before(from.Started) {
 			return true
@@ -210,6 +361,101 @@ func (r *Router) inScope(from, to Session) bool {
 	}
 	return false
 }
+
+// ---- pending (queued until the target is idle) ----
+
+type pendingItem struct {
+	ID        string    `json:"id"`
+	Queued    time.Time `json:"queued"`
+	Owner     bool      `json:"owner,omitempty"`
+	FromSid   string    `json:"from_sid,omitempty"`
+	FromLabel string    `json:"from_label,omitempty"`
+	ToNode    string    `json:"to_node"`
+	Realm     string    `json:"realm"`
+	Text      string    `json:"text"`
+	Origin    Origin    `json:"origin"`
+}
+
+func (r *Router) queued(node string) int {
+	n := 0
+	for _, p := range r.pending {
+		if p.ToNode == node {
+			n++
+		}
+	}
+	return n
+}
+
+func (r *Router) pendingPath() string { return filepath.Join(r.StateDir, "msg", "pending.json") }
+
+func (r *Router) savePending() {
+	if os.MkdirAll(filepath.Dir(r.pendingPath()), 0o700) != nil {
+		r.Errs++
+		return
+	}
+	b, _ := json.Marshal(r.pending)
+	tmp := r.pendingPath() + ".tmp"
+	if os.WriteFile(tmp, b, 0o600) != nil || os.Rename(tmp, r.pendingPath()) != nil {
+		r.Errs++
+	}
+}
+
+// Pump delivers queued messages whose target is idle now (or expires old ones). done is called
+// for every queued fenced message that reached a final state, so the sender's inbox gets it.
+func (r *Router) Pump(done func(Origin, Result)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cfg()
+	r.load()
+	if len(r.pending) == 0 {
+		return
+	}
+	all, err := r.Dir.Sessions()
+	if err != nil {
+		return
+	}
+	var keep []pendingItem
+	changed := false
+	for _, p := range r.pending {
+		fin := func(res Result) {
+			changed = true
+			if !p.Owner && done != nil && p.Origin.Rid != "" {
+				done(p.Origin, res)
+			}
+		}
+		if r.now().Sub(p.Queued) > r.PendingTTL {
+			fin(Result{Status: "refused", Code: "expired"})
+			continue
+		}
+		target := resolve(all, p.Realm, p.ToNode, "")
+		if target == nil || !r.ready(target.Sid) {
+			keep = append(keep, p)
+			continue
+		}
+		if p.Owner {
+			r.deliverOwner(p.FromLabel, *target, p.Text)
+			fin(Result{Status: "ok"})
+			continue
+		}
+		var sender *Session
+		for i := range all {
+			if all[i].Sid == p.FromSid {
+				sender = &all[i]
+			}
+		}
+		if sender == nil || !r.inScope(*sender, *target) {
+			fin(r.receipt(p.FromSid, 0, target.Sid, Result{Status: "refused", Code: "scope"}))
+			continue
+		}
+		fin(r.deliverFenced(*sender, *target, p.Text))
+	}
+	if changed {
+		r.pending = keep
+		r.savePending()
+	}
+}
+
+// ---- receipts ----
 
 // Receipt is one line of receipts.jsonl.
 type Receipt struct {
@@ -224,55 +470,116 @@ type Receipt struct {
 
 func (r *Router) path() string { return filepath.Join(r.StateDir, "msg", "receipts.jsonl") }
 
-func (r *Router) receipts() []Receipt {
+// load reads the receipts and the pending file once. Only the last MaxReplyWindow of receipts
+// is kept in memory (reply-to-sender never looks further back), and the file is compacted to
+// that when it has grown past 256 KiB, so a send never scans an unbounded log.
+func (r *Router) load() {
+	if r.loaded {
+		return
+	}
+	r.loaded = true
+	if b, err := os.ReadFile(r.pendingPath()); err == nil {
+		_ = json.Unmarshal(b, &r.pending)
+	}
 	f, err := os.Open(r.path())
 	if err != nil {
-		return nil
+		return
 	}
 	defer f.Close()
-	var out []Receipt
+	cut := r.now().Add(-r.MaxReplyWindow)
+	total := 0
 	sc := bufio.NewScanner(f)
 	for sc.Scan() {
+		total++
 		var rc Receipt
-		if json.Unmarshal(sc.Bytes(), &rc) == nil {
-			out = append(out, rc)
+		if json.Unmarshal(sc.Bytes(), &rc) == nil && rc.TS.After(cut) {
+			r.rcpts = append(r.rcpts, rc)
 		}
 	}
-	return out
+	if st, err := f.Stat(); err == nil && st.Size() > 256<<10 && len(r.rcpts) < total {
+		var sb strings.Builder
+		for _, rc := range r.rcpts {
+			b, _ := json.Marshal(rc)
+			sb.Write(b)
+			sb.WriteByte('\n')
+		}
+		tmp := r.path() + ".tmp"
+		if os.WriteFile(tmp, []byte(sb.String()), 0o600) != nil || os.Rename(tmp, r.path()) != nil {
+			r.Errs++
+		}
+	}
 }
 
 // receipt records the outcome and stamps the id into the result. The log never holds the text.
-func (r *Router) receipt(from, to string, res Result) Result {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	rc := Receipt{ID: ulid.New(), TS: r.now().UTC(), From: from, To: to, Status: res.Status, Code: res.Code}
-	if all, err := r.Dir.Sessions(); err == nil {
-		for _, s := range all {
-			if s.Sid == from {
-				rc.FromGen = s.Gen
-			}
-		}
-	}
+func (r *Router) receipt(from string, fromGen int, to string, res Result) Result {
+	rc := Receipt{ID: ulid.New(), TS: r.now().UTC(), From: from, FromGen: fromGen, To: to, Status: res.Status, Code: res.Code}
 	res.Receipt = rc.ID
-	if os.MkdirAll(filepath.Dir(r.path()), 0o700) == nil {
-		if f, err := os.OpenFile(r.path(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
-			b, _ := json.Marshal(rc)
-			f.Write(append(b, '\n'))
-			f.Close()
-		}
+	r.rcpts = append(r.rcpts, rc)
+	if os.MkdirAll(filepath.Dir(r.path()), 0o700) != nil {
+		r.Errs++
+		return res
 	}
+	f, err := os.OpenFile(r.path(), os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		r.Errs++
+		return res
+	}
+	b, _ := json.Marshal(rc)
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		r.Errs++
+	}
+	f.Close()
 	return res
 }
 
-// clean makes s one line of printable text of at most max runes: control characters (ESC,
-// newline, ...) become spaces, so the text can't start a new line or type an escape sequence.
-func clean(s string, max int) string {
+// ---- stamps and text ----
+
+func boundary() string {
+	var b [4]byte
+	_, _ = rand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+func stampFenced(sender Session, text string) string {
+	b := boundary()
+	return fmt.Sprintf("[MSG from %s · %s · fenced · #%s] %s ‹end #%s›", ident(sender.BusID, 80), ident(sender.Label, 120), b, flat(text, MaxText), b)
+}
+
+// ident limits a field the daemon puts into a stamp to characters that can't end it.
+func ident(s string, max int) string {
+	var sb strings.Builder
+	for _, c := range s {
+		if sb.Len() >= max {
+			break
+		}
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9', c == ':', c == '.', c == '_', c == '-', c == '/', c == '#':
+			sb.WriteRune(c)
+		default:
+			sb.WriteByte('_')
+		}
+	}
+	if sb.Len() == 0 {
+		return "unknown"
+	}
+	return sb.String()
+}
+
+// flat makes s one line of printable text of at most max runes: control characters (ESC,
+// newline, ...) become spaces, the characters a stamp is made of ([ ] · ‹ ›) are replaced, and
+// a trailing backslash (Claude Code's "continue on the next line") is dropped, so the text can
+// neither start a new line, forge a stamp, nor merge with the next message.
+func flat(s string, max int) string {
+	repl := map[rune]rune{'[': '(', ']': ')', '·': '.', '‹': '<', '›': '>'}
 	var sb strings.Builder
 	n := 0
 	lastSpace := false
 	for _, c := range s {
-		if unicode.IsControl(c) || unicode.Is(unicode.Cf, c) || c == ' ' || c == ' ' {
+		if unicode.IsControl(c) || unicode.Is(unicode.Cf, c) || unicode.IsSpace(c) {
 			c = ' '
+		}
+		if x, ok := repl[c]; ok {
+			c = x
 		}
 		if c == ' ' {
 			if lastSpace {
@@ -288,7 +595,7 @@ func clean(s string, max int) string {
 		}
 		sb.WriteRune(c)
 	}
-	return strings.TrimSpace(sb.String())
+	return strings.TrimRight(strings.TrimSpace(sb.String()), "\\ ")
 }
 
 // DaemonDir is the production Directory: the daemon's session records plus a liveness probe.
@@ -304,7 +611,11 @@ func (d DaemonDir) Sessions() ([]Session, error) {
 	}
 	var out []Session
 	for _, rec := range recs {
-		s := Session{Sid: rec.Sid, Label: rec.Spec.Label, Gen: rec.Gen, BusID: "ccsbx:" + rec.Sid, Started: rec.Started}
+		realm := rec.Spec.Realm
+		if realm == "" {
+			realm = "production"
+		}
+		s := Session{Sid: rec.Sid, Label: rec.Spec.Label, Gen: rec.Gen, BusID: "ccsbx:" + rec.Sid, Realm: realm, Started: rec.Started}
 		_ = json.Unmarshal(rec.Spec.MsgScope, &s.Scope)
 		s.Live = rec.Ended == nil && d.Alive(rec.Sid)
 		out = append(out, s)

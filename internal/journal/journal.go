@@ -82,6 +82,12 @@ type Store struct {
 	cur     *os.File
 	curDay  string
 	waiters []chan struct{}
+	hooks   map[string]hookState // sid -> the last hook event the fence reported
+}
+
+type hookState struct {
+	Type string
+	TS   time.Time
 }
 
 var segRe = regexp.MustCompile(`^seg-(\d{8})\.jsonl$`)
@@ -110,7 +116,42 @@ func Open(dir, machine string, retentionDays int) (*Store, error) {
 	if err := s.recover(); err != nil {
 		return nil, err
 	}
+	s.rebuildHooks()
 	return s, nil
+}
+
+// rebuildHooks restores the per-session "last hook" from the newest segment, so a daemon
+// restart doesn't forget that a session is mid-turn. A session with no hook event in it is
+// simply unknown, and unknown is never idle.
+func (s *Store) rebuildHooks() {
+	s.hooks = map[string]hookState{}
+	segs := s.segments()
+	for i := len(segs) - 1; i >= 0 && i >= len(segs)-2; i-- {
+		recs, _, _ := scan(filepath.Join(s.Dir, segs[i]))
+		for _, r := range recs {
+			s.noteHook(r)
+		}
+	}
+}
+
+func (s *Store) noteHook(r Record) {
+	if r.Src == "fence" && strings.HasPrefix(r.Type, "hook.") && r.Sid != "" {
+		s.hooks[r.Sid] = hookState{r.Type, r.TS}
+	}
+}
+
+// IdleSince reports whether the session's last hook event is Stop, i.e. its turn is over and
+// Claude Code is sitting at the input prompt, and when that happened. Anything else (a prompt
+// submitted, a tool running, a permission Notification, nothing seen yet) is not idle: the pane
+// may be showing a menu, and a message typed into a menu answers it.
+func (s *Store) IdleSince(sid string) (time.Time, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	h, ok := s.hooks[sid]
+	if !ok || h.Type != "hook.Stop" {
+		return time.Time{}, false
+	}
+	return h.TS, true
 }
 
 func (s *Store) now() time.Time {
@@ -226,6 +267,7 @@ func (s *Store) Append(e Event) (Record, error) {
 		return rec, err
 	}
 	s.seq = rec.Seq
+	s.noteHook(rec)
 	if s.oldest == 0 {
 		s.oldest = rec.Seq
 	}

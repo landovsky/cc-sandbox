@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/journal"
+	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
 )
 
@@ -274,5 +275,115 @@ func TestCockpitEndpointsNeedARealm(t *testing.T) {
 	}
 	if code, _ := r.do(t, "GET", "/v1/cockpit/status?realm=..%2Fx", "", ""); code != 400 {
 		t.Fatal(code)
+	}
+}
+
+// ---- caller classes: the unix socket is the owner, the TCP port is a token holder ------------
+
+type fakeDirT struct{ s []msg.Session }
+
+func (f fakeDirT) Sessions() ([]msg.Session, error) { return f.s, nil }
+
+type nopOut struct{ lines []string }
+
+func (n *nopOut) Deliver(sid, line string) error {
+	n.lines = append(n.lines, sid+": "+line)
+	return nil
+}
+
+type idleT struct{ idle bool }
+
+func (i idleT) IdleSince(string) (time.Time, bool) { return time.Now().Add(-time.Hour), i.idle }
+
+func newAuthRig(t *testing.T, idle bool) (local, tcp *httptest.Server, out *nopOut) {
+	j, _ := journal.Open(t.TempDir(), "hp-ubuntu", 0)
+	q, _ := verbq.Open(t.TempDir())
+	dir := fakeDirT{[]msg.Session{{Sid: "sM", Label: "cc-sandbox:mgr", Realm: "production", Live: true, Gen: 1}}}
+	out = &nopOut{}
+	rt := &msg.Router{Dir: dir, Out: out, Idle: idleT{idle}, StateDir: t.TempDir()}
+	s := &Server{J: j, Q: q, Msg: rt, Dir: dir, Token: "0123456789abcdef-token"}
+	local, tcp = httptest.NewServer(s.Handler()), httptest.NewServer(s.TCPHandler())
+	t.Cleanup(func() { local.Close(); tcp.Close(); j.Close(); q.Close() })
+	return
+}
+
+func call(t *testing.T, method, url, token, body string) (int, map[string]any) {
+	req, _ := http.NewRequest(method, url, bytes.NewBufferString(body))
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var m map[string]any
+	json.NewDecoder(resp.Body).Decode(&m)
+	return resp.StatusCode, m
+}
+
+// context: any local process can reach 127.0.0.1. Without the token the TCP port gives a
+// stranger neither the journal (every session's fence text) nor the cockpit lease.
+func TestTCPListenerNeedsTheTokenAndNeverServesOwnerOperations(t *testing.T) {
+	local, tcp, out := newAuthRig(t, true)
+	if code, _ := call(t, "GET", tcp.URL+"/v1/events", "", ""); code != 401 {
+		t.Fatalf("no token: %d", code)
+	}
+	if code, _ := call(t, "GET", tcp.URL+"/v1/events", "wrong-token-wrong-token", ""); code != 401 {
+		t.Fatalf("wrong token: %d", code)
+	}
+	if code, _ := call(t, "GET", tcp.URL+"/v1/events", "0123456789abcdef-token", ""); code != 200 {
+		t.Fatalf("right token: %d", code)
+	}
+	if code, _ := call(t, "POST", tcp.URL+"/v1/cockpit/lease?realm=production", "0123456789abcdef-token", `{"holder":"hp"}`); code != 200 {
+		t.Fatalf("lease with token: %d", code)
+	}
+	if code, m := call(t, "POST", tcp.URL+"/v1/cockpit/lease?realm=production", "0123456789abcdef-token", `{"holder":"evil","steal":true}`); code != 403 {
+		t.Fatalf("steal over TCP: %d %v", code, m)
+	}
+	if code, _ := call(t, "POST", tcp.URL+"/v1/sessions/sM/deliver", "0123456789abcdef-token", `{"from":"x","text":"hi"}`); code != 403 || len(out.lines) != 0 {
+		t.Fatalf("deliver over TCP: %d %v", code, out.lines)
+	}
+	if code, _ := call(t, "POST", local.URL+"/v1/cockpit/lease?realm=production", "", `{"holder":"owner","steal":true}`); code != 200 {
+		t.Fatalf("steal over the socket: %d", code)
+	}
+}
+
+func TestTCPWithNoTokenConfiguredRefusesEverything(t *testing.T) {
+	j, _ := journal.Open(t.TempDir(), "m", 0)
+	defer j.Close()
+	s := httptest.NewServer((&Server{J: j}).TCPHandler())
+	defer s.Close()
+	if code, _ := call(t, "GET", s.URL+"/v1/info", "", ""); code != 401 {
+		t.Fatalf("%d", code)
+	}
+	if code, _ := call(t, "GET", s.URL+"/v1/info", "Bearer", ""); code != 401 {
+		t.Fatalf("empty token matched an empty configured token: %d", code)
+	}
+}
+
+// context: the owner's deliver goes through the daemon, which refuses to type into a busy pane
+// (409), and queues on request (202).
+func TestOwnerDeliverIsGatedByTheIdleRule(t *testing.T) {
+	local, _, out := newAuthRig(t, false)
+	if code, m := call(t, "POST", local.URL+"/v1/sessions/sM/deliver", "", `{"from":"cc-tree","text":"hi"}`); code != 409 || m["code"] != "target_busy" || len(out.lines) != 0 {
+		t.Fatalf("busy: %d %v %v", code, m, out.lines)
+	}
+	if code, _ := call(t, "POST", local.URL+"/v1/sessions/sM/deliver", "", `{"from":"cc-tree","text":"hi","queue":true}`); code != 202 || len(out.lines) != 0 {
+		t.Fatalf("queue: %d %v", code, out.lines)
+	}
+	if code, m := call(t, "GET", local.URL+"/v1/resolve?label=cc-sandbox:mgr", "", ""); code != 200 || m["sid"] != "sM" || m["idle"] != false {
+		t.Fatalf("resolve: %d %v", code, m)
+	}
+	if code, _ := call(t, "GET", local.URL+"/v1/resolve?label=nope:x", "", ""); code != 404 {
+		t.Fatalf("resolve unknown: %d", code)
+	}
+}
+
+func TestOwnerDeliverToAnIdlePaneLands(t *testing.T) {
+	local, _, out := newAuthRig(t, true)
+	code, m := call(t, "POST", local.URL+"/v1/sessions/sM/deliver", "", `{"from":"cc-tree","text":"hi"}`)
+	if code != 200 || len(out.lines) != 1 || !strings.Contains(out.lines[0], "trust: unfenced (owner device)") {
+		t.Fatalf("%d %v %v", code, m, out.lines)
 	}
 }

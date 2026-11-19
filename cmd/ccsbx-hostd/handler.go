@@ -39,7 +39,9 @@ func (m *mux) handle(r hostd.Request) hostd.Reply {
 // msgHandler is U3b: msg.send and msg.reply go through the scope rule and into the target pane.
 func msgHandler(rt *msg.Router) hostd.Handler {
 	return func(r hostd.Request) hostd.Reply {
-		res := rt.Send(msg.Session{Sid: r.Sid}, r.Body) // scope is re-read from the record by sid
+		// scope is re-read from the record by sid; a message to a busy pane waits, and the
+		// final result is written into the sender's inbox by the pump.
+		res := rt.SendWith(msg.Session{Sid: r.Sid}, r.Body, msg.Origin{Sid: r.Sid, Gen: r.Gen, Rid: r.Rid, ID: r.ID})
 		return hostd.Reply{Status: res.Status, Result: res}
 	}
 }
@@ -78,5 +80,13 @@ func replyWriter(stateDir string, d *start.Daemon) verbq.ReplyFunc {
 			result = map[string]string{"code": res.Code}
 		}
 		return hostd.WriteReply(gdir, hostd.Reply{Rid: it.Rid, ID: it.ID, Status: res.Status, Result: result, Seq: int(it.Seq)}) == nil
+	}
+}
+
+// pumpReply writes the final result of a queued message into the sender's inbox.
+func pumpReply(stateDir string) func(msg.Origin, msg.Result) {
+	return func(o msg.Origin, res msg.Result) {
+		gdir := filepath.Join(stateDir, "s", o.Sid, fmt.Sprintf("g%d", o.Gen))
+		_ = hostd.WriteReply(gdir, hostd.Reply{Rid: o.Rid, ID: o.ID, Status: res.Status, Result: res})
 	}
 }

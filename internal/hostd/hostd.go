@@ -81,6 +81,7 @@ type Config struct {
 	MaxTotal         int     // requests per generation in its lifetime; beyond: shed silently
 	ShedRefs         int     // refusal replies written per scan once the bucket is empty
 	Handler          Handler // nil: every known type is answered error/not_built
+	OnTick           func()  // called after every scan (the message pump)
 	Journal          Journal // nil: events.jsonl is not ingested (U3a alone)
 	MaxEventsPerScan int     // events taken from one outbox per scan
 	MaxEventLine     int     // bytes per events.jsonl line; longer lines are dropped
@@ -154,12 +155,13 @@ type Hostd struct {
 	boxes     map[string]*outbox
 	start     *start.Daemon
 	epochDone bool
-	done      map[string]bool // generations drained for good (their box is freed)
+	done      map[string]bool   // generations drained for good (their box is freed)
+	reuse     map[string]string // gdir/name -> the ULID a re-ingested request had the first time
 }
 
 func New(cfg Config) *Hostd {
 	cfg.Defaults()
-	return &Hostd{Cfg: cfg, boxes: map[string]*outbox{}, done: map[string]bool{}, start: &start.Daemon{StateDir: cfg.StateDir}}
+	return &Hostd{Cfg: cfg, boxes: map[string]*outbox{}, done: map[string]bool{}, reuse: map[string]string{}, start: &start.Daemon{StateDir: cfg.StateDir}}
 }
 
 var (
@@ -205,9 +207,13 @@ func (h *Hostd) Scan() Stats {
 		h.loadState(gdir, box)
 		h.lifecycle(gdir, rec, box, "session.start")
 		h.scanOne(gdir, sid, gen, rec, box, stale, &st)
-		h.ingestEvents(gdir, rec, gen, box, &st)
+		if !stale { // a dead generation's hook events are not the live node's state
+			h.ingestEvents(gdir, rec, gen, box, &st)
+		}
 		if closedErr == nil || stale {
-			h.ingestEvents(gdir, rec, gen, box, &st) // the final drain
+			if !stale {
+				h.ingestEvents(gdir, rec, gen, box, &st) // the final drain
+			}
 			h.lifecycle(gdir, rec, box, "session.end")
 			h.done[gdir] = true
 			delete(h.boxes, gdir)
@@ -285,7 +291,10 @@ func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, s
 			continue
 		}
 		box.tokens--
-		id := ulid.New()
+		id := h.reuse[gdir+"/"+n] // a request re-ingested after an epoch reset keeps its first ULID
+		if id == "" {
+			id = ulid.New()
+		}
 		data, ino, err := root.ReadFile("requests/"+n, Limits{Uid: h.Cfg.FenceUID, Max: h.Cfg.MaxBytes})
 		if err != nil {
 			code := classify(err)
@@ -477,12 +486,15 @@ func (h *Hostd) loadLedger(gdir string, box *outbox) {
 	}
 }
 
-// Run scans every interval until stop is closed.
+// Run scans every interval until stop is closed, calling OnTick after each scan.
 func (h *Hostd) Run(interval time.Duration, stop <-chan struct{}) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
 	for {
 		h.Scan()
+		if h.Cfg.OnTick != nil {
+			h.Cfg.OnTick()
+		}
 		select {
 		case <-stop:
 			return

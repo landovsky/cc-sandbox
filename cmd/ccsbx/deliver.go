@@ -1,35 +1,59 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
-	"github.com/landovsky/cc-sandbox/internal/msg"
 )
+
+// exitBusy: the target is not at its input prompt, so nothing was typed (retry, or --queue).
+const exitBusy = 3
 
 func deliverCmd() *cli.Command {
 	return &cli.Command{
 		Name:    "deliver",
-		Summary: "owner-device delivery into a session's pane, stamped 'unfenced (owner device)' (U3b)",
+		Summary: "owner-device delivery into a session's pane, through the daemon, stamped 'unfenced (owner device)' (U3b)",
 		Recipes: `  ccsbx deliver --to cc-sandbox:2f3e --from cc-tree "ping"     # by node (the live session now)
   ccsbx deliver --to s0k1dry66qg --text -  < note.txt              # by sid, text from stdin
-  The stamp is "[MSG from <from> · trust: unfenced (owner device)] <text>": never 'human'.
-  No scope rule (the owner may write to any live session). The text is flattened to one line.
-  Exit 0 delivered, 1 failed, 2 no live session for --to.`,
+  ccsbx deliver --to cc-sandbox:2f3e --queue "when you are free"   # wait for the prompt instead of failing
+  The stamp is "[MSG from <from> · trust: unfenced (owner device) · #<boundary>] <text> ‹end #<boundary>›":
+  never 'human'. <from> is a label ([A-Za-z0-9:._/-], other characters become _). The text is
+  flattened to one line. No scope rule (the owner may write to any live session), but the idle rule
+  holds: text is typed only into a pane at its input prompt (the session's last hook event is
+  Stop); a pane in a turn or at a menu is never typed into.
+  Talks to the daemon on <state>/hostd.sock (ccsbx-hostd run). Exit 0 delivered or queued, 1 failed,
+  2 no live session for --to, 3 target busy (not typed).`,
 		Setup: func(f *cli.Flags) {
-			stateFlags(f)
-			f.String("to", "", "target: a node (label), bus id or sid")
-			f.String("from", "owner", "who the stamp names")
+			home, _ := os.UserHomeDir()
+			f.String("state", filepath.Join(home, ".local", "state", "ccsbx"), "daemon state directory")
+			f.String("socket", "", "the daemon's unix socket (default <state>/hostd.sock)")
+			f.String("to", "", "target: a node (label), or a sid")
+			f.String("from", "owner", "who the stamp names (a label)")
 			f.String("text", "", "message text; - reads stdin (or give it as arguments)")
-			f.String("tmux-socket", "ccsbx", "tmux -L socket the panes live on")
+			f.Bool("queue", false, "if the target is busy, hold the message until its prompt is back (up to the daemon's TTL)")
 			f.Bool("json", false, "print the receipt as JSON")
 		},
 		Run: runDeliver,
 	}
+}
+
+func unixClient(sock string) *http.Client {
+	return &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
+		},
+	}}
 }
 
 func runDeliver(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
@@ -42,32 +66,72 @@ func runDeliver(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 	if text == "" {
 		text = strings.Join(args, " ")
 	}
-	if get("to") == "" || strings.TrimSpace(text) == "" {
+	to := get("to")
+	if to == "" || strings.TrimSpace(text) == "" {
 		fmt.Fprintln(stderr, "ccsbx deliver: --to and a text are required")
 		return cli.ExitUsage
 	}
-	d, err := daemonFrom(f)
+	sock := get("socket")
+	if sock == "" {
+		sock = filepath.Join(get("state"), "hostd.sock")
+	}
+	c := unixClient(sock)
+	// A node (label) is resolved to its live session by the daemon; a sid is used as it is.
+	sid := to
+	if strings.Contains(to, ":") {
+		resp, err := c.Get("http://d/v1/resolve?label=" + url.QueryEscape(to))
+		if err != nil {
+			fmt.Fprintf(stderr, "ccsbx deliver: the daemon isn't answering on %s (is `ccsbx-hostd run` up?): %v\n", sock, err)
+			return cli.ExitFail
+		}
+		var r struct {
+			Sid string `json:"sid"`
+		}
+		json.NewDecoder(resp.Body).Decode(&r)
+		resp.Body.Close()
+		if resp.StatusCode == 404 {
+			fmt.Fprintf(stderr, "ccsbx deliver: no live session for %q\n", to)
+			return cli.ExitRefused
+		}
+		if resp.StatusCode != 200 || r.Sid == "" {
+			fmt.Fprintf(stderr, "ccsbx deliver: resolve failed (HTTP %d)\n", resp.StatusCode)
+			return cli.ExitFail
+		}
+		sid = r.Sid
+	}
+	body, _ := json.Marshal(map[string]any{"from": get("from"), "text": text, "queue": get("queue") == "true"})
+	resp, err := c.Post("http://d/v1/sessions/"+url.PathEscape(sid)+"/deliver", "application/json", bytes.NewReader(body))
 	if err != nil {
-		fmt.Fprintln(stderr, "ccsbx deliver:", err)
+		fmt.Fprintf(stderr, "ccsbx deliver: the daemon isn't answering on %s: %v\n", sock, err)
 		return cli.ExitFail
 	}
-	tm := &msg.Tmux{Socket: get("tmux-socket")}
-	rt := &msg.Router{Dir: msg.DaemonDir{D: d, Alive: tm.Alive}, Out: tm, StateDir: d.StateDir}
-	res := rt.DeliverOwner(get("from"), get("to"), text)
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
 	if get("json") == "true" {
-		b, _ := json.Marshal(res)
-		fmt.Fprintln(stdout, string(b))
+		fmt.Fprintln(stdout, strings.TrimSpace(string(raw)))
 	}
-	switch {
-	case res.Status == "ok":
+	var res struct {
+		Status, Code, Receipt, To string
+	}
+	json.Unmarshal(raw, &res)
+	switch resp.StatusCode {
+	case 200:
 		if get("json") != "true" {
 			fmt.Fprintf(stdout, "delivered to %s (receipt %s)\n", res.To, res.Receipt)
 		}
 		return cli.ExitOK
-	case res.Code == "no_live_session":
-		fmt.Fprintf(stderr, "ccsbx deliver: no live session for %q\n", get("to"))
+	case 202:
+		if get("json") != "true" {
+			fmt.Fprintf(stdout, "queued for %s: it waits for the prompt (receipt %s)\n", to, res.Receipt)
+		}
+		return cli.ExitOK
+	case 404:
+		fmt.Fprintf(stderr, "ccsbx deliver: no live session for %q\n", to)
 		return cli.ExitRefused
+	case 409:
+		fmt.Fprintf(stderr, "ccsbx deliver: %s is busy (not at its input prompt); nothing was typed. Retry, or use --queue\n", to)
+		return exitBusy
 	}
-	fmt.Fprintf(stderr, "ccsbx deliver: %s %s\n", res.Status, res.Code)
+	fmt.Fprintf(stderr, "ccsbx deliver: HTTP %d %s %s\n", resp.StatusCode, res.Status, res.Code)
 	return cli.ExitFail
 }

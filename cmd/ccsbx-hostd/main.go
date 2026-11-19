@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,11 +37,14 @@ func app() *cli.App {
 			Summary: "scan every live outbox until stopped (or once with --once)",
 			Recipes: `  ccsbx-hostd run --once                  # one pass, print what was accepted/refused/shed
   ccsbx-hostd run --interval 250ms        # the daemon loop + the API on <state>/hostd.sock
-  ccsbx-hostd run --listen 127.0.0.1:7481 # ...and on loopback, for curl:
-    curl -s 'http://127.0.0.1:7481/v1/events?after=0'          # replay after a cursor
-    curl -s 'http://127.0.0.1:7481/v1/events?after=41&epoch=E&wait=20'   # long-poll
-    curl -N 'http://127.0.0.1:7481/v1/events/stream?after=41'  # SSE
-    curl -s -d '{"seq":41,"epoch":"E","tree_sha":"<sha>"}' http://127.0.0.1:7481/v1/cursors/production
+  curl --unix-socket <state>/hostd.sock http://d/v1/events?after=0              # replay after a cursor
+  curl --unix-socket <state>/hostd.sock 'http://d/v1/events?after=41&epoch=E&wait=20'   # long-poll
+  curl --unix-socket <state>/hostd.sock -N 'http://d/v1/events/stream?after=41'  # SSE
+  curl --unix-socket <state>/hostd.sock -d '{"seq":41,"epoch":"E","tree_sha":"<sha>"}' http://d/v1/cursors/production
+  ccsbx-hostd run --listen 127.0.0.1:7481 --listen-token-file ~/.config/ccsbx/api-token
+    curl -H "Authorization: Bearer $(cat ~/.config/ccsbx/api-token)" http://127.0.0.1:7481/v1/info
+  The unix socket is mode 0600 (owner class: also deliver and lease steal). The loopback port is
+  token-protected and read/cockpit only.
   Direct mode (dev): the outbox is writable by the host, so T:outbox-host-write-refused is red
   until gate M, and every result is "not evidence". Requests are never echoed: refusals carry
   a rule name (too_big, not_regular, hardlink, wrong_owner, unsafe_path, bad_json, unknown_type,
@@ -58,7 +62,8 @@ func app() *cli.App {
 				f.String("journal", "", "journal directory (default <state>/journal)")
 				f.Int("retention-days", 14, "journal retention; values below 14 are refused")
 				f.String("socket", "", "unix socket for the daemon API, mode 0600 (default <state>/hostd.sock; '-' disables)")
-				f.String("listen", "", "also serve the API on this loopback address, e.g. 127.0.0.1:7481 (non-loopback is refused until M2a)")
+				f.String("listen", "", "also serve the journal/cockpit API on this loopback address, e.g. 127.0.0.1:7481; needs --listen-token-file; no deliver, no steal there")
+				f.String("listen-token-file", "", "file (mode 0600) holding the bearer token the --listen address requires")
 				f.Int("lease-ttl", 90, "cockpit lease TTL in seconds (one holder per realm)")
 				f.Int("queue-max", 10000, "pending cockpit requests per realm before refused: queue_full")
 				f.String("interval", "250ms", "time between scans")
@@ -103,7 +108,8 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		return cli.ExitFail
 	}
 	defer j.Close()
-	h := hostd.New(hostd.Config{Journal: j,
+	rt.Idle = j // a message is typed only into a pane whose last hook event is Stop
+	h := hostd.New(hostd.Config{Journal: j, OnTick: func() { rt.Pump(pumpReply(get("state"))) },
 		StateDir: get("state"), FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
 		Handler: m.handle, Rate: float64(num("rate")), Burst: num("burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
 	})
@@ -113,17 +119,17 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		return cli.ExitOK
 	}
 	var servers []*http.Server
-	srv := &daemonapi.Server{J: j, Q: q, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
+	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
 	sock := get("socket")
 	if sock == "" {
 		sock = filepath.Join(get("state"), "hostd.sock")
 	}
-	serve := func(l net.Listener, err error, what string) bool {
+	serve := func(l net.Listener, err error, what string, h http.Handler) bool {
 		if err != nil {
 			fmt.Fprintf(stderr, "ccsbx-hostd: %s: %v\n", what, err)
 			return false
 		}
-		hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		hs := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
 		servers = append(servers, hs)
 		go hs.Serve(l)
 		lg.Printf("api on %s", what)
@@ -131,13 +137,19 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	}
 	if sock != "-" {
 		l, err := daemonapi.ListenUnix(sock)
-		if !serve(l, err, "unix:"+sock) {
+		if !serve(l, err, "unix:"+sock, srv.Handler()) {
 			return cli.ExitFail
 		}
 	}
 	if a := get("listen"); a != "" {
+		tok, err := readToken(get("listen-token-file"))
+		if err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: --listen needs --listen-token-file: %v\n", err)
+			return cli.ExitUsage
+		}
+		srv.Token = tok
 		l, err := daemonapi.ListenLoopback(a)
-		if !serve(l, err, a) {
+		if !serve(l, err, a, srv.TCPHandler()) {
 			return cli.ExitFail
 		}
 	}
@@ -160,6 +172,30 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		hs.Close()
 	}
 	return cli.ExitOK
+}
+
+// readToken reads the bearer token for the TCP listener. The file must be private (0600 or
+// stricter) and the token at least 16 characters, so a shared or empty one is refused.
+func readToken(path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("no file given")
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if st.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("%s is readable by others (chmod 600)", path)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	t := strings.TrimSpace(string(b))
+	if len(t) < 16 {
+		return "", fmt.Errorf("%s: the token must be at least 16 characters", path)
+	}
+	return t, nil
 }
 
 func hostname() string { h, _ := os.Hostname(); return h }

@@ -15,6 +15,8 @@
 package daemonapi
 
 import (
+	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -27,20 +29,51 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/journal"
+	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
 )
 
 // Server serves one journal.
 type Server struct {
 	J       *journal.Store
-	Q       *verbq.Queue  // nil: the cockpit endpoints answer 404
+	Q       *verbq.Queue // nil: the cockpit endpoints answer 404
+	Msg     *msg.Router  // nil: the deliver endpoints answer 404
+	Dir     msg.Directory
+	Token   string        // bearer token the TCP listener requires (the unix socket needs none: it is 0600)
 	MaxWait time.Duration // longest long-poll
 	Info    map[string]any
 }
 
-// Handler returns the mux.
-func (s *Server) Handler() http.Handler {
+type ctxKey struct{}
+
+func isLocal(r *http.Request) bool { v, _ := r.Context().Value(ctxKey{}).(bool); return v }
+
+// Handler is the API for the unix socket: mode 0600, so only the daemon's own user reaches it
+// (owner class). Everything is served, including deliver and the lease's steal.
+func (s *Server) Handler() http.Handler { return s.build(true) }
+
+// TCPHandler is the API for the loopback listener. Every request needs the bearer token;
+// deliver and steal are not served there at all (owner-class operations, socket only).
+func (s *Server) TCPHandler() http.Handler { return s.build(false) }
+
+func (s *Server) build(local bool) http.Handler {
+	m := s.mux()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !local {
+			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+			if s.Token == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
+				writeJSON(w, 401, map[string]any{"error": "unauthorized"})
+				return
+			}
+		}
+		m.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, local)))
+	})
+}
+
+func (s *Server) mux() *http.ServeMux {
 	m := http.NewServeMux()
+	m.HandleFunc("/v1/resolve", s.resolve)
+	m.HandleFunc("/v1/sessions/", s.deliver)
 	m.HandleFunc("/v1/info", s.info)
 	m.HandleFunc("/v1/events", s.events)
 	m.HandleFunc("/v1/events/stream", s.stream)
@@ -332,6 +365,10 @@ func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 400, map[string]any{"error": "holder is required"})
 		return
 	}
+	if b.Steal && !isLocal(r) {
+		writeJSON(w, 403, map[string]any{"error": "steal is an owner operation: use the unix socket"})
+		return
+	}
 	l, err := s.Q.Acquire(realm, b.Holder, b.Token, b.Steal)
 	if errors.Is(err, verbq.ErrLeaseHeld) {
 		// Say who holds it and for how long, never the token.
@@ -402,4 +439,73 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, st)
+}
+
+// ---- local message delivery (U3b, plan §4.4) ----
+
+// resolve: GET /v1/resolve?label= -> the live session for a node, and whether its pane is at the
+// input prompt. Owner class (socket only), like deliver.
+func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
+	if s.Msg == nil || s.Dir == nil {
+		writeJSON(w, 404, map[string]any{"error": "no_messaging"})
+		return
+	}
+	if !isLocal(r) {
+		writeJSON(w, 403, map[string]any{"error": "owner operation: use the unix socket"})
+		return
+	}
+	all, err := s.Dir.Sessions()
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": "internal"})
+		return
+	}
+	t := msg.Resolve(all, r.URL.Query().Get("label"))
+	if t == nil {
+		writeJSON(w, 404, map[string]any{"error": "no_live_session"})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"sid": t.Sid, "label": t.Label, "gen": t.Gen, "realm": t.Realm, "idle": s.Msg.IdleNow(t.Sid)})
+}
+
+// deliver: POST /v1/sessions/<sid>/deliver {from, text, queue}. The stamp is
+// "trust: unfenced (owner device)", never "human". 200 delivered, 202 queued, 404 no live
+// session, 409 target_busy (not at its prompt; the text was NOT typed).
+func (s *Server) deliver(w http.ResponseWriter, r *http.Request) {
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/sessions/")
+	sid, ok := strings.CutSuffix(rest, "/deliver")
+	if !ok || sid == "" || strings.Contains(sid, "/") {
+		writeJSON(w, 404, map[string]any{"error": "not_found"})
+		return
+	}
+	if s.Msg == nil {
+		writeJSON(w, 404, map[string]any{"error": "no_messaging"})
+		return
+	}
+	if !isLocal(r) || r.Method != http.MethodPost {
+		writeJSON(w, 403, map[string]any{"error": "owner operation: POST on the unix socket"})
+		return
+	}
+	var b struct {
+		From  string `json:"from"`
+		Text  string `json:"text"`
+		Queue bool   `json:"queue"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if json.Unmarshal(body, &b) != nil {
+		writeJSON(w, 400, map[string]any{"error": "bad_json"})
+		return
+	}
+	res := s.Msg.DeliverOwner(b.From, sid, b.Text, b.Queue)
+	code := 200
+	switch {
+	case res.Status == "queued":
+		code = 202
+	case res.Code == "no_live_session":
+		code = 404
+	case res.Code == "target_busy":
+		code = 409
+	case res.Status != "ok":
+		code = 502
+	}
+	writeJSON(w, code, res)
 }

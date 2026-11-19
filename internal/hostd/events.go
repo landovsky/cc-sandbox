@@ -42,13 +42,16 @@ func (h *Hostd) loadState(gdir string, box *outbox) {
 
 func (h *Hostd) saveState(gdir string, box *outbox) {
 	p := h.statePath(gdir)
-	if os.MkdirAll(filepath.Dir(p), 0o700) != nil {
-		return
-	}
 	b, _ := json.Marshal(box.state)
 	tmp := p + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		_ = os.Rename(tmp, p)
+	err := os.MkdirAll(filepath.Dir(p), 0o700)
+	if err == nil {
+		if err = os.WriteFile(tmp, b, 0o600); err == nil {
+			err = os.Rename(tmp, p)
+		}
+	}
+	if err != nil { // never silent: events may be journaled twice after a restart
+		h.Cfg.Logf("hostd: state write failed (%v): events may be journaled again after a restart", err)
 	}
 }
 
@@ -199,6 +202,8 @@ func (h *Hostd) forgetUnreplied(gdir string) {
 		rid := strings.TrimSuffix(r.Name, ".json")
 		if _, err := os.Stat(filepath.Join(gdir, "in", "replies", rid+".json")); err == nil {
 			keep = append(keep, ln)
+		} else if r.ID != "" {
+			h.reuse[gdir+"/"+r.Name] = r.ID // handled again, but under the id it had: downstream can dedupe
 		}
 	}
 	out := bytes.Join(keep, []byte{'\n'})

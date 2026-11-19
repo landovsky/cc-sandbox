@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/pins"
 	"github.com/landovsky/cc-sandbox/internal/profile"
 )
@@ -36,24 +37,29 @@ type Record struct {
 	Ended      *time.Time `json:"ended,omitempty"`
 	Spec       LaunchSpec `json:"spec"`
 	Reply      StartReply `json:"reply"`
+	// GitDir is the gitdir the fence may see read-only, decided once at the session's first
+	// start. Later generations reuse it: the worktree's .git file is agent-written and is never
+	// read again.
+	GitDir string `json:"git_dir,omitempty"`
 }
 
 // Daemon holds the policy knobs and the state directory.
 type Daemon struct {
-	StateDir    string
-	ProfilesDir string
-	Machine     string // this machine's name; a spec for another machine is refused
-	Uid         int    // the caller's uid (from the OS, never from the spec)
-	Image       string // fence image reference recorded in the pin
-	PinsFile    string // pins.toml; missing means no production pins
-	CCVersion   string
-	MaxLive     int // machine_full above this many live sessions
-	MaxPerHour  int // rate_capped above this many starts by one caller in an hour
-	Backend     string
-	Socket      string // tmux -L name for the attach command; default ccsbx
-	Root        string // "direct" tonight
-	Launcher    Launcher
-	Now         func() time.Time
+	StateDir     string
+	ProfilesDir  string
+	Machine      string // this machine's name; a spec for another machine is refused
+	Uid          int    // the caller's uid (from the OS, never from the spec)
+	Image        string // fence image reference recorded in the pin
+	PinsFile     string // pins.toml; missing means no production pins
+	WorktreeRoot string // every worktree must be inside this directory (CCSBX_WORKTREE_ROOT)
+	CCVersion    string
+	MaxLive      int // machine_full above this many live sessions
+	MaxPerHour   int // rate_capped above this many starts by one caller in an hour
+	Backend      string
+	Socket       string // tmux -L name for the attach command; default ccsbx
+	Root         string // "direct" tonight
+	Launcher     Launcher
+	Now          func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
 	Exe string
 }
@@ -103,12 +109,14 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	if s.Workdir.Path == "" || s.Workdir.Repo != "" {
 		return nil, refuse(NotBuilt, "only workdir.path is supported (repo/base/branch needs the git route, H1)")
 	}
-	if !filepath.IsAbs(s.Workdir.Path) {
-		return nil, refuse(BadSpec, "workdir.path must be absolute")
+	rw, err := backend.CheckWorkdir(s.Workdir.Path, d.WorktreeRoot, d.StateDir)
+	if err != nil {
+		return nil, refuse(BadSpec, "workdir: %v", err)
 	}
-	if st, err := os.Stat(s.Workdir.Path); err != nil || !st.IsDir() {
+	if st, err := os.Stat(rw); err != nil || !st.IsDir() {
 		return nil, refuse(BadSpec, "workdir.path %s is not a directory", s.Workdir.Path)
 	}
+	s.Workdir.Path = rw // the resolved path is what gets mounted and recorded
 
 	p, err := profile.Load(d.ProfilesDir, s.Profile)
 	if err != nil {
@@ -168,7 +176,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 			return nil, refuse(BadSpec, "resume: session %s belongs to another caller", old.Sid)
 		case old.Label != s.Label:
 			return nil, refuse(BadSpec, "resume: session %s has label %q, not %q (a resume keeps its label)", old.Sid, old.Label, s.Label)
-		case old.Spec.Workdir.Path != s.Workdir.Path:
+		case old.Spec.Workdir.Path != rw:
 			return nil, refuse(BadSpec, "resume: workdir must be the same, the transcript is keyed by it")
 		}
 		cp := *old
@@ -182,7 +190,12 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		if err != nil {
 			return nil, err
 		}
-		rec = &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s}
+		// First start only: the worktree has not been written by an agent of this session yet.
+		gd, err := backend.ResolveGitDir(rw)
+		if err != nil {
+			return nil, refuse(BadSpec, "workdir git metadata: %v", err)
+		}
+		rec = &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s, GitDir: gd}
 	}
 	sid := rec.Sid
 	rec.Reply = StartReply{

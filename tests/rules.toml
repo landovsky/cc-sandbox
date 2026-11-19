@@ -927,3 +927,23 @@ block = "pending"
 invariants = [5]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "gitdir-from-record"
+title = "the gitdir a fence sees is decided once at first start and kept in the session record; the agent-writable .git file is never trusted for a later generation"
+suite = "fence"
+allow = "tests/twin-go.sh ./internal/backend TestGitDirFromRecordAllow"
+block = "tests/twin-go.sh ./internal/backend TestGitDirFromRecordBlock"
+invariants = [2, 4, 10]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "workdir-inside-root"
+title = "a worktree must resolve inside the operator-set worktree root: not the home, the state dir, a symlink out, or a hidden home directory"
+suite = "fence"
+allow = "tests/twin-go.sh ./internal/backend TestCheckWorkdir"
+block = "tests/twin-go.sh ./internal/backend TestWorkdirNotInHiddenHomeDirs"
+invariants = [2]
+backends = ["unit"]
+where = "any"

@@ -21,7 +21,7 @@ BIN=${CCSBX_BIN:-bin/ccsbx}
 docker image inspect "$IMG" >/dev/null 2>&1 || { echo "FAIL: image $IMG not present locally (not pulling)"; exit 1; }
 
 STATE=$(mktemp -d)
-mkdir -p /var/tmp
+mkdir -p /var/tmp/ccsbx-hello
 PIDS=()
 # Files the fence wrote (uid 10001) can't be removed by the host user: sweep them from a container.
 rmstate() { docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"; }
@@ -45,15 +45,15 @@ ok()   { echo "ok   [$RULE/$TWIN]: $*"; }
 new_session() {
   local spec; spec=$(sed "s/lid-hello-1/lid-$1-$$/;s/cc-sandbox:hello/cc-sandbox:$1-$$/;s/\"billing\":\"stub\"/\"billing\":\"stub\"/" tests/specs/hello.json)
   local sid
-  sid=$(printf '%s' "$spec" | "$BIN" start --state "$STATE" --machine hp-ubuntu --launcher none --spec - --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["sid"])') || return 1
+  sid=$(printf '%s' "$spec" | "$BIN" start --state "$STATE" --machine hp-ubuntu --worktree-root /var/tmp --launcher none --spec - --json | python3 -c 'import sys,json;print(json.load(sys.stdin)["sid"])') || return 1
   echo "$sid" >> "$STATE/sids"; echo "$sid"
 }
 # fence <sid> <cmd...>: run in the foreground, output on stdout.
-fence() { local sid=$1; shift; "$BIN" run --state "$STATE" --machine hp-ubuntu --sid "$sid" --image "$IMG" -- "$@" 2>/dev/null; }
+fence() { local sid=$1; shift; "$BIN" run --state "$STATE" --machine hp-ubuntu --worktree-root /var/tmp --sid "$sid" --image "$IMG" -- "$@" 2>/dev/null; }
 # fence_bg <sid> <cmd...>: run in the background and wait for its container to exist.
 fence_bg() {
   local sid=$1; shift
-  "$BIN" run --state "$STATE" --machine hp-ubuntu --sid "$sid" --image "$IMG" -- "$@" >/dev/null 2>&1 &
+  "$BIN" run --state "$STATE" --machine hp-ubuntu --worktree-root /var/tmp --sid "$sid" --image "$IMG" -- "$@" >/dev/null 2>&1 &
   PIDS+=("$!")
   for _ in $(seq 1 50); do docker inspect "ccsbx-$sid-g1" >/dev/null 2>&1 && return 0; sleep 0.2; done
   fail "container ccsbx-$sid-g1 never appeared"

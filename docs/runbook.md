@@ -1,0 +1,335 @@
+[Index](README.md)
+
+# cc-sandbox runbook: every manual procedure
+
+> **Rule (Tomas, Q18):** every manual procedure lives here, in the same PR as the piece that
+> introduces it. One section each, with five fields: **When, Who, Steps, Check, Rollback.**
+> `tests/procedures-check.sh` fails when a piece marked `+O7` in the
+> [build plan](cc-unified-model-build-plan.md) has no section, or a section lacks a field.
+> A section says which pieces it covers in a `<!-- procedure: ID ... -->` comment.
+>
+> **Status of each procedure.** *live* = written against things that exist today and run as
+> written. *planned* = written from the plan before the piece exists; the command shown is the
+> design, and `_GAP:_` marks what the building piece must confirm. When a piece lands, it
+> replaces "planned" with "live" and runs the steps once.
+>
+> Operational facts (topology, secrets, backups) are in [`artifacts/gitops.md`](../artifacts/gitops.md).
+> **Night 1 (2026-11-19) waives invariant 14**: while tomas is in the docker group, every fence
+> result is "not evidence". Nothing here is deployed by a night run; each deploy is a human gate.
+
+| # | Procedure | Status | Covers |
+|---|---|---|---|
+| 1 | [Evening gate](#1-evening-gate) | live (preflight) | R1–R22, NB1 |
+| 2 | [Morning gate](#2-morning-gate) | live up to the install; the rest planned | R10, NB4 |
+| 3 | [hp root install: plan, install, check](#3-hp-root-install) | written, **never run** | I0, U0, U0b |
+| 4 | [Night auto-start and stop](#4-night-auto-start-and-stop) | planned | NB4 |
+| 5 | [Redeploy a cc-sandbox binary (ccsbx-deploy)](#5-redeploy-a-cc-sandbox-binary) | planned | NB5 |
+| 6 | [Cockpit failover](#6-cockpit-failover) | planned | C13 |
+| 7 | [future-two unlock](#7-future-two-unlock-after-a-reboot) | live (k3s side) | O3 |
+| 8 | [Pin promote](#8-pin-promote) | planned | H2 |
+| 9 | [Roll back a live tool to its P0 tag](#9-roll-back-a-live-tool-to-its-p0-tag) | live | P0 |
+| 10 | [Hub redeploy and rollback (native release)](#10-hub-redeploy-and-rollback) | planned | B9 |
+| 11 | [Strict-mode flag flips (`SB_REQUIRE_AUTH`)](#11-strict-mode-flag-flips) | planned | B6b |
+| 12 | [Rotate keys](#12-rotate-keys) | planned | M9, O5 |
+| 13 | [Rotate the subscription setup-token](#13-rotate-the-subscription-setup-token) | planned | R5b, O5 |
+| 14 | [The approval code](#14-the-approval-code) | planned | P7 |
+| 15 | [Add a procedure (this document's own rule)](#15-add-a-procedure) | live | O7 |
+
+---
+
+## 1. Evening gate
+<!-- procedure: O7 NB1 -->
+
+- **When:** before a night starts, once. The preflight is `bin/ccsbx-preflight`.
+- **Who:** Tomas, 60–90 min the first time. `R1–R22` are his steps (plan §7.2); the preflight only
+  reads.
+- **Steps:**
+  1. Do the R-steps you can; leave the rest.
+  2. `bin/ccsbx-preflight --evening` (add `-v` for full detail, `--json` for the night manager).
+  3. For each failure the last lines name it: `ABORT:` means the night doesn't start, `SKIP:` means
+     only the dependent pieces are parked and listed in the morning report.
+  4. To start anyway, waive a check on purpose: `--waive C-R12`. A waived check shows as
+     `waived`, never as pass.
+  5. Type `Arm!` in the night manager's tab (R16) after the preflight is green.
+- **Check:** exit 0 with `nothing failed`, or only waived rows. `bin/ccsbx-preflight --list` shows
+  every check with its gates.
+- **Rollback:** nothing to undo (read-only). To stand the night down: `cc-tree disarm cc-sandbox:2f3e`
+  and see §4.
+
+## 2. Morning gate
+<!-- procedure: O7 R10 -->
+
+- **When:** after night 1, before night 2. ~45 min including the reboot.
+- **Who:** Tomas only (root, the SHARED merge, the reboot).
+- **Steps:**
+  1. Read `docs/night-1-morning.md` (the report and the `install-linux.sh plan` output).
+  2. Decide the open questions in the P14 inventory (`cc-sandbox/nodes/4rcv/inventory.md` in the
+     tree repo), above all the three `github-runner@N` units (they keep docker access through their
+     own unit) and the memory-store backup job.
+  3. `units/install-linux.sh install --yes` under sudo: see §3.
+  4. Merge the M8/M1 PR (**the first SHARED go**) in `~/git/k3s`.
+  5. `sudo reboot`. Open a tmux session again.
+  6. `bin/ccsbx-preflight --morning --post-M1`.
+- **Check:** step 6 exits 0; `units/install-linux.sh check` exits 0; in a fresh tmux
+  `grep Groups /proc/$(pgrep -u $USER -o tmux)/status` has neither the docker nor the lxd gid;
+  `sudo -n -l` lists NOPASSWD only for `ccsbx-root` (and `ccsbx-deploy` if Q12 = yes).
+- **Rollback:** the install writes a backup of every file it changes (§3 Rollback). Until step 5
+  the old paths still work. After the reboot, to get docker back for tomas:
+  `sudo usermod -aG docker tomas` and log in again; that restores invariant-14-waived mode.
+
+## 3. hp root install
+<!-- procedure: I0 U0 U0b -->
+
+- **When:** at the morning gate (R10). Never unattended and never from a night run. It **refuses**
+  while B9 (the native hub) or P15 (the replacements for hp's docker users) is missing, because it
+  removes tomas from the docker group and the live hub is a docker container.
+- **Who:** Tomas, with sudo. `plan` and `check` need no root.
+- **Steps:**
+  1. `units/install-linux.sh plan`: prints every step, changes nothing. Read it.
+  2. `sudo units/install-linux.sh install --yes`. It checks the refusals first, takes a backup of
+     what it changes under `/var/backups/ccsbx-install/<timestamp>/`, and does the steps in the
+     order `plan` printed. It stops at the first failed step and says which.
+  3. `sudo reboot` (group changes apply to new login sessions only).
+  4. `units/install-linux.sh check`.
+- **Check:** `check` exits 0 after the reboot and prints one `ok`/`FAIL` line per step. Before the
+  install it exits non-zero and names what is still open.
+- **Rollback:** `sudo units/install-linux.sh uninstall --yes` restores the backup (sudoers lines,
+  sops owner and mode, group membership), removes the `ccsbx*` users and units it created, and
+  keeps the keys directory unless `--purge-keys`. `lxd` and the snap are not reinstalled: that
+  path was an accident.
+
+## 4. Night auto-start and stop
+<!-- procedure: NB4 -->
+
+- **When:** *planned.* After the morning-gate reboot, once `ccsbx-preflight --morning` is green.
+  Stop: when the night should not run (sick, travelling, a bug found).
+- **Who:** the tschedule job starts it; Tomas stops it.
+- **Steps:**
+  - *Start:* the tschedule job runs `ccsbx-preflight --morning --abort-only`, then
+    `cc-tree cockpit up`, then starts the night manager. `_GAP:_ the job's name and schedule are
+    NB4's to decide.`
+  - *Stop:* `cc-tree disarm cc-sandbox:2f3e` (the runner goes off), then disable the tschedule job.
+    The night stop rules (a piece failing 3 times is parked, doors down 30 min means hp-only work,
+    a rate or spend limit parks the pieces that need it) are in plan §7.2.
+- **Check:** after a reboot, `cc-tree show cc-sandbox` shows the manager `working` within 10 min.
+  Morning table: `bin/ccsbx-night-report --dry-run` (add `--send` to send it).
+- **Rollback:** disarm; nothing the night wrote is deployed, so a stopped night leaves only
+  branches and PRs.
+
+## 5. Redeploy a cc-sandbox binary
+<!-- procedure: NB5 -->
+
+- **When:** *planned, only if Q12 = yes.* Night 2+, to ship a binary built by CI from `main`
+  without a human: `ccsbx`, `ccsbx-hostd`, the forwarder, the sidecar.
+- **Who:** the night manager, through one sudoers rule for `/usr/local/sbin/ccsbx-deploy`
+  (R10c). Tomas installs that rule.
+- **Steps:** `sudo -n ccsbx-deploy install <name>@sha256:<digest>`. It accepts only artifacts
+  built by Actions from `main`, digest-pinned and attestation-verified.
+- **Check:** `sudo -n ccsbx-deploy install ccsbx-root` is **refused** (it never installs
+  `ccsbx-root`, the signer, itself, or anything that talks to `ccsbx-keys`);
+  `sudo -n ccsbx-deploy install <unattested>` is refused. The preflight checks both (C-R10c).
+- **Rollback:** install the previous digest the same way (the previous digest is in the log the
+  command prints). For `ccsbx-root` or the signer: Tomas, by hand, §3.
+
+## 6. Cockpit failover
+<!-- procedure: C13 -->
+
+- **When:** *planned.* The cockpit (the tree view's writer) normally runs on hp. Move it when hp
+  is going down, or when the cockpit machine died and you want the tree live again. While the
+  cockpit is down only visibility is lost: fenced work, messages and grants carry on (plan §8).
+- **Who:** Tomas, from the machine that should hold the cockpit.
+- **Steps:**
+  1. If the old cockpit is alive: on it, `cc-tree cockpit down`.
+  2. On the new machine: `cc-tree cockpit up`. It runs `cc-tree sync --pull`, checks that the last
+     cursor-ack commit is an ancestor of HEAD (else it refuses with "N commits not pushed": push
+     them on the old machine first), takes the daemon snapshot, then tails from the cursor.
+  3. If the old machine is dead and holds the lease: `cc-tree cockpit up --steal`. Use it only
+     when the old cockpit really is down, since two writers means duplicate verbs.
+- **Check:** `cc-tree cockpit status` on the new machine shows the lease held on every daemon
+  (hp, future-two, the Mac if in); the gap's events appear; no duplicate journal ids in
+  `history-*.jsonl`. Test: the cockpit-kill test (plan §8, C20).
+- **Rollback:** `cc-tree cockpit down` on the new machine and `cc-tree cockpit up` on the old
+  one. If `up` was never run, cc-tree behaves as it does today (standalone).
+
+## 7. future-two unlock after a reboot
+<!-- procedure: O3 -->
+
+- **When:** future-two reboots (Hetzner maintenance, a kernel update). Its disk is LUKS and waits
+  for a manual unlock; until then every door and every future-two session is down. O3's watchdog
+  (every 5 min on hp, two failures) sends one Telegram with the command when its `bootID`
+  changed. R11: no reboot may be planned during a night.
+- **Who:** Tomas, from his phone or any machine.
+- **Steps:** unlock over dropbear (port 2222) with `future-two-unlock` (k3s
+  `docs/HARDWARE-INVENTORY.md`). `_GAP:_ the command is not on hp; where it lives (the Mac, a
+  phone shortcut) and its exact arguments aren't recorded here: write them in once Tomas has run it
+  with this doc open.` Never type the passphrase into an agent session.
+- **Check:** `kubectl get node future-two` shows Ready (from the Mac, or hp's audit-reader); doors
+  `/health` 200; the watchdog sends "recovered". Fenced sessions that were on future-two lost
+  unpushed work: check their branches.
+- **Rollback:** nothing to roll back. If the node doesn't return: hp-only work continues (the
+  night rules say hp-only after 30 min of doors down), and `ccsbx start --backend docker` stays.
+
+## 8. Pin promote
+<!-- procedure: H2 -->
+
+- **When:** *planned.* A new fence image, `ccsbx` binary or Claude Code version should become
+  production. Weekly bump job O6 builds a candidate and opens a PR on green; promotion is manual.
+- **Who:** Tomas (decision: manual promote, Q18).
+- **Steps:**
+  1. The candidate digest runs under `e2e-*` profiles only (it is refused under `dev-default`).
+  2. Run the full suite on hp and future-two (plus the Mac when Q12 puts it in):
+     `ccsbx selftest --suites all --backend docker` and `--backend k8s`.
+  3. Promote: edit `pins.toml` to the new digest and merge. `_GAP:_ H2 decides whether a
+     command (`ccsbx pins promote <digest>`) writes it. A promote with a red result must be refused.`
+  4. On the k3s side the VAP accepts any digest in `@sha256:` form from our three repos, so no
+     cluster change is needed.
+- **Check:** `T:unpinned-refused` (an unpinned production digest is refused); the next production
+  start uses the new digest (`ccsbx start --json` prints it).
+- **Rollback:** put the previous digest back in `pins.toml` and merge. Running sessions keep their
+  image until their next generation.
+
+## 9. Roll back a live tool to its P0 tag
+<!-- procedure: P0 -->
+
+- **When:** a change to a live tool (session-bus, cc-tree/cc-flow, ccsp) misbehaves and the fix
+  is not obvious. Every one of them was tagged `pre-ccsbx-2026-11-19` before any change (P0).
+  Every builder change to these tools is behind a flag first: **turn the flag off before you
+  roll back** (see §11).
+- **Who:** Tomas. Builders never run `ccsp deploy|rollback`, `sb-deploy-hub`, or restart a live
+  service (deny list).
+- **Steps:**
+  - **cc-tree / cc-flow** (live from the `~/.dotfiles` checkout; hp's `cc-tree` resolves to
+    `~/.dotfiles/bin/cc-tree`). Restore only the tool's files, not the whole repo:
+    ```
+    cd ~/.dotfiles
+    git rev-parse pre-ccsbx-2026-11-19                    # the tag exists
+    git diff --stat pre-ccsbx-2026-11-19 -- bin/cc-tree bin/cc-pick bin/cc-tree-web bin/lib/cc_tree*.py ccf
+    git checkout pre-ccsbx-2026-11-19 -- bin/cc-tree bin/cc-pick bin/cc-tree-web bin/lib/cc_tree*.py
+    git commit -m "revert cc-tree to pre-ccsbx-2026-11-19"
+    systemctl --user restart cc-tree-web                  # the web view
+    ```
+    (`ccf` exists only after C1; `git checkout` fails on a missing path: drop it from the line.)
+    On the Mac: `git pull` there, no restart.
+  - **session-bus hub, today's docker deploy:** `SB_BRANCH=pre-ccsbx-2026-11-19 sb-deploy-hub`
+    ships the tag with `git archive` and relaunches the container (the script's `SB_BRANCH`
+    override). After B9 use §10 instead. The spokes (hp hooks, the Mac's launchd unit) need no
+    change.
+  - **ccsp (the secret proxy):** tag `pre-ccsbx-2026-11-19` in its own repo. Follow that
+    repo's own `ccsp rollback` procedure and its docs; they live in that repo and this one never
+    touches it. `_GAP:_ link it here once the ccsp rollback command is confirmed with the person
+    who runs it.`
+- **Check:**
+  - cc-tree: `cc-tree show cc-sandbox` works; `tests`: S0 (`make standalone`, stream C) is green.
+  - session-bus: `sb-deploy-hub status` lists the Mac and hp; `ccq` shows live sessions; a new
+    endpoint added by the change now returns 404.
+  - ccsp: a normal Claude session still gets model replies.
+- **Rollback:** (of this rollback) the revert is a commit (cc-tree), a redeploy (hub) or a deploy
+  (ccsp), so redo the change from the branch.
+
+## 10. Hub redeploy and rollback
+<!-- procedure: B9 -->
+
+- **When:** *planned.* After B9, the hub is a native release under a systemd user unit on hp (no
+  docker). Redeploy to ship a change; roll back when the new release misbehaves.
+- **Who:** Tomas. A night run builds and tests the release on a spare port and never switches the
+  live hub (human gate).
+- **Steps:** `sb-deploy-hub` ships `git archive` into a new release directory, then
+  `systemctl --user restart` the unit; the previous release dir is kept. `--dry-run` prints the
+  steps and changes nothing. `_GAP:_ exact subcommands and the release path are B9's: confirm
+  against `sb-deploy-hub --help` once merged.`
+- **Check:** `/health` on the hub port; `ccq` lists the Mac and hp; probe something unique to the
+  new build (a new route returns 401/422, not 404), since `/health` only proves the process booted.
+- **Rollback:** point the unit's `current` at the previous release dir and restart the user unit;
+  the previous release is intact by design. Standalone: the hub must run with no cc-sandbox
+  component (S0).
+
+## 11. Strict-mode flag flips
+<!-- procedure: B6b -->
+
+- **When:** *planned.* Every builder change to a live tool ships with its strict mode **off**.
+  Flip it only after every reader and spoke is on a version that works with it. First flag:
+  `SB_REQUIRE_AUTH` (B6b, fail-closed hub auth), after B6a has put auth on every hub reader on hp
+  and the Mac.
+- **Who:** Tomas, at a human gate.
+- **Steps:**
+  1. On a test hub on a spare port: set `SB_REQUIRE_AUTH=1`; with no `SB_SECRET` the hub must
+     refuse to boot; `curl <hub>/sessions` without auth must answer 401.
+  2. Against that test hub, `cc-tree show`, `cc-pick`, `ccq` must still list both machines (B6a).
+  3. Only then set the flag in the live unit's environment and restart (§10).
+- **Check:** unauthenticated `/sessions` → 401; `ccq` on hp and the Mac still lists sessions; old
+  `ccmsg` works. With the flag off, S0 is green.
+- **Rollback:** unset `SB_REQUIRE_AUTH` and restart the hub. Today's behaviour returns at once.
+
+## 12. Rotate keys
+<!-- procedure: M9 O5 -->
+
+- **When:** *planned.* Model and GitHub App keys every 90 days; machine keys yearly or on loss;
+  session tokens are ≤ 12 h and need nothing; the launcher kubeconfig token every 30 days (the
+  launcher renews it itself, K8). Immediately on any suspected leak.
+- **Who:** Tomas for keys held in git/SOPS; the launcher for its own token.
+- **Steps:** `ccsbx keys --help` lists every recipe (O5 makes that true). Machine keys follow
+  **add, roll, remove**: add the new public key to `config/machines/<m>.json` (PR, ConfigMap
+  `ccsbx-machines`), roll the signer onto it, then remove the old one. API key and GitHub App key:
+  create the new one in the Console / GitHub, encrypt with SOPS into the k3s repo as in R5/R7,
+  PR, and let Flux apply; then delete the old one at the provider. Never paste a key into an agent
+  session.
+- **Check:** a removed key is refused (401) within 2 min (`T:key-signs-foreign-machine`); a door's
+  `/health` says `credential: apikey` (never the value); a token with 2 days left is renewed by the
+  launcher.
+- **Rollback:** until the old key is removed at the provider, re-add it to the list and the SOPS
+  file; after removal there is no rollback, so roll forward with another new key.
+
+## 13. Rotate the subscription setup-token
+<!-- procedure: R5b -->
+
+- **When:** *planned.* Yearly (it expires after a year; O3 warns 30 days before) and immediately on
+  any suspected leak. A stolen token is a uncapped credential for the whole subscription.
+- **Who:** Tomas, on the Mac (browser login).
+- **Steps:**
+  1. `claude setup-token` on the Mac: it prints a one-year token and saves nothing.
+  2. In the k3s repo on a branch: `read -rs T; printf 'CLAUDE_CODE_OAUTH_TOKEN=%s\n' "$T" | sops -e
+     --filename-override apps/cc-sandbox/secrets-cc-sandbox-model-sub.env --input-type dotenv
+     --output-type dotenv /dev/stdin > apps/cc-sandbox/secrets-cc-sandbox-model-sub.env; unset T`,
+     commit, PR. Only test keys go in until Q13 (k3s secrets-encryption) is done.
+  3. After the merge, revoke the **old** token: claude.ai → Settings → Claude Code → the token
+     list (not in the official docs; U4s checks that revocation works).
+  4. Record the creation date in `artifacts/gitops.md` §5.
+- **Check:** the model door's `/health` says `subscription: ok` (never the value) after one
+  1-token request; `bin/ccsbx-preflight --post-M1 --only C-R5bp` is green.
+- **Rollback:** the old token works until revoked: re-merge the old SOPS file if the new one is
+  bad. After revocation, make a new one.
+
+## 14. The approval code
+<!-- procedure: P7 -->
+
+- **When:** *planned.* A fenced session asks for one more egress route or one extra repo read
+  (a low-tier `grant.request`). The model door sends Tomas a 6-digit code by Telegram and creates
+  the request; nothing is approved without both Tomas's Tailscale identity and the code.
+- **Who:** Tomas only. An agent can't: a decision from a session token or through the forwarder is
+  refused (403).
+- **Steps:**
+  1. A ❓ card appears in the tree (only from door-originated events).
+  2. Open the decision page on the door's owner listener from a tailnet device (the link is on the
+     card; tailnet hostnames are not written in this public repo).
+  3. Type the code from Telegram and choose approve or deny. First decision wins.
+  4. Medium and high tiers are refused at solo; use the friends-tier path later.
+- **Check:** card turns ✅ with `proof: header+otp`; the session gets `grant.decided`; the grant
+  dies with the generation.
+- **Rollback:** a grant is an overlay for one generation: end the session (`ccsbx stop`) or let
+  it end. Lost code: let the request expire and ask again; there is no way to approve without it.
+
+## 15. Add a procedure
+<!-- procedure: O7 -->
+
+- **When:** every piece marked `+O7` in the build plan adds its section in the same PR, and a
+  deploy or a manual step that someone has to remember counts as a procedure.
+- **Who:** the builder of the piece; the reviewer checks it.
+- **Steps:**
+  1. Copy a section above. Keep the five fields in this order: When, Who, Steps, Check, Rollback.
+  2. Add `<!-- procedure: PIECE ... -->` under the heading with the piece ids it covers.
+  3. Say *planned* or *live* in When, and mark anything unconfirmed `_GAP:_`.
+  4. Add a row to the table at the top and run `tests/procedures-check.sh`.
+- **Check:** `tests/procedures-check.sh` exits 0 (it reads the `+O7` pieces from the plan and each
+  section's five fields). `make procedures` is the same command once P1's Makefile exists.
+  `~/git/k3s/scripts/gitops-inventory.sh` lists cc-sandbox as compliant.
+- **Rollback:** a doc: revert the commit.

@@ -119,7 +119,7 @@ func TestFenceCannotInjectCredentials(t *testing.T) {
 func TestApproveViaFwd(t *testing.T) {
 	r := newRig(t)
 	for _, p := range []string{"/egress/v1/approvals/ar-1/decide", "/egress/v1/grants/ar-1/approve",
-		"/egress/github/owner/decide", "/model/v1/admin/keys"} {
+		"/egress/github/owner/decide", "/model/v1/admin/keys", "/egress/v1/x/approve", "/egress/v1/x/decide", "/egress/v1/x/decision", "/egress/v1/x/revoke"} {
 		for _, m := range []string{"POST", "PUT", "GET"} {
 			if c := r.fence(t, m, p, nil).StatusCode; c != 403 {
 				t.Fatalf("%s %s -> %d", m, p, c)
@@ -143,9 +143,11 @@ func TestApproveViaFwd(t *testing.T) {
 	}
 	s := httptest.NewServer(f)
 	defer s.Close()
-	resp, _ := http.Post(s.URL+"/egress/v1/approvals/1/decide", "application/json", strings.NewReader("{}"))
-	if resp.StatusCode != 403 {
-		t.Fatalf("broad rule routed a decision: %d", resp.StatusCode)
+	for _, seg := range []string{"approve", "approvals", "approval", "decide", "decision", "decisions", "grants", "owner", "admin", "revoke", "keys", "sign"} {
+		resp, _ := http.Post(s.URL+"/egress/v1/x/"+seg, "application/json", strings.NewReader("{}"))
+		if resp.StatusCode != 403 {
+			t.Fatalf("broad rule routed a /%s endpoint: %d", seg, resp.StatusCode)
+		}
 	}
 }
 

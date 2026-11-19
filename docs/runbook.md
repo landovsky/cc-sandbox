@@ -25,7 +25,7 @@
 | 4 | [Night auto-start and stop](#4-night-auto-start-and-stop) | planned | NB4 |
 | 5 | [Redeploy a cc-sandbox binary (ccsbx-deploy)](#5-redeploy-a-cc-sandbox-binary) | planned | NB5 |
 | 6 | [Cockpit failover](#6-cockpit-failover) | planned | C13 |
-| 7 | [future-two unlock](#7-future-two-unlock-after-a-reboot) | live (k3s side) | O3 |
+| 7 | [future-two unlock](#7-future-two-unlock-after-a-reboot) | planned (the alert); the unlock itself is the k3s side's | O3 |
 | 8 | [Pin promote](#8-pin-promote) | planned | H2 |
 | 9 | [Roll back a live tool to its P0 tag](#9-roll-back-a-live-tool-to-its-p0-tag) | live | P0 |
 | 10 | [Hub redeploy and rollback (native release)](#10-hub-redeploy-and-rollback) | planned | B9 |
@@ -155,17 +155,24 @@
 <!-- procedure: O3 -->
 
 - **When:** future-two reboots (Hetzner maintenance, a kernel update). Its disk is LUKS and waits
-  for a manual unlock; until then every door and every future-two session is down. O3's watchdog
-  (every 5 min on hp, two failures) sends one Telegram with the command when its `bootID`
-  changed. R11: no reboot may be planned during a night.
+  for a manual unlock; until then every door and every future-two session is down. R11: no reboot
+  may be planned during a night.
+  **The alert for it is planned, not built.** What runs today (per k3s review 2026-11-20): the k3s
+  CronJob `cc-sandbox-watchdog` (every 5 min) alerts on Pending or failing pods only, and the shared
+  `k8s-event-notifier` covers node pressure and evictions. Neither checks `bootID` or names the
+  unlock command, and nothing runs on hp's tschedule. So today a reboot shows up as a pile of
+  Pending pods, or as the doors' `/health` failing, not as "future-two rebooted".
+  `_GAP:_ O3 (the bootID check, the unlock command in the message, the 30-day setup-token warning)
+  is unbuilt: until it exists, check the node by hand after any Hetzner notice.`
 - **Who:** Tomas, from his phone or any machine.
 - **Steps:** unlock over dropbear (port 2222) with `future-two-unlock` (k3s
   `docs/HARDWARE-INVENTORY.md`). `_GAP:_ the command is not on hp; where it lives (the Mac, a
   phone shortcut) and its exact arguments aren't recorded here: write them in once Tomas has run it
   with this doc open.` Never type the passphrase into an agent session.
-- **Check:** `kubectl get node future-two` shows Ready (from the Mac, or hp's audit-reader); doors
-  `/health` 200; the watchdog sends "recovered". Fenced sessions that were on future-two lost
-  unpushed work: check their branches.
+- **Check:** the node is Ready (`kubectl get node future-two`, from the Mac or with the `ccsbx-ops`
+  read RBAC); doors `/health` 200; `kubectl -n cc-sandbox create job --from=cronjob/cc-sandbox-watchdog
+  wd-now` shows no Pending pods. Fenced sessions that were on future-two lost unpushed work: check
+  their branches.
 - **Rollback:** nothing to roll back. If the node doesn't return: hp-only work continues (the
   night rules say hp-only after 30 min of doors down), and `ccsbx start --backend docker` stays.
 
@@ -282,7 +289,7 @@
 ## 13. Rotate the subscription setup-token
 <!-- procedure: R5b -->
 
-- **When:** *planned.* Yearly (it expires after a year; O3 warns 30 days before) and immediately on
+- **When:** *planned.* Yearly (it expires after a year; O3 is meant to warn 30 days before, `_GAP:_` unbuilt, so put the date in a calendar) and immediately on
   any suspected leak. A stolen token is a uncapped credential for the whole subscription.
 - **Who:** Tomas, on the Mac (browser login).
 - **Steps:**

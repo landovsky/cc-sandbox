@@ -8,6 +8,9 @@ import (
 	"os"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
+	"github.com/landovsky/cc-sandbox/internal/fwd"
+	"github.com/landovsky/cc-sandbox/internal/stub"
+	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
 var version = "dev"
@@ -35,6 +38,21 @@ func app() *cli.App {
 			startCmd(),
 			selftestCmd(),
 			settingsCmd(),
+			{
+				Name: "fwd", Raw: true,
+				Summary: "the per-session forwarder: holds the token, signs door calls (P2)",
+				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return fwd.Main(a, os.Stdin, o, e) },
+			},
+			{
+				Name: "stub", Raw: true,
+				Summary: "scripted model stub, local mode, e2e-* profiles only (C18)",
+				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return stub.Main(a, o, e) },
+			},
+			{
+				Name: "token", Raw: true,
+				Summary: "mint and verify session tokens, dev key file (U5)",
+				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return token.Main(a, o, e) },
+			},
 			{
 				Name:    "steering-check",
 				Summary: "flag changes to steering files in a diff (H1)",

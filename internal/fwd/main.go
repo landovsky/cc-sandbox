@@ -35,7 +35,7 @@ possession, and relays to that door only. Anything not in the route allowlist is
 refused 403; decision/approval/owner endpoints can never be routed. fwd exits when
 the token expires or on SIGTERM. Closing stdin does not stop it.
 
-Flags (each also settable as CCSBX_FWD_<NAME>, e.g. CCSBX_FWD_LISTEN):
+Flags: (each also settable as CCSBX_FWD_<NAME>, e.g. CCSBX_FWD_LISTEN)
   --listen ADDR     host:port or unix:/path to serve the fence on     (required)
   --door NAME=URL   a door this session may reach; repeatable        (required)
                     e.g. --door model=http://ccsp-model.cc-sandbox-doors:8080

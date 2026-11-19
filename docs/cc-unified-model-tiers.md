@@ -1,7 +1,7 @@
 ---
 type: design
 status: draft
-version: 2.3
+version: 2.4
 title: "Agent fence: tier profiles"
 task: ai-tooling:#6gqx
 date: 2026-11-19
@@ -72,9 +72,10 @@ browser) and subscribes to every daemon's events. Nothing in the
   headers plus an owner listener reachable only through the Tailscale proxy (invariant 27).
 
 **Billing per session.** Tom's development work uses the Claude subscription, and ops work
-(chatbot evaluation, pharmacy ops) uses an API key. Whether the model door may hold a
-subscription login is open (#6f24). Until it's answered, subscription sessions run unfenced or
-on a stub, and API-key sessions run fenced.
+(chatbot evaluation, pharmacy ops) uses an API key. **Decided (v2.4, #6f24):** the model door
+holds the subscription as a one-year `claude setup-token` and injects it, so fenced sessions use
+the subscription from the first slice. The only cost control is the hard monthly cap on the API
+key; runaway cost is a known limitation (doc 1 §9).
 
 - **Grants at this tier** are static per-session profiles, kept on each launcher (not on the
   cockpit machine) and approved per machine. **A small low-tier ask exists** (v2.3, amends N5):

@@ -1,7 +1,7 @@
 ---
 type: design
 status: draft
-version: 2.3
+version: 2.4
 title: "Agent fence: CC Flow as a client"
 task: ai-tooling:#6gqx
 date: 2026-11-19
@@ -86,6 +86,11 @@ below says what happens while it's away.
 - Schedules (tschedule).
 
 ## Caveats
+
+- **CC Flow stands alone** (invariant 29, v2.4). Every change made here for the fence keeps
+  CC Flow and session-bus working without it: with no `ccsbx`, no daemon and every flag off,
+  cc-tree, cc-pick, the web, `ccmsg` and `ccq` behave as they did at the `pre-ccsbx-2026-11-19`
+  tag. Doc 5's S0 suite proves it before every change.
 
 - **Managers stay unfenced** until CC Flow's manager verbs exist behind the tool door. They're
   outside the contract until then (doc 1, invariant 13). Invariants 12 and 14 (host keys under a

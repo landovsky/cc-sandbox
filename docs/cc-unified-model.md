@@ -1,7 +1,7 @@
 ---
 type: design
 status: draft
-version: 2.3
+version: 2.4
 title: "Agent fence: threat model and security contract"
 task: ai-tooling:#6gqx (parent ai-tooling:#62b5, milestone ai-tooling:#6rrd)
 date: 2026-11-19
@@ -174,6 +174,10 @@ session on a machine shares one address on the private network.
 
 **Billing.** The model door can hold more than one credential (for example a subscription
 login and an API key). The launcher picks one per session and records it (invariant 18).
+**Subscription** (v2.4): the door holds the owner's one-year token from `claude setup-token`
+(static, so no refresh-token custody) and injects it as the bearer credential, with the OAuth
+capability header, for sessions billed `subscription`. The fence holds only a dummy credential.
+This works from the first slice (doc 5 U4, R5b).
 
 ## 5. Invariants
 
@@ -237,6 +241,10 @@ login and an API key). The launcher picks one per session and records it (invari
     session daemon keeps its events and replays them when the cockpit reconnects, and requests
     meant for the cockpit are queued by the daemon and delivered later. Steering means driving
     sessions through the cockpit, nothing more.
+29. **The client tools stand alone** (v2.4). However CC Flow (cc-tree) and the message bus
+    (session-bus) are changed for the fence, they keep working without it: with the fence
+    absent or switched off, they behave as they did before. The model door's base, ccsp, is
+    exempt. Every change to them is tested both ways (doc 5 S0).
 
 ## 6. Grants and approvals
 
@@ -313,7 +321,14 @@ are descoped (§9).
 - Any allowed write channel can leak data.
 - Only fixed rate caps exist: no detection of unusual volume, no alerting, and nobody watches the audit log.
 - A privileged agent can be persuaded by a colleague.
-- **Runaway cost.** A looping agent burns money. The only control is the hard cap on the model key.
+- **Runaway cost** (a known limitation, not a threat this model mitigates; v2.4). A looping
+  agent burns money. API-key sessions are bounded only by the hard monthly cap on the key.
+  Subscription sessions are bounded only by the plan's own usage limits, so a runaway fenced
+  session can use up the owner's own window. The doors keep no budgets.
+- **The subscription token is a long-lived credential** (v2.4). It lasts a year, isn't capped,
+  and revoking it isn't a documented API. Only the model door holds it. The consumer terms on
+  intermediating subscription credentials are read as allowing the owner's own door for the
+  owner's own unmodified Claude Code; that's a reading, not a ruling.
 - **Stolen phone or surface.** Approvals stay passkey-protected, but the device can read screens
   and notifications.
 - **Undelivered messages are lost.** Because delivery isn't durable, a message to a machine
@@ -337,7 +352,8 @@ are descoped (§9).
   feature, not a control for the four threats. The minimal path in §7 covers the solo tier.
 - **Shared knowledge notes and Graphiti.** They belong to the orchestrator's world.
 - **Other harnesses** (a Codex adapter and so on). Claude Code only at first.
-- **OAuth refresh-token custody.** Static tokens and the GitHub App first, OAuth later.
+- **OAuth refresh-token custody.** Static tokens and the GitHub App first, OAuth later. The
+  subscription's `setup-token` is static (one year), so it needs no refresh custody (v2.4).
 - **gVisor or other stronger isolation.** Containers share the host kernel.
 - **Native Mac virtualization.** Macs run the same image through Docker. Native Mac
   virtualization is deferred.

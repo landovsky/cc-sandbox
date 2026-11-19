@@ -8,7 +8,7 @@ One picture of how sandboxed agent sessions are placed, fenced, granted access, 
 
 ## Reading order
 
-1. The unified model, **v2.3** (current). Read these first, in order:
+1. The unified model, **v2.4** (current). Read these first, in order:
    1. [cc-unified-model.md](cc-unified-model.md): the threats, the security contract and its invariants.
    2. [cc-unified-model-tiers.md](cc-unified-model-tiers.md): what solo, friends and company each add, machines, third party.
    3. [cc-unified-model-cc-flow.md](cc-unified-model-cc-flow.md): CC Flow as a client (the portable cockpit).

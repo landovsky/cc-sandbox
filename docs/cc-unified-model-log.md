@@ -1,7 +1,7 @@
 ---
 type: log
 status: working
-version: 2.3
+version: 2.4
 title: "Agent fence: working log (changes, conflicts, decisions, build list)"
 task: ai-tooling:#6gqx
 date: 2026-11-19
@@ -13,6 +13,19 @@ supersedes: unified-model.md v1 §4–§6
 **Docs:** [1 · contract](cc-unified-model.md) · [2 · tiers](cc-unified-model-tiers.md) · [3 · CC Flow as a client](cc-unified-model-cc-flow.md) · **4 · working log** · [5 · build plan](cc-unified-model-build-plan.md)
 
 # Working log
+
+## v2.3 → v2.4 (Tomas's answers to the build plan's ❓s, 2026-11-19)
+
+- **Cost:** only the $50/month Console cap on the API key. The door budgets, the 80 % stop and
+  the per-night window budget are dropped. Runaway cost is a known limitation (doc 1 §9).
+- **Subscription in the fence from the first slice** (#4wsw reversed; #6f24 decided): the model
+  door holds a one-year `claude setup-token` and injects it. Doc 1 §4 and §9, doc 2, doc 5 U4 and
+  R5b. k3s secrets-encryption (❓ Q13) moves onto the critical path.
+- **Invariant 29, standalone:** cc-flow/cc-tree and session-bus keep working without cc-sandbox;
+  ccsp is exempt. Doc 5 S0 and a standalone line on every ccf and sb piece.
+- **Revert tags** before the first change to a live tool (doc 5 P0), and an **ops procedures
+  doc** for every manual procedure (doc 5 O7).
+- **Night 1 starts tonight** without the day prep (doc 5 §7.4).
 
 ## v2.2 → v2.3 (the build plan and its review panel, 2026-11-19)
 
@@ -158,9 +171,9 @@ The nodes and recommendations are unchanged unless the v2 note says otherwise.
 
 **Still on the critical path**
 - **#6f24** Model credential. **Decided:** billing is chosen per session, with the subscription
-  for dev work and an API key with a hard cap for ops work. **Still open:** whether the central
-  model door may hold the subscription login. Until then, subscription sessions run unfenced or
-  on a stub, so this doesn't block the build.
+  for dev work and an API key with a hard cap for ops work. **Decided in v2.4:** the central
+  model door holds the subscription as a one-year `claude setup-token` and injects it, from the
+  first slice (doc 5 U4, R5b).
 - **#6d6g** Leave the docker group on the Linux machines (hp, Hetzner). **It's now required by
   invariant 14**, not optional, and makes `ccsbx` a fixed-flag root wrapper (U0). On the Mac, see N8.
 - **Central vs per-machine doors.** **Decided: central**, on Hetzner.

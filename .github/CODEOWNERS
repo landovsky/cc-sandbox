@@ -10,7 +10,6 @@
 /internal/signer/       @landovsky
 /internal/hostd/        @landovsky
 /internal/door/         @landovsky
-/internal/gitroute/     @landovsky
 /internal/approval/     @landovsky
 /cmd/ccsbx-root/        @landovsky
 /cmd/ccsbx-signer/      @landovsky

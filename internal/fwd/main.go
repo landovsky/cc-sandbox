@@ -92,7 +92,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if len(doorFlags) == 0 && os.Getenv("CCSBX_FWD_DOORS") != "" {
 		doorFlags = strings.Fields(os.Getenv("CCSBX_FWD_DOORS"))
 	}
-	rules := DefaultRules
+	var rules []Rule // nil = the built-in allowlist for the configured doors
 	if *routesFile != "" {
 		b, err := os.ReadFile(*routesFile)
 		if err == nil {
@@ -105,6 +105,9 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 	}
 	if *printRoutes {
+		if rules == nil {
+			rules = DefaultRules
+		}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
 		enc.Encode(rules)

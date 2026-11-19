@@ -204,7 +204,8 @@ That's about 25 dev-days plus the gates. Parallel streams:
 | U15b | **Package mirrors instead of CONNECT**: door-terminated reverse proxies for npm and PyPI (GET only, no upload hosts) and Go (`GOPROXY=<door>/go`, only modules in the worktree's `go.sum` or on an allowlist, `-mod=readonly`). Per-session byte caps | S | cs | U15 | `T:npm-publish-refused`, `T:goproxy-unlisted-module-refused`, `npm view left-pad` works (hp) |
 | U16 | **Git route**: parse receive-pack; refuse deletes, protected branches and refs outside the token's branch; quarantine ref, then `PATCH {force:false}` (GitHub refuses non-fast-forward); path rules on both file names; **refuse ≥ 300 files or ≥ 250 commits** (compare-API caps); delete the quarantine ref | S + S | cs | U15 | `T:push-ff-allow`, `T:force-push-refused`, `T:push-main-refused`, `T:push-forbidden-path`, `T:push-301-files-refused` (hp) |
 | O2 | Door decision log → Loki + a Grafana dashboard | S | cs | M1 | Grafana `{namespace="cc-sandbox-doors"} \|= "deny"` shows the M1 401 test within 1 min |
-| O3 | Watchdog (tschedule on hp, every 5 min): door `/health`s, future-two Ready + bootID; two failures → one Telegram with the unlock command if bootID changed | XS | cs | M1 | stop a door via an OWN PR in a test window → Telegram within 10 min; revert → "recovered"; **+O7** |
+| O3 | **Pod watchdog: live, owned by k3s.** CronJob `cc-sandbox/cc-sandbox-watchdog`, every 5 min, alerts by Telegram on **Pending or failing pods only** (k3s main `8aaacc0`, reviewed 2026-11-20). It checks **no** door `/health`, **no** node bootID and sends **no** unlock prompt | — (done) | k3s | K1, K3 | k3s's `scripts/cc-sandbox-check.sh` passes; a probe pod left Pending → Telegram within 10 min (Mac kubeconfig) |
+| O3b | **`_GAP:_` door and node watch**: door `/health`s (session and owner listeners), future-two Ready + bootID, and on a changed bootID, **one Telegram with the unlock command**; also the setup-token expiry warning 30 days ahead. **Who builds it is open**: either ask k3s to extend their watchdog (a SHARED scope change, since it needs node reads and tailnet reach to the doors), or our own later piece, a tschedule job on hp. Until then, a future-two reboot is noticed only when the doors stop answering (the night's stop rule) | XS | cs (or k3s, if asked) | M1 | stop a door via an OWN PR in a test window → Telegram within 10 min; revert → "recovered"; a recorded bootID changed by hand → the unlock message; **+O7** |
 | O4 | **Spend: the Console cap only** ($50/month on the `cc-sandbox` workspace, Q12). Nothing at the door. The night report shows API spend and the window as information, never as a stop rule | XS | cs | U4, R5 | the Console limit is recorded in gitops.md §5; NB3's table has the spend and window columns (hp) |
 
 ### Phase D · future-two pod backend
@@ -472,7 +473,7 @@ hp's poll.
 - **gitops.md** (O1, K7): app `cc-sandbox`, platform k3s, namespaces `cc-sandbox` and `cc-sandbox-doors`, nodes `[future-two]` (plus the docker fences on hp and the Mac, outside k3s), credentials `sops`, backups `_N/A_` for the stateless doors.
 - **Logs:** one JSON line per door decision → promtail → Loki → a Grafana dashboard (O2). There's no Alertmanager, so watching is O3 plus k8s-event-notifier.
 - **Spend:** only the Console workspace's monthly cap on the API key ($50, hard). Subscription sessions have only the plan's own limits. Nothing is budgeted at the door (O4); runaway cost is a known limitation (doc 1 §9).
-- **Rotation:** the model and GitHub App keys every 90 days; the subscription setup-token yearly (it expires after one year; O3 warns 30 days before) and at once on any suspected leak; machine keys yearly or on loss; session tokens ≤ 12 h; the launcher token every 30 days, renewed by the launcher itself.
+- **Rotation:** the model and GitHub App keys every 90 days; the subscription setup-token yearly (it expires after one year; O3b warns 30 days before) and at once on any suspected leak; machine keys yearly or on loss; session tokens ≤ 12 h; the launcher token every 30 days, renewed by the launcher itself.
 - **Backups:**
   - config and static grants are in git;
   - keys are SOPS in git, plus Tomas's offline age master;
@@ -548,7 +549,7 @@ is skipped and listed, never waited on.
 | R10b | **During the day: the `ccsbx-keys` uid + age key on hp**, so K8 can encrypt the kubeconfig to us | `sudo useradd --system --home-dir /var/lib/ccsbx-keys --create-home --shell /usr/sbin/nologin ccsbx-keys && sudo -u ccsbx-keys age-keygen -o /var/lib/ccsbx-keys/age.key && sudo chmod 600 /var/lib/ccsbx-keys/age.key && sudo -u ccsbx-keys age-keygen -y /var/lib/ccsbx-keys/age.key` → send the printed public key to devops:#6c44 | plain `test -r /var/lib/ccsbx-keys/age.key` as tomas fails; the K8 SOPS file names that recipient (hp, evening) | skip F2–F5 |
 | R10c | (❓ Q12) `ccsbx-deploy` (NB5) for night-2+ redeploys: one sudoers rule for only that binary | `sudo visudo -f /etc/sudoers.d/91-ccsbx-deploy` with one line allowing just `/usr/local/sbin/ccsbx-deploy` | `sudo -n /usr/local/sbin/ccsbx-deploy --help` = 0; `ccsbx-deploy install ccsbx-root` → refused (hp, morning) | skip redeploys |
 | R10d | **Mac root install** (only if Q12 puts the Mac in, or before Accept 1–3 are run on the Mac) | on the Mac: `sudo units/install-mac.sh install --yes` (`_ccsbx`, the signer, hostd) | `install-mac.sh check` = 0 (Mac) | skip Mac legs |
-| R11 | **future-two up, no reboot planned** | no Hetzner maintenance; `future-two-unlock` works from the phone | node Ready, no pressure; bootID recorded and compared all night by O3 (hp) | abort if NotReady |
+| R11 | **future-two up, no reboot planned** | no Hetzner maintenance; `future-two-unlock` works from the phone | node Ready, no pressure; bootID recorded and compared all night by O3b (hp); **until O3b exists**, only `kubectl get node future-two` Ready is checked | abort if NotReady |
 | R12 | (❓ Q11, optional) **The Mac kubectl session**, started and briefed (§7.3) | on the Mac: a tab `k8s-mac`, **lid open or clamshell on AC with a display**, `caffeinate -dimsu &`, `claude --permission-mode dontAsk` in `~/cc-sandbox-night` (a local dir, **not** the public repo) with §7.3's settings and **the scoped `ccsbx-ops` kubeconfig** (K8 adds a read + rollout-restart SA), then paste the brief | `ccq` lists it; a `KREQ-1 ping` from the night manager's node gets `KRES-1 ok` within 120 s (hp) | skip (requests go to the morning list) |
 | R13 | Mac awake + Docker Desktop (only if Q12 = yes for that night) | on AC with the lid open: `sudo pmset -c sleep 0 disksleep 0 powernap 0`; macOS auto-update off for the night; Docker Desktop: start at login, auto-update **off**, 6 CPU / 16 GB / 128 GB, file sharing only the worktree root, Kubernetes off; record the version in gitops.md | `pmset -g` sleep = 0; `docker version -f '{{.Server.Version}}'` = pinned; `docker run --rm --network none ccsbx-fence@<digest> true` = 0 (Mac) | skip Mac legs |
 | R14 | **Permission modes** (Q12) | builders: `bypassPermissions` plus the deny list in `cc-sandbox/.claude/settings.json`: deny sudo except the helper, ssh except hp, `git push --force*`, pushes to main, `kubectl apply/delete/edit/patch`, `sops -d`, `tailscale *`, `ccsp deploy\|rollback`, broad `docker run -v /`. The Mac session: `dontAsk` plus an allow list | a `claude -p --permission-mode bypassPermissions` probe in cc-sandbox shows `sudo -n true`, `git push --force` and `ccsp deploy` denied (hp, evening) | abort |
@@ -777,7 +778,8 @@ deploy, Q6).
 | U15b | package mirrors | no | — | — | — | U15 |
 | U16 | git route | no | — | — | — | U15 |
 | O2 | Loki dashboard | no | — | — | — | M1, k3s |
-| O3 | watchdog | no | — | — | — | M1 |
+| O3 | pod watchdog (k3s CronJob) | no | — | done | — | — |
+| O3b | door + node/bootID watch (`_GAP:_`) | no | — | — | — | M1; who builds it (k3s or us) |
 | O4 | Console cap | no | — | set the Console limit (R5) | — | 🔑 R5 |
 | **Phase D** | | | | | | |
 | F2 | k8s backend | **dep U0b + R10b** | the launcher kubeconfig lives under `ccsbx-keys` | R10b (2) + R10 (45) | could run with the kubeconfig readable by tomas, but then any hp agent gets pods/exec; **not recommended** | **SHARED** K2/K3/K8/K9/K11 |
@@ -972,7 +974,7 @@ Each item is a script Tomas can run. Together they're `make accept`.
 10. **Nightly.** The full suite and e2e run unattended on hp (stub model, plus one real `say hi` on the API key and one on the subscription). They must be green three nights in a row, reported in a Telegram table.
 11. **Ops.**
     - `artifacts/gitops.md` is reviewed by k3s (K7);
-    - the watchdog alerts on a door drill;
+    - the door watch (O3b) alerts on a door drill, and the k3s pod watchdog (O3) on a Pending probe;
     - the Console cap is set and recorded, and an upstream limit refusal reaches the session as `upstream_limit`;
     - every procedure is in the ops procedures doc (O7, `make procedures`);
     - session-bus runs with `SB_REQUIRE_AUTH` on and every reader still works.
@@ -983,7 +985,7 @@ Each item is a script Tomas can run. Together they're `make accept`.
 
 | Risk | Effect | Mitigation |
 |---|---|---|
-| **future-two reboots** (LUKS waits for a manual unlock) | every fenced session on every machine loses the model and egress; future-two sessions lose unpushed work | O3 alert with the unlock command; push early; ❓ Q1; doors down = hp-only work at night |
+| **future-two reboots** (LUKS waits for a manual unlock) | every fenced session on every machine loses the model and egress; future-two sessions lose unpushed work | O3b alert with the unlock command (a `_GAP:_` until built; the live O3 only sees Pending/failing pods); push early; ❓ Q1; doors down = hp-only work at night |
 | **hp down** | cockpit (usually), builders, hp fences, **the hub**, future-two pod creation, token renewal and attach | future-two keeps working; same-node messages and M2d keep messaging up; the cockpit moves to the Mac (M5); the hub on hp is an accepted SPOF like the doors; sessions on future-two die at token expiry (≤ 12 h) if hp stays down |
 | **hp's existing root paths** (NOPASSWD sudo, the docker and lxd groups, a writable sops) | any unfenced agent is root, so invariants 12 and 14 don't hold | ❓ Q7 at the morning gate, plus a reboot; night 1 is marked "invariant 14 waived" |
 | Removing those root paths breaks other projects on hp | about 20 containers and the pharmacy runners lose their management path | P14 inventory + P15 replacements before gate M; Tomas keeps password sudo |
@@ -1073,7 +1075,7 @@ Each is a ❓ node with a recommendation. **NB** = night-blocking (R1). **Status
 
 | # | Decision | Recommendation | NB |
 |---|---|---|---|
-| Q1 (#4gcc) | **Where the doors run**, given future-two's manual LUKS unlock | pin them to future-two for the pilot; O3 alerts with the unlock command; revisit after the first slice (a float to an auto-recovering node is a SHARED scope change) | |
+| Q1 (#4gcc) | **Where the doors run**, given future-two's manual LUKS unlock | pin them to future-two for the pilot; O3b (not built yet) alerts with the unlock command; revisit after the first slice (a float to an auto-recovering node is a SHARED scope change) | |
 | Q2 (#65s2) | **k3s scope amendments**: doors in their own ns `cc-sandbox-doors`; K11 rules for launcher-created pods; K8 self-token renewal; K13 hostd PVC; a NetPol on the operator egress proxy | yes to all. Without the separate namespace the launcher can read the Anthropic and GitHub keys | NB |
 | Q3 (#42yx) | **Tailnet ACL grants**: (a) `tag:ccsbx` (dedicated) → hp:4011 and → hp/Mac:7480, plus hp → 6443; or (c) no outbound path from pods, hp pulls | (a) | NB |
 | Q4 (#4wws) | **Overnight review** of OWN PRs | (b) a k3s reviewer session overnight during the pilot; (a) auto-merge once K12 CI exists | NB |

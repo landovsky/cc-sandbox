@@ -1,5 +1,9 @@
 # Security-critical paths need Tomas's review (plan §2). Overnight work on these stays a PR.
 /internal/fwd/          @landovsky
+/internal/backend/      @landovsky
+/internal/start/        @landovsky
+/tests/fence-test.sh    @landovsky
+/tests/rules.toml       @landovsky
 /internal/token/        @landovsky
 /internal/signer/       @landovsky
 /internal/hostd/        @landovsky

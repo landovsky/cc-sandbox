@@ -505,3 +505,20 @@ func TestDuplicateTopLevelKeysAreRefused(t *testing.T) {
 		t.Fatalf("%s %+v", f.code("dup"), f.got)
 	}
 }
+
+// context: a session's verbs are applied in the order it wrote them; hostd must hand them to
+// the queue in name order (time-ordered rids), not in whatever order the directory lists.
+func TestRequestsAreHandledInNameOrder(t *testing.T) {
+	f := newFixture(t, nil)
+	for _, n := range []string{"0005", "0001", "0004", "0002", "0003"} {
+		f.req(n+".json", `{"type":"ccf.mark"}`)
+	}
+	f.h.Scan()
+	var got []string
+	for _, r := range f.got {
+		got = append(got, r.Rid)
+	}
+	if strings.Join(got, ",") != "0001,0002,0003,0004,0005" {
+		t.Fatalf("%v", got)
+	}
+}

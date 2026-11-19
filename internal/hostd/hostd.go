@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -230,6 +231,9 @@ func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, s
 	}
 	var genN int
 	fmt.Sscanf(gen, "g%d", &genN)
+	// Directory order is arbitrary. Name order is the one stable order we can give, and it is
+	// write order when the fence names requests with time-ordered ids (the ccf stub does).
+	sort.Strings(names)
 
 	now := h.Cfg.Now()
 	box.tokens += now.Sub(box.last).Seconds() * h.Cfg.Rate
@@ -357,16 +361,28 @@ func classify(err error) string {
 }
 
 // reply writes in/replies/<rid>.json (tmp + rename). rid is already validated by nameRe.
-func (h *Hostd) reply(gdir string, r Reply) {
+func (h *Hostd) reply(gdir string, r Reply) { _ = WriteReply(gdir, r) }
+
+// WriteReply writes a reply into a generation's inbox; the fence mounts in/ read-only. A later
+// reply for the same rid replaces the earlier one (queued -> the final result). It refuses a
+// rid that is not a plain name and a generation directory that is gone.
+func WriteReply(gdir string, r Reply) error {
+	if !nameRe.MatchString(r.Rid + ".json") {
+		return fmt.Errorf("bad rid")
+	}
+	if st, err := os.Stat(filepath.Join(gdir, "in")); err != nil || !st.IsDir() {
+		return fmt.Errorf("no inbox")
+	}
 	dir := filepath.Join(gdir, "in", "replies")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
+		return err
 	}
 	b, _ := json.Marshal(r)
 	tmp := filepath.Join(dir, "."+r.Rid+".tmp")
-	if os.WriteFile(tmp, b, 0o644) == nil {
-		_ = os.Rename(tmp, filepath.Join(dir, r.Rid+".json"))
+	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+		return err
 	}
+	return os.Rename(tmp, filepath.Join(dir, r.Rid+".json"))
 }
 
 // The ledger is the daemon's own record of which outbox files it has processed, so a restart

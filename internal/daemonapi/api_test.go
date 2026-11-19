@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/journal"
+	"github.com/landovsky/cc-sandbox/internal/verbq"
 )
 
 type rig struct {
@@ -186,4 +187,92 @@ func TestLoopbackOnlyUntilTheTailnetListenerExists(t *testing.T) {
 		t.Fatal(err)
 	}
 	l.Close()
+}
+
+// ---- M4: cockpit lease and verb queue over HTTP --------------------------------------------
+
+type qrig struct {
+	*rig
+	q *verbq.Queue
+}
+
+func newQRig(t *testing.T) *qrig {
+	j, _ := journal.Open(t.TempDir(), "hp-ubuntu", 0)
+	q, err := verbq.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := httptest.NewServer((&Server{J: j, Q: q}).Handler())
+	t.Cleanup(func() { s.Close(); j.Close(); q.Close() })
+	return &qrig{&rig{j, s}, q}
+}
+
+func (r *qrig) do(t *testing.T, method, path, token, body string) (int, map[string]any) {
+	req, _ := http.NewRequest(method, r.srv.URL+path, bytes.NewBufferString(body))
+	if token != "" {
+		req.Header.Set("X-Lease", token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var m map[string]any
+	json.NewDecoder(resp.Body).Decode(&m)
+	return resp.StatusCode, m
+}
+
+// context: "no cockpit → done returns queued; a second lease in the same realm → 409; the e2e
+// realm leaves production alone" — M4's acceptance, over the wire.
+func TestCockpitLeaseAndQueueOverHTTP(t *testing.T) {
+	r := newQRig(t)
+	r.q.Enqueue("production", verbq.Item{ID: "i1", Sid: "s1", Gen: 1, Rid: "a", Type: "ccf.done"})
+	if code, m := r.do(t, "GET", "/v1/cockpit/status?realm=production", "", ""); code != 200 || m["pending"].(float64) != 1 || m["lease"] != nil {
+		t.Fatalf("status without a cockpit: %d %v", code, m)
+	}
+	code, m := r.do(t, "POST", "/v1/cockpit/lease?realm=production", "", `{"holder":"hp"}`)
+	if code != 200 || m["token"] == "" || m["ttl_s"].(float64) != 90 {
+		t.Fatalf("%d %v", code, m)
+	}
+	tok := m["token"].(string)
+	code, m = r.do(t, "POST", "/v1/cockpit/lease?realm=production", "", `{"holder":"mac"}`)
+	if code != 409 || m["holder"] != "hp" || m["token"] != nil {
+		t.Fatalf("second lease: %d %v (the holder's token must not leak)", code, m)
+	}
+	if code, _ := r.do(t, "POST", "/v1/cockpit/lease?realm=e2e", "", `{"holder":"mac"}`); code != 200 {
+		t.Fatalf("e2e realm: %d", code)
+	}
+	if code, _ := r.do(t, "GET", "/v1/cockpit/requests?realm=production", "wrong", ""); code != 409 {
+		t.Fatalf("wrong token: %d", code)
+	}
+	code, m = r.do(t, "GET", "/v1/cockpit/requests?realm=production", tok, "")
+	items := m["items"].([]any)
+	if code != 200 || len(items) != 1 {
+		t.Fatalf("%d %v", code, m)
+	}
+	if code, m = r.do(t, "POST", "/v1/cockpit/requests/i1/result?realm=production", tok, `{"status":"transient","code":"RepoBusy"}`); code != 200 || m["applied"] != false {
+		t.Fatalf("%d %v", code, m)
+	}
+	if code, m = r.do(t, "GET", "/v1/cockpit/status?realm=production", "", ""); m["warnings"].([]any)[0].(map[string]any)["last_error"] != "RepoBusy" {
+		t.Fatalf("%d %v", code, m)
+	}
+	if code, m = r.do(t, "POST", "/v1/cockpit/requests/i1/result?realm=production", tok, `{"status":"ok"}`); code != 200 || m["applied"] != true {
+		t.Fatalf("%d %v", code, m)
+	}
+	if code, _ = r.do(t, "POST", "/v1/cockpit/lease?realm=production&release=1", "", fmt.Sprintf(`{"token":%q}`, tok)); code != 200 {
+		t.Fatalf("release %d", code)
+	}
+	if code, _ := r.do(t, "POST", "/v1/cockpit/lease?realm=production", "", `{"holder":"mac"}`); code != 200 {
+		t.Fatalf("after release: %d", code)
+	}
+}
+
+func TestCockpitEndpointsNeedARealm(t *testing.T) {
+	r := newQRig(t)
+	if code, _ := r.do(t, "GET", "/v1/cockpit/status", "", ""); code != 400 {
+		t.Fatal(code)
+	}
+	if code, _ := r.do(t, "GET", "/v1/cockpit/status?realm=..%2Fx", "", ""); code != 400 {
+		t.Fatal(code)
+	}
 }

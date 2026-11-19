@@ -21,6 +21,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
+	"github.com/landovsky/cc-sandbox/internal/verbq"
 )
 
 var version = "dev"
@@ -58,6 +59,8 @@ func app() *cli.App {
 				f.Int("retention-days", 14, "journal retention; values below 14 are refused")
 				f.String("socket", "", "unix socket for the daemon API, mode 0600 (default <state>/hostd.sock; '-' disables)")
 				f.String("listen", "", "also serve the API on this loopback address, e.g. 127.0.0.1:7481 (non-loopback is refused until M2a)")
+				f.Int("lease-ttl", 90, "cockpit lease TTL in seconds (one holder per realm)")
+				f.Int("queue-max", 10000, "pending cockpit requests per realm before refused: queue_full")
 				f.String("interval", "250ms", "time between scans")
 				f.Bool("once", false, "scan once and print the stats as a line, then exit")
 			},
@@ -79,6 +82,16 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	rt := &msg.Router{Dir: msg.DaemonDir{D: d, Alive: tm.Alive}, Out: tm, StateDir: get("state")}
 	m := &mux{}
 	m.on("msg.", msgHandler(rt))
+	q, err := verbq.Open(filepath.Join(get("state"), "queue"))
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx-hostd:", err)
+		return cli.ExitFail
+	}
+	defer q.Close()
+	q.TTL = time.Duration(num("lease-ttl")) * time.Second
+	q.MaxPending = num("queue-max")
+	q.Reply = replyWriter(get("state"), d)
+	m.on("ccf.", verbHandler(q, d))
 	lg := log.New(stderr, "ccsbx-hostd: ", log.LstdFlags)
 	jdir := get("journal")
 	if jdir == "" {
@@ -100,7 +113,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		return cli.ExitOK
 	}
 	var servers []*http.Server
-	srv := &daemonapi.Server{J: j, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
+	srv := &daemonapi.Server{J: j, Q: q, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
 	sock := get("socket")
 	if sock == "" {
 		sock = filepath.Join(get("state"), "hostd.sock")

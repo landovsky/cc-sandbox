@@ -4,6 +4,10 @@
 //	GET  /v1/events?after=&epoch=&realm=&limit=&wait=     replay; wait (seconds) long-polls
 //	GET  /v1/events/stream?after=&epoch=&realm=           SSE; the id: field is the seq
 //	GET  /v1/cursors/<name>      POST /v1/cursors/<name> {seq, epoch, tree_sha}
+//	POST /v1/cockpit/lease?realm=            {holder, token?, steal?}; ?release=1 gives it up
+//	GET  /v1/cockpit/requests?realm=&limit=  holder only (header X-Lease: <token>)
+//	POST /v1/cockpit/requests/<id>/result?realm=  {status, code, result}; holder only
+//	GET  /v1/cockpit/status?realm=           depth, ⚠ items, who holds the lease (no token)
 //
 // It serves on a unix socket (mode 0600: owner class only) and, optionally, on a loopback TCP
 // address for curl. There is no non-loopback listener here: the tailnet listener and the
@@ -23,11 +27,13 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/journal"
+	"github.com/landovsky/cc-sandbox/internal/verbq"
 )
 
 // Server serves one journal.
 type Server struct {
 	J       *journal.Store
+	Q       *verbq.Queue  // nil: the cockpit endpoints answer 404
 	MaxWait time.Duration // longest long-poll
 	Info    map[string]any
 }
@@ -39,6 +45,10 @@ func (s *Server) Handler() http.Handler {
 	m.HandleFunc("/v1/events", s.events)
 	m.HandleFunc("/v1/events/stream", s.stream)
 	m.HandleFunc("/v1/cursors/", s.cursor)
+	m.HandleFunc("/v1/cockpit/lease", s.lease)
+	m.HandleFunc("/v1/cockpit/requests", s.requests)
+	m.HandleFunc("/v1/cockpit/requests/", s.result)
+	m.HandleFunc("/v1/cockpit/status", s.status)
 	return m
 }
 
@@ -259,4 +269,137 @@ func ListenLoopback(addr string) (net.Listener, error) {
 		return nil, fmt.Errorf("--listen %s: only a loopback address is allowed until M2a (tailnet listener)", addr)
 	}
 	return net.Listen("tcp", addr)
+}
+
+// ---- cockpit verb queue and lease (M4) ----
+
+func (s *Server) qfail(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, verbq.ErrLeaseHeld):
+		writeJSON(w, 409, map[string]any{"error": "lease_held"})
+	case errors.Is(err, verbq.ErrLeaseLost):
+		writeJSON(w, 409, map[string]any{"error": "lease_lost"})
+	case errors.Is(err, verbq.ErrBadRealm), errors.Is(err, verbq.ErrBadResult):
+		writeJSON(w, 400, map[string]any{"error": err.Error()})
+	case errors.Is(err, verbq.ErrNoSuchItem):
+		writeJSON(w, 404, map[string]any{"error": err.Error()})
+	default:
+		writeJSON(w, 500, map[string]any{"error": "internal"})
+	}
+}
+
+func (s *Server) cockpit(w http.ResponseWriter, r *http.Request) (realm string, ok bool) {
+	if s.Q == nil {
+		writeJSON(w, 404, map[string]any{"error": "no_queue"})
+		return "", false
+	}
+	realm = r.URL.Query().Get("realm")
+	if realm == "" {
+		writeJSON(w, 400, map[string]any{"error": "realm is required"})
+		return "", false
+	}
+	return realm, true
+}
+
+func (s *Server) lease(w http.ResponseWriter, r *http.Request) {
+	realm, ok := s.cockpit(w, r)
+	if !ok {
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, 405, map[string]any{"error": "method"})
+		return
+	}
+	var b struct {
+		Holder string `json:"holder"`
+		Token  string `json:"token"`
+		Steal  bool   `json:"steal"`
+	}
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 4096))
+	if len(body) > 0 && json.Unmarshal(body, &b) != nil {
+		writeJSON(w, 400, map[string]any{"error": "bad_json"})
+		return
+	}
+	if r.URL.Query().Get("release") == "1" {
+		if err := s.Q.Release(realm, b.Token); err != nil {
+			s.qfail(w, err)
+			return
+		}
+		writeJSON(w, 200, map[string]any{"released": true})
+		return
+	}
+	if b.Holder == "" {
+		writeJSON(w, 400, map[string]any{"error": "holder is required"})
+		return
+	}
+	l, err := s.Q.Acquire(realm, b.Holder, b.Token, b.Steal)
+	if errors.Is(err, verbq.ErrLeaseHeld) {
+		// Say who holds it and for how long, never the token.
+		writeJSON(w, 409, map[string]any{"error": "lease_held", "holder": l.Holder, "expires": l.Expires})
+		return
+	}
+	if err != nil {
+		s.qfail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"realm": l.Realm, "holder": l.Holder, "token": l.Token, "expires": l.Expires, "ttl_s": int(s.Q.TTL.Seconds())})
+}
+
+func (s *Server) requests(w http.ResponseWriter, r *http.Request) {
+	realm, ok := s.cockpit(w, r)
+	if !ok {
+		return
+	}
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeJSON(w, 400, map[string]any{"error": "limit must be a non-negative integer"})
+			return
+		}
+		limit = n
+	}
+	items, err := s.Q.Pull(realm, r.Header.Get("X-Lease"), limit)
+	if err != nil {
+		s.qfail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"realm": realm, "items": items})
+}
+
+func (s *Server) result(w http.ResponseWriter, r *http.Request) {
+	realm, ok := s.cockpit(w, r)
+	if !ok {
+		return
+	}
+	id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/cockpit/requests/"), "/result")
+	if r.Method != http.MethodPost || id == "" || strings.Contains(id, "/") {
+		writeJSON(w, 405, map[string]any{"error": "POST /v1/cockpit/requests/<id>/result"})
+		return
+	}
+	var res verbq.Result
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	if json.Unmarshal(body, &res) != nil {
+		writeJSON(w, 400, map[string]any{"error": "bad_json"})
+		return
+	}
+	written, err := s.Q.Report(realm, r.Header.Get("X-Lease"), id, res)
+	if err != nil {
+		s.qfail(w, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"applied": res.Status != "transient", "reply_written": written})
+}
+
+func (s *Server) status(w http.ResponseWriter, r *http.Request) {
+	realm, ok := s.cockpit(w, r)
+	if !ok {
+		return
+	}
+	st, err := s.Q.Status(realm)
+	if err != nil {
+		s.qfail(w, err)
+		return
+	}
+	writeJSON(w, 200, st)
 }

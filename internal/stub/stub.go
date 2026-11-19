@@ -199,7 +199,7 @@ func messages(w http.ResponseWriter, r *http.Request) {
 // findTool returns the offered tool matching verb: mcp__ccf__<verb> or ccf_<verb>.
 func findTool(req *request, verb string) (string, map[string]json.RawMessage) {
 	for _, t := range req.Tools {
-		if t.Name == "mcp__ccf__"+verb || t.Name == "ccf_"+verb || strings.HasSuffix(t.Name, "__ccf_"+verb) {
+		if t.Name == "mcp__ccf__"+verb || t.Name == "ccf_"+verb { // exact: a same-suffix tool of another server must not match
 			return t.Name, t.InputSchema.Properties
 		}
 	}

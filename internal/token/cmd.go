@@ -16,12 +16,14 @@ const Usage = `ccsbx token — mint and check session tokens (U5, dev key file, 
 
 Usage:
   ccsbx token mint   --sub S --label L --billing B --profile P --aud A [flags]
-  ccsbx token verify --token T [--proof P --method M --path PATH] --aud A [flags]
+  ccsbx token verify --keyring FILE --token T --aud A [--proof P --method M --path PATH --body-file F]
+  ccsbx token pubkey --key-file F --owners a,b --machines x,y     (a keyring line for doors)
   ccsbx token kid    [--key-file F]
 
 Flags: (each also CCSBX_TOKEN_<NAME>; --key-file also reads CCSBX_KEY_FILE)
   --key-file FILE   dev signing key, base64 seed, mode 0600 (mint creates it if absent;
-                    verify and kid never do)
+                    pubkey and kid never do). Doors never get this file, only a keyring.
+  --keyring FILE    public keys a door trusts: "<kid> <pubkey> owners=a machines=x" per line
   mint:
     --sub S         owner/machine/sid/g<gen>, e.g. tomas/hp-ubuntu/s01jd7k2m9/g1  (required)
     --label L       node label                       --billing api|subscription|stub (required)
@@ -31,14 +33,15 @@ Flags: (each also CCSBX_TOKEN_<NAME>; --key-file also reads CCSBX_KEY_FILE)
     --fwd-secrets   print the JSON a forwarder reads on stdin ({"token","key"}) with a fresh
                     per-generation key, instead of the bare token
   verify:
-    --token T --aud A --proof P --method M --path PATH   without --proof only the signature,
-                    expiry and audience are checked, and the output says so
+    --token T --aud A --proof P --method M --path PATH --body-file F   without --proof only the
+                    signature, key scope, expiry and audience are checked, and the output says so
 
 Recipes:
   start a forwarder for a test session:
     ccsbx token mint --sub tomas/hp-ubuntu/sX/g1 --label t --billing stub --profile e2e-test \
        --aud ccsbx-model --fwd-secrets | ccsbx fwd --listen 127.0.0.1:7481 --door model=http://127.0.0.1:8080
-  which key signs?   ccsbx token kid
+  give a door its trust root:  ccsbx token pubkey --key-file $CCSBX_KEY_FILE --owners tomas \
+                                 --machines hp-ubuntu > keyring
 Exit codes: 0 ok, 1 failure, 2 token refused, 64 usage.
 `
 
@@ -89,6 +92,10 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	branch := fs.String("branch", "", "")
 	placedBy := fs.String("placed-by", "", "")
 	fwdSecrets := fs.Bool("fwd-secrets", false, "")
+	keyring := fs.String("keyring", envOr("KEYRING", ""), "")
+	owners := fs.String("owners", "", "")
+	machines := fs.String("machines", "", "")
+	bodyFile := fs.String("body-file", "", "")
 	tok := fs.String("token", "", "")
 	proof := fs.String("proof", "", "")
 	method := fs.String("method", "POST", "")
@@ -104,6 +111,19 @@ func Main(args []string, stdout, stderr io.Writer) int {
 			return 1
 		}
 		fmt.Fprintln(stdout, k.KID)
+		return 0
+
+	case "pubkey":
+		k, err := LoadKeyFile(*keyFile)
+		if err != nil || *owners == "" || *machines == "" {
+			if err != nil {
+				fmt.Fprintln(stderr, "token:", err)
+			} else {
+				fmt.Fprintln(stderr, "token pubkey: --owners and --machines are required (a key with no scope is refused)")
+			}
+			return 64
+		}
+		fmt.Fprintln(stdout, k.KeyringLine(csv(*owners), csv(*machines)))
 		return 0
 
 	case "mint":
@@ -137,7 +157,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return 0
 
 	case "verify":
-		k, err := LoadKeyFile(*keyFile)
+		ring, err := LoadPublicKeyring(*keyring)
 		if err != nil || *tok == "" || len(aud) == 0 {
 			if err != nil {
 				fmt.Fprintln(stderr, "token:", err)
@@ -146,13 +166,20 @@ func Main(args []string, stdout, stderr io.Writer) int {
 			}
 			return 64
 		}
-		v := NewVerifier(Keyring{k.KID: k.Public}, aud[0])
+		v := NewVerifier(ring, aud[0])
+		var body []byte
+		if *bodyFile != "" {
+			if body, err = os.ReadFile(*bodyFile); err != nil {
+				fmt.Fprintln(stderr, "token:", err)
+				return 1
+			}
+		}
 		var c *Claims
-		note := "signature, expiry and audience only; no proof given"
+		note := "signature, key scope, expiry and audience only; no proof given"
 		if *proof == "" {
 			c, err = v.checkNoProof(*tok, time.Now())
 		} else {
-			c, err = v.Verify(*tok, *proof, *method, *path, time.Now())
+			c, err = v.Verify(*tok, *proof, *method, *path, body, time.Now())
 			note = "full check incl. proof of possession"
 		}
 		if err != nil {
@@ -171,6 +198,13 @@ func (v *Verifier) checkNoProof(tok string, now time.Time) (*Claims, error) {
 	c, err := parse(tok, v.ring)
 	if err != nil {
 		return nil, err
+	}
+	owner, machine, _, _, err := c.SubParts()
+	if err != nil {
+		return nil, err
+	}
+	if !v.ring[c.kid].allows(owner, machine) {
+		return nil, ErrKeyScope
 	}
 	if now.Unix() >= c.Exp {
 		return nil, ErrExpired

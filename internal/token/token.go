@@ -16,8 +16,9 @@
 //	key, _ := token.LoadOrCreateKeyFile(os.Getenv("CCSBX_KEY_FILE")) // dev key
 //	gen, _ := token.NewGenKey()                                      // per generation
 //	tok, _ := token.Mint(key, claims(gen.Public), now)               // hostd side
-//	v := token.NewVerifier(token.Keyring{key.KID: key.Public}, "ccsbx-model")
-//	c, err := v.Verify(tok, proofHeader, "POST", "/v1/messages", now) // door side
+//	ring, _ := token.LoadPublicKeyring(path)                          // door side: public keys only
+//	v := token.NewVerifier(ring, "ccsbx-model")
+//	c, err := v.Verify(tok, proofHeader, "POST", "/v1/messages", body, now)
 package token
 
 import (
@@ -60,6 +61,9 @@ var (
 	ErrProofStale  = errors.New("token: proof timestamp outside window")
 	ErrProofReplay = errors.New("token: proof nonce already used")
 	ErrSub         = errors.New("token: sub must be owner/machine/sid/g<gen>")
+	ErrKeyScope    = errors.New("token: signing key is not allowed to speak for this owner/machine")
+	ErrState       = errors.New("token: door cannot persist revocation state; refusing")
+	ErrClaim       = errors.New("token: billing must be api|subscription|stub and profile must be set")
 )
 
 // Claims are the token body. Identity comes from the daemon only (invariant 1).
@@ -76,6 +80,8 @@ type Claims struct {
 	Cnf      string   `json:"cnf"` // base64url ed25519 public key of the forwarder (this generation)
 	Iat      int64    `json:"iat"`
 	Exp      int64    `json:"exp"`
+
+	kid string // which key signed it; set by parse, never part of the token body
 }
 
 // SubParts splits Sub into owner, machine, sid and generation.
@@ -148,8 +154,21 @@ func loadKeyFile(path string, create bool) (*Key, error) {
 			return nil, err
 		}
 		enc := base64.StdEncoding.EncodeToString(seed) + "\n"
-		if err := os.WriteFile(path, []byte(enc), 0o600); err != nil {
+		// O_EXCL: never follow a symlink planted at the path, and if another process created
+		// the key a moment ago, use its key instead of overwriting it.
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if errors.Is(err, os.ErrExist) {
+			return loadKeyFile(path, false)
+		}
+		if err != nil {
 			return nil, err
+		}
+		_, werr := f.WriteString(enc)
+		if cerr := f.Close(); werr == nil {
+			werr = cerr
+		}
+		if werr != nil {
+			return nil, werr
 		}
 		return KeyFromSeed(seed)
 	}
@@ -219,6 +238,9 @@ func Mint(k *Key, c Claims, now time.Time) (string, error) {
 	if len(c.Aud) == 0 {
 		return "", errors.New("token: aud required")
 	}
+	if (c.Billing != "api" && c.Billing != "subscription" && c.Billing != "stub") || c.Profile == "" {
+		return "", ErrClaim // invariant 18: no door may invent a default billing
+	}
 	if pk, err := b64.DecodeString(c.Cnf); err != nil || len(pk) != ed25519.PublicKeySize {
 		return "", errors.New("token: cnf must be a base64url ed25519 public key")
 	}
@@ -232,8 +254,81 @@ func Mint(k *Key, c Claims, now time.Time) (string, error) {
 	return h + "." + p + "." + b64.EncodeToString(sig), nil
 }
 
-// Keyring maps kid → public key (the machine keys a door trusts).
-type Keyring map[string]ed25519.PublicKey
+// KeyScope is what one trusted key may sign for (invariant 27): sessions whose sub names an
+// owner in Owners and a machine in Machines. An empty list allows nothing, so a scope can't be
+// "forgotten" into allow-all.
+type KeyScope struct {
+	Pub      ed25519.PublicKey
+	Owners   []string
+	Machines []string
+}
+
+func (k KeyScope) allows(owner, machine string) bool {
+	has := func(l []string, v string) bool {
+		for _, x := range l {
+			if x == v {
+				return true
+			}
+		}
+		return false
+	}
+	return has(k.Owners, owner) && has(k.Machines, machine)
+}
+
+// Keyring maps kid → the key and the scope it may sign within (the machine keys a door trusts).
+type Keyring map[string]KeyScope
+
+// LoadPublicKeyring reads a keyring file for a door. Lines: `<kid> <base64 public key>
+// owners=a,b machines=x,y`; `#` starts a comment. Doors load only this, never a seed
+// (invariant 12: only the signer holds signing keys). A line whose key is a 32-byte seed
+// can't be told from a public key by length, so the kid must equal KIDOf(public key).
+func LoadPublicKeyring(path string) (Keyring, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	ring := Keyring{}
+	for i, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Fields(line)
+		if len(f) < 4 {
+			return nil, fmt.Errorf("token: keyring %s:%d: want `kid pubkey owners=… machines=…`", path, i+1)
+		}
+		pub, err := base64.StdEncoding.DecodeString(f[1])
+		if err != nil || len(pub) != ed25519.PublicKeySize || KIDOf(pub) != f[0] {
+			return nil, fmt.Errorf("token: keyring %s:%d: kid does not match the public key", path, i+1)
+		}
+		sc := KeyScope{Pub: pub}
+		for _, kv := range f[2:] {
+			k, v, _ := strings.Cut(kv, "=")
+			switch k {
+			case "owners":
+				sc.Owners = splitList(v)
+			case "machines":
+				sc.Machines = splitList(v)
+			default:
+				return nil, fmt.Errorf("token: keyring %s:%d: unknown field %q", path, i+1, k)
+			}
+		}
+		if len(sc.Owners) == 0 || len(sc.Machines) == 0 {
+			return nil, fmt.Errorf("token: keyring %s:%d: owners= and machines= are required", path, i+1)
+		}
+		ring[f[0]] = sc
+	}
+	if len(ring) == 0 {
+		return nil, fmt.Errorf("token: keyring %s is empty", path)
+	}
+	return ring, nil
+}
+
+// KeyringLine is the line a host writes for a key it has the seed of.
+func (k *Key) KeyringLine(owners, machines []string) string {
+	return fmt.Sprintf("%s %s owners=%s machines=%s", k.KID, base64.StdEncoding.EncodeToString(k.Public),
+		strings.Join(owners, ","), strings.Join(machines, ","))
+}
 
 // parse checks structure, alg, kid and signature, and returns the claims.
 func parse(tok string, ring Keyring) (*Claims, error) {
@@ -252,10 +347,11 @@ func parse(tok string, ring Keyring) (*Claims, error) {
 	if h.Alg != "EdDSA" { // never "none", never HS*: the alg is not negotiable
 		return nil, ErrAlg
 	}
-	pub, ok := ring[h.KID]
+	sc, ok := ring[h.KID]
 	if !ok {
 		return nil, ErrUnknownKID
 	}
+	pub := sc.Pub
 	sig, err := b64.DecodeString(parts[2])
 	if err != nil || len(sig) != ed25519.SignatureSize {
 		return nil, ErrBadSig
@@ -271,8 +367,26 @@ func parse(tok string, ring Keyring) (*Claims, error) {
 	if err := json.Unmarshal(pb, &c); err != nil {
 		return nil, ErrMalformed
 	}
+	c.kid = h.KID
 	return &c, nil
 }
 
 // B64 exposes the base64url (unpadded) codec used on the wire, for the forwarder.
 func B64() *base64.Encoding { return b64 }
+
+// Ring is a one-key Keyring for tests and the dev tools, scoped to the given owners/machines.
+// Doors load their ring from a file (LoadPublicKeyring) and never from a Key.
+func (k *Key) Ring(owners, machines []string) Keyring {
+	return Keyring{k.KID: KeyScope{Pub: k.Public, Owners: owners, Machines: machines}}
+}
+
+// splitList splits a comma list and drops empty items ("a,,b" and "" must not yield "").
+func splitList(v string) []string {
+	var out []string
+	for _, x := range strings.Split(v, ",") {
+		if x = strings.TrimSpace(x); x != "" {
+			out = append(out, x)
+		}
+	}
+	return out
+}

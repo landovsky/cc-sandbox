@@ -312,8 +312,8 @@ where = "any"
 id = "key-signs-foreign-machine"
 title = "a machine key cannot sign for another machine"
 suite = "keys"
-allow = "pending"
-block = "pending"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestKeySignsForeignMachine$|TestGenerationStateIsPerMachine$'"
 invariants = [8]
 backends = ["unit"]
 where = "any"
@@ -925,5 +925,48 @@ suite = "verbs"
 allow = "pending"
 block = "pending"
 invariants = [5]
+backends = ["unit"]
+where = "any"
+
+# Added by the night-1 review of PR #1 (U5-S1, U5-S2, U5-S3, P2-S1): each has a block twin that
+# was red with its guard removed and green with it in place.
+
+[[rule]]
+id = "proof-bound-to-request"
+title = "a proof is bound to its door, token and body: replayed elsewhere or with another body it is refused"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestProofBoundToDoorTokenAndBody$'"
+invariants = [8]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "door-holds-public-keys-only"
+title = "a door loads a scoped public keyring, never a signing seed"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestDoorsLoadPublicKeysOnly$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "revocation-fails-closed"
+title = "a door that cannot persist a revocation refuses requests, and the revocation survives a restart"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestRevocationFailsClosed$'"
+invariants = [8, 17]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "fwd-door-addresses-pinned"
+title = "the forwarder resolves each door once and dials only those addresses"
+suite = "doors"
+allow = "tests/go-test.sh ./internal/fwd 'TestForwardsWithTokenAndProof$'"
+block = "tests/go-test.sh ./internal/fwd 'TestDoorAddressesArePinned$'"
+invariants = [4]
 backends = ["unit"]
 where = "any"

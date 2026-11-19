@@ -3,9 +3,12 @@ package token
 import (
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -21,36 +24,46 @@ const (
 	NonceTTL = 5 * time.Minute
 	// ProofHeader carries the proof on every door request.
 	ProofHeader = "X-Ccsbx-Proof"
+	// MaxBody is the largest request body a door hashes for the proof.
+	MaxBody = 32 << 20
 )
 
-// proof is the wire form: base64url(JSON). The method and path are not sent;
-// the door signs-over what it actually received, so a proof for one request
-// cannot be moved to another.
+// proof is the wire form: base64url(JSON). Method, path, door, token hash and body hash
+// are not sent; the door signs-over what it actually received, so a proof made for one
+// request, door, token or body cannot be moved to another.
 type proof struct {
 	TS    int64  `json:"ts"`
 	Nonce string `json:"nonce"`
 	Sig   string `json:"sig"`
 }
 
-func proofInput(method, path string, ts int64, nonce string) []byte {
+func sha(b []byte) string { h := sha256.Sum256(b); return hex.EncodeToString(h[:]) }
+
+// proofInput is what the generation key signs. aud binds the proof to one door, ath to one
+// token (as DPoP's `ath`), bh to one body (sha256 of the request body; of "" if none).
+func proofInput(method, path, aud, tok string, body []byte, ts int64, nonce string) []byte {
 	b, _ := json.Marshal(struct {
 		Method string `json:"method"`
 		Path   string `json:"path"`
+		Aud    string `json:"aud"`
+		Ath    string `json:"ath"`
+		BH     string `json:"bh"`
 		TS     int64  `json:"ts"`
 		Nonce  string `json:"nonce"`
-	}{strings.ToUpper(method), path, ts, nonce})
+	}{strings.ToUpper(method), path, aud, sha([]byte(tok)), sha(body), ts, nonce})
 	return append([]byte(DomainPoP+"\x00"), b...)
 }
 
-// SignProof makes the ProofHeader value for one request. path is the request
-// URI path plus raw query, exactly as the door will see it.
-func SignProof(g *GenKey, method, path string, now time.Time) (string, error) {
+// SignProof makes the ProofHeader value for one request to the door named aud. path is the
+// request URI path plus raw query, exactly as the door will see it; body is the whole
+// request body (nil if none).
+func SignProof(g *GenKey, method, path, aud, tok string, body []byte, now time.Time) (string, error) {
 	nb := make([]byte, 16)
 	if _, err := rand.Read(nb); err != nil {
 		return "", err
 	}
 	nonce := b64.EncodeToString(nb)
-	sig := ed25519.Sign(g.Private, proofInput(method, path, now.Unix(), nonce))
+	sig := ed25519.Sign(g.Private, proofInput(method, path, aud, tok, body, now.Unix(), nonce))
 	pb, _ := json.Marshal(proof{TS: now.Unix(), Nonce: nonce, Sig: b64.EncodeToString(sig)})
 	return b64.EncodeToString(pb), nil
 }
@@ -60,52 +73,67 @@ type Verifier struct {
 	ring Keyring
 	aud  string
 
-	mu      sync.Mutex
-	nonces  map[string]time.Time // nonce → expiry
-	maxGen  map[string]int       // sid → highest generation ever seen or revoked
-	revoked map[string]int       // sid → generations ≤ this are revoked
+	mu     sync.Mutex
+	nonces map[string]time.Time // nonce → expiry
+	// State is keyed by owner/machine/sid: the same sid string under another machine is a
+	// different session, so one machine's key can't move another's generation counter.
+	maxGen  map[string]int
+	revoked map[string]int // generations ≤ this are revoked
 
 	statePath string
+	stateErr  error // set when the last save failed; the door refuses requests until it clears
 }
 
 // NewVerifier builds a verifier for one door. aud is the door's name
-// (for example "ccsbx-model"); tokens must list it.
+// (for example "ccsbx-model"); tokens must list it and proofs are bound to it.
 func NewVerifier(ring Keyring, aud string) *Verifier {
 	return &Verifier{ring: ring, aud: aud, nonces: map[string]time.Time{},
 		maxGen: map[string]int{}, revoked: map[string]int{}}
 }
 
-// Revoke is hostd's revoke{sid,gen} at generation end: that generation and all
-// earlier ones are dead (T:token-after-exit).
-func (v *Verifier) Revoke(sid string, gen int) {
+func sessKey(owner, machine, sid string) string { return owner + "/" + machine + "/" + sid }
+
+// Revoke is hostd's revoke{sid,gen} at generation end: that generation and all earlier ones
+// are dead (T:token-after-exit). It returns an error if the revocation could not be made
+// durable; the door then refuses every request until it can (fail closed, invariant 17).
+func (v *Verifier) Revoke(owner, machine, sid string, gen int) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if cur, ok := v.revoked[sid]; !ok || gen > cur {
-		v.revoked[sid] = gen
+	k := sessKey(owner, machine, sid)
+	if cur, ok := v.revoked[k]; !ok || gen > cur {
+		v.revoked[k] = gen
 	}
-	if cur, ok := v.maxGen[sid]; !ok || gen > cur {
-		v.maxGen[sid] = gen
+	if cur, ok := v.maxGen[k]; !ok || gen > cur {
+		v.maxGen[k] = gen
 	}
-	v.saveLocked()
+	return v.saveLocked()
 }
 
-// MaxGen returns the persisted high-water mark for sid (-1 if unseen).
-func (v *Verifier) MaxGen(sid string) int {
+// MaxGen returns the persisted high-water mark for a session (-1 if unseen).
+func (v *Verifier) MaxGen(owner, machine, sid string) int {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if g, ok := v.maxGen[sid]; ok {
+	if g, ok := v.maxGen[sessKey(owner, machine, sid)]; ok {
 		return g
 	}
 	return -1
 }
 
-// Verify checks token + proof for one request. Order matters: the cheap
-// signature checks come first, and the nonce is recorded only after everything
-// else passed, so garbage can't fill the cache.
-func (v *Verifier) Verify(tok, proofHdr, method, path string, now time.Time) (*Claims, error) {
+// Verify checks token + proof for one request to this door. Order matters: the cheap
+// signature checks come first, and the nonce is recorded only after everything else
+// passed, so garbage can't fill the cache.
+func (v *Verifier) Verify(tok, proofHdr, method, path string, body []byte, now time.Time) (*Claims, error) {
 	c, err := parse(tok, v.ring)
 	if err != nil {
 		return nil, err
+	}
+	owner, machine, sid, gen, err := c.SubParts()
+	if err != nil {
+		return nil, err
+	}
+	// Invariant 27: the signing key must be allowed to speak for this owner and machine.
+	if sc := v.ring[c.kid]; !sc.allows(owner, machine) {
+		return nil, ErrKeyScope
 	}
 	if c.Exp-c.Iat > int64(MaxLifetime/time.Second) {
 		return nil, ErrLifetime
@@ -125,10 +153,6 @@ func (v *Verifier) Verify(tok, proofHdr, method, path string, now time.Time) (*C
 	if !okAud {
 		return nil, ErrAudience
 	}
-	sid, gen := c.SID(), c.Gen()
-	if sid == "" || gen < 0 {
-		return nil, ErrSub
-	}
 
 	// Proof of possession.
 	if proofHdr == "" {
@@ -147,7 +171,7 @@ func (v *Verifier) Verify(tok, proofHdr, method, path string, now time.Time) (*C
 		return nil, ErrBadProof
 	}
 	sig, err := b64.DecodeString(p.Sig)
-	if err != nil || !ed25519.Verify(ed25519.PublicKey(cnf), proofInput(method, path, p.TS, p.Nonce), sig) {
+	if err != nil || !ed25519.Verify(ed25519.PublicKey(cnf), proofInput(method, path, v.aud, tok, body, p.TS, p.Nonce), sig) {
 		return nil, ErrBadProof
 	}
 	if d := now.Unix() - p.TS; d > int64(ProofWindow/time.Second) || -d > int64(ProofWindow/time.Second) {
@@ -156,10 +180,16 @@ func (v *Verifier) Verify(tok, proofHdr, method, path string, now time.Time) (*C
 
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	if r, ok := v.revoked[sid]; ok && gen <= r {
+	if v.stateErr != nil { // a door that can't remember revocations must not serve
+		if err := v.saveLocked(); err != nil {
+			return nil, ErrState
+		}
+	}
+	k := sessKey(owner, machine, sid)
+	if r, ok := v.revoked[k]; ok && gen <= r {
 		return nil, ErrGenRevoked
 	}
-	if m, ok := v.maxGen[sid]; ok && gen < m { // a newer generation exists (T:token-gen-bump)
+	if m, ok := v.maxGen[k]; ok && gen < m { // a newer generation exists (T:token-gen-bump)
 		return nil, ErrGenRevoked
 	}
 	for n, exp := range v.nonces { // prune
@@ -171,24 +201,27 @@ func (v *Verifier) Verify(tok, proofHdr, method, path string, now time.Time) (*C
 	if _, seen := v.nonces[key]; seen {
 		return nil, ErrProofReplay
 	}
-	v.nonces[key] = now.Add(NonceTTL)
-	if cur, ok := v.maxGen[sid]; !ok || gen > cur {
-		v.maxGen[sid] = gen
-		v.saveLocked()
+	if cur, ok := v.maxGen[k]; !ok || gen > cur {
+		v.maxGen[k] = gen
+		if err := v.saveLocked(); err != nil {
+			return nil, ErrState
+		}
 	}
+	v.nonces[key] = now.Add(NonceTTL)
 	return c, nil
 }
 
 // PersistTo makes max_gen and revocations survive a door restart (plan U5:
 // "persist max_gen[sid]"). It loads the file if present and rewrites it
-// atomically on every change. Without it, state is in memory only.
+// atomically (temp file, fsync, rename, fsync of the directory) on every change.
+// Without it, state is in memory only.
 func (v *Verifier) PersistTo(path string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	v.statePath = path
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil
+		return v.saveLocked() // prove now that we can write, not at the first revocation
 	}
 	if err != nil {
 		return err
@@ -211,13 +244,44 @@ type persisted struct {
 	Revoked map[string]int `json:"revoked"`
 }
 
-func (v *Verifier) saveLocked() {
+// saveLocked writes the state durably, or records why it could not.
+func (v *Verifier) saveLocked() error {
 	if v.statePath == "" {
-		return
+		return nil
 	}
-	b, _ := json.Marshal(persisted{v.maxGen, v.revoked})
-	tmp := v.statePath + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		os.Rename(tmp, v.statePath)
+	err := writeDurable(v.statePath, v.maxGen, v.revoked)
+	v.stateErr = err
+	if err != nil {
+		return errors.Join(ErrState, err)
 	}
+	return nil
+}
+
+func writeDurable(path string, maxGen, revoked map[string]int) error {
+	b, _ := json.Marshal(persisted{maxGen, revoked})
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	d, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }

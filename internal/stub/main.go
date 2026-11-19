@@ -18,7 +18,7 @@ import (
 const Usage = `ccsbx stub — the scripted model stub, local mode (C18)
 
 Usage:
-  ccsbx stub --listen 127.0.0.1:PORT [--key-file FILE] [--aud NAME] [--state FILE]
+  ccsbx stub --listen 127.0.0.1:PORT --keyring FILE [--aud NAME] [--state FILE]
   ccsbx stub --print-catalog
 
 A fake Anthropic Messages API for e2e runs. Put it behind the forwarder as the
@@ -31,7 +31,8 @@ Scripts: a user message containing E2E:<name> selects a row of the fixed catalog
 
 Flags: (each also CCSBX_STUB_<NAME>)
   --listen ADDR      loopback host:port                      (required)
-  --key-file FILE    dev key whose public half verifies tokens (default $CCSBX_KEY_FILE)
+  --keyring FILE     public keys that may sign tokens, with owner/machine scope; make it with
+                     'ccsbx token pubkey'. A door never gets a signing key. (default $CCSBX_KEYRING)
   --aud NAME         audience the token must list            (default ccsbx-model)
   --state FILE       persist max_gen/revocations here        (default: memory only)
   --print-catalog    print the scripts as JSON and exit (starts nothing)
@@ -60,7 +61,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("stub", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", envOr("LISTEN", ""), "")
-	keyFile := fs.String("key-file", envOr("KEY_FILE", os.Getenv("CCSBX_KEY_FILE")), "")
+	keyring := fs.String("keyring", envOr("KEYRING", os.Getenv("CCSBX_KEYRING")), "")
 	aud := fs.String("aud", envOr("AUD", "ccsbx-model"), "")
 	state := fs.String("state", envOr("STATE", ""), "")
 	printCat := fs.Bool("print-catalog", false, "")
@@ -78,12 +79,12 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "stub: --listen must be a loopback host:port (local mode only), got", *listen)
 		return 2
 	}
-	k, err := token.LoadKeyFile(*keyFile)
+	ring, err := token.LoadPublicKeyring(*keyring)
 	if err != nil {
 		fmt.Fprintln(stderr, "stub:", err)
 		return 2
 	}
-	v := token.NewVerifier(token.Keyring{k.KID: k.Public}, *aud)
+	v := token.NewVerifier(ring, *aud)
 	if *state != "" {
 		if err := v.PersistTo(*state); err != nil {
 			fmt.Fprintln(stderr, "stub:", err)
@@ -100,10 +101,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// isLoopback accepts IP literals only: a name like "localhost" would be resolved later, by
+// whatever /etc/hosts or NSS says, and "local mode only" must not depend on that.
 func isLoopback(h string) bool {
-	if h == "localhost" {
-		return true
-	}
 	ip := net.ParseIP(strings.Trim(h, "[]"))
 	return ip != nil && ip.IsLoopback()
 }

@@ -177,9 +177,10 @@ no-token-in-fence/allow|no-token-in-fence/block)
   "$BIN" token mint --key-file "$STATE/dev.key" --sub "tomas/hp-ubuntu/$sid/g1" --label nt --billing stub --profile e2e-test \
       --aud ccsbx-model --fwd-secrets > "$STATE/secrets.json" || fail "mint"
   chmod 0600 "$STATE/dev.key"
+  "$BIN" token pubkey --key-file "$STATE/dev.key" --owners tomas --machines hp-ubuntu > "$STATE/keyring" || fail "pubkey"
   docker run --rm -i --name "ccsbx-fwd-$$" --network "$net" --network-alias fwd \
-      -v "$BINABS:/ccsbx:ro" -v "$STATE/dev.key:/dev.key:ro" "$IMG" sh -c \
-      '/ccsbx stub --listen 127.0.0.1:8081 --key-file /dev.key & exec /ccsbx fwd --listen :8080 --door model=http://127.0.0.1:8081' \
+      -v "$BINABS:/ccsbx:ro" -v "$STATE/keyring:/keyring:ro" "$IMG" sh -c \
+      '/ccsbx stub --listen 127.0.0.1:8081 --keyring /keyring & exec /ccsbx fwd --listen :8080 --door model=http://127.0.0.1:8081' \
       < "$STATE/secrets.json" >"$STATE/fwd.log" 2>&1 &
   PIDS+=("$!")
   call="import urllib.request,json

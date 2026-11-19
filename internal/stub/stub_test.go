@@ -31,7 +31,7 @@ func newChain(t *testing.T, profile, billing string) *chain {
 	if err != nil {
 		t.Fatal(err)
 	}
-	v := token.NewVerifier(token.Keyring{key.KID: key.Public}, "ccsbx-model")
+	v := token.NewVerifier(key.Ring([]string{"tomas"}, []string{"hp-ubuntu"}), "ccsbx-model")
 	door := httptest.NewServer(Gate(v, Handler(), t.Logf))
 	t.Cleanup(door.Close)
 	du, _ := url.Parse(door.URL)
@@ -96,7 +96,7 @@ func TestTurnEndsAfterToolResult(t *testing.T) {
 // dev-default session, or an e2e profile on a billed credential, gets 403.
 func TestNonE2EProfileRefused(t *testing.T) {
 	for _, tc := range []struct{ profile, billing string }{
-		{"dev-default", "stub"}, {"e2e-basic", "api"}, {"e2e-basic", "subscription"}, {"", "stub"}, {"xe2e-basic", "stub"},
+		{"dev-default", "stub"}, {"e2e-basic", "api"}, {"e2e-basic", "subscription"}, {"xe2e-basic", "stub"},
 	} {
 		c := newChain(t, tc.profile, tc.billing)
 		code, out := c.post(t, prompt("E2E:outcome", toolsJSON, false))
@@ -145,7 +145,28 @@ func TestLocalModeOnly(t *testing.T) {
 	if Main([]string{"--print-catalog"}, &out, &errb) != 0 || !strings.Contains(out.String(), "outcome") {
 		t.Fatal("catalog")
 	}
-	if Main([]string{"--listen", "127.0.0.1:0", "--key-file", filepath.Join(t.TempDir(), "absent")}, &out, &errb) != 2 {
-		t.Fatal("a missing key file must not be created by a verifier")
+	if Main([]string{"--listen", "127.0.0.1:0", "--keyring", filepath.Join(t.TempDir(), "absent")}, &out, &errb) != 2 {
+		t.Fatal("a missing keyring is refused, never created")
+	}
+}
+
+// NIT C18-N1: the scripted call goes to the ccf server's tool only, never to a same-suffix tool
+// of another MCP server.
+func TestOnlyTheCcfServersToolMatches(t *testing.T) {
+	c := newChain(t, "e2e-basic", "stub")
+	_, out := c.post(t, prompt("E2E:outcome", `[{"name":"mcp__other__ccf_outcome","input_schema":{}}]`, false))
+	if strings.Contains(out, "tool_use") {
+		t.Fatalf("called another server's tool: %s", out)
+	}
+}
+
+// NIT C18-N2: "local mode" is an IP-literal check; a name is never trusted to be loopback.
+func TestLocalhostNameIsNotTrusted(t *testing.T) {
+	var out, errb bytes.Buffer
+	if Main([]string{"--listen", "localhost:9999", "--keyring", "x"}, &out, &errb) != 2 {
+		t.Fatal("a hostname was accepted as loopback")
+	}
+	if !isLoopback("127.0.0.1") || !isLoopback("[::1]") || isLoopback("10.0.0.1") {
+		t.Fatal("IP literals")
 	}
 }

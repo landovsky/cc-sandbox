@@ -3,6 +3,7 @@ package token
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -20,10 +21,10 @@ func TestMiddlewareEndToEnd(t *testing.T) {
 	defer srv.Close()
 
 	do := func(tok string, g *GenKey) int {
-		req, _ := http.NewRequest("POST", srv.URL+"/v1/messages?x=1", nil)
+		req, _ := http.NewRequest("POST", srv.URL+"/v1/messages?x=1", strings.NewReader("{}"))
 		req.Header.Set("Authorization", "Bearer "+tok)
 		if g != nil {
-			p, _ := SignProof(g, "POST", "/v1/messages?x=1", time.Now())
+			p, _ := SignProof(g, "POST", "/v1/messages?x=1", "ccsbx-model", tok, []byte("{}"), time.Now())
 			req.Header.Set(ProofHeader, p)
 		}
 		resp, err := http.DefaultClient.Do(req)

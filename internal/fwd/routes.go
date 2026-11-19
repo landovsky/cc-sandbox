@@ -54,8 +54,8 @@ func (v Verdict) String() string {
 	return [...]string{"allow", "unclean path", "decision endpoint", "no matching rule"}[v]
 }
 
-// CleanPath returns the path a door would see, or false if the path could be read
-// two ways. fwd forwards exactly the checked bytes, so there is no second parse
+// CleanPath returns the escaped path a door would see, or false if the path could be read
+// two ways. fwd forwards exactly these bytes (as RawPath), so there is no second parse
 // that could disagree with this one.
 func CleanPath(u *url.URL) (string, bool) {
 	raw := u.EscapedPath()
@@ -82,6 +82,20 @@ func CleanPath(u *url.URL) (string, bool) {
 		return "", false
 	}
 	return raw, true
+}
+
+// QueryHasDecisionWord reports whether a query string of a non-read request carries a decision
+// word as a whole token in a key or value (?action=approve). Decisions live on the owner
+// listener, so this is defence in depth behind a broad --routes file.
+func QueryHasDecisionWord(rawQuery string) bool {
+	for _, tok := range strings.FieldsFunc(strings.ToLower(rawQuery), func(r rune) bool {
+		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+	}) {
+		if denySegments[tok] {
+			return true
+		}
+	}
+	return false
 }
 
 // Check decides whether method+p (a clean path, without query) may go to door.

@@ -2,6 +2,7 @@ package fwd
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -37,23 +38,28 @@ func newRig(t *testing.T) *rig {
 	}
 	gen, _ := token.NewGenKey()
 	tok, err := token.Mint(key, token.Claims{Sub: "tomas/hp-ubuntu/sFWD/g1", Billing: "stub", Profile: "dev-default",
-		Aud: []string{"ccsbx-model"}, Cnf: token.CnfOf(gen.Public)}, time.Now())
+		Aud: []string{"ccsbx-model", "ccsbx-egress"}, Cnf: token.CnfOf(gen.Public)}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
 	r := &rig{tok: tok, gen: gen, seen: make(chan *http.Request, 64), logs: &bytes.Buffer{}}
-	v := token.NewVerifier(token.Keyring{key.KID: key.Public}, "ccsbx-model")
-	r.door = httptest.NewServer(v.Middleware(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+	ring := key.Ring([]string{"tomas"}, []string{"hp-ubuntu"})
+	handler := func(w http.ResponseWriter, q *http.Request) {
 		r.hits.Add(1)
 		r.seen <- q
 		io.Copy(io.Discard, q.Body)
 		w.Header().Set("Location", "http://169.254.169.254/")
 		w.WriteHeader(200)
 		w.Write([]byte("door ok"))
-	}), nil))
+	}
+	// Two doors, each with its own verifier and audience: a proof for one is useless at the other.
+	r.door = httptest.NewServer(token.NewVerifier(ring, "ccsbx-model").Middleware(http.HandlerFunc(handler), nil))
 	t.Cleanup(r.door.Close)
+	egress := httptest.NewServer(token.NewVerifier(ring, "ccsbx-egress").Middleware(http.HandlerFunc(handler), nil))
+	t.Cleanup(egress.Close)
 	du, _ := url.Parse(r.door.URL)
-	f, err := New(Config{Token: tok, Key: gen, Doors: map[string]*url.URL{"model": du, "egress": du},
+	eu, _ := url.Parse(egress.URL)
+	f, err := New(Config{Token: tok, Key: gen, Doors: map[string]*url.URL{"model": du, "egress": eu},
 		Logf: func(format string, a ...any) { r.logs.WriteString(strings.TrimSpace(format) + "\n") }})
 	if err != nil {
 		t.Fatal(err)
@@ -206,7 +212,7 @@ func TestCannotReachNonDoor(t *testing.T) {
 	if other.Load() != 0 {
 		t.Fatal("reached a non-door")
 	}
-	if r.f.cfg.dialOnly[evilAddr] {
+	if len(r.f.cfg.pinned[evilAddr]) > 0 {
 		t.Fatal("a non-door is in the dial set")
 	}
 }
@@ -265,5 +271,100 @@ func TestMainHelpStartsNothing(t *testing.T) {
 	}
 	if Main([]string{"--listen", "127.0.0.1:0"}, strings.NewReader(""), &out, &errb) != 2 {
 		t.Fatal("missing doors must be a usage error")
+	}
+}
+
+// context "DNS for a door name changes after start (P2-S1)": the token and a fresh proof must
+// not follow it. Door names are resolved once and the addresses pinned; the dialer never asks DNS
+// again, and it refuses any host:port that is not a configured door.
+func TestDoorAddressesArePinned(t *testing.T) {
+	r := newRig(t)
+	du, _ := url.Parse(r.door.URL)
+	_, port, _ := net.SplitHostPort(du.Host)
+	var lookups atomic.Int64
+	f, err := New(Config{Token: r.tok, Key: r.gen,
+		Doors: map[string]*url.URL{"model": {Scheme: "http", Host: "door.invalid:" + port}},
+		Resolve: func(host string) ([]net.IP, error) {
+			if lookups.Add(1) > 1 {
+				return []net.IP{net.ParseIP("203.0.113.9")}, nil // a changed DNS answer
+			}
+			return []net.IP{net.ParseIP("127.0.0.1")}, nil
+		}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := httptest.NewServer(f)
+	defer s.Close()
+	for i := 0; i < 3; i++ {
+		resp, err := http.Post(s.URL+"/model/v1/messages", "application/json", strings.NewReader("{}"))
+		if err != nil || resp.StatusCode != 200 {
+			t.Fatalf("call %d: %v %v", i, resp, err)
+		}
+	}
+	if lookups.Load() != 1 {
+		t.Fatalf("the door name was resolved %d times; once at start only", lookups.Load())
+	}
+	if _, err := New(Config{Token: r.tok, Key: r.gen, Doors: map[string]*url.URL{"model": {Scheme: "http", Host: "gone.invalid:80"}},
+		Resolve: func(string) ([]net.IP, error) { return nil, errors.New("nxdomain") }}); err == nil {
+		t.Fatal("a door that does not resolve at start was accepted")
+	}
+}
+
+// NIT P2-N1: the door receives the bytes CleanPath checked, not a re-escaped variant.
+func TestEscapedPathForwardedAsChecked(t *testing.T) {
+	r := newRig(t)
+	resp := r.fence(t, "GET", "/egress/github/repos/o/r/contents/a%20b", nil)
+	if resp.StatusCode != 200 {
+		t.Fatalf("%d", resp.StatusCode)
+	}
+	if got := (<-r.seen).URL.EscapedPath(); got != "/github/repos/o/r/contents/a%20b" {
+		t.Fatalf("door saw %s", got)
+	}
+}
+
+// NIT P2-N2: a method the door's own rules might name exactly must reach it in canonical form only.
+func TestMethodMustBeUpperCase(t *testing.T) {
+	r := newRig(t)
+	c, _ := net.Dial("tcp", strings.TrimPrefix(r.fwd.URL, "http://"))
+	defer c.Close()
+	c.Write([]byte("post /model/v1/messages HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"))
+	b, _ := io.ReadAll(c)
+	if !strings.Contains(string(b), " 403 ") && !strings.Contains(string(b), " 400 ") {
+		t.Fatalf("lower-case method relayed: %s", b)
+	}
+	if r.hits.Load() != 0 {
+		t.Fatal("the door was reached")
+	}
+}
+
+// NIT P2-N3: behind a broad rules file, ?action=approve on a write is still a decision.
+func TestDecisionWordInQueryOfAWrite(t *testing.T) {
+	r := newRig(t)
+	du, _ := url.Parse(r.door.URL)
+	f, err := New(Config{Token: r.tok, Key: r.gen, Doors: map[string]*url.URL{"model": du},
+		Rules: []Rule{{Door: "model", Methods: []string{"GET", "POST"}, Path: "/v1/**"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := httptest.NewServer(f)
+	defer s.Close()
+	resp, _ := http.Post(s.URL+"/model/v1/x?action=approve", "application/json", strings.NewReader("{}"))
+	if resp.StatusCode != 403 {
+		t.Fatalf("write with a decision query: %d", resp.StatusCode)
+	}
+	resp, _ = http.Post(s.URL+"/model/v1/x?action=list", "application/json", strings.NewReader("{}"))
+	if resp.StatusCode != 200 {
+		t.Fatalf("allow twin: %d", resp.StatusCode)
+	}
+}
+
+// context "the proof is bound to the body (U5-S1)": a large body arrives intact and verified.
+func TestBodyIsHashedIntoTheProof(t *testing.T) {
+	r := newRig(t)
+	big := strings.Repeat("x", 3<<20)
+	req, _ := http.NewRequest("POST", r.fwd.URL+"/model/v1/messages", strings.NewReader(big))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("%v %v", resp, err)
 	}
 }

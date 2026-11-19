@@ -38,6 +38,8 @@ the token expires or on SIGTERM. Closing stdin does not stop it.
 Flags: (each also settable as CCSBX_FWD_<NAME>, e.g. CCSBX_FWD_LISTEN)
   --listen ADDR     host:port or unix:/path to serve the fence on     (required)
   --door NAME=URL   a door this session may reach; repeatable        (required)
+                    its name is resolved once at start and the addresses are pinned; the
+                    proof is bound to audience "ccsbx-<NAME>"
                     e.g. --door model=http://ccsp-model.cc-sandbox-doors:8080
   --routes FILE     JSON allowlist replacing the built-in one: [{"door","methods","path"}]
                     patterns: "*" = one segment, trailing "**" = the rest
@@ -48,8 +50,9 @@ Flags: (each also settable as CCSBX_FWD_<NAME>, e.g. CCSBX_FWD_LISTEN)
 
 Recipes:
   check what a fence could reach:   ccsbx fwd --print-routes
-  local test with a stub door:      printf '{"token":"…","key":"…"}' | ccsbx fwd \
-                                      --listen 127.0.0.1:7481 --door model=http://127.0.0.1:8080
+  local test with a stub door:      ccsbx token mint … --fwd-secrets | ccsbx fwd \
+                                      --listen unix:/run/ccsbx/g1/fwd.sock --door model=http://127.0.0.1:8080
+  (use a unix socket, mode 0600, not a loopback port: any local process could use a port)
 `
 
 type secrets struct {

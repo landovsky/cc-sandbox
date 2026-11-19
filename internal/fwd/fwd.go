@@ -20,12 +20,14 @@
 package fwd
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -40,15 +42,19 @@ import (
 
 // Config is everything a Forwarder needs.
 type Config struct {
-	Token    string
-	Key      *token.GenKey
-	Doors    map[string]*url.URL // name → base URL (scheme://host:port[/base])
-	Rules    []Rule
-	CAFile   string // extra root CA for https doors ("" = system roots)
-	MaxBody  int64  // request body cap in bytes (0 = 32 MiB)
-	Logf     func(format string, a ...any)
-	Now      func() time.Time
-	dialOnly map[string]bool
+	Token   string
+	Key     *token.GenKey
+	Doors   map[string]*url.URL // name → base URL (scheme://host:port[/base])
+	Rules   []Rule
+	CAFile  string // extra root CA for https doors ("" = system roots)
+	MaxBody int64  // request body cap in bytes (0 = 32 MiB)
+	Logf    func(format string, a ...any)
+	Now     func() time.Time
+	// Resolve looks a door name up, once, at New. The addresses are pinned: the dialer connects to
+	// those IPs only and never asks DNS again, so a changed answer can't send the token elsewhere.
+	// Default: the system resolver.
+	Resolve func(host string) ([]net.IP, error)
+	pinned  map[string][]string // door host:port → pinned ip:port list
 }
 
 // Forwarder is an http.Handler.
@@ -85,20 +91,48 @@ func New(cfg Config) (*Forwarder, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	cfg.dialOnly = map[string]bool{}
+	if cfg.Resolve == nil {
+		cfg.Resolve = net.LookupIP
+	}
+	cfg.pinned = map[string][]string{}
 	for name, u := range cfg.Doors {
 		if u.Scheme != "http" && u.Scheme != "https" {
 			return nil, fmt.Errorf("fwd: door %s: scheme must be http or https", name)
 		}
-		cfg.dialOnly[hostPort(u)] = true
+		hp := hostPort(u)
+		if _, done := cfg.pinned[hp]; done {
+			continue
+		}
+		var ips []net.IP
+		if ip := net.ParseIP(u.Hostname()); ip != nil {
+			ips = []net.IP{ip}
+		} else {
+			var err error
+			if ips, err = cfg.Resolve(u.Hostname()); err != nil || len(ips) == 0 {
+				return nil, fmt.Errorf("fwd: door %s: cannot resolve %s: %v", name, u.Hostname(), err)
+			}
+		}
+		_, port, _ := net.SplitHostPort(hp)
+		for _, ip := range ips {
+			cfg.pinned[hp] = append(cfg.pinned[hp], net.JoinHostPort(ip.String(), port))
+		}
 	}
 	tr := &http.Transport{
 		Proxy: nil, // HTTP_PROXY in the environment must not redirect door calls
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			if !cfg.dialOnly[addr] { // T:fwd-cannot-reach-non-door
+			pins, ok := cfg.pinned[addr]
+			if !ok { // T:fwd-cannot-reach-non-door
 				return nil, fmt.Errorf("fwd: %s is not a configured door", addr)
 			}
-			return (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, addr)
+			var last error
+			for _, ip := range pins { // the pinned addresses only; DNS is not consulted again
+				c, err := (&net.Dialer{Timeout: 10 * time.Second}).DialContext(ctx, network, ip)
+				if err == nil {
+					return c, nil
+				}
+				last = err
+			}
+			return nil, last
 		},
 		TLSClientConfig:       &tls.Config{MinVersion: tls.VersionTLS12},
 		ResponseHeaderTimeout: 10 * time.Minute, // model calls are slow
@@ -148,6 +182,11 @@ func hostPort(u *url.URL) string {
 
 type ctxKey struct{}
 
+type route struct {
+	door, rest string
+	body       []byte
+}
+
 // splitDoor turns "/model/v1/messages" into ("model", "/v1/messages").
 func splitDoor(p string) (string, string) {
 	rest := strings.TrimPrefix(p, "/")
@@ -172,6 +211,10 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deny(http.StatusForbidden, "not a door route")
 		return
 	}
+	if r.Method != strings.ToUpper(r.Method) { // "put" must not slip past a door rule written for PUT
+		deny(http.StatusForbidden, "method must be upper case")
+		return
+	}
 	clean, ok := CleanPath(r.URL)
 	if !ok {
 		deny(http.StatusForbidden, "unclean path")
@@ -190,9 +233,23 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deny(http.StatusServiceUnavailable, "generation ended")
 		return
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, f.cfg.MaxBody)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead && QueryHasDecisionWord(r.URL.RawQuery) {
+		deny(http.StatusForbidden, "refused: "+DenyDecision.String())
+		return
+	}
+	// The whole body is read here: the proof is bound to its hash, so the door can tell a body
+	// the session sent from one an interceptor substituted.
+	var body []byte
+	if r.Body != nil {
+		var err error
+		if body, err = io.ReadAll(http.MaxBytesReader(w, r.Body, f.cfg.MaxBody)); err != nil {
+			deny(http.StatusRequestEntityTooLarge, "body too large")
+			return
+		}
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
 	f.counts.ok.Add(1)
-	f.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, [2]string{door, rest})))
+	f.proxy.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), ctxKey{}, route{door, rest, body})))
 }
 
 func (f *Forwarder) expiry() int64 {
@@ -217,12 +274,14 @@ func (f *Forwarder) expiry() int64 {
 func (f *Forwarder) Expiry() time.Time { return time.Unix(f.expiry(), 0) }
 
 func (f *Forwarder) rewrite(pr *httputil.ProxyRequest) {
-	dr := pr.In.Context().Value(ctxKey{}).([2]string)
-	base := f.cfg.Doors[dr[0]]
+	dr := pr.In.Context().Value(ctxKey{}).(route)
+	base := f.cfg.Doors[dr.door]
 	out := pr.Out
 	out.URL.Scheme, out.URL.Host = base.Scheme, base.Host
-	out.URL.Path = strings.TrimSuffix(base.Path, "/") + dr[1]
-	out.URL.RawPath = ""
+	// CleanPath checked rest in its escaped form; the door gets exactly those bytes.
+	raw := strings.TrimSuffix(base.EscapedPath(), "/") + dr.rest
+	out.URL.Path, _ = url.PathUnescape(raw)
+	out.URL.RawPath = raw
 	out.Host = base.Host
 
 	// Drop everything the fence could use to pose as someone: its own credentials,
@@ -237,7 +296,7 @@ func (f *Forwarder) rewrite(pr *httputil.ProxyRequest) {
 			out.Header.Del(k)
 		}
 	}
-	proof, err := token.SignProof(f.cfg.Key, out.Method, out.URL.RequestURI(), f.cfg.Now())
+	proof, err := token.SignProof(f.cfg.Key, out.Method, out.URL.RequestURI(), "ccsbx-"+dr.door, f.cfg.Token, dr.body, f.cfg.Now())
 	if err != nil {
 		out.Header.Set(token.ProofHeader, "")
 	}

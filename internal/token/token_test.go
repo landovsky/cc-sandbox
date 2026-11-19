@@ -24,7 +24,7 @@ func newRig(t *testing.T) *rig {
 		t.Fatal(err)
 	}
 	g, _ := NewGenKey()
-	r := &rig{key: k, gen: g, v: NewVerifier(Keyring{k.KID: k.Public}, "ccsbx-model")}
+	r := &rig{key: k, gen: g, v: NewVerifier(k.Ring([]string{"tomas"}, []string{"hp-ubuntu"}), "ccsbx-model")}
 	r.base = Claims{Sub: "tomas/hp-ubuntu/s01jd7k2m9/g3", Label: "cc-sandbox:326q", Billing: "api",
 		Profile: "dev-default", Aud: []string{"ccsbx-model"}, Cnf: CnfOf(g.Public)}
 	r.tok = r.mint(t, r.base)
@@ -42,8 +42,8 @@ func (r *rig) mint(t *testing.T, c Claims) string {
 
 func (r *rig) call(t *testing.T, tok string, g *GenKey, now time.Time) (*Claims, error) {
 	t.Helper()
-	p, _ := SignProof(g, "POST", "/v1/messages", now)
-	return r.v.Verify(tok, p, "POST", "/v1/messages", now)
+	p, _ := SignProof(g, "POST", "/v1/messages", "ccsbx-model", tok, nil, now)
+	return r.v.Verify(tok, p, "POST", "/v1/messages", nil, now)
 }
 
 func TestTokenAccepted(t *testing.T) {
@@ -62,30 +62,30 @@ func TestTokenCopied(t *testing.T) {
 	if _, err := r.call(t, r.tok, thief, t0); err != ErrBadProof {
 		t.Fatalf("foreign key: %v", err)
 	}
-	if _, err := r.v.Verify(r.tok, "", "POST", "/v1/messages", t0); err != ErrNoProof {
+	if _, err := r.v.Verify(r.tok, "", "POST", "/v1/messages", nil, t0); err != ErrNoProof {
 		t.Fatalf("no proof: %v", err)
 	}
 	// A proof made for one request can't be moved to another path or method.
-	p, _ := SignProof(r.gen, "POST", "/v1/messages", t0)
-	if _, err := r.v.Verify(r.tok, p, "POST", "/v1/other", t0); err != ErrBadProof {
+	p, _ := SignProof(r.gen, "POST", "/v1/messages", "ccsbx-model", r.tok, nil, t0)
+	if _, err := r.v.Verify(r.tok, p, "POST", "/v1/other", nil, t0); err != ErrBadProof {
 		t.Fatalf("moved path: %v", err)
 	}
-	if _, err := r.v.Verify(r.tok, p, "GET", "/v1/messages", t0); err != ErrBadProof {
+	if _, err := r.v.Verify(r.tok, p, "GET", "/v1/messages", nil, t0); err != ErrBadProof {
 		t.Fatalf("moved method: %v", err)
 	}
 }
 
 func TestProofReplayAndStale(t *testing.T) {
 	r := newRig(t)
-	p, _ := SignProof(r.gen, "POST", "/x", t0)
-	if _, err := r.v.Verify(r.tok, p, "POST", "/x", t0); err != nil {
+	p, _ := SignProof(r.gen, "POST", "/x", "ccsbx-model", r.tok, nil, t0)
+	if _, err := r.v.Verify(r.tok, p, "POST", "/x", nil, t0); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.v.Verify(r.tok, p, "POST", "/x", t0.Add(time.Second)); err != ErrProofReplay {
+	if _, err := r.v.Verify(r.tok, p, "POST", "/x", nil, t0.Add(time.Second)); err != ErrProofReplay {
 		t.Fatalf("replay: %v", err)
 	}
-	old, _ := SignProof(r.gen, "POST", "/x", t0)
-	if _, err := r.v.Verify(r.tok, old, "POST", "/x", t0.Add(3*time.Minute)); err != ErrProofStale {
+	old, _ := SignProof(r.gen, "POST", "/x", "ccsbx-model", r.tok, nil, t0)
+	if _, err := r.v.Verify(r.tok, old, "POST", "/x", nil, t0.Add(3*time.Minute)); err != ErrProofStale {
 		t.Fatalf("stale: %v", err)
 	}
 }
@@ -151,7 +151,7 @@ func TestTokenAfterExit(t *testing.T) {
 	if _, err := r.call(t, r.tok, r.gen, t0); err != nil {
 		t.Fatal(err)
 	}
-	r.v.Revoke("s01jd7k2m9", 3)
+	r.v.Revoke("tomas", "hp-ubuntu", "s01jd7k2m9", 3)
 	if _, err := r.call(t, r.tok, r.gen, t0.Add(time.Second)); err != ErrGenRevoked {
 		t.Fatalf("got %v", err)
 	}
@@ -188,7 +188,7 @@ func TestMaxGenSurvivesRestart(t *testing.T) {
 	c4.Sub = "tomas/hp-ubuntu/s01jd7k2m9/g4"
 	c4.Cnf = CnfOf(g4.Public)
 	r.call(t, r.mint(t, c4), g4, t0)
-	r.v = NewVerifier(Keyring{r.key.KID: r.key.Public}, "ccsbx-model") // door restarts
+	r.v = NewVerifier(r.key.Ring([]string{"tomas"}, []string{"hp-ubuntu"}), "ccsbx-model") // door restarts
 	if err := r.v.PersistTo(state); err != nil {
 		t.Fatal(err)
 	}
@@ -202,9 +202,9 @@ func TestExpiryAudienceLifetime(t *testing.T) {
 	if _, err := r.call(t, r.tok, r.gen, t0.Add(13*time.Hour)); err != ErrExpired {
 		t.Fatalf("expired: %v", err)
 	}
-	wrong := NewVerifier(Keyring{r.key.KID: r.key.Public}, "ccsbx-egress")
-	p, _ := SignProof(r.gen, "POST", "/x", t0)
-	if _, err := wrong.Verify(r.tok, p, "POST", "/x", t0); err != ErrAudience {
+	wrong := NewVerifier(r.key.Ring([]string{"tomas"}, []string{"hp-ubuntu"}), "ccsbx-egress")
+	p, _ := SignProof(r.gen, "POST", "/x", "ccsbx-egress", r.tok, nil, t0)
+	if _, err := wrong.Verify(r.tok, p, "POST", "/x", nil, t0); err != ErrAudience {
 		t.Fatalf("aud: %v", err)
 	}
 	long := r.base

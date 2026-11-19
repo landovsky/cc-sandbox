@@ -73,6 +73,7 @@ func (s *Server) build(local bool) http.Handler {
 func (s *Server) mux() *http.ServeMux {
 	m := http.NewServeMux()
 	m.HandleFunc("/v1/resolve", s.resolve)
+	m.HandleFunc("/v1/sessions", s.sessions)
 	m.HandleFunc("/v1/sessions/", s.deliver)
 	m.HandleFunc("/v1/info", s.info)
 	m.HandleFunc("/v1/events", s.events)
@@ -82,6 +83,7 @@ func (s *Server) mux() *http.ServeMux {
 	m.HandleFunc("/v1/cockpit/requests", s.requests)
 	m.HandleFunc("/v1/cockpit/requests/", s.result)
 	m.HandleFunc("/v1/cockpit/status", s.status)
+	m.HandleFunc("/v1/cockpit/pending", s.pending)
 	return m
 }
 
@@ -508,4 +510,44 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request) {
 		code = 502
 	}
 	writeJSON(w, code, res)
+}
+
+// pending: GET /v1/cockpit/pending?realm=&node=&type= — what is queued for a node (read-only, no
+// lease: a reseed must not seed from a checkpoint older than a pending one).
+func (s *Server) pending(w http.ResponseWriter, r *http.Request) {
+	realm, ok := s.cockpit(w, r)
+	if !ok {
+		return
+	}
+	items, err := s.Q.Pending(realm, r.URL.Query().Get("node"), r.URL.Query().Get("type"))
+	if err != nil {
+		s.qfail(w, err)
+		return
+	}
+	writeJSON(w, 200, items)
+}
+
+// sessions: GET /v1/sessions — the sessions the daemon runs now, as a JSON array.
+func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
+	if s.Dir == nil {
+		writeJSON(w, 404, map[string]any{"error": "no_directory"})
+		return
+	}
+	all, err := s.Dir.Sessions()
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": "internal"})
+		return
+	}
+	out := []map[string]any{}
+	for _, x := range all {
+		if !x.Live {
+			continue
+		}
+		idle := false
+		if s.Msg != nil {
+			idle = s.Msg.IdleNow(x.Sid)
+		}
+		out = append(out, map[string]any{"sid": x.Sid, "label": x.Label, "gen": x.Gen, "realm": x.Realm, "state": "running", "idle": idle})
+	}
+	writeJSON(w, 200, out)
 }

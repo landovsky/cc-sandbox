@@ -1,12 +1,14 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
 
 	"github.com/landovsky/cc-sandbox/internal/hostd"
+	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
@@ -46,8 +48,12 @@ func msgHandler(rt *msg.Router) hostd.Handler {
 	}
 }
 
+type appender interface {
+	Append(journal.Event) (journal.Record, error)
+}
+
 // verbHandler is M4: ccf.* requests are queued for the realm's cockpit and answered at once.
-func verbHandler(q *verbq.Queue, d *start.Daemon) hostd.Handler {
+func verbHandler(q *verbq.Queue, d *start.Daemon, j appender) hostd.Handler {
 	return func(r hostd.Request) hostd.Reply {
 		realm := "production"
 		if rec, err := d.Load(r.Sid); err == nil && rec.Spec.Realm != "" {
@@ -59,6 +65,21 @@ func verbHandler(q *verbq.Queue, d *start.Daemon) hostd.Handler {
 			return hostd.Reply{Status: "refused", Result: map[string]string{"code": "queue_full"}}
 		case err != nil:
 			return hostd.Reply{Status: "error", Result: map[string]string{"code": "io_error"}}
+		}
+		// The cockpit's follower reads the journal: the request goes there too, under the id the
+		// daemon gave it, so the result it reports names the same id.
+		var env struct {
+			Data json.RawMessage `json:"data"`
+		}
+		_ = json.Unmarshal(r.Body, &env)
+		data := json.RawMessage(`{}`)
+		if len(env.Data) > 0 && env.Data[0] == '{' {
+			data = env.Data
+		}
+		if j != nil {
+			if _, err := j.Append(journal.Event{ID: r.ID, Sid: r.Sid, Gen: r.Gen, Node: r.Label, Realm: realm, Src: "fence", Type: r.Type, Data: data}); err != nil {
+				return hostd.Reply{Status: "error", Result: map[string]string{"code": "io_error"}}
+			}
 		}
 		return hostd.Reply{Status: "queued", Result: map[string]any{"seq": it.Seq}, Seq: int(it.Seq)}
 	}

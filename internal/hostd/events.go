@@ -61,7 +61,7 @@ func (h *Hostd) lifecycle(gdir string, rec *start.Record, box *outbox, typ strin
 		return
 	}
 	done := &box.state.Started
-	if typ == "session.end" {
+	if typ == "session.ended" {
 		done = &box.state.Ended
 	}
 	if *done {
@@ -69,7 +69,17 @@ func (h *Hostd) lifecycle(gdir string, rec *start.Record, box *outbox, typ strin
 	}
 	var gen int
 	fmt.Sscanf(filepath.Base(gdir), "g%d", &gen)
-	data, _ := json.Marshal(map[string]string{"full_id": rec.Reply.ID})
+	// session.started carries what cc-tree's verb writer needs to learn the sid -> node map
+	// (sid, node, role, gen, workdir, backend); the daemon fills all of it, the fence none.
+	var cl struct {
+		Role string `json:"role"`
+	}
+	_ = json.Unmarshal(rec.Spec.Client, &cl)
+	if cl.Role == "" {
+		cl.Role = "worker"
+	}
+	data, _ := json.Marshal(map[string]any{"full_id": rec.Reply.ID, "node": rec.Spec.Label, "role": cl.Role, "gen": gen,
+		"workdir": rec.Spec.Workdir.Path, "backend": rec.Reply.Backend, "machine": rec.Spec.Machine})
 	if _, err := h.Cfg.Journal.Append(journal.Event{Sid: rec.Sid, Gen: gen, Node: rec.Spec.Label, Realm: rec.Spec.Realm, Src: "host", Type: typ, Data: data}); err != nil {
 		h.Cfg.Logf("hostd: journal append failed: %v", err)
 		return

@@ -96,7 +96,6 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	q.TTL = time.Duration(num("lease-ttl")) * time.Second
 	q.MaxPending = num("queue-max")
 	q.Reply = replyWriter(get("state"), d)
-	m.on("ccf.", verbHandler(q, d))
 	lg := log.New(stderr, "ccsbx-hostd: ", log.LstdFlags)
 	jdir := get("journal")
 	if jdir == "" {
@@ -108,6 +107,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		return cli.ExitFail
 	}
 	defer j.Close()
+	m.on("ccf.", verbHandler(q, d, j))
 	rt.Idle = j // a message is typed only into a pane whose last hook event is Stop
 	h := hostd.New(hostd.Config{Journal: j, OnTick: func() { rt.Pump(pumpReply(get("state"))) },
 		StateDir: get("state"), FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),

@@ -57,6 +57,9 @@ type Event struct {
 	Sid, Node, Realm, Src, Type string
 	Gen                         int
 	Data                        json.RawMessage
+	// ID, when set (a valid ULID), is used as the record's id instead of a fresh one: a fence
+	// request keeps the id the daemon gave it, so the cockpit's result names the same id.
+	ID string
 }
 
 var (
@@ -243,7 +246,11 @@ func (s *Store) Append(e Event) (Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	t := s.now().UTC()
-	rec := Record{V: 1, Epoch: s.epoch, Seq: s.seq + 1, ID: ulid.At(t), TS: t, Machine: s.Machine,
+	id := e.ID
+	if !ulid.Valid(id) {
+		id = ulid.At(t)
+	}
+	rec := Record{V: 1, Epoch: s.epoch, Seq: s.seq + 1, ID: id, TS: t, Machine: s.Machine,
 		Sid: e.Sid, Gen: e.Gen, Node: e.Node, Realm: e.Realm, Src: e.Src, Type: e.Type, Data: e.Data}
 	b, err := json.Marshal(rec)
 	if err != nil {
@@ -422,10 +429,12 @@ func (s *Store) Cursor(name string) (Cursor, bool, error) {
 	return c, true, json.Unmarshal(b, &c)
 }
 
-// Advance moves the named cursor to seq, but only together with the tree commit SHA the
-// application produced: without a SHA, or with the previous SHA while seq moves, it refuses, so
-// a cursor can never run ahead of what is committed in the tree repo. It never moves back, and
-// never past the head of this journal or into another epoch.
+// Advance moves the named cursor to seq, but only together with the SHA of the tree commit
+// that applying the events produced (or, when those events changed nothing, the tree's HEAD
+// then): without a valid SHA it refuses, so a cursor never runs ahead of what is committed in
+// the tree repo, and a taking-over cockpit can check the SHA is an ancestor of its HEAD. Read
+// cursors (tab-<machine>) need none. It never moves back, never past the head of this journal,
+// never into another epoch.
 func (s *Store) Advance(name string, seq int64, epoch, treeSHA string) (Cursor, error) {
 	if !nameRe.MatchString(name) {
 		return Cursor{}, ErrUnknownRealm
@@ -433,7 +442,9 @@ func (s *Store) Advance(name string, seq int64, epoch, treeSHA string) (Cursor, 
 	if epoch != s.epoch {
 		return Cursor{}, ErrEpoch
 	}
-	if !shaRe.MatchString(treeSHA) {
+	// A read cursor (tab-<machine>: tab state only, no tree writes) has no tree commit to show.
+	readOnly := strings.HasPrefix(name, "tab-")
+	if !readOnly && !shaRe.MatchString(treeSHA) {
 		return Cursor{}, ErrCursorNoSHA
 	}
 	if seq < 0 || seq > s.Head() {
@@ -448,9 +459,6 @@ func (s *Store) Advance(name string, seq int64, epoch, treeSHA string) (Cursor, 
 	if had {
 		if seq < prev.Seq {
 			return Cursor{}, ErrCursorBack
-		}
-		if seq > prev.Seq && treeSHA == prev.TreeSHA {
-			return Cursor{}, ErrCursorNoSHA
 		}
 	}
 	c := Cursor{Name: name, Seq: seq, Epoch: epoch, TreeSHA: treeSHA, Updated: s.now().UTC()}

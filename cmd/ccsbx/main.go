@@ -32,6 +32,11 @@ func app() *cli.App {
 			runCmd(),
 			startCmd(),
 			deliverCmd(),
+			lsCmd(),
+			eventsCmd(),
+			cursorCmd(),
+			pendingCmd(),
+			cockpitCmd(),
 			selftestCmd(),
 			settingsCmd(),
 			{

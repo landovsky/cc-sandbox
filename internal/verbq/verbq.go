@@ -68,6 +68,7 @@ type Result struct {
 	Status string          `json:"status"` // ok | refused | error | stale | transient
 	Code   string          `json:"code,omitempty"`
 	Result json.RawMessage `json:"result,omitempty"`
+	Commit string          `json:"commit,omitempty"` // the tree commit that applying it produced
 }
 
 // ReplyFunc writes the final result into the session's inbox (in/replies/<rid>.json). It
@@ -361,6 +362,26 @@ func (q *Queue) Report(realm, token, id string, res Result) (written bool, err e
 		written = q.Reply(done, res)
 	}
 	return written, nil
+}
+
+// Pending lists a realm's pending requests, optionally for one node and one type, oldest
+// first. It is read-only and needs no lease: a cockpit that is not the holder (a reseed on
+// another machine) still has to know what is waiting for a node.
+func (q *Queue) Pending(realm, node, typ string) ([]Item, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	r, err := q.realm(realm)
+	if err != nil {
+		return nil, err
+	}
+	out := []Item{}
+	for _, it := range r.pending {
+		if (node == "" || it.Node == node) && (typ == "" || it.Type == typ) {
+			out = append(out, *it)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out, nil
 }
 
 // Status summarises a realm for the view.

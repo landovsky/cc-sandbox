@@ -205,7 +205,7 @@ func (h *Hostd) Scan() Stats {
 		// (a SIGKILLed `ccsbx run` leaves none). One pass drains it, then it is forgotten.
 		stale := genN != rec.Gen || rec.Ended != nil
 		h.loadState(gdir, box)
-		h.lifecycle(gdir, rec, box, "session.start")
+		h.lifecycle(gdir, rec, box, "session.started")
 		h.scanOne(gdir, sid, gen, rec, box, stale, &st)
 		if !stale { // a dead generation's hook events are not the live node's state
 			h.ingestEvents(gdir, rec, gen, box, &st)
@@ -214,7 +214,7 @@ func (h *Hostd) Scan() Stats {
 			if !stale {
 				h.ingestEvents(gdir, rec, gen, box, &st) // the final drain
 			}
-			h.lifecycle(gdir, rec, box, "session.end")
+			h.lifecycle(gdir, rec, box, "session.ended")
 			h.done[gdir] = true
 			delete(h.boxes, gdir)
 		}

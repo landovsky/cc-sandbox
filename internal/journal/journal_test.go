@@ -95,15 +95,15 @@ func TestJournalDurableBlock(t *testing.T) {
 // replay from its cursor returns exactly what it missed, in order, once.
 func TestReplayAfterCursorReturnsExactlyTheMissedEvents(t *testing.T) {
 	s := open(t, t.TempDir())
-	for _, ty := range []string{"session.start", "hook.UserPromptSubmit", "hook.Stop"} {
+	for _, ty := range []string{"session.started", "hook.UserPromptSubmit", "hook.Stop"} {
 		s.Append(ev(ty))
 	}
 	last := s.Head()
-	for _, ty := range []string{"hook.PreToolUse", "hook.PostToolUse", "hook.Stop", "session.end"} {
+	for _, ty := range []string{"hook.PreToolUse", "hook.PostToolUse", "hook.Stop", "session.ended"} {
 		s.Append(ev(ty))
 	}
 	got, err := s.After(last, s.Epoch(), "", 0)
-	if err != nil || len(got) != 4 || got[0].Type != "hook.PreToolUse" || got[3].Type != "session.end" {
+	if err != nil || len(got) != 4 || got[0].Type != "hook.PreToolUse" || got[3].Type != "session.ended" {
 		t.Fatalf("%v %+v", err, got)
 	}
 	again, _ := s.After(s.Head(), s.Epoch(), "", 0)
@@ -189,8 +189,9 @@ func TestPruneKeepsFourteenDaysAndSeqStaysGapless(t *testing.T) {
 const sha1_ = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678"
 const sha2_ = "b1b2c3d4e5f60718293a4b5c6d7e8f9012345679"
 
-// context: a cursor advances with the tree commit it produced; the cockpit that takes over
-// reads that SHA and checks it is an ancestor of its HEAD before pulling.
+// context: a write cursor advances with a tree commit SHA (the one its events produced, or the
+// HEAD when they changed nothing); the cockpit that takes over reads that SHA and checks it is an
+// ancestor of its HEAD before pulling.
 func TestCursorAdvancesOnlyWithItsTreeCommit(t *testing.T) {
 	s := open(t, t.TempDir())
 	for i := 0; i < 5; i++ {
@@ -205,8 +206,11 @@ func TestCursorAdvancesOnlyWithItsTreeCommit(t *testing.T) {
 	if c, err := s.Advance("production", 2, s.Epoch(), sha1_); err != nil || c.Seq != 2 {
 		t.Fatalf("%v %+v", err, c)
 	}
-	if _, err := s.Advance("production", 4, s.Epoch(), sha1_); err != ErrCursorNoSHA {
-		t.Fatalf("same sha, further seq must be refused: %v", err)
+	if _, err := s.Advance("production", 3, s.Epoch(), sha1_); err != nil {
+		t.Fatalf("events that changed nothing keep the tree's HEAD: %v", err)
+	}
+	if _, err := s.Advance("tab-hp", 3, s.Epoch(), ""); err != nil {
+		t.Fatalf("a read cursor needs no tree commit: %v", err)
 	}
 	if _, err := s.Advance("production", 4, s.Epoch(), sha2_); err != nil {
 		t.Fatal(err)
@@ -301,7 +305,7 @@ func TestIdleSurvivesRestartAndIgnoresHostEvents(t *testing.T) {
 	dir := t.TempDir()
 	s := open(t, dir)
 	s.Append(hook("hook.Stop"))
-	s.Append(Event{Sid: "s1", Src: "host", Type: "session.end"})
+	s.Append(Event{Sid: "s1", Src: "host", Type: "session.ended"})
 	s.Close()
 	s2 := open(t, dir)
 	if _, ok := s2.IdleSince("s1"); !ok {

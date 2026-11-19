@@ -59,15 +59,15 @@ func evTypes(m map[string]any) string {
 // curl .../v1/events?after=<last> must return exactly the missed events (M3's acceptance).
 func TestReplayOverHTTPReturnsExactlyTheMissedEvents(t *testing.T) {
 	r := newRig(t)
-	r.add("session.start")
+	r.add("session.started")
 	r.add("hook.Stop")
 	_, first := r.get(t, "/v1/events")
 	last := int64(first["head"].(float64))
-	for _, ty := range []string{"hook.UserPromptSubmit", "hook.Stop", "session.end"} {
+	for _, ty := range []string{"hook.UserPromptSubmit", "hook.Stop", "session.ended"} {
 		r.add(ty)
 	}
 	code, m := r.get(t, fmt.Sprintf("/v1/events?after=%d&epoch=%s", last, r.j.Epoch()))
-	if code != 200 || evTypes(m) != "hook.UserPromptSubmit,hook.Stop,session.end" {
+	if code != 200 || evTypes(m) != "hook.UserPromptSubmit,hook.Stop,session.ended" {
 		t.Fatalf("%d %v", code, m)
 	}
 }
@@ -107,7 +107,7 @@ func TestLongPollWakesOnAppend(t *testing.T) {
 
 func TestSSEStreamsReplayThenLive(t *testing.T) {
 	r := newRig(t)
-	r.add("session.start")
+	r.add("session.started")
 	resp, err := http.Get(r.srv.URL + "/v1/events/stream?after=0")
 	if err != nil {
 		t.Fatal(err)

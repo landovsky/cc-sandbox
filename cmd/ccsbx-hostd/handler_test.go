@@ -34,7 +34,7 @@ func TestDoneIsQueuedThenAnsweredWhenTheCockpitApplies(t *testing.T) {
 	defer q.Close()
 	q.Reply = replyWriter(state, d)
 	m := &mux{}
-	m.on("ccf.", verbHandler(q, d))
+	m.on("ccf.", verbHandler(q, d, nil))
 	h := hostd.New(hostd.Config{StateDir: state, FenceUID: os.Getuid(), Handler: m.handle})
 	h.Scan()
 

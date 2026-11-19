@@ -49,14 +49,14 @@ func TestHookEventsAreJournaledWithDaemonIdentity(t *testing.T) {
 	j := f.withJournal(t.TempDir())
 	f.appendEvents(
 		`{"type":"hook.Stop","data":{"n":1},"sid":"s-forged","node":"cc-sandbox:boss","src":"host"}`+"\n",
-		`{"type":"session.end","data":{}}`+"\n", // a fence cannot journal a host event type
+		`{"type":"session.ended","data":{}}`+"\n", // a fence cannot journal a host event type
 		`not json`+"\n",
 		`{"type":"hook.PostToolUse","data":{"tool":"Bash"}}`+"\n",
 		`{"type":"hook.Notif`, // torn: waits for the rest
 	)
 	st := f.h.Scan()
 	got, _ := j.After(0, "", "", 0)
-	if strings.Join(types(got), ",") != "host:session.start,fence:hook.Stop,fence:hook.PostToolUse" {
+	if strings.Join(types(got), ",") != "host:session.started,fence:hook.Stop,fence:hook.PostToolUse" {
 		t.Fatalf("%v", types(got))
 	}
 	if got[1].Sid != sid || got[1].Node != "cc-sandbox:abcd/worker" || got[1].Src != "fence" || got[1].Seq != 2 {
@@ -97,7 +97,7 @@ func TestSessionEndIsJournaledAfterTheLastEventsAndOnce(t *testing.T) {
 	f.h.Scan()
 	f.h.Scan()
 	got, _ := j.After(0, "", "", 0)
-	if strings.Join(types(got), ",") != "host:session.start,fence:hook.Stop,host:session.end" {
+	if strings.Join(types(got), ",") != "host:session.started,fence:hook.Stop,host:session.ended" {
 		t.Fatalf("%v", types(got))
 	}
 }
@@ -181,7 +181,7 @@ func TestEpochResetReingestBlock(t *testing.T) {
 		t.Fatalf("re-ingested %+v", f.got)
 	}
 	got, _ := j2.After(0, "", "", 0)
-	if strings.Join(types(got), ",") != "host:session.start,fence:hook.Stop,fence:hook.PostToolUse" {
+	if strings.Join(types(got), ",") != "host:session.started,fence:hook.Stop,fence:hook.PostToolUse" {
 		t.Fatalf("journal not rebuilt from the outbox: %v", types(got))
 	}
 	if _, ok := f.reply("lost"); !ok {

@@ -2,17 +2,13 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
 )
@@ -46,14 +42,6 @@ func deliverCmd() *cli.Command {
 		},
 		Run: runDeliver,
 	}
-}
-
-func unixClient(sock string) *http.Client {
-	return &http.Client{Timeout: 15 * time.Second, Transport: &http.Transport{
-		DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
-			return (&net.Dialer{}).DialContext(ctx, "unix", sock)
-		},
-	}}
 }
 
 func runDeliver(f *cli.Flags, args []string, stdout, stderr io.Writer) int {

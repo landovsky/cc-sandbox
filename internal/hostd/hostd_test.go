@@ -335,7 +335,7 @@ func TestOversizeRequestRefusedWithoutEcho(t *testing.T) {
 func TestBadJsonAndUnknownTypeRefusedWithoutEcho(t *testing.T) {
 	f := newFixture(t, nil)
 	f.req("junk.json", `{"type": `+secret)
-	f.req("odd.json", `{"type":"session.start","x":"`+secret+`"}`)
+	f.req("odd.json", `{"type":"session.started","x":"`+secret+`"}`)
 	f.h.Scan()
 	if f.code("junk") != "refused:bad_json" || f.code("odd") != "refused:unknown_type" {
 		t.Fatalf("%s %s", f.code("junk"), f.code("odd"))

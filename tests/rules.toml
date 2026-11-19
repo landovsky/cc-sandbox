@@ -1,0 +1,85 @@
+# The allow/block catalogue (build plan §6, invariant 23). One [[rule]] per T:<id>.
+#
+#   id          the T:<id> name, without the prefix
+#   title       what the rule protects, in a sentence
+#   suite       fence | outbox | settings | keys | git | doors | msg | approvals | cluster | verbs
+#   allow       twin 1: a shell command (run from the repo root) that exits 0 when the legitimate
+#               path still works. Without it, a fence that blocks everything would pass.
+#   block       twin 2: exits 0 when the forbidden path is refused.
+#   invariants  the doc-1 invariant numbers the rule enforces
+#   backends    docker | k8s | unit (a rule runs on every backend it lists)
+#   where       hp | mac | mac-kubeconfig | any
+#
+# "pending" as a twin means declared, not built: reported as pending, fails `selftest --strict`.
+# A row with a missing or empty allow/block fails `make test` (internal/rules meta-test).
+# Twins see CCSBX_BACKEND, CCSBX_RULE and CCSBX_TWIN in their environment.
+
+[[rule]]
+id = "fence-flags"
+title = "the fence runs with the fixed flags: uid 10001, read-only, no caps, no-new-privileges, pids, no host env"
+suite = "fence"
+allow = "pending"
+block = "pending"
+invariants = [2, 3, 14]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "no-internet"
+title = "the fence is on an --internal network: no route out"
+suite = "fence"
+allow = "pending"
+block = "pending"
+invariants = [4]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "no-dns-exfil"
+title = "the fence has no resolver, so a canary domain's log stays empty"
+suite = "fence"
+allow = "pending"
+block = "pending"
+invariants = [4, 10]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "outbox-per-gen"
+title = "out/ and in/ live under a per-generation directory, never shared or reused"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [10, 11]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "image-no-secret"
+title = "the fence image holds no credential, token or key"
+suite = "fence"
+allow = "pending"
+block = "pending"
+invariants = [2, 26]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "deny-under-bypass"
+title = "the compiled managed settings keep the deny list when the session runs in bypassPermissions"
+suite = "settings"
+allow = "pending"
+block = "pending"
+invariants = [3, 7]
+backends = ["unit", "docker"]
+where = "hp"
+
+[[rule]]
+id = "worktree-mcp-ignored"
+title = "an MCP server declared inside the worktree is not loaded; managed MCP is ccf only"
+suite = "settings"
+allow = "pending"
+block = "pending"
+invariants = [3, 25]
+backends = ["unit", "docker"]
+where = "hp"

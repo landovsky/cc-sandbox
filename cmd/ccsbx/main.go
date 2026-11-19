@@ -52,17 +52,7 @@ func app() *cli.App {
 				},
 				Run: notBuilt("U2"),
 			},
-			{
-				Name:    "selftest",
-				Summary: "run the rule table (tests/rules.toml) and the fence tests (U19a)",
-				Recipes: "  ccsbx selftest --suites --json    # list suites\n  ccsbx selftest --backend docker",
-				Setup: func(f *cli.Flags) {
-					f.Bool("suites", false, "list suites and exit")
-					f.String("backend", "", "backend to test (docker)")
-					f.Bool("json", false, "machine-readable output")
-				},
-				Run: notBuilt("U19a"),
-			},
+			selftestCmd(),
 			{
 				Name:    "steering-check",
 				Summary: "flag changes to steering files in a diff (H1)",

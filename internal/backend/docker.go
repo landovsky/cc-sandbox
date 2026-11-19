@@ -112,6 +112,11 @@ func (s Spec) RunArgs() []string {
 // Prepare creates the per-generation directories and the home. It refuses to reuse a generation
 // directory: a second run of the same (sid, gen) would share an outbox (invariant 11).
 func (s Spec) Prepare() error {
+	if !s.NotEvid {
+		// helper mode: leaves must be 10001:10001 0700, made by ccsbx-root (gate M). Direct mode's
+		// 0777 leaves are not acceptable there, so refuse until that exists.
+		return fmt.Errorf("helper mode needs ccsbx-root to create 10001-owned 0700 generation dirs (not built); the 0777 leaves are direct-mode only")
+	}
 	if _, err := CheckWorkdir(s.Workdir, s.WorktreeRoot, s.StateDir); err != nil {
 		return err
 	}

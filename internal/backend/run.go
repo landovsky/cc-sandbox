@@ -36,6 +36,9 @@ func (r *Runner) Run(s Spec) (int, error) {
 	if err := s.Prepare(); err != nil {
 		return -1, err
 	}
+	if err := s.writePID(); err != nil {
+		return -1, err
+	}
 	for name, b := range r.Files {
 		p := filepath.Join(s.GenDir(), name)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {

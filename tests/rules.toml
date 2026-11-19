@@ -957,3 +957,23 @@ block = "tests/resume-test.sh block"
 invariants = [25]
 backends = ["docker"]
 where = "hp"
+
+[[rule]]
+id = "orphan-reaped"
+title = "after a SIGKILL of 'ccsbx run' its container and network are removed by 'ccsbx gc', and a live run is never touched"
+suite = "fence"
+allow = "tests/gc-test.sh allow"
+block = "tests/gc-test.sh block"
+invariants = [11]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "leaves-0777-direct-only"
+title = "world-writable generation leaves exist only in direct mode; helper mode refuses until ccsbx-root makes 10001-owned 0700 leaves"
+suite = "fence"
+allow = "tests/twin-go.sh ./internal/backend TestOneOutboxPerGeneration"
+block = "tests/twin-go.sh ./internal/backend TestWorldWritableLeavesAreDirectModeOnly"
+invariants = [11, 14]
+backends = ["unit"]
+where = "any"

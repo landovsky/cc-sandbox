@@ -26,7 +26,7 @@ func spec(t *testing.T) Spec {
 	wt := filepath.Join(root, "wt")
 	os.Mkdir(wt, 0o755)
 	return Spec{Sid: "sabc123", Label: "cc-sandbox:x", Gen: 1, Image: "img", StateDir: filepath.Join(root, "state"),
-		Workdir: wt, WorktreeRoot: root, MemoryMB: 4096, Pids: 512}
+		Workdir: wt, WorktreeRoot: root, MemoryMB: 4096, Pids: 512, NotEvid: true}
 }
 
 func has(args []string, seq ...string) bool {
@@ -290,5 +290,29 @@ func TestSweepArgs(t *testing.T) {
 func TestMovedParsesSweepOutput(t *testing.T) {
 	if m := moved("moved .bashrc\nnoise\nmoved .claude/CLAUDE.md\n"); len(m) != 2 || m[1] != ".claude/CLAUDE.md" {
 		t.Fatal(m)
+	}
+}
+
+// U1b-N1: the 0777 leaves are a direct-mode compromise (the fence's uid 10001 does not own them).
+// Helper mode wants 10001:10001 0700 leaves made by ccsbx-root. Until that exists, Prepare must
+// refuse in helper mode rather than quietly ship the direct-mode permissions.
+func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
+	d := spec(t)
+	if err := d.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	for _, l := range []string{"out", "in", "managed"} {
+		st, err := os.Stat(filepath.Join(d.GenDir(), l))
+		if err != nil || st.Mode().Perm() != 0o777 {
+			t.Fatalf("direct mode leaf %s: %v %v", l, st, err)
+		}
+	}
+	h := spec(t)
+	h.NotEvid = false // helper mode
+	if err := h.Prepare(); err == nil {
+		t.Fatal("helper mode created generation dirs with the direct-mode 0777 leaves")
+	}
+	if _, err := os.Stat(h.GenDir()); err == nil {
+		t.Fatal("helper mode left a generation directory behind after refusing")
 	}
 }

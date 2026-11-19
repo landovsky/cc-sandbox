@@ -61,8 +61,8 @@ the only way out for the model, git and packages.
 
 - **future-two** (Hetzner, the only k3s node used; `pool=shared:NoSchedule` taint; LUKS, so a
   reboot waits for a manual unlock: dropbear :2222, k3s `docs/HARDWARE-INVENTORY.md`, runbook §7):
-  namespace `cc-sandbox` (fence + sidecar pods, the in-cluster hostd) and `cc-sandbox-doors`
-  (the two doors). Pods are created by hp's launcher with a namespace-scoped kubeconfig and carry
+  namespace `cc-sandbox` (fence + sidecar pods) and `cc-sandbox-doors` (the two doors and the
+  in-cluster hostd; the VAP refuses role door/hostd in `cc-sandbox`, per k3s 2026-11-20). Pods are created by hp's launcher with a namespace-scoped kubeconfig and carry
   `cc-sandbox/role=session|door`, no SA token, no Secret refs, ≤ 4Gi / 4 CPU / 40Gi per container.
 - **Admission and network** (per k3s review 2026-11-20): two ValidatingAdmissionPolicies,
   `cc-sandbox-pod-guard` and `cc-sandbox-subresource-guard`, pin pods and images (K11); the
@@ -74,7 +74,7 @@ the only way out for the model, git and packages.
   (so the hostd's PVC is not here: it is in `cc-sandbox-doors`, per k3s 2026-11-20; see §7).
 - **hp-ubuntu** is not a k3s node. It runs the docker fences, `ccsbx-hostd :7480` (uid `ccsbx`),
   `ccsbx-root` (the only sudo target), the `ccsbx-keys` uid with the machine key, the signer, tmux
-  server `-L ccsbx`, and the session-bus hub `:4011`. How hp reaches the cluster: over the tailnet to the k3s control plane on port 6443, through the existing admin grant in the Tailscale policy; the launcher kubeconfig uses it (per k3s 2026-11-20). The address is deliberately not written here: this repo is public.
+  server `-L ccsbx`, and the session-bus hub `:4011`. How hp reaches the cluster: hp reaches the k3s control plane's API over the tailnet admin grant, and the launcher kubeconfig uses that server (per k3s 2026-11-20). The address is deliberately not written here: this repo is public.
 - **The Mac** (optional, Q12): Docker Desktop fences, `_ccsbx` signer, hostd. Not required by any gate.
 - **Worktrees on future-two** are `emptyDir` with a size limit (ephemeral: push early).
 - Full picture: plan §1 and §5.
@@ -86,7 +86,7 @@ the only way out for the model, git and packages.
   `./apps/cc-sandbox`, `prune` and `wait` on) applies them. The k3s reviewer merges OWN paths;
   Tomas merges SHARED ones.
 - **SHARED files** (outside `apps/cc-sandbox/`, so a Tomas merge each; per k3s review 2026-11-20):
-  the two VAPs, the Namespaces, the ProxyClass, the NetworkPolicies in `tailscale-ns`, the
+  the two VAPs, the Namespaces, the ProxyClass, the NetworkPolicies in `tailscale`, the
   `flux-system` Role, and the root-list entry for the Kustomization.
 - **Deploy check:** `flux get kustomization cc-sandbox` (Ready, and the revision is the merge you
   expected). We have no kubectl in a night; the k3s side or the Mac runs it.

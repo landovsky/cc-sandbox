@@ -25,6 +25,9 @@ func TestArgsAllowlistBlock(t *testing.T) {
 		{"write-tree"},
 		{"log", "--outp=/tmp/x"}, {"log", "--ext-d"}, {"diff", "--ext-diff"}, {"diff", "--textc"}, {"log", "-p", "--textconv"},
 		{"status", "--por"}, {"status", "-sb"}, {"diff", "--name"}, {"show", "--format=%H", "--output=/tmp/y"},
+		{"diff", "/etc/passwd", "/dev/null"}, {"diff", "--", "/etc/passwd", "/dev/null"}, {"diff", "../../etc/passwd", "/dev/null"},
+		{"diff", "--", "../x"}, {"diff", "~/.ssh/id_ed25519", "/dev/null"}, {"diff", "a/../../b", "c"}, {"show", "HEAD:../../x"}, {"ls-files", "--", "/etc"},
+		{"log", "--format=%GS"}, {"log", "--format=%H %G?"}, {"show", "--pretty=format:%GK"},
 		{"log", ":(attr:filter)x"}, {"log", "--", ":(top)x", "--oops"}, {"diff", "-c", "core.pager=x"}, {"ls-files", "--with-tree=HEAD", "--recurse-submodules"},
 	} {
 		if _, err := r.Run(args...); err == nil || !strings.Contains(err.Error(), "refused") {
@@ -43,12 +46,17 @@ func TestArgsAllowlistBlock(t *testing.T) {
 // listed flags.
 func TestArgsAllowlistAllow(t *testing.T) {
 	r, gd, wt := repo(t)
+	write(t, wt, "second.txt", "2\n")
+	if _, err := r.Commit("s", "second"); err != nil {
+		t.Fatal(err)
+	}
 	write(t, wt, "n.txt", "n\n")
 	for _, args := range [][]string{
 		{"status", "--porcelain"}, {"status", "--short", "--branch"}, {"diff", "--name-only", "--no-renames"}, {"diff", "--stat"},
 		{"log", "--oneline", "-1"}, {"log", "--format=%B", "--max-count=1"}, {"show", "--name-only", "--format=%H", "HEAD"},
 		{"rev-parse", "--absolute-git-dir"}, {"rev-parse", "HEAD"}, {"ls-files", "-z"}, {"ls-tree", "-r", "--name-only", "HEAD"},
 		{"rev-list", "--count", "HEAD"}, {"diff", "HEAD", "--", "n.txt"},
+		{"diff", "HEAD~1"}, {"diff", "HEAD...HEAD"}, {"log", "HEAD~1..HEAD"}, {"diff", "--", "sub/dir/file.txt"}, {"rev-parse", "HEAD@{0}"}, {"show", "HEAD:README.md"},
 	} {
 		if _, err := r.Run(args...); err != nil {
 			t.Errorf("git %v: %v", args, err)

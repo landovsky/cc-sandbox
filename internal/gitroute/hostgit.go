@@ -159,15 +159,48 @@ func checkArgs(args []string) error {
 			if strings.HasPrefix(a, ":") {
 				return fmt.Errorf("%w: pathspec magic %q", ErrRefused, a)
 			}
+			if err := insideWorktree(a); err != nil {
+				return err
+			}
 		case a == "--":
 			dashdash = true
 		case strings.HasPrefix(a, "-"):
 			if !contains(fs.exact, a) && !matchAny(pats, a) {
 				return fmt.Errorf("%w: flag %s is not allowed for git %s", ErrRefused, a, args[0])
 			}
+			if strings.Contains(a, "%G") {
+				// %G? %GS %GK ... make git run gpg on the host to verify signatures
+				return fmt.Errorf("%w: signature placeholders in a format run gpg", ErrRefused)
+			}
 		case strings.HasPrefix(a, ":"):
 			return fmt.Errorf("%w: pathspec magic %q", ErrRefused, a)
+		default:
+			// A positional is a revision or a path. Either way it must stay inside the repo:
+			// git diff switches to --no-index IMPLICITLY when a path lies outside the worktree,
+			// and would print any host file it can read.
+			if err := insideWorktree(a); err != nil {
+				return err
+			}
 		}
+	}
+	return nil
+}
+
+// insideWorktree refuses an argument that names a place outside the worktree: absolute paths,
+// "~", and any ".." path segment. A range such as "a..b" or "a...b" is fine (the dots are not a
+// segment on their own); so is "HEAD~1" and "HEAD@{1}".
+func insideWorktree(a string) error {
+	if strings.HasPrefix(a, "/") || strings.HasPrefix(a, "~") {
+		return fmt.Errorf("%w: %q is outside the worktree", ErrRefused, a)
+	}
+	// split on '/' and on ':' (rev:path) so HEAD:../x is caught as well
+	for _, seg := range strings.FieldsFunc(a, func(r rune) bool { return r == '/' || r == ':' }) {
+		if seg == ".." {
+			return fmt.Errorf("%w: %q leaves the worktree", ErrRefused, a)
+		}
+	}
+	if i := strings.IndexByte(a, ':'); i >= 0 && strings.HasPrefix(a[i+1:], "/") {
+		return fmt.Errorf("%w: %q is outside the worktree", ErrRefused, a)
 	}
 	return nil
 }

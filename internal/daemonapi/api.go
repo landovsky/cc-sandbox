@@ -79,6 +79,9 @@ func (s *Server) mux() *http.ServeMux {
 	m.HandleFunc("/v1/events", s.events)
 	m.HandleFunc("/v1/events/stream", s.stream)
 	m.HandleFunc("/v1/cursors/", s.cursor)
+	m.HandleFunc("/v1/cursors", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, 200, map[string]any{"epoch": s.J.Epoch(), "head": s.J.Head(), "cursors": s.J.Cursors()})
+	})
 	m.HandleFunc("/v1/cockpit/lease", s.lease)
 	m.HandleFunc("/v1/cockpit/requests", s.requests)
 	m.HandleFunc("/v1/cockpit/requests/", s.result)

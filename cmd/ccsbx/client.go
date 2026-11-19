@@ -191,6 +191,7 @@ func cursorCmd() *cli.Command {
 		Summary: "get or set a named journal cursor (kept at the daemon)",
 		Recipes: `  ccsbx cursor get cockpit-hp-ubuntu --json                         {"seq","epoch","tree_sha"} ({"seq":0} if never set)
   ccsbx cursor set cockpit-hp-ubuntu --seq 41 --epoch E --tree-sha <sha>
+  ccsbx cursor list                                                 {"epoch","head","cursors":[...]} newest first
   A write cursor moves only with the SHA of the tree commit its events produced (or the tree's
   HEAD when they changed nothing); a read cursor (name starts with tab-) needs none.`,
 		Setup: func(f *cli.Flags) {
@@ -202,8 +203,19 @@ func cursorCmd() *cli.Command {
 		},
 		Run: func(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 			get := func(n string) string { return f.Lookup(n).Value.String() }
+			if len(args) == 1 && args[0] == "list" {
+				code, b, err := newAPI(f).do("GET", "/v1/cursors", nil, nil)
+				if err != nil {
+					return fail(stderr, "cursor", err)
+				}
+				if code != 200 {
+					return httpFail(stderr, "cursor", code, b)
+				}
+				fmt.Fprintln(stdout, strings.TrimSpace(string(b)))
+				return cli.ExitOK
+			}
 			if len(args) != 2 || (args[0] != "get" && args[0] != "set") {
-				fmt.Fprintln(stderr, "usage: ccsbx cursor get NAME | cursor set NAME --seq N --epoch E [--tree-sha SHA]")
+				fmt.Fprintln(stderr, "usage: ccsbx cursor list | cursor get NAME | cursor set NAME --seq N --epoch E [--tree-sha SHA]")
 				return cli.ExitUsage
 			}
 			a := newAPI(f)

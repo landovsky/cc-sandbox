@@ -465,6 +465,21 @@ func (s *Store) Cursor(name string) (Cursor, bool, error) {
 	return c, true, json.Unmarshal(b, &c)
 }
 
+// Cursors lists every named cursor, newest update first.
+func (s *Store) Cursors() []Cursor {
+	ents, _ := os.ReadDir(filepath.Join(s.Dir, "cursors"))
+	out := []Cursor{}
+	for _, e := range ents {
+		if n := strings.TrimSuffix(e.Name(), ".json"); n != e.Name() && nameRe.MatchString(n) {
+			if c, ok, _ := s.Cursor(n); ok {
+				out = append(out, c)
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Updated.After(out[j].Updated) })
+	return out
+}
+
 // Advance moves the named cursor to seq, but only together with the SHA of the tree commit
 // that applying the events produced (or, when those events changed nothing, the tree's HEAD
 // then): without a valid SHA it refuses, so a cursor never runs ahead of what is committed in

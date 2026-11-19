@@ -57,3 +57,18 @@ func TestProfiles(t *testing.T) {
 		}
 	})
 }
+
+// H2: the candidate channel is for e2e-* profiles only, so the shipped e2e profile must exist,
+// carry the flag, and be stub-billed (an e2e run never spends real money).
+func TestShippedE2EProfile(t *testing.T) {
+	p, err := Load("../../profiles", "e2e-default")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !p.E2E {
+		t.Fatal("e2e-default is not flagged e2e")
+	}
+	if _, b := p.Allows("hp-ubuntu", "api"); b {
+		t.Fatal("an e2e profile may bill the api")
+	}
+}

@@ -91,6 +91,7 @@ const (
 	BadSpec            = "bad_spec"
 	WrongMachine       = "wrong_machine"
 	NotBuilt           = "not_built"
+	ImageNotPinned     = "image_not_pinned"
 )
 
 // Refusal is a policy refusal, not a failure.

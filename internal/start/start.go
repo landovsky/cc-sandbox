@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/pins"
 	"github.com/landovsky/cc-sandbox/internal/profile"
 )
 
@@ -44,6 +45,7 @@ type Daemon struct {
 	Machine     string // this machine's name; a spec for another machine is refused
 	Uid         int    // the caller's uid (from the OS, never from the spec)
 	Image       string // fence image reference recorded in the pin
+	PinsFile    string // pins.toml; missing means no production pins
 	CCVersion   string
 	MaxLive     int // machine_full above this many live sessions
 	MaxPerHour  int // rate_capped above this many starts by one caller in an hour
@@ -124,6 +126,15 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		return nil, refuse(BillingUnavailable, "profile %s does not allow billing %q", p.Name, s.Billing)
 	}
 
+	pl, err := pins.Load(d.PinsFile)
+	if err != nil {
+		return nil, fmt.Errorf("pins: %w", err)
+	}
+	channel, err := pins.Check(pl, nil, d.Image, p, d.Root != "helper")
+	if err != nil {
+		return nil, refuse(ImageNotPinned, "%v", err)
+	}
+
 	live, started := 0, 0
 	for _, r := range recs {
 		if r.Ended == nil && d.Launcher.Alive(r.Sid) {
@@ -176,7 +187,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	sid := rec.Sid
 	rec.Reply = StartReply{
 		V: 1, Sid: sid, Gen: rec.Gen, ID: fmt.Sprintf("%s/%s/%s/g%d", s.Owner, d.Machine, sid, rec.Gen), Backend: d.Backend,
-		Pin:     Pin{CC: orUnpinned(d.CCVersion), Image: orUnpinned(d.Image), Channel: "dev"},
+		Pin:     Pin{CC: orUnpinned(d.CCVersion), Image: orUnpinned(d.Image), Channel: channel},
 		Attach:  Attach{Local: []string{"tmux", "-L", orDefault(d.Socket, "ccsbx"), "attach", "-t", sid}, Remote: []string{"ssh", "-t", d.Machine, "ccsbx", "attach", sid}},
 		Journal: Journal{Epoch: d.epoch(), Seq: len(recs)},
 		NotEv:   d.Root != "helper",

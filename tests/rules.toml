@@ -840,13 +840,13 @@ where = "hp"
 
 [[rule]]
 id = "unpinned-refused"
-title = "an unpinned production digest is refused"
-suite = "cluster"
-allow = "pending"
-block = "pending"
-invariants = [15]
-backends = ["k8s"]
-where = "hp"
+title = "an unpinned image never runs: a tag is refused outside direct mode, a candidate digest runs only under e2e-* profiles (user space; ccsbx-root and the VAP enforce the same at gate M)"
+suite = "pins"
+allow = "tests/twin-go.sh ./internal/pins TestUnpinnedRefusedAllow"
+block = "tests/twin-go.sh ./internal/pins TestUnpinnedRefusedBlock"
+invariants = [15, 26]
+backends = ["unit"]
+where = "any"
 
 [[rule]]
 id = "candidate-only-for-e2e"

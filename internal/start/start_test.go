@@ -27,7 +27,7 @@ func newDaemon(t *testing.T) (*Daemon, *fakeLauncher) {
 	t.Helper()
 	fl := &fakeLauncher{alive: map[string]bool{}}
 	return &Daemon{StateDir: t.TempDir(), ProfilesDir: "../../profiles", Machine: "hp-ubuntu", Uid: 1000,
-		MaxLive: 8, MaxPerHour: 20, Backend: "docker", Root: "direct", Launcher: fl, Exe: "ccsbx"}, fl
+		MaxLive: 8, MaxPerHour: 20, Backend: "docker", Root: "direct", Launcher: fl, Exe: "ccsbx", Image: "ccsbx-fence:dev", PinsFile: t.TempDir() + "/pins.toml"}, fl
 }
 
 func spec(mod func(*LaunchSpec)) *LaunchSpec {
@@ -323,6 +323,30 @@ func TestFailedLaunch(t *testing.T) {
 		d.Launcher = &fakeLauncher{alive: map[string]bool{}}
 		if _, err := d.Start(spec(nil)); err != nil {
 			t.Fatalf("retry: %v", err)
+		}
+	})
+}
+
+func TestImagePins(t *testing.T) {
+	t.Run("a mutable tag outside direct mode is refused: unpinned images never run on a real fence", func(t *testing.T) {
+		d, fl := newDaemon(t)
+		d.Root = "helper"
+		if _, err := d.Start(spec(nil)); code(err) != ImageNotPinned || fl.launch != 0 {
+			t.Fatal(err)
+		}
+	})
+	t.Run("in direct mode a local dev tag runs and the reply says channel dev", func(t *testing.T) {
+		d, _ := newDaemon(t)
+		rep, err := d.Start(spec(nil))
+		if err != nil || rep.Pin.Channel != "dev" {
+			t.Fatalf("%v %v", rep, err)
+		}
+	})
+	t.Run("a candidate digest is refused under dev-default even in direct mode", func(t *testing.T) {
+		d, _ := newDaemon(t)
+		d.Image = "ghcr.io/landovsky/ccsbx-fence@sha256:" + strings.Repeat("2", 64)
+		if _, err := d.Start(spec(nil)); code(err) != ImageNotPinned {
+			t.Fatal(err)
 		}
 	})
 }

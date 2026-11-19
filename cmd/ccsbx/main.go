@@ -30,6 +30,8 @@ func app() *cli.App {
 		Version: version,
 		Cmds: []*cli.Command{
 			runCmd(),
+			pinCheckCmd(),
+			pinPromoteCmd(),
 			startCmd(),
 			selftestCmd(),
 			settingsCmd(),

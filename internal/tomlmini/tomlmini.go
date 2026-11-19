@@ -1,4 +1,5 @@
-package rules
+// Package tomlmini reads the small TOML subset ccsbx files use (rules.toml, pins.toml).
+package tomlmini
 
 import (
 	"fmt"
@@ -6,11 +7,11 @@ import (
 	"strings"
 )
 
-// parseTOML reads the small TOML subset tests/rules.toml uses, because ccsbx has zero third-party
+// Parse reads the TOML subset ccsbx files use, because ccsbx has zero third-party
 // modules. Supported: `[[name]]` array-of-tables headers, `key = "string"`, `key = 123`,
 // `key = true|false`, one-line arrays of strings or ints, and `#` comments. Anything else is an
 // error, so a typo can't silently drop a field.
-func parseTOML(src string) (map[string][]map[string]any, error) {
+func Parse(src string) (map[string][]map[string]any, error) {
 	out := map[string][]map[string]any{}
 	var cur map[string]any
 	for n, raw := range strings.Split(src, "\n") {

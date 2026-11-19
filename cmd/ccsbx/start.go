@@ -18,6 +18,7 @@ func stateFlags(f *cli.Flags) {
 	f.String("state", filepath.Join(home, ".local", "state", "ccsbx"), "daemon state directory (session records, lock)")
 	f.String("profiles", "profiles", "directory of <name>.json profiles")
 	f.String("machine", hostname(), "this machine's name; a spec for another machine is refused")
+	f.String("pins", "pins.toml", "production pins file (digests that may run under any profile)")
 	f.String("root", "direct", "privilege mode: direct (dev, as the caller; results are not evidence) or helper")
 }
 
@@ -41,7 +42,7 @@ func daemonFrom(f *cli.Flags) (*start.Daemon, error) {
 	}
 	d := &start.Daemon{
 		StateDir: abs(get("state")), ProfilesDir: abs(get("profiles")), Machine: get("machine"), Uid: os.Getuid(),
-		Backend: "docker", Root: get("root"), Exe: exe,
+		Backend: "docker", Root: get("root"), Exe: exe, PinsFile: abs(get("pins")),
 	}
 	return d, nil
 }
@@ -93,7 +94,7 @@ func runStart(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	d.Image, d.CCVersion, d.Socket = get("image"), get("cc-version"), get("tmux-socket")
 	fmt.Sscanf(get("max-live"), "%d", &d.MaxLive)
 	fmt.Sscanf(get("max-per-hour"), "%d", &d.MaxPerHour)
-	env := []string{"--state", d.StateDir, "--profiles", d.ProfilesDir, "--machine", d.Machine, "--image", d.Image, "--root", d.Root}
+	env := []string{"--state", d.StateDir, "--profiles", d.ProfilesDir, "--pins", d.PinsFile, "--machine", d.Machine, "--image", d.Image, "--root", d.Root}
 	if c := strings.Fields(get("run-cmd")); len(c) > 0 {
 		env = append(append(env, "--"), c...)
 	}

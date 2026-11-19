@@ -14,6 +14,7 @@ One picture of how sandboxed agent sessions are placed, fenced, granted access, 
    3. [cc-unified-model-cc-flow.md](cc-unified-model-cc-flow.md): CC Flow as a client (the portable cockpit).
    4. [cc-unified-model-log.md](cc-unified-model-log.md): changes per version, open items, decisions, conflicts, the old build list.
    5. [cc-unified-model-build-plan.md](cc-unified-model-build-plan.md): the whole build, phased, with owners, acceptance tests, the nightly prerequisites, the Accept list, risks, the review panel's findings and the ❓ list.
+   6. [k3s-amendments-2026-11-19.md](k3s-amendments-2026-11-19.md): the exact spec for the second batch of k3s scope amendments (doors namespace, K11 extension, token renewal, hostd PVC, egress-proxy NetPols, ops SA, ACL fragments).
    - [unified-model.md](unified-model.md): **v1, superseded** by the four docs above. Kept for the history the area docs link to.
 2. The five area docs (inputs to v1) (each one names its own ❓ nodes):
    - [model/mcp-gateway.md](model/mcp-gateway.md) (A): how agents reach MCP servers through one door with no MCP credential inside the fence.

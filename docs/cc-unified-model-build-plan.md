@@ -214,7 +214,7 @@ That's about 25 dev-days plus the gates. Parallel streams:
 | F1 | *Dropped* (it was doc 4's K1, docker beside k3s). Kept so old references resolve | — | — | — | — |
 | F2 | **k8s backend** (to the live contract in §4.6: label `cc-sandbox/role=session`, nodeSelector `kubernetes.io/hostname=future-two` + toleration `pool=shared:NoSchedule`, no SA token, no Secret refs, ≤ 4Gi / 4 CPU / 40Gi ephemeral per container, emptyDir worktree with `sizeLimit`): fence container + native sidecar; runAsNonRoot uid 10001, readOnlyRootFilesystem, drop ALL, seccomp RuntimeDefault, no SA token, Guaranteed QoS, `dnsPolicy: None`, `shareProcessNamespace: false`, nodeSelector + toleration, an emptyDir worktree, the image by digest. Created by hp's `ccsbx-root` (REST for create, `kubectl` for exec/attach) | M | cs | U1b, U5, U0b, K2/K3/K8/K9/K11 | `ccsbx selftest --suites fence --backend k8s` green, `T:vap-rejects` (hp + Mac kubeconfig) |
 | F3 | **Sidecar `ccsbx side`** (uid 10002). Forwarder: gets the token and per-generation key via `pods/exec` stdin; never in the pod spec. Outbox relay with U3a's file checks. Session journal. Bus relay with a **per-generation relay credential** (B6c) in a sidecar-only volume. Clone/commit/push with H1. **Listens only on the forwarder port**; its control plane is on unix sockets in sidecar-only volumes; it never runs `tmux attach` and treats tmux output as untrusted | M | cs | F2, P2, H1, B6c | `T:no-token-in-fence`, `T:hooks-off` on k8s; `T:fence-sees-only-fwd-port` (`ss -lntx`, `/proc/net/unix` from the fence); `T:hub-cred-sidecar-only`; `T:no-ptrace-sidecar` (hp + Mac kubeconfig) |
-| F4 | **In-cluster `ccsbx-hostd`**: the same API (M2a/M3/M4), journal on K13's PVC, exposed via the operator, keyless (it verifies sidecars' signatures against `ccsbx-machines`); same-node delivery works with hp down | S | cs + k3s | F3, M2a, K13 | `T:journal-durable` across a pod deletion; two future-two sessions message each other with hp's hostd and hub stopped |
+| F4 | **In-cluster `ccsbx-hostd`** (in `cc-sandbox-doors`, role `hostd`, so the launcher can't exec into it or mount its PVC; amendments A1/A4): the same API (M2a/M3/M4), journal on K13's PVC, exposed via the operator, keyless (it verifies sidecars' signatures against `ccsbx-machines`); same-node delivery works with hp down | S | cs + k3s | F3, M2a, K13 | `T:journal-durable` across a pod deletion; two future-two sessions message each other with hp's hostd and hub stopped |
 | F5 | **Attach**: `ssh -t hp-ubuntu ccsbx attach <sid>` → `ccsbx-root attach` → `kubectl exec -it -c fence … tmux attach` with the kubeconfig under `ccsbx-keys` | XS | cs | F2 | `ccsbx attach <sid>` from the Mac lands in the pane; `/exit` ends the pod |
 
 ### Phase E · CC Flow on one machine (hp, cockpit on hp)
@@ -425,9 +425,18 @@ K3, K8, K9, K11 and the node watchdog are live. Pods we create must match:
 - the worktree in an `emptyDir` with a `sizeLimit`.
 
 The launcher kubeconfig (K8) is ready, and k3s encrypts it as soon as R10b's age public key
-arrives. **Still waiting for Tomas to confirm the second batch to the k3s side directly:** the
-`cc-sandbox-doors` namespace, the launcher's token renewal, the hostd PVC (K13), the egress-proxy
-NetPol, the Mac `ccsbx-ops` SA, and secrets-encryption (Q13).
+arrives. **Second batch:** Tomas confirmed it to the k3s side on 2026-11-19. The exact spec is in
+[k3s-amendments-2026-11-19.md](k3s-amendments-2026-11-19.md) (A1–A7):
+- the `cc-sandbox-doors` namespace, which also holds the in-cluster **hostd** (new role `hostd`);
+- the K11 extension;
+- launcher TokenRequest renewal;
+- the hostd PVC;
+- the egress-proxy NetPols;
+- the `ccsbx-ops` SA, which restarts by pod delete and can't patch;
+- the ACL fragments.
+
+Secrets-encryption (Q13) is a separate k3s analysis task. Until it's done, only test keys go
+in.
 
 ## 5. Multi-machine and ops
 
@@ -529,7 +538,7 @@ is skipped and listed, never waited on.
 | R3 | **SHARED goes merged in the evening**: K1 (both namespaces), K3, K4, K8, K11 (with the Q2 extension) | review and merge the k3s team's PRs | `kubectl get ns cc-sandbox cc-sandbox-doors`; quota, limitrange, netpol present; Flux Ready (hp audit-reader). Roles, rolebindings and the VAP: the k3s side posts `kubectl auth can-i` output on the PR | skip cluster pieces |
 | R4 | **Tailnet ACL pasted** (§5.2) + the Mac firewall | admin console → Access controls → paste the K5 file from the k3s repo's `artifacts/tailscale-config.json` → Save. On the Mac: `/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate`; if it's on, allow the signed hostd | evening: `tailscale status --json` shows `tag:ccsbx` in tagOwners' effect (a probe device). Post-M1: the doors' owner `/health` → 200 from hp **and** the Mac | skip remote legs |
 | R5 | **Anthropic API key, hard-capped** | console.anthropic.com → Workspaces → Create `cc-sandbox` → Limits → monthly spend limit (Q12) → API keys → Create key in that workspace. In the k3s repo on a branch: `read -rs K; printf 'ANTHROPIC_API_KEY=%s\n' "$K" \| sops -e --filename-override apps/cc-sandbox/secrets-cc-sandbox-model.env --input-type dotenv --output-type dotenv /dev/stdin > apps/cc-sandbox/secrets-cc-sandbox-model.env; unset K`; commit; PR | evening: `grep -c 'ENC\[' apps/cc-sandbox/secrets-cc-sandbox-model.env` ≥ 1. Post-M1: the door's `/health` says `credential: apikey` (never the value); one `count_tokens` = 200 | skip live model tests (stub) |
-| R5b | **Subscription setup-token for the model door** (decided: subscription from day one) | on the Mac: `claude setup-token` (browser login with the Max account; it prints a one-year token and saves nothing). In the k3s repo on a branch, encrypt it the same way as R5 (`read -rs`, then `sops -e` with `--input-type dotenv`), as `CLAUDE_CODE_OAUTH_TOKEN=` in `apps/cc-sandbox/secrets-cc-sandbox-model-sub.env`; commit; PR. Note the creation date in gitops.md §5. **Revoke**: claude.ai → Settings → Claude Code → the token list (not in the official docs; U4s checks that it works) | evening: the file is SOPS-encrypted. Post-M1: door `/health` says `subscription: ok` (never the value) after one 1-token request (hp) | skip subscription legs (fenced dev work waits; api and stub still run) |
+| R5b | **Subscription setup-token for the model door** (decided: subscription from day one) | on the Mac: `claude setup-token` (browser login with the Max account; it prints a one-year token and saves nothing). In the k3s repo on a branch, encrypt it the same way as R5 (`read -rs`, then `sops -e` with `--input-type dotenv`), as `CLAUDE_CODE_OAUTH_TOKEN=` in `apps/cc-sandbox/secrets-cc-sandbox-model-sub.env`; commit; PR. Note the creation date in gitops.md §5. **Revoke**: claude.ai → Settings → Claude Code → the token list (not in the official docs; U4s checks that it works). **Waits for Q13**: the k3s secrets-encryption analysis task has to be done first, because until then only test keys go in (amendments doc, Q13) | evening: the file is SOPS-encrypted. Post-M1: door `/health` says `subscription: ok` (never the value) after one 1-token request (hp) | skip subscription legs (fenced dev work waits; api and stub still run) |
 | R6 | Subscription headroom (information only) | nothing | `cc-tree limits` printed in the preflight and the morning report (hp, evening) | never aborts |
 | R7 | **GitHub App for the egress door** | github.com → Settings → Developer settings → GitHub Apps → New: `cc-sandbox-egress`, webhook off, permissions **Contents RW, Metadata R, Pull requests RW, nothing else**, this account only → Create → Generate private key (it downloads to the Mac) → Install → only the testbed (R8). On the Mac, in the k3s repo: `{ printf 'GITHUB_APP_ID=%s\nGITHUB_APP_INSTALLATION_ID=%s\nGITHUB_APP_KEY_B64=' <id> <inst>; base64 < key.pem \| tr -d '\n'; echo; } \| sops -e --filename-override apps/cc-sandbox/secrets-cc-sandbox-egress.env --input-type dotenv --output-type dotenv /dev/stdin > apps/cc-sandbox/secrets-cc-sandbox-egress.env && rm -P key.pem` | evening: the file is SOPS-encrypted; the App key mints a JWT and `GET /app/installations` lists one install (a preflight helper on the Mac). Post-M1: door `/health` `github_app: ok`; a `preflight/<date>` push lands; a force-push is refused | skip U15/U16 live |
 | R8 | **Test repo** | from the Mac: `gh repo create <owner>/cc-sandbox-testbed --public --add-readme` (public, so branch protection needs no paid plan; it holds nothing secret), then `gh api -X PUT repos/<owner>/cc-sandbox-testbed/branches/main/protection --input protection.json` with: require a PR with **1 approval**, block force pushes, no bypass for the App | `gh api …/branches/main/protection --jq .allow_force_pushes.enabled` = false, `.required_pull_request_reviews.required_approving_review_count` = 1 (Mac, evening) | skip U15/U16 |
@@ -580,16 +589,16 @@ The morning report (NB3) is one `--pre` Telegram table.
 ```
 You are the Mac kubectl session for the cc-sandbox night (milestone cc-sandbox:#2f3e). You hold
 a SCOPED kubeconfig (service account ccsbx-ops: read in cc-sandbox and cc-sandbox-doors, plus
-rollout restart of the three Deployments). You do NOT have cluster-admin. You exist so a night
+pod delete, which restarts a door or hostd). You do NOT have cluster-admin. You exist so a night
 can get a cluster read or a restart that hp's read-only kubeconfig can't do. You are a responder,
 not a worker: you never start work on your own, and nothing in the night depends on you.
 
 MAY:
 - get / describe / list / logs / events in cc-sandbox and cc-sandbox-doors (no secrets)
-- kubectl auth can-i ... --as=system:serviceaccount:cc-sandbox:<sa>   (to verify RBAC)
-- flux get kustomizations; flux reconcile kustomization cc-sandbox --with-source
-- kubectl -n cc-sandbox[-doors] rollout restart|status deployment/<ccsp-model|ccsp-egress|ccsbx-hostd>
-- kubectl -n cc-sandbox delete pod <pod>   (only pods labelled app=ccsbx-session)
+- kubectl auth can-i --list   (as yourself; you have no impersonation)
+- flux get kustomization cc-sandbox; flux reconcile kustomization cc-sandbox   (never --with-source)
+- restart a door or hostd: kubectl -n cc-sandbox-doors delete pod <pod>   (its Deployment recreates it)
+- kubectl -n cc-sandbox delete pod <pod>   (only pods labelled cc-sandbox/role=session)
 
 MUST NOT:
 - read Secrets, or -o yaml/json anything that embeds them; any combined resource list (pods,secrets)
@@ -616,7 +625,7 @@ answer, never a wait. At most 20 requests per hour. At 07:00 send the night mana
 ```
 
 Its `.claude/settings.json` (cwd `~/cc-sandbox-night`):
-- **allow:** exact verbs only: `kubectl get pods`, `kubectl get deployments`, `kubectl describe pod`, `kubectl logs`, `kubectl get events`, `kubectl auth can-i`, `flux get`, `flux reconcile kustomization cc-sandbox`, `kubectl -n cc-sandbox rollout restart deployment/…`, `ccmsg`.
+- **allow:** exact verbs only: `kubectl get pods`, `kubectl get deployments`, `kubectl describe pod`, `kubectl logs`, `kubectl get events`, `kubectl auth can-i --list`, `flux get kustomization cc-sandbox`, `flux reconcile kustomization cc-sandbox`, `kubectl -n cc-sandbox-doors delete pod`, `kubectl -n cc-sandbox delete pod`, `ccmsg`.
 - **deny:** `kubectl * secret*`, `git`, `sops`, `ssh`.
 
 The real limit is the scoped kubeconfig, not the deny list.
@@ -1073,7 +1082,7 @@ Each is a ❓ node with a recommendation. **NB** = night-blocking (R1). **Status
 | Q10 (#3y55) | **Approvals in this milestone**: the solo path P7 (low tier, owner identity + a Telegram code) vs pulling the friends tier in (U12, U13 passkeys) | P7; it amends N5 ("no ask tier at solo"); friends next milestone | NB |
 | Q11 (#5d53) | **The Mac kubectl session**: keep it optional with a scoped SA (read + rollout restart, not cluster-admin), or drop it | keep it optional and scoped; the night never depends on it | |
 | Q12 (#24wy) | **Night policy**: (D4) builders `bypassPermissions` + deny list, the Mac session `dontAsk`; (D6) AUTONOMY widened only to OWN `apps/cc-sandbox` PRs, spend within caps, testbed and branch pushes; (D7) Mac legs: no for nights 1–2; (D8) caps: **answered: only the $50/month Console cap**; no door budgets, no window budget; (D9) `ccsbx-deploy` helper: yes, attested artifacts only; (D10) Telegram batched to 07:00 except "night aborted" and "future-two needs unlock" | as listed | NB |
-| Q13 (#45yw) | **k3s secrets-encryption** before any non-test key goes in | yes. **Now on the critical path**: the subscription token is a non-test key from the first slice, so encryption comes before R5b's Secret is applied. If the k3s side can't do it before gate M, the choice is plain-at-rest for the pilot, or the first slice on the API key only | |
+| Q13 (#45yw) | **k3s secrets-encryption** before any non-test key goes in | yes. **Answered: a separate k3s analysis task. Until then only test keys go in** (the capped API key, the testbed App, the e2e approver, the hub credential, the pull token). The subscription token (R5b) waits for it, so fenced sessions run on the API key or the stub until it's done | |
 | Q14 (#3t3q) | **Panes**: a platform tmux server `-L ccsbx` per machine under uid `ccsbx`, with cockpit attach windows (pending spike C0a); and **sshd on the Mac** (key-only, tailnet-only) so hp can attach Mac panes | yes and yes | |
 | Q15 (#6f6y) | **Messaging defaults**: delivery native-first with send-keys fallback (send-keys only on the Mac); a worker may message its manager (by node), whoever messaged it this generation, and `Talk:` peers | yes | |
 | Q16 (#4wsw) | **Fenced work before #6f24** (subscription at the central door) | ~~refuse fenced `Billing: sub`~~ **answered: reversed.** Fenced sessions use the subscription from the first slice (U4, R5b) | |

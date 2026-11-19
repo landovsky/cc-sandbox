@@ -54,3 +54,28 @@ func (t *Tmux) Deliver(sid, line string) error {
 	}
 	return nil
 }
+
+// CcmsgHub reaches an unfenced session through the session bus's ccmsg (direct mode: the daemon
+// runs as the same user). node is "tree:id"; ccmsg wants "tree:#id".
+type CcmsgHub struct {
+	Bin     string
+	Command func(name string, args ...string) *exec.Cmd
+}
+
+func (h CcmsgHub) Send(node, line string) error {
+	addr := node
+	if t, id, ok := strings.Cut(node, ":"); ok && !strings.HasPrefix(id, "#") {
+		addr = t + ":#" + id
+	}
+	args := []string{"--kind", "question", addr, line}
+	var c *exec.Cmd
+	if h.Command != nil {
+		c = h.Command(h.Bin, args...)
+	} else {
+		c = exec.Command(h.Bin, args...)
+	}
+	if out, err := c.CombinedOutput(); err != nil {
+		return fmt.Errorf("ccmsg: %v: %s", err, out)
+	}
+	return nil
+}

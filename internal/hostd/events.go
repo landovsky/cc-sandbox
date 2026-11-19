@@ -141,9 +141,13 @@ func (h *Hostd) ingestEvents(gdir string, rec *start.Record, gen string, box *ou
 			st.Reasons["events_bad_line"]++
 			continue
 		}
-		if _, err := h.Cfg.Journal.Append(journal.Event{Sid: rec.Sid, Gen: genN, Node: rec.Spec.Label, Realm: rec.Spec.Realm, Src: "fence", Type: typ, Data: data}); err != nil {
+		jr, err := h.Cfg.Journal.Append(journal.Event{Sid: rec.Sid, Gen: genN, Node: rec.Spec.Label, Realm: rec.Spec.Realm, Src: "fence", Type: typ, Data: data})
+		if err != nil {
 			h.Cfg.Logf("hostd: journal append failed: %v", err)
 			break
+		}
+		if h.Cfg.OnEvent != nil {
+			h.Cfg.OnEvent(jr)
 		}
 		taken++
 	}

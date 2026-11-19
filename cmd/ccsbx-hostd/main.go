@@ -66,6 +66,8 @@ func app() *cli.App {
 				f.String("listen-token-file", "", "file (mode 0600) holding the bearer token the --listen address requires")
 				f.Int("lease-ttl", 90, "cockpit lease TTL in seconds (one holder per realm)")
 				f.Int("queue-max", 10000, "pending cockpit requests per realm before refused: queue_full")
+				f.String("ccmsg-bin", "", "ccmsg (session-bus) to reach an unfenced manager on this machine, e.g. ~/.dotfiles/session-bus/bin/ccmsg; empty: only ccsbx sessions are reachable")
+				f.Bool("hear", false, "C23 hear: tell a worker's manager by message when the worker needs a human decision (permission prompt, question dialog)")
 				f.String("interval", "250ms", "time between scans")
 				f.Bool("once", false, "scan once and print the stats as a line, then exit")
 			},
@@ -107,9 +109,16 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		return cli.ExitFail
 	}
 	defer j.Close()
-	m.on("ccf.", verbHandler(q, d, j))
-	rt.Idle = j // a message is typed only into a pane whose last hook event is Stop
-	h := hostd.New(hostd.Config{Journal: j, OnTick: func() { rt.Pump(pumpReply(get("state"))) },
+	m.on("ccf.", verbHandler(q, d, j, rt))
+	rt.Idle = j
+	if b := get("ccmsg-bin"); b != "" {
+		rt.Hub = msg.CcmsgHub{Bin: b} // an unfenced manager on this machine, through the session bus
+	}
+	var onEvent func(journal.Record)
+	if get("hear") == "true" {
+		onEvent = hearFunc(rt)
+	} // a message is typed only into a pane whose last hook event is Stop
+	h := hostd.New(hostd.Config{Journal: j, OnEvent: onEvent, OnTick: func() { rt.Pump(pumpReply(get("state"))) },
 		StateDir: get("state"), FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
 		Handler: m.handle, Rate: float64(num("rate")), Burst: num("burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
 	})

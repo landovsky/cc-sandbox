@@ -4,9 +4,13 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/hostd"
+	"github.com/landovsky/cc-sandbox/internal/journal"
+	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
 )
@@ -34,7 +38,7 @@ func TestDoneIsQueuedThenAnsweredWhenTheCockpitApplies(t *testing.T) {
 	defer q.Close()
 	q.Reply = replyWriter(state, d)
 	m := &mux{}
-	m.on("ccf.", verbHandler(q, d, nil))
+	m.on("ccf.", verbHandler(q, d, nil, nil))
 	h := hostd.New(hostd.Config{StateDir: state, FenceUID: os.Getuid(), Handler: m.handle})
 	h.Scan()
 
@@ -74,5 +78,124 @@ func TestResultForAnEndedGenerationIsReportedUnwritten(t *testing.T) {
 	os.WriteFile(filepath.Join(state, "sessions", "s0gone001.json"), b, 0o600)
 	if replyWriter(state, d)(verbq.Item{Sid: "s0gone001", Gen: 1, Rid: "r"}, verbq.Result{Status: "ok"}) {
 		t.Fatal("wrote into a dead generation's inbox")
+	}
+}
+
+type recOut struct{ lines map[string][]string }
+
+func (r *recOut) Deliver(sid, line string) error {
+	if r.lines == nil {
+		r.lines = map[string][]string{}
+	}
+	r.lines[sid] = append(r.lines[sid], line)
+	return nil
+}
+
+type recHub struct{ got []string }
+
+func (h *recHub) Send(node, line string) error { h.got = append(h.got, node+" <- "+line); return nil }
+
+type alwaysIdle struct{}
+
+func (alwaysIdle) IdleSince(string, int) (time.Time, bool) { return time.Now().Add(-time.Hour), true }
+
+func writeSession(t *testing.T, state, sid, label, manager string) {
+	scope := json.RawMessage(`{"manager":{"node":"` + manager + `"},"peers":[],"reply_window_s":86400}`)
+	rec := start.Record{Sid: sid, Gen: 1, Label: label, Started: time.Now(), Spec: start.LaunchSpec{Label: label, Realm: "production", MsgScope: scope},
+		Reply: start.StartReply{ID: "tomas/hp/" + sid + "/g1"}}
+	os.MkdirAll(filepath.Join(state, "sessions"), 0o700)
+	b, _ := json.Marshal(rec)
+	os.WriteFile(filepath.Join(state, "sessions", sid+".json"), b, 0o600)
+}
+
+func askQuestion(t *testing.T, state, sid string) {
+	g := filepath.Join(state, "s", sid, "g1")
+	os.MkdirAll(filepath.Join(g, "out", "requests"), 0o755)
+	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	os.WriteFile(filepath.Join(g, "out", "requests", "q1.json"), []byte(`{"type":"ccf.question","data":{"text":"Which database?","options":["pg","sqlite"]}}`), 0o644)
+}
+
+// context: C23 — the cockpit is down and a worker asks Tomas a question. The question is queued
+// for the tree (the cockpit applies it when it is back) AND the manager in scope gets it now, by
+// message, so nothing waits on the cockpit.
+func TestQuestionIsQueuedAndTheManagerGetsItNowAllow(t *testing.T) {
+	state := t.TempDir()
+	writeSession(t, state, "s0worker1", "cc-sandbox:w1", "cc-sandbox:mgr")
+	writeSession(t, state, "s0mgr0001", "cc-sandbox:mgr", "")
+	askQuestion(t, state, "s0worker1")
+	d := &start.Daemon{StateDir: state}
+	out := &recOut{}
+	rt := &msg.Router{Dir: msg.DaemonDir{D: d, Alive: func(string) bool { return true }}, Out: out, Idle: alwaysIdle{}, StateDir: state}
+	q, _ := verbq.Open(filepath.Join(state, "queue"))
+	defer q.Close()
+	m := &mux{}
+	m.on("ccf.", verbHandler(q, d, nil, rt))
+	hostd.New(hostd.Config{StateDir: state, FenceUID: os.Getuid(), Handler: m.handle}).Scan()
+	if st, _ := q.Status("production"); st.Pending != 1 {
+		t.Fatalf("not queued for the tree: %+v", st)
+	}
+	got := out.lines["s0mgr0001"]
+	if len(got) != 1 || !strings.Contains(got[0], "QUESTION: Which database? (options: pg | sqlite)") || !strings.Contains(got[0], "· fenced ·") {
+		t.Fatalf("the manager did not get it: %q", got)
+	}
+}
+
+// context: a manager is always an unfenced session on the host, so it is no ccsbx session. The
+// question reaches it through the session bus (ccmsg), stamped as the daemon's.
+func TestQuestionReachesAnUnfencedManagerThroughTheHub(t *testing.T) {
+	state := t.TempDir()
+	writeSession(t, state, "s0worker1", "cc-sandbox:w1", "cc-sandbox:mgr")
+	askQuestion(t, state, "s0worker1")
+	d := &start.Daemon{StateDir: state}
+	hub := &recHub{}
+	rt := &msg.Router{Dir: msg.DaemonDir{D: d, Alive: func(string) bool { return true }}, Out: &recOut{}, Idle: alwaysIdle{}, Hub: hub, StateDir: state}
+	q, _ := verbq.Open(filepath.Join(state, "queue"))
+	defer q.Close()
+	m := &mux{}
+	m.on("ccf.", verbHandler(q, d, nil, rt))
+	hostd.New(hostd.Config{StateDir: state, FenceUID: os.Getuid(), Handler: m.handle}).Scan()
+	if len(hub.got) != 1 || !strings.HasPrefix(hub.got[0], "cc-sandbox:mgr <- [MSG from ccsbx:s0worker1 · cc-sandbox:w1 · fenced · #") {
+		t.Fatalf("%q", hub.got)
+	}
+}
+
+// context: other verbs (outcome, done, ...) are queued only; just `question` is dual.
+func TestOtherVerbsDoNotMessageTheManager(t *testing.T) {
+	state := t.TempDir()
+	writeSession(t, state, "s0worker1", "cc-sandbox:w1", "cc-sandbox:mgr")
+	g := filepath.Join(state, "s", "s0worker1", "g1")
+	os.MkdirAll(filepath.Join(g, "out", "requests"), 0o755)
+	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	os.WriteFile(filepath.Join(g, "out", "requests", "o1.json"), []byte(`{"type":"ccf.outcome","data":{"text":"x"}}`), 0o644)
+	d := &start.Daemon{StateDir: state}
+	hub := &recHub{}
+	rt := &msg.Router{Dir: msg.DaemonDir{D: d, Alive: func(string) bool { return true }}, Out: &recOut{}, Idle: alwaysIdle{}, Hub: hub, StateDir: state}
+	q, _ := verbq.Open(filepath.Join(state, "queue"))
+	defer q.Close()
+	m := &mux{}
+	m.on("ccf.", verbHandler(q, d, nil, rt))
+	hostd.New(hostd.Config{StateDir: state, FenceUID: os.Getuid(), Handler: m.handle}).Scan()
+	if len(hub.got) != 0 {
+		t.Fatalf("%q", hub.got)
+	}
+}
+
+// context: hear — a worker that stops at a permission prompt is something its manager should
+// hear about even when the cockpit is down; a quiet Stop is not.
+func TestHearTellsTheManagerOfAPermissionPrompt(t *testing.T) {
+	state := t.TempDir()
+	writeSession(t, state, "s0worker1", "cc-sandbox:w1", "cc-sandbox:mgr")
+	hub := &recHub{}
+	d := &start.Daemon{StateDir: state}
+	rt := &msg.Router{Dir: msg.DaemonDir{D: d, Alive: func(string) bool { return true }}, Out: &recOut{}, Idle: alwaysIdle{}, Hub: hub, StateDir: state}
+	hear := hearFunc(rt)
+	hear(journal.Record{Type: "hook.Stop", Sid: "s0worker1", Node: "cc-sandbox:w1", Data: json.RawMessage(`{}`)})
+	hear(journal.Record{Type: "hook.Notification", Sid: "s0worker1", Node: "cc-sandbox:w1", Data: json.RawMessage(`{"notification_type":"idle_prompt"}`)})
+	if len(hub.got) != 0 {
+		t.Fatalf("heard nothing worth hearing: %q", hub.got)
+	}
+	hear(journal.Record{Type: "hook.Notification", Sid: "s0worker1", Node: "cc-sandbox:w1", Data: json.RawMessage(`{"notification_type":"permission_prompt"}`)})
+	if len(hub.got) != 1 || !strings.Contains(hub.got[0], "HEAR: cc-sandbox:w1 needs a decision from a human (permission_prompt)") {
+		t.Fatalf("%q", hub.got)
 	}
 }

@@ -90,6 +90,7 @@ type Origin struct {
 type Router struct {
 	Dir      Directory
 	Out      Deliverer
+	Hub      Hub // optional: for an in-scope node that has no live ccsbx session (an unfenced manager)
 	Idle     Idler
 	StateDir string
 	Now      func() time.Time
@@ -190,6 +191,17 @@ func (r *Router) SendWith(from Session, body []byte, o Origin) Result {
 		if !nodeInScope(*sender, b.To.Node) {
 			return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "refused", Code: "scope"})
 		}
+		// An in-scope node with no ccsbx session is an unfenced session on this machine (a
+		// manager is always local): the hub path (ccmsg) reaches it, if there is one.
+		if r.Hub != nil && b.To.Node != "" {
+			if !r.pairOK(sender.Sid, "hub:"+b.To.Node) {
+				return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "refused", Code: "rate_capped"})
+			}
+			if err := r.Hub.Send(b.To.Node, stampFenced(*sender, b.Text)); err != nil {
+				return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "undeliverable"})
+			}
+			return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "ok", To: "hub:" + b.To.Node})
+		}
 		return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "no_live_session"})
 	}
 	if target.Sid == sender.Sid || !r.inScope(*sender, *target) {
@@ -218,6 +230,30 @@ func (r *Router) deliverFenced(sender, target Session, text string) Result {
 		return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "error", Code: "undeliverable"})
 	}
 	return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "ok", To: target.Sid})
+}
+
+// Hub delivers to a node that is not a ccsbx session (an unfenced manager on this machine),
+// outside the daemon: today through ccmsg. The line is already stamped.
+type Hub interface{ Send(node, line string) error }
+
+// ToManager sends text from a fenced session to its manager node, as the daemon (not the
+// fence) decides: C23's questions and hear. The node comes from the sender's record.
+func (r *Router) ToManager(from Session, kind, text string, o Origin) Result {
+	all, err := r.Dir.Sessions()
+	if err != nil {
+		return Result{Status: "error", Code: "undeliverable"}
+	}
+	for _, s := range all {
+		if s.Sid == from.Sid {
+			node := s.Scope.Manager.Node
+			if node == "" {
+				return Result{Status: "refused", Code: "scope"}
+			}
+			b, _ := json.Marshal(map[string]any{"type": "msg.send", "to": map[string]string{"node": node}, "kind": kind, "text": text})
+			return r.SendWith(from, b, o)
+		}
+	}
+	return Result{Status: "refused", Code: "scope"}
 }
 
 // DeliverOwner is a delivery from the owner's device (the daemon's unix socket). The target is

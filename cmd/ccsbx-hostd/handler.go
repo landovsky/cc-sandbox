@@ -53,7 +53,7 @@ type appender interface {
 }
 
 // verbHandler is M4: ccf.* requests are queued for the realm's cockpit and answered at once.
-func verbHandler(q *verbq.Queue, d *start.Daemon, j appender) hostd.Handler {
+func verbHandler(q *verbq.Queue, d *start.Daemon, j appender, rt *msg.Router) hostd.Handler {
 	return func(r hostd.Request) hostd.Reply {
 		realm := "production"
 		if rec, err := d.Load(r.Sid); err == nil && rec.Spec.Realm != "" {
@@ -80,6 +80,9 @@ func verbHandler(q *verbq.Queue, d *start.Daemon, j appender) hostd.Handler {
 			if _, err := j.Append(journal.Event{ID: r.ID, Sid: r.Sid, Gen: r.Gen, Node: r.Label, Realm: realm, Src: "fence", Type: r.Type, Data: data}); err != nil {
 				return hostd.Reply{Status: "error", Result: map[string]string{"code": "io_error"}}
 			}
+		}
+		if r.Type == "ccf.question" && rt != nil {
+			notifyQuestion(rt, r, env.Data)
 		}
 		return hostd.Reply{Status: "queued", Result: map[string]any{"seq": it.Seq}, Seq: int(it.Seq)}
 	}
@@ -109,5 +112,48 @@ func pumpReply(stateDir string) func(msg.Origin, msg.Result) {
 	return func(o msg.Origin, res msg.Result) {
 		gdir := filepath.Join(stateDir, "s", o.Sid, fmt.Sprintf("g%d", o.Gen))
 		_ = hostd.WriteReply(gdir, hostd.Reply{Rid: o.Rid, ID: o.ID, Status: res.Status, Result: res})
+	}
+}
+
+// notifyQuestion is C23: `question` is a dual verb. The cockpit queue has it (the tree gets its
+// ❓), and the manager in scope gets it NOW as a message, so a question is never stuck behind a
+// cockpit that is down. The message is the daemon's, from the sender's record: the fence only
+// supplied the text. A busy manager's pane gets it when its turn ends (the idle rule).
+func notifyQuestion(rt *msg.Router, r hostd.Request, data json.RawMessage) {
+	var d struct {
+		Text    string   `json:"text"`
+		Options []string `json:"options"`
+	}
+	_ = json.Unmarshal(data, &d)
+	if strings.TrimSpace(d.Text) == "" {
+		return
+	}
+	text := "QUESTION: " + d.Text
+	if len(d.Options) > 0 {
+		text += " [options: " + strings.Join(d.Options, " | ") + "]"
+	}
+	rt.ToManager(msg.Session{Sid: r.Sid}, "question", text, msg.Origin{})
+}
+
+// hearFunc is C23's hear for fenced workers: computed here, from journal facts, and sent to the
+// worker's manager as a message (the cockpit may be down). A worker that needs a human decision
+// (permission prompt, question dialog) or has ended is something its manager should hear.
+func hearFunc(rt *msg.Router) func(journal.Record) {
+	return func(e journal.Record) {
+		var what string
+		switch e.Type {
+		case "hook.Notification":
+			var d struct {
+				T string `json:"notification_type"`
+			}
+			_ = json.Unmarshal(e.Data, &d)
+			if d.T == "permission_prompt" || d.T == "elicitation_dialog" {
+				what = "needs a decision from a human (" + d.T + ")"
+			}
+		}
+		if what == "" {
+			return
+		}
+		rt.ToManager(msg.Session{Sid: e.Sid}, "hear", "HEAR: "+e.Node+" "+what, msg.Origin{})
 	}
 }

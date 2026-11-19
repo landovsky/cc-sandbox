@@ -32,6 +32,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/ulid"
 )
@@ -73,18 +74,19 @@ var Types = map[string]bool{
 // Config holds every tunable (all reachable as ccsbx-hostd flags / CCSBX_* env vars).
 type Config struct {
 	StateDir         string
-	FenceUID         int     // owner uid required of every outbox file
-	MaxBytes         int64   // per request file
-	Rate             float64 // requests per second per outbox
-	Burst            int     // bucket size per outbox
-	MaxList          int     // names read per outbox per scan
-	MaxTotal         int     // requests per generation in its lifetime; beyond: shed silently
-	ShedRefs         int     // refusal replies written per scan once the bucket is empty
-	Handler          Handler // nil: every known type is answered error/not_built
-	OnTick           func()  // called after every scan (the message pump)
-	Journal          Journal // nil: events.jsonl is not ingested (U3a alone)
-	MaxEventsPerScan int     // events taken from one outbox per scan
-	MaxEventLine     int     // bytes per events.jsonl line; longer lines are dropped
+	FenceUID         int                  // owner uid required of every outbox file
+	MaxBytes         int64                // per request file
+	Rate             float64              // requests per second per outbox
+	Burst            int                  // bucket size per outbox
+	MaxList          int                  // names read per outbox per scan
+	MaxTotal         int                  // requests per generation in its lifetime; beyond: shed silently
+	ShedRefs         int                  // refusal replies written per scan once the bucket is empty
+	Handler          Handler              // nil: every known type is answered error/not_built
+	OnEvent          func(journal.Record) // called after each fence event was journaled (hear)
+	OnTick           func()               // called after every scan (the message pump)
+	Journal          Journal              // nil: events.jsonl is not ingested (U3a alone)
+	MaxEventsPerScan int                  // events taken from one outbox per scan
+	MaxEventLine     int                  // bytes per events.jsonl line; longer lines are dropped
 	Now              func() time.Time
 	Logf             func(format string, args ...any)
 }

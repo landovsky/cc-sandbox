@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# e2e/00-standalone — standalone (invariant 29): cc-tree, ccmsg and ccq work with cc-sandbox absent.
+# Runs with no ccsbx on PATH and no CCSBX_* env, against a scratch tree repo. Part of `make e2e`.
+. "$(dirname "$0")/lib.sh"; e2e_init
+clean_path="$(printf '%s' "$PATH" | tr ':' '\n' | grep -v -x -e "$REPO/bin" | paste -sd:)"
+sa() { env -u CCSBX_STATE -u CCSBX_ROOT -u CCSBX_TMUX_SOCKET -u CCSBX_PROFILES -u CCSBX_PINS -u CCSBX_BIN PATH="$clean_path" "$@"; }
+
+if sa sh -c 'command -v ccsbx' >/dev/null; then
+  bad "the probe really has no ccsbx on PATH, otherwise this test proves nothing" "$(sa sh -c 'command -v ccsbx')"
+else ok "the probe has no ccsbx on PATH and no CCSBX_* env, as on a machine without cc-sandbox"; fi
+
+check "R22: the scratch tree repo is created and listed, so nightly e2e never writes the live tree" \
+  bash -c 'cc-tree init e2e "E2E scratch" >/dev/null && cc-tree trees | grep -q "^e2e"'
+[ "$(cc-tree trees | grep -c .)" = 1 ] && ok "the scratch repo holds only the e2e tree (none of Tomas's trees leaked in)" \
+  || bad "the scratch repo holds only the e2e tree" "$(cc-tree trees)"
+
+id="$(sa cc-tree add e2e:root --no-derive --title "standalone one" "first task" 2>&1 | awk '/^e2e:/{print $1; exit}')"
+[ -n "$id" ] && ok "cc-tree add creates a node with no ccsbx around ($id)" || bad "cc-tree add creates a node" "no id printed"
+check "cc-tree show lists the node" bash -c "cc-tree show e2e | grep -q 'standalone one'"
+check "cc-tree describe --outcome records what was seen on the node" \
+  bash -c "cc-tree describe '$id' --outcome 'RAN x SAW y' >/dev/null && grep -q 'RAN x SAW y' '$CC_TREE_REPO/e2e/tree.md'"
+check "cc-tree done ticks the node, with no Check: and no daemon to ask" \
+  bash -c "cc-tree done '$id' >/dev/null && grep -q '^- \[x\] standalone one' '$CC_TREE_REPO/e2e/tree.md'"
+for t in ccmsg ccq; do
+  out="$(sa "$t" --help 2>&1)"; rc=$?
+  { [ $rc -eq 0 ] && ! grep -qi ccsbx <<<"$out"; } && ok "$t --help works and does not mention ccsbx (the bus is unchanged by cc-sandbox)" \
+    || bad "$t --help works and does not mention ccsbx" "rc=$rc $out"
+done
+
+# S0: the real standalone suite, when it exists on this machine
+s0="${E2E_S0_DIR:-$HOME/.dotfiles}"
+if make -C "$s0" -n standalone >/dev/null 2>&1; then
+  check "S0 make standalone (cc-tree + session-bus suites) is green" make -C "$s0" standalone
+else
+  skip "S0 make standalone is green" "no 'standalone' target in $s0 yet (S0 is on dotfiles branch n1-c, not merged); set E2E_S0_DIR"
+fi

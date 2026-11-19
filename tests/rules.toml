@@ -1,0 +1,929 @@
+# The allow/block catalogue (build plan §6, invariant 23). One [[rule]] per T:<id>.
+#
+#   id          the T:<id> name, without the prefix
+#   title       what the rule protects, in a sentence
+#   suite       fence | outbox | settings | keys | git | doors | msg | approvals | cluster | verbs
+#   allow       twin 1: a shell command (run from the repo root) that exits 0 when the legitimate
+#               path still works. Without it, a fence that blocks everything would pass.
+#   block       twin 2: exits 0 when the forbidden path is refused.
+#   invariants  the doc-1 invariant numbers the rule enforces
+#   backends    docker | k8s | unit (a rule runs on every backend it lists)
+#   where       hp | mac | mac-kubeconfig | any
+#
+# "pending" as a twin means declared, not built: reported as pending, fails `selftest --strict`.
+# A row with a missing or empty allow/block fails `make test` (internal/rules meta-test).
+# Twins see CCSBX_BACKEND, CCSBX_RULE and CCSBX_TWIN in their environment.
+
+[[rule]]
+id = "fence-flags"
+title = "the fence runs with the fixed flags: uid 10001, read-only, no caps, no-new-privileges, pids, no host env"
+suite = "fence"
+allow = "tests/fence-test.sh fence-flags allow"
+block = "tests/fence-test.sh fence-flags block"
+invariants = [2, 3, 14]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "no-internet"
+title = "the fence is on an --internal network: no route out"
+suite = "fence"
+allow = "tests/fence-test.sh no-internet allow"
+block = "tests/fence-test.sh no-internet block"
+invariants = [4]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "no-dns-exfil"
+title = "the fence has no resolver, so a canary domain's log stays empty"
+suite = "fence"
+allow = "tests/fence-test.sh no-dns-exfil allow"
+block = "tests/fence-test.sh no-dns-exfil block"
+invariants = [4, 10]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "outbox-per-gen"
+title = "out/ and in/ live under a per-generation directory, never shared or reused"
+suite = "outbox"
+allow = "tests/fence-test.sh outbox-per-gen allow"
+block = "tests/fence-test.sh outbox-per-gen block"
+invariants = [10, 11]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "image-no-secret"
+title = "the fence image holds no credential, token or key"
+suite = "fence"
+allow = "pending"
+block = "pending"
+invariants = [2, 26]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "deny-under-bypass"
+title = "the compiled managed settings keep the deny list when the session runs in bypassPermissions"
+suite = "settings"
+allow = "tests/twin-go.sh ./internal/settings TestDenyUnderBypassAllow"
+block = "tests/twin-go.sh ./internal/settings TestDenyUnderBypassBlock"
+invariants = [3, 7]
+backends = ["unit", "docker"]
+where = "hp"
+
+[[rule]]
+id = "worktree-mcp-ignored"
+title = "an MCP server declared inside the worktree is not loaded; managed MCP is ccf only"
+suite = "settings"
+allow = "tests/twin-go.sh ./internal/settings TestWorktreeMCPIgnoredAllow"
+block = "tests/twin-go.sh ./internal/settings TestWorktreeMCPIgnoredBlock"
+invariants = [3, 25]
+backends = ["unit", "docker"]
+where = "hp"
+
+# --- the rest of the §6 catalogue (U19b): declared, twins pending until the owning piece lands.
+# The invariants numbers on these rows are a first mapping by the tests stream; the owning piece
+# confirms them when it replaces "pending" with real twins.
+
+[[rule]]
+id = "no-token-in-fence"
+title = "no door token or key exists anywhere in the fence"
+suite = "fence"
+allow = "pending"
+block = "pending"
+invariants = [2, 26]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "fence-sees-only-fwd"
+title = "the fence reaches only the forwarder port, nothing else on the host"
+suite = "fence"
+allow = "pending"
+block = "pending"
+invariants = [4]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "outbox-stamp-from-outbox"
+title = "a stamp is only honoured for a file that came out of the outbox"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [10, 11]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "outbox-symlink"
+title = "a symlink in the outbox is refused, never followed"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [10]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "outbox-fifo"
+title = "a fifo in the outbox is refused"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [10]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "outbox-hardlink"
+title = "a hardlink out of the outbox is refused"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [10]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "outbox-sparse"
+title = "a sparse file in the outbox is refused or bounded"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [10]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "outbox-host-write-refused"
+title = "the fence cannot write to the host side of the outbox (red until gate M)"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [10, 11]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "outbox-flood"
+title = "an outbox flood hits the size and count caps"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [10]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "daemon-authz"
+title = "the daemon refuses a caller that is not the owner"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [5]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "start-rate"
+title = "starts are rate-limited per owner"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [5]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "profile-not-approved-for-machine"
+title = "a profile not approved for this machine is refused at start"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [5, 6]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "one-live-generation"
+title = "a second live generation of one session is refused"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "one-cockpit-per-realm"
+title = "a second cockpit in one realm is refused"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "journal-durable"
+title = "the daemon journal survives a kill -9"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "epoch-reset-reingest"
+title = "after an epoch reset the journal is re-ingested without duplicates"
+suite = "outbox"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "keys-unreadable"
+title = "the signing keys are unreadable to the fence and to tomas"
+suite = "keys"
+allow = "pending"
+block = "pending"
+invariants = [8]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "root-wrapper-rejects"
+title = "the root wrapper rejects any call not from the daemon"
+suite = "keys"
+allow = "pending"
+block = "pending"
+invariants = [8]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "token-copied"
+title = "a token copied out of its fence is refused (PoP)"
+suite = "keys"
+allow = "pending"
+block = "pending"
+invariants = [8]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "token-after-exit"
+title = "a token is refused after its session exits"
+suite = "keys"
+allow = "pending"
+block = "pending"
+invariants = [8]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "token-gen-bump"
+title = "a token of an old generation is refused"
+suite = "keys"
+allow = "pending"
+block = "pending"
+invariants = [8, 11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "token-unknown-kid"
+title = "a token signed by an unknown key id is refused"
+suite = "keys"
+allow = "pending"
+block = "pending"
+invariants = [8]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "key-signs-foreign-machine"
+title = "a machine key cannot sign for another machine"
+suite = "keys"
+allow = "pending"
+block = "pending"
+invariants = [8]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "mac-key-above-mac-max"
+title = "a Mac key cannot sign above the mac-max tier"
+suite = "keys"
+allow = "pending"
+block = "pending"
+invariants = [8]
+backends = ["unit"]
+where = "mac"
+
+[[rule]]
+id = "git-hooks-off"
+title = "host git runs with hooks disabled"
+suite = "git"
+allow = "pending"
+block = "pending"
+invariants = [12]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "git-dotgit-redirect"
+title = "a .git redirect in the worktree is not followed"
+suite = "git"
+allow = "pending"
+block = "pending"
+invariants = [12]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "git-gitattributes-filter"
+title = "a gitattributes filter does not run on the host"
+suite = "git"
+allow = "pending"
+block = "pending"
+invariants = [12]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "git-submodule-ignored"
+title = "a submodule in the worktree is ignored by host git"
+suite = "git"
+allow = "pending"
+block = "pending"
+invariants = [12]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "git-steering-flag"
+title = "a steering flag (-c, --exec-path) from the fence is refused"
+suite = "git"
+allow = "pending"
+block = "pending"
+invariants = [12]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "fence-cannot-commit"
+title = "the fence cannot commit; commits go through the outbox"
+suite = "git"
+allow = "pending"
+block = "pending"
+invariants = [12]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "check-runs-in-fence"
+title = "a node Check: command runs inside a fence, not on the host"
+suite = "git"
+allow = "pending"
+block = "pending"
+invariants = [12]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "no-host-fork"
+title = "no host git process is forked on behalf of the fence beyond the shim"
+suite = "git"
+allow = "pending"
+block = "pending"
+invariants = [12]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "model-door-allow"
+title = "the model door passes an API and a subscription request"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "model-door-no-token"
+title = "the model door refuses a request without a token"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "model-door-subscription-headers"
+title = "subscription headers are set by the door, not by the fence"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "no-oauth-in-fence"
+title = "no OAuth credential is visible in the fence"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [2, 26]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "billing-pinned"
+title = "the billing mode is pinned by the profile and cannot be switched in-session"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "upstream-limit-passthrough"
+title = "an upstream rate-limit reply reaches the agent unchanged"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "model-door-redaction"
+title = "secrets in a model request are redacted at the door"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [26]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "webfetch-open-logged"
+title = "a web fetch to a public host is allowed and logged"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [4, 9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "webfetch-private-refused"
+title = "a web fetch to a private or tailnet address is refused"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [4, 9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "websearch-through-model-door"
+title = "web search goes provider-side through the model door"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [4, 9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "egress-api-contents-refused"
+title = "GitHub API contents/ref/merge calls are refused"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "npm-publish-refused"
+title = "npm publish through the egress door is refused"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "goproxy-unlisted-refused"
+title = "a Go module not on the allowlist is refused"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "no-app-token-anywhere"
+title = "no GitHub App token reaches the fence, the logs or the outbox"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [2, 26]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "push-ff-allowed"
+title = "a fast-forward push of the session branch is allowed"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "push-force-refused"
+title = "a force push is refused"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "push-main-refused"
+title = "a push to main is refused"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "push-forbidden-path-refused"
+title = "a push touching a forbidden path (CODEOWNERS) is refused"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "push-301-files-refused"
+title = "a push of 301 files or more is refused"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [9]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "fwd-only-doors"
+title = "the forwarder relays only to doors"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [4]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "fwd-cannot-reach-non-door"
+title = "the forwarder cannot reach a non-door address"
+suite = "doors"
+allow = "pending"
+block = "pending"
+invariants = [4]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "msg-in-scope"
+title = "a message to a peer in scope is delivered"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "msg-out-of-scope"
+title = "a message outside the session's scope is refused"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "msg-no-cockpit"
+title = "a fenced session cannot message the cockpit directly"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "msg-cross-machine"
+title = "a cross-machine message is relayed and signed"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "msg-forged-from"
+title = "a forged from= field is overwritten by the relay"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "msg-hub-down"
+title = "with the hub down the message is queued or refused, never lost silently"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "hub-rejects-unsigned-fenced"
+title = "the hub rejects an unsigned message from a fenced session"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "relay-cannot-impersonate"
+title = "the relay cannot join, track or send as another sid"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "msg-stamp-replay"
+title = "a replayed stamp is refused"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "msg-kind-tamper"
+title = "a tampered kind is refused"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "hub-credential-sidecar-only"
+title = "the hub credential exists only in the sidecar"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [2, 26]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "approve-low-with-code"
+title = "a low-tier approval with the code succeeds"
+suite = "approvals"
+allow = "pending"
+block = "pending"
+invariants = [14]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "approve-without-code-hp-agent"
+title = "an approval without the code from an hp agent is refused"
+suite = "approvals"
+allow = "pending"
+block = "pending"
+invariants = [14]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "approve-via-fwd"
+title = "an approval sent through the forwarder is refused (403)"
+suite = "approvals"
+allow = "pending"
+block = "pending"
+invariants = [14]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "approve-decide-twice"
+title = "a second decision on one approval is refused"
+suite = "approvals"
+allow = "pending"
+block = "pending"
+invariants = [14]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "approve-medium-refused"
+title = "a medium-tier approval is refused tonight"
+suite = "approvals"
+allow = "pending"
+block = "pending"
+invariants = [14]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "approval-dies-with-gen"
+title = "an open approval dies with its generation"
+suite = "approvals"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "approve-spoofed-ts-header"
+title = "a spoofed Tailscale identity header from the fence is ignored"
+suite = "approvals"
+allow = "pending"
+block = "pending"
+invariants = [14]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "question-answer-not-proof"
+title = "an answer to a question is not a proof of approval"
+suite = "approvals"
+allow = "pending"
+block = "pending"
+invariants = [14]
+backends = ["docker", "k8s"]
+where = "hp"
+
+[[rule]]
+id = "door-ingress"
+title = "only the allowed ingress reaches a door"
+suite = "cluster"
+allow = "pending"
+block = "pending"
+invariants = [4]
+backends = ["k8s"]
+where = "hp"
+
+[[rule]]
+id = "launcher-no-exec-into-doors"
+title = "the launcher cannot exec into doors or mount their Secret"
+suite = "cluster"
+allow = "pending"
+block = "pending"
+invariants = [2]
+backends = ["k8s"]
+where = "hp"
+
+[[rule]]
+id = "vap-rejects"
+title = "the admission policy rejects a non-conforming pod"
+suite = "cluster"
+allow = "pending"
+block = "pending"
+invariants = [3]
+backends = ["k8s"]
+where = "hp"
+
+[[rule]]
+id = "unpinned-refused"
+title = "an unpinned image never runs: a tag is refused outside direct mode, a candidate digest runs only under e2e-* profiles (user space; ccsbx-root and the VAP enforce the same at gate M)"
+suite = "pins"
+allow = "tests/twin-go.sh ./internal/pins TestUnpinnedRefusedAllow"
+block = "tests/twin-go.sh ./internal/pins TestUnpinnedRefusedBlock"
+invariants = [15, 26]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "candidate-only-for-e2e"
+title = "a candidate digest runs under e2e-* profiles only"
+suite = "cluster"
+allow = "pending"
+block = "pending"
+invariants = [15]
+backends = ["k8s"]
+where = "hp"
+
+[[rule]]
+id = "fx-epoch-reset"
+title = "an epoch reset is handled by the verb layer"
+suite = "verbs"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "fx-partial"
+title = "a partial verb write is detected and repaired"
+suite = "verbs"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "fx-stale-dropped"
+title = "a stale verb is dropped"
+suite = "verbs"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "fx-stale-human"
+title = "a stale verb on a human-edited node is surfaced, not applied"
+suite = "verbs"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "fx-stale-moved"
+title = "a stale verb on a moved node is surfaced, not applied"
+suite = "verbs"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "fx-stale-rename-tree"
+title = "a stale verb after a tree rename is surfaced, not applied"
+suite = "verbs"
+allow = "pending"
+block = "pending"
+invariants = [11]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "fenced-start-refused"
+title = "a fenced session cannot start another session"
+suite = "verbs"
+allow = "pending"
+block = "pending"
+invariants = [5]
+backends = ["unit"]
+where = "any"

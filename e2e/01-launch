@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# e2e/01-launch — hook point 1: a start call mints sid and gen, refuses what it must (plan §9 item 2).
+# Real tonight: `ccsbx start --launcher none` (the daemon's decisions, no pane). Skipped: what needs
+# the fence image, cc-tree's placement (C1) or another machine.
+. "$(dirname "$0")/lib.sh"; e2e_init
+st() { "$CCSBX" start --launcher none --json "$@"; }
+spec e2e:launch lid-l1 > "$E2E_ROOT/l1.json"
+
+out="$(st --spec "$E2E_ROOT/l1.json" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && ok "start under e2e-default with billing=stub answers a StartReply" || bad "start answers a StartReply" "rc=$rc $out"
+sid="$(jget sid <<<"$out" 2>/dev/null)"; gen="$(jget gen <<<"$out" 2>/dev/null)"
+{ [ -n "$sid" ] && [ "$gen" = 1 ]; } && ok "the daemon mints the sid and generation 1; the caller sent neither" || bad "daemon mints sid and gen 1" "sid=$sid gen=$gen"
+[ "$(jget not_evidence <<<"$out" 2>/dev/null)" = True ] && ok "a direct-mode reply carries not_evidence=true, so no one mistakes tonight's run for a fence proof" \
+  || bad "direct-mode reply carries not_evidence=true" "$out"
+
+out2="$(st --spec "$E2E_ROOT/l1.json" 2>&1)"
+[ "$(jget sid <<<"$out2" 2>/dev/null)" = "$sid" ] && ok "a retry with the same request id returns the same session (a cockpit retry must not double-start)" \
+  || bad "same request id returns the same sid" "$out2"
+
+spec e2e:nobill lid-l2 's/"billing":"stub"/"billing":""/' > "$E2E_ROOT/l2.json"
+st --spec "$E2E_ROOT/l2.json" >/dev/null 2>&1; rc=$?
+[ $rc -eq 2 ] && ok "no billing mode is refused with exit 2: a fence with no billing pinned must not start" || bad "no billing -> exit 2" "rc=$rc"
+
+spec e2e:wrongm lid-l3 's/"machine":"hp-ubuntu"/"machine":"elsewhere"/' > "$E2E_ROOT/l3.json"
+out="$(st --spec "$E2E_ROOT/l3.json" 2>&1)"; rc=$?
+{ [ $rc -eq 2 ] && grep -q wrong_machine <<<"$out"; } && ok "a spec for another machine is refused as wrong_machine (each daemon starts only its own sessions)" \
+  || bad "wrong machine refused" "rc=$rc $out"
+
+if docker image inspect ccsbx-fence:dev >/dev/null 2>&1; then
+  skip "a second start of a live label is refused already_running" "needs a pane that stays alive; the live-pane leg is not written yet (image present, TODO)"
+else
+  skip "a second start of a live label is refused already_running" "needs the fence image ccsbx-fence:dev (U1a local build) to keep a pane alive; launcher=none has no live pane"
+fi
+skip "cc-tree add --start / cc-tree start launch a fenced node through the placement function" "needs C1 (cc-tree placement)"
+skip "a fenced node can never start unfenced" "needs C1"
+skip "a manager's cc-tree start reaches the target daemon" "needs C16 + M2c"
+skip "start on the Mac and on future-two" "needs gate M (Mac daemon, future-two)"

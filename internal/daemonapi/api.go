@@ -466,7 +466,7 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"error": "no_live_session"})
 		return
 	}
-	writeJSON(w, 200, map[string]any{"sid": t.Sid, "label": t.Label, "gen": t.Gen, "realm": t.Realm, "idle": s.Msg.IdleNow(t.Sid)})
+	writeJSON(w, 200, map[string]any{"sid": t.Sid, "label": t.Label, "gen": t.Gen, "realm": t.Realm, "idle": s.Msg.IdleNow(t.Sid, t.Gen)})
 }
 
 // deliver: POST /v1/sessions/<sid>/deliver {from, text, queue}. The stamp is
@@ -545,7 +545,7 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 		}
 		idle := false
 		if s.Msg != nil {
-			idle = s.Msg.IdleNow(x.Sid)
+			idle = s.Msg.IdleNow(x.Sid, x.Gen)
 		}
 		out = append(out, map[string]any{"sid": x.Sid, "label": x.Label, "gen": x.Gen, "realm": x.Realm, "state": "running", "idle": idle})
 	}

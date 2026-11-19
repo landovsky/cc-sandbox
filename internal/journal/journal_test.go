@@ -278,23 +278,23 @@ func hook(typ string) Event {
 // Only a finished turn (hook.Stop as the last word) means "at the input prompt".
 func TestIdleOnlyAfterStopAndNotWhileATurnRuns(t *testing.T) {
 	s := open(t, t.TempDir())
-	if _, ok := s.IdleSince("s1"); ok {
+	if _, ok := s.IdleSince("s1", 1); ok {
 		t.Fatal("a session we have heard nothing from is not idle (it may be at a trust dialog)")
 	}
 	s.Append(hook("hook.UserPromptSubmit"))
-	if _, ok := s.IdleSince("s1"); ok {
+	if _, ok := s.IdleSince("s1", 1); ok {
 		t.Fatal("mid-turn is not idle")
 	}
 	s.Append(hook("hook.Notification")) // "needs your permission": a menu is up
-	if _, ok := s.IdleSince("s1"); ok {
+	if _, ok := s.IdleSince("s1", 1); ok {
 		t.Fatal("a permission notification is not idle")
 	}
 	s.Append(hook("hook.Stop"))
-	if _, ok := s.IdleSince("s1"); !ok {
+	if _, ok := s.IdleSince("s1", 1); !ok {
 		t.Fatal("after Stop it is idle")
 	}
 	s.Append(hook("hook.UserPromptSubmit"))
-	if _, ok := s.IdleSince("s1"); ok {
+	if _, ok := s.IdleSince("s1", 1); ok {
 		t.Fatal("a new prompt makes it busy again")
 	}
 }
@@ -308,11 +308,85 @@ func TestIdleSurvivesRestartAndIgnoresHostEvents(t *testing.T) {
 	s.Append(Event{Sid: "s1", Src: "host", Type: "session.ended"})
 	s.Close()
 	s2 := open(t, dir)
-	if _, ok := s2.IdleSince("s1"); !ok {
+	if _, ok := s2.IdleSince("s1", 1); !ok {
 		t.Fatal("idle lost on restart")
 	}
 	s2.Append(Event{Sid: "s2", Src: "host", Type: "hook.Stop"})
-	if _, ok := s2.IdleSince("s2"); ok {
+	if _, ok := s2.IdleSince("s2", 1); ok {
 		t.Fatal("a host event was taken for the fence's word")
+	}
+}
+
+// ---- T:idle-per-generation, T:idle-notification-type ------------------------------------------
+
+func hookG(typ string, gen int, data string) Event {
+	return Event{Sid: "s1", Gen: gen, Src: "fence", Type: typ, Data: json.RawMessage(data)}
+}
+
+// context: the session was resumed as generation 2. Its new Claude Code starts at its own
+// startup dialogs (trust folder, resume picker); generation 1's last Stop says nothing about
+// that pane, and an Enter typed into it would pick the dialog's default.
+func TestIdleIsPerGenerationAllow(t *testing.T) {
+	s := open(t, t.TempDir())
+	s.Append(hookG("hook.Stop", 1, `{}`))
+	if _, ok := s.IdleSince("s1", 1); !ok {
+		t.Fatal("generation 1 is idle after its Stop")
+	}
+	s.Append(hookG("hook.Stop", 2, `{}`))
+	if _, ok := s.IdleSince("s1", 2); !ok {
+		t.Fatal("generation 2 is idle after its own Stop")
+	}
+}
+
+func TestIdleIsPerGenerationBlock(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	s.Append(hookG("hook.Stop", 1, `{}`))
+	s.Append(Event{Sid: "s1", Gen: 2, Src: "host", Type: "session.started", Data: json.RawMessage(`{}`)})
+	if _, ok := s.IdleSince("s1", 2); ok {
+		t.Fatal("a new generation inherited the old one's idle")
+	}
+	s.Append(hookG("hook.SessionStart", 2, `{}`))
+	if _, ok := s.IdleSince("s1", 2); ok {
+		t.Fatal("SessionStart is not idle")
+	}
+	s.Close()
+	s2 := open(t, dir)
+	if _, ok := s2.IdleSince("s1", 2); ok {
+		t.Fatal("restart mixed the generations up")
+	}
+	if _, ok := s2.IdleSince("s1", 1); !ok {
+		t.Fatal("generation 1's own idle lost on restart")
+	}
+}
+
+// context: Claude Code fires Notification for several reasons. "Waiting for input" after a Stop
+// (idle_prompt) leaves the pane at its prompt; a permission prompt or any other kind means a
+// menu is up. An event that doesn't say which is read as the worse one.
+func TestIdleNotificationTypeAllow(t *testing.T) {
+	s := open(t, t.TempDir())
+	s.Append(hookG("hook.Stop", 1, `{}`))
+	s.Append(hookG("hook.Notification", 1, `{"notification_type":"idle_prompt","message":"waiting"}`))
+	if _, ok := s.IdleSince("s1", 1); !ok {
+		t.Fatal("idle_prompt after Stop must stay idle")
+	}
+}
+
+func TestIdleNotificationTypeBlock(t *testing.T) {
+	for _, data := range []string{`{"notification_type":"permission_prompt"}`, `{"notification_type":"elicitation_dialog"}`, `{"message":"x"}`, `{}`, `[]`} {
+		s := open(t, t.TempDir())
+		s.Append(hookG("hook.Stop", 1, `{}`))
+		s.Append(Event{Sid: "s1", Gen: 1, Src: "fence", Type: "hook.Notification", Data: json.RawMessage(data)})
+		if _, ok := s.IdleSince("s1", 1); ok {
+			t.Fatalf("Notification %s after Stop must make the pane busy", data)
+		}
+		s.Close()
+	}
+	// idle_prompt must not promote a pane that is mid-turn
+	s := open(t, t.TempDir())
+	s.Append(hookG("hook.UserPromptSubmit", 1, `{}`))
+	s.Append(hookG("hook.Notification", 1, `{"notification_type":"idle_prompt"}`))
+	if _, ok := s.IdleSince("s1", 1); ok {
+		t.Fatal("idle_prompt promoted a busy pane")
 	}
 }

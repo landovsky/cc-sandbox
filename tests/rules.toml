@@ -242,3 +242,23 @@ block = "tests/twin-go.sh ./internal/msg TestMsgNotIntoMenuBlock"
 invariants = [5, 6]
 backends = ["unit"]
 where = "hp"
+
+[[rule]]
+id = "idle-per-generation"
+title = "a resumed session's new generation is idle only after ITS OWN Stop, never on the old generation's"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/journal TestIdleIsPerGenerationAllow"
+block = "tests/twin-go.sh ./internal/journal TestIdleIsPerGenerationBlock"
+invariants = [5, 6]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "idle-notification-type"
+title = "after a Stop, a Notification of type idle_prompt stays idle; permission_prompt and any other (or untyped) one means a menu is up"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/journal TestIdleNotificationTypeAllow"
+block = "tests/twin-go.sh ./internal/journal TestIdleNotificationTypeBlock"
+invariants = [5, 6]
+backends = ["unit"]
+where = "hp"

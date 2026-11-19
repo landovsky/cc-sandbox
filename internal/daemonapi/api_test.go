@@ -293,7 +293,7 @@ func (n *nopOut) Deliver(sid, line string) error {
 
 type idleT struct{ idle bool }
 
-func (i idleT) IdleSince(string) (time.Time, bool) { return time.Now().Add(-time.Hour), i.idle }
+func (i idleT) IdleSince(string, int) (time.Time, bool) { return time.Now().Add(-time.Hour), i.idle }
 
 func newAuthRig(t *testing.T, idle bool) (local, tcp *httptest.Server, out *nopOut) {
 	j, _ := journal.Open(t.TempDir(), "hp-ubuntu", 0)

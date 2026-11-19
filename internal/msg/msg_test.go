@@ -22,7 +22,7 @@ type fakeIdle struct {
 	since map[string]time.Time
 }
 
-func (f *fakeIdle) IdleSince(sid string) (time.Time, bool) {
+func (f *fakeIdle) IdleSince(sid string, gen int) (time.Time, bool) {
 	if f.busy[sid] {
 		return time.Time{}, false
 	}

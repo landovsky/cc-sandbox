@@ -85,11 +85,18 @@ type Store struct {
 	cur     *os.File
 	curDay  string
 	waiters []chan struct{}
-	hooks   map[string]hookState // sid -> the last hook event the fence reported
+	hooks   map[hookKey]hookState // (sid, gen) -> where the fence says its prompt is
+}
+
+// hookKey is per generation: a resumed session's new generation starts at its own startup
+// (trust dialog, resume picker), whatever the previous generation's last Stop said.
+type hookKey struct {
+	Sid string
+	Gen int
 }
 
 type hookState struct {
-	Type string
+	Idle bool
 	TS   time.Time
 }
 
@@ -127,7 +134,7 @@ func Open(dir, machine string, retentionDays int) (*Store, error) {
 // restart doesn't forget that a session is mid-turn. A session with no hook event in it is
 // simply unknown, and unknown is never idle.
 func (s *Store) rebuildHooks() {
-	s.hooks = map[string]hookState{}
+	s.hooks = map[hookKey]hookState{}
 	segs := s.segments()
 	for i := len(segs) - 1; i >= 0 && i >= len(segs)-2; i-- {
 		recs, _, _ := scan(filepath.Join(s.Dir, segs[i]))
@@ -137,21 +144,50 @@ func (s *Store) rebuildHooks() {
 	}
 }
 
+// noteHook folds one fence hook event into the (sid, gen)'s idle state:
+//
+//	hook.Stop                              idle: the turn is over, the prompt is back
+//	hook.Notification idle_prompt          unchanged: "waiting for input" after a Stop is still
+//	                                       idle, and it must not promote a busy pane
+//	hook.Notification (any other type)     busy: permission_prompt, elicitation_dialog, ... a
+//	                                       menu is up
+//	every other hook (a prompt, a tool, SessionStart, ...)   busy
+//
+// "Idle" is the FENCE's claim (the hook runs inside the fence, which an agent could write to),
+// so it can only withhold a message, never authorise anything: the worst a lying fence does is
+// make its own pane look idle and receive messages it was in scope for anyway.
+// The Notification rule needs the managed hook (C3's ccf-hook) to put notification_type into
+// the event's data; an event without it counts as "any other type", i.e. busy (fail closed).
 func (s *Store) noteHook(r Record) {
-	if r.Src == "fence" && strings.HasPrefix(r.Type, "hook.") && r.Sid != "" {
-		s.hooks[r.Sid] = hookState{r.Type, r.TS}
+	if r.Src != "fence" || !strings.HasPrefix(r.Type, "hook.") || r.Sid == "" {
+		return
+	}
+	k := hookKey{r.Sid, r.Gen}
+	switch r.Type {
+	case "hook.Stop":
+		s.hooks[k] = hookState{true, r.TS}
+	case "hook.Notification":
+		var d struct {
+			Type string `json:"notification_type"`
+		}
+		_ = json.Unmarshal(r.Data, &d)
+		if d.Type == "idle_prompt" {
+			return
+		}
+		s.hooks[k] = hookState{false, r.TS}
+	default:
+		s.hooks[k] = hookState{false, r.TS}
 	}
 }
 
-// IdleSince reports whether the session's last hook event is Stop, i.e. its turn is over and
-// Claude Code is sitting at the input prompt, and when that happened. Anything else (a prompt
-// submitted, a tool running, a permission Notification, nothing seen yet) is not idle: the pane
-// may be showing a menu, and a message typed into a menu answers it.
-func (s *Store) IdleSince(sid string) (time.Time, bool) {
+// IdleSince reports whether generation gen of the session is at its input prompt (see
+// noteHook), and since when. Nothing seen yet, or only a previous generation's events, is not
+// idle: the pane may be at a startup dialog, and Enter would pick its default.
+func (s *Store) IdleSince(sid string, gen int) (time.Time, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	h, ok := s.hooks[sid]
-	if !ok || h.Type != "hook.Stop" {
+	h, ok := s.hooks[hookKey{sid, gen}]
+	if !ok || !h.Idle {
 		return time.Time{}, false
 	}
 	return h.TS, true

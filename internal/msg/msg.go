@@ -75,7 +75,7 @@ type Deliverer interface{ Deliver(sid, line string) error }
 
 // Idler says whether a session's pane is at its input prompt, and since when. nil: never.
 type Idler interface {
-	IdleSince(sid string) (time.Time, bool)
+	IdleSince(sid string, gen int) (time.Time, bool)
 }
 
 // Origin says where the final result of a queued message goes (the sender's inbox).
@@ -198,7 +198,7 @@ func (r *Router) SendWith(from Session, body []byte, o Origin) Result {
 	if !r.pairOK(sender.Sid, target.Sid) {
 		return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "refused", Code: "rate_capped"})
 	}
-	if !r.ready(target.Sid) {
+	if !r.ready(target.Sid, target.Gen) {
 		if r.queued(target.Label) >= r.PendingMax {
 			return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "refused", Code: "queue_full"})
 		}
@@ -212,10 +212,11 @@ func (r *Router) SendWith(from Session, body []byte, o Origin) Result {
 
 func (r *Router) deliverFenced(sender, target Session, text string) Result {
 	line := stampFenced(sender, text)
+	r.delivered[target.Sid] = r.now() // busy from here on, before the paste can race a second sender
 	if err := r.Out.Deliver(target.Sid, line); err != nil {
+		delete(r.delivered, target.Sid)
 		return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "error", Code: "undeliverable"})
 	}
-	r.delivered[target.Sid] = r.now()
 	return r.receipt(sender.Sid, sender.Gen, target.Sid, Result{Status: "ok", To: target.Sid})
 }
 
@@ -243,7 +244,7 @@ func (r *Router) DeliverOwner(who, to, text string, queue bool) Result {
 	if target == nil || strings.TrimSpace(text) == "" {
 		return r.receipt("owner", 0, "", Result{Status: "error", Code: "no_live_session"})
 	}
-	if !r.ready(target.Sid) {
+	if !r.ready(target.Sid, target.Gen) {
 		if !queue {
 			return r.receipt("owner", 0, target.Sid, Result{Status: "refused", Code: "target_busy"})
 		}
@@ -261,28 +262,33 @@ func (r *Router) DeliverOwner(who, to, text string, queue bool) Result {
 func (r *Router) deliverOwner(who string, target Session, text string) Result {
 	b := boundary()
 	line := fmt.Sprintf("[MSG from %s · trust: unfenced (owner device) · #%s] %s ‹end #%s›", who, b, flat(text, MaxText), b)
+	r.delivered[target.Sid] = r.now()
 	if err := r.Out.Deliver(target.Sid, line); err != nil {
+		delete(r.delivered, target.Sid)
 		return r.receipt("owner", 0, target.Sid, Result{Status: "error", Code: "undeliverable"})
 	}
-	r.delivered[target.Sid] = r.now()
 	return r.receipt("owner", 0, target.Sid, Result{Status: "ok", To: target.Sid})
 }
 
 // Idle reports whether the session is at its input prompt right now: the fence reported Stop,
 // and nothing has been typed into it since.
 // IdleNow reports whether the session is at its input prompt right now.
-func (r *Router) IdleNow(sid string) bool {
+func (r *Router) IdleNow(sid string, gen int) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.cfg()
-	return r.ready(sid)
+	return r.ready(sid, gen)
 }
 
-func (r *Router) ready(sid string) bool {
+// ready: the generation's pane is at its prompt (a Stop of THIS generation came after the last
+// thing typed into it). The check and the paste happen under the router's lock, one message at
+// a time, and the pane is marked busy before the paste; the window that remains (the human
+// typing in the pane between the last Stop and the paste) is tmux's, not ours to close.
+func (r *Router) ready(sid string, gen int) bool {
 	if r.Idle == nil {
 		return false
 	}
-	since, ok := r.Idle.IdleSince(sid)
+	since, ok := r.Idle.IdleSince(sid, gen)
 	if !ok {
 		return false
 	}
@@ -428,7 +434,7 @@ func (r *Router) Pump(done func(Origin, Result)) {
 			continue
 		}
 		target := resolve(all, p.Realm, p.ToNode, "")
-		if target == nil || !r.ready(target.Sid) {
+		if target == nil || !r.ready(target.Sid, target.Gen) {
 			keep = append(keep, p)
 			continue
 		}

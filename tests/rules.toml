@@ -83,3 +83,76 @@ block = "tests/twin-go.sh ./internal/settings TestWorktreeMCPIgnoredBlock"
 invariants = [3, 25]
 backends = ["unit", "docker"]
 where = "hp"
+
+# ---- U3a: ccsbx-hostd (outbox reader). Direct mode: every result is "not evidence". ----
+
+[[rule]]
+id = "stamp-from-outbox"
+title = "a request's identity comes from the outbox path and the session record, never from the file's bytes"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestStampFromOutboxAllow"
+block = "tests/twin-go.sh ./internal/hostd TestStampFromOutboxBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "outbox-symlink"
+title = "a symlink in the outbox (to a host file, or inside it) is never followed or read"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxSymlinkAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxSymlinkBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "outbox-fifo"
+title = "a FIFO in the outbox cannot hang the daemon"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxFifoAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxFifoBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "outbox-hardlink"
+title = "a hard-linked file (nlink != 1) in the outbox is refused"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxHardlinkAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxHardlinkBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "outbox-sparse"
+title = "a sparse file bigger than the cap is refused by its apparent size, unread"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxSparseAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxSparseBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "outbox-flood"
+title = "thousands of request files cost bounded work: a burst is served, the rest is shed"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxFloodAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxFloodBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+# RED in direct mode by design: tomas can write the outbox until the privilege split (gate M).
+[[rule]]
+id = "outbox-host-write-refused"
+title = "the host user cannot write into an outbox (only the fence uid can; the daemon only reads)"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxHostWriteRefusedAllow"
+block = "CCSBX_TWIN=1 tests/twin-go.sh ./internal/hostd TestOutboxHostWriteRefusedBlock"
+invariants = [10, 14]
+backends = ["docker"]
+where = "hp"

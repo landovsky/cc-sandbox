@@ -125,3 +125,34 @@ func TestSteeringCaseInsensitiveAndMore(t *testing.T) {
 		}
 	}
 }
+
+// The guard on positional arguments is lexical, so a symlink INSIDE the worktree that points at a
+// host file or directory must not turn an allowed-looking path into a host read. Whatever git
+// does with these (refuse, or treat the link as a link), the host file's content must never come
+// back through Run.
+func TestSymlinksInWorktreeDoNotLeakHostFiles(t *testing.T) {
+	r, _, wt := repo(t)
+	dir := t.TempDir()
+	secret := filepath.Join(dir, "secret.txt")
+	os.WriteFile(secret, []byte("TOP SECRET CONTENT\n"), 0o600)
+	os.Symlink(secret, filepath.Join(wt, "leakfile"))
+	os.Symlink(dir, filepath.Join(wt, "leakdir"))
+	os.Symlink("/dev/null", filepath.Join(wt, "nulllink"))
+	for _, args := range [][]string{
+		{"diff", "leakfile", "nulllink"}, {"diff", "--", "leakfile"}, {"diff", "--", "leakdir/secret.txt"},
+		{"diff", "leakdir/secret.txt", "nulllink"}, {"diff", "--no-index"}, {"status", "--porcelain", "--", "leakdir"},
+		{"log", "-p", "--", "leakfile"}, {"ls-files", "-z", "--", "leakdir"}, {"show", "HEAD:leakfile"},
+	} {
+		out, _ := r.Run(args...)
+		if strings.Contains(out, "TOP SECRET") {
+			t.Errorf("git %v returned host file content: %q", args, out)
+		}
+	}
+	// and a commit stores the LINK, never the target's bytes
+	if _, err := r.Commit("s", "links"); err != nil {
+		t.Fatal(err)
+	}
+	if out, _ := r.Run("show", "--format=%B", "-p", "HEAD"); strings.Contains(out, "TOP SECRET") {
+		t.Fatalf("a symlink target's content ended up in a commit: %q", out)
+	}
+}

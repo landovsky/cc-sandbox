@@ -2,7 +2,7 @@
 # Docker-backend twins for tests/rules.toml (U1b). Direct mode: results are NOT EVIDENCE.
 #
 #   tests/fence-test.sh <rule> <allow|block>
-#   rules: fence-flags no-internet no-dns-exfil outbox-per-gen
+#   rules: fence-flags no-internet no-dns-exfil outbox-per-gen no-token-in-fence
 #   tests/fence-test.sh --help
 #
 # Environment (all optional):
@@ -26,6 +26,7 @@ PIDS=()
 # Files the fence wrote (uid 10001) can't be removed by the host user: sweep them from a container.
 rmstate() { docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"; }
 cleanup() {
+  docker rm -f "ccsbx-fwd-$$" >/dev/null 2>&1
   docker rm -f "ccsbx-canary-$$" >/dev/null 2>&1   # first: a connected peer blocks the network removal
   for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
   wait 2>/dev/null   # let ccsbx run finish its own cleanup before we sweep
@@ -164,6 +165,52 @@ outbox-per-gen/block)
   echo "$seen" | head -1 | grep -qx 0 || fail "a new session's out/ is not empty: $seen"
   echo "$seen" | tail -1 | grep -qx 0 || fail "another outbox is visible in the fence: $seen"
   ok "per-generation outbox, rerun refused, new session starts empty";;
+
+no-token-in-fence/allow|no-token-in-fence/block)
+  # The forwarder (with a loopback stub door behind it, local mode) runs as a peer on the fence's
+  # own network under the alias 'fwd', fed its token and key on STDIN. The fence holds neither.
+  sid=$(new_session nt) || fail "start"
+  fence_bg "$sid" sleep 60
+  net=ccsbx-net-$sid-g1
+  [ "$RULE" = no-token-in-fence ] || fail "internal"
+  BINABS=$(readlink -f "$BIN")
+  "$BIN" token mint --key-file "$STATE/dev.key" --sub "tomas/hp-ubuntu/$sid/g1" --label nt --billing stub --profile e2e-test \
+      --aud ccsbx-model --fwd-secrets > "$STATE/secrets.json" || fail "mint"
+  chmod 0600 "$STATE/dev.key"
+  docker run --rm -i --name "ccsbx-fwd-$$" --network "$net" --network-alias fwd \
+      -v "$BINABS:/ccsbx:ro" -v "$STATE/dev.key:/dev.key:ro" "$IMG" sh -c \
+      '/ccsbx stub --listen 127.0.0.1:8081 --key-file /dev.key & exec /ccsbx fwd --listen :8080 --door model=http://127.0.0.1:8081' \
+      < "$STATE/secrets.json" >"$STATE/fwd.log" 2>&1 &
+  PIDS+=("$!")
+  call="import urllib.request,json
+r=urllib.request.Request('http://fwd:8080/model/v1/messages',data=json.dumps({'model':'m','messages':[{'role':'user','content':'E2E:hi'}]}).encode(),headers={'content-type':'application/json'})
+print(urllib.request.urlopen(r,timeout=5).read().decode())"
+  got=""
+  for _ in $(seq 1 25); do got=$(docker exec "ccsbx-$sid-g1" $PY "$call" 2>&1) && break; sleep 0.4; done
+  if [ "$TWIN" = allow ]; then
+    echo "$got" | grep -q STUB-OK || fail "the fence could not use the model door through fwd: $got | fwd.log: $(cat "$STATE/fwd.log")"
+    ok "no-credential call through fwd reached the stub door: STUB-OK"
+  else
+    echo "$got" | grep -q STUB-OK || fail "precondition: fwd path not working, the scan would be vacuous: $got"
+    tok=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$STATE/secrets.json")
+    key=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["key"])' "$STATE/secrets.json")
+    # Everything the fence can read: every process's environ and cmdline, its env, and every
+    # readable file outside /proc,/sys,/dev; plus how docker describes the container.
+    dump=$( { docker exec "ccsbx-$sid-g1" sh -c 'cat /proc/[0-9]*/environ /proc/[0-9]*/cmdline 2>/dev/null; env; find / -xdev \( -path /proc -o -path /sys -o -path /dev \) -prune -o -type f -readable -size -2M -exec cat {} + 2>/dev/null'; docker inspect "ccsbx-$sid-g1"; } | tr '\0' '\n')
+    [ -n "$dump" ] || fail "scan produced nothing"
+    echo "$dump" | grep -qF "$sid" || fail "scan control failed: the fence's own sid is not in the dump, so the scan sees too little"
+    for needle in "${tok##*.}" "$(echo "$tok" | cut -d. -f2)" "$key" "Bearer ey"; do
+      echo "$dump" | grep -qF -- "$needle" && fail "secret material visible in the fence (needle ${needle:0:12}…)"
+    done
+    # Positive control (the scan must be able to fail): plant the token in the fence's /tmp and the
+    # same scan has to find it. The container is thrown away at the end of the test.
+    docker exec "ccsbx-$sid-g1" sh -c "echo ${tok##*.} > /tmp/planted"
+    docker exec "ccsbx-$sid-g1" sh -c 'cat /tmp/planted' | grep -qF "${tok##*.}" || fail "positive control: the planted token was not found by the scan method"
+    docker exec "ccsbx-$sid-g1" rm -f /tmp/planted
+    # fwd's own process is not in the fence's pid namespace.
+    docker exec "ccsbx-$sid-g1" sh -c 'grep -l '[-][-]door' /proc/[0-9]*/cmdline 2>/dev/null' | grep -q . && fail "the forwarder process is visible from the fence"
+    ok "after a successful model call, no token, key or Bearer header anywhere the fence can read ($(echo "$dump" | wc -l) lines scanned, control found)"
+  fi;;
 
 *) echo "unknown rule/twin: $RULE/$TWIN"; exit 2;;
 esac

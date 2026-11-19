@@ -21,6 +21,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // FenceUID is the uid and gid inside the fence.
@@ -191,6 +192,9 @@ func ResolveGitDir(workdir string) (string, error) {
 		if !isGitDir(p) {
 			return "", fmt.Errorf("%s is not a git directory", p)
 		}
+		if err := hostOwnedGitDir(p); err != nil {
+			return "", err
+		}
 		return p, nil
 	}
 	b, err := os.ReadFile(p)
@@ -223,7 +227,52 @@ func ResolveGitDir(workdir string) (string, error) {
 	if err := CheckPath(t); err != nil {
 		return "", err
 	}
+	if err := hostOwnedGitDir(t); err != nil {
+		return "", err
+	}
 	return t, nil
+}
+
+// hostOwnedGitDir applies, for a gitdir about to be mounted, the same rule host git applies before
+// it runs (internal/gitroute): the gitdir and its config, info and hooks are owned by this uid and
+// are not writable by another group or by the world. A gitdir a fence could write is refused.
+func hostOwnedGitDir(gd string) error {
+	dirs := []string{gd}
+	if cd, err := os.ReadFile(filepath.Join(gd, "commondir")); err == nil { // a linked worktree
+		c := strings.TrimSpace(string(cd))
+		if !filepath.IsAbs(c) {
+			c = filepath.Join(gd, c)
+		}
+		dirs = append(dirs, filepath.Clean(c))
+	}
+	var paths []string
+	for _, d := range dirs {
+		paths = append(paths, d, filepath.Join(d, "config"), filepath.Join(d, "info"), filepath.Join(d, "hooks"))
+	}
+	for _, p := range paths {
+		st, err := os.Lstat(p)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if st.Mode()&os.ModeSymlink != 0 {
+			return fmt.Errorf("%s is a symlink", p)
+		}
+		if st.Mode().Perm()&0o002 != 0 {
+			return fmt.Errorf("%s is world-writable", p)
+		}
+		if sys, ok := st.Sys().(*syscall.Stat_t); ok {
+			if int(sys.Uid) != os.Getuid() {
+				return fmt.Errorf("%s is not owned by the host user", p)
+			}
+			if st.Mode().Perm()&0o020 != 0 && int(sys.Gid) != os.Getgid() {
+				return fmt.Errorf("%s is writable by group %d", p, sys.Gid)
+			}
+		}
+	}
+	return nil
 }
 
 func isGitDir(d string) bool {

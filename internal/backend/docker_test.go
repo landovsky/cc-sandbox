@@ -292,3 +292,36 @@ func TestMovedParsesSweepOutput(t *testing.T) {
 		t.Fatal(m)
 	}
 }
+
+// RC-1: a gitdir that a fence could write (another uid owns it, or it is world- or foreign-group
+// writable) must not be accepted for a new session: it may be a directory the earlier fence
+// planted, and mounting it would show this fence that fence's files.
+func TestGitDirMustBeHostOwned(t *testing.T) {
+	repo, wt := linked(t)
+	gd := filepath.Join(repo, ".git", "worktrees", "wt")
+	if _, err := ResolveGitDir(wt); err != nil {
+		t.Fatalf("a host-owned gitdir was refused: %v", err)
+	}
+	for name, path := range map[string]string{"gitdir": gd, "config": filepath.Join(repo, ".git", "config"), "hooks": filepath.Join(repo, ".git", "hooks")} {
+		st, err := os.Stat(path)
+		if err != nil {
+			continue
+		}
+		mode := st.Mode()
+		os.Chmod(path, mode.Perm()|0o002)
+		if _, err := ResolveGitDir(wt); err == nil {
+			t.Errorf("a world-writable %s was accepted", name)
+		}
+		os.Chmod(path, mode.Perm())
+	}
+	if _, err := ResolveGitDir(wt); err != nil {
+		t.Fatalf("restored: %v", err)
+	}
+	// a plain .git directory inside the worktree is the same case
+	plain := vt(t)
+	sh(t, plain, "git", "init", "-q", "-b", "main", ".")
+	os.Chmod(filepath.Join(plain, ".git"), 0o777)
+	if _, err := ResolveGitDir(plain); err == nil {
+		t.Error("a world-writable .git directory was accepted")
+	}
+}

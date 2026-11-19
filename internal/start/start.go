@@ -266,3 +266,6 @@ func orDefault(s, def string) string {
 	}
 	return s
 }
+
+// Records lists every session record, for the daemon's resolvers (message delivery, journal).
+func (d *Daemon) Records() ([]*Record, error) { return d.records() }

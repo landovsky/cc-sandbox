@@ -31,6 +31,7 @@ func app() *cli.App {
 		Cmds: []*cli.Command{
 			runCmd(),
 			startCmd(),
+			deliverCmd(),
 			selftestCmd(),
 			settingsCmd(),
 			{

@@ -156,3 +156,35 @@ block = "CCSBX_TWIN=1 tests/twin-go.sh ./internal/hostd TestOutboxHostWriteRefus
 invariants = [10, 14]
 backends = ["docker"]
 where = "hp"
+
+# ---- U3b: local message delivery (scope rule, stamp, send-keys). Direct mode: not evidence. ----
+
+[[rule]]
+id = "msg-in-scope"
+title = "a worker's message to its manager lands stamped 'fenced', identity from the daemon's record"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestMsgInScopeAllow"
+block = "tests/twin-go.sh ./internal/msg TestMsgInScopeBlock"
+invariants = [8]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "msg-out-of-scope"
+title = "a message to a session outside manager/peers/reply-to-sender is refused: scope, nothing delivered"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestMsgOutOfScopeAllow"
+block = "tests/twin-go.sh ./internal/msg TestMsgOutOfScopeBlock"
+invariants = [8]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "msg-no-cockpit"
+title = "with cc-tree and the hub unreachable a same-machine message still lands in the pane (real tmux)"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestMsgNoCockpitAllow"
+block = "tests/twin-go.sh ./internal/msg TestMsgNoCockpitBlock"
+invariants = [8]
+backends = ["unit"]
+where = "hp"

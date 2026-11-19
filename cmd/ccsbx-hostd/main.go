@@ -15,6 +15,8 @@ import (
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/hostd"
+	"github.com/landovsky/cc-sandbox/internal/msg"
+	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
 var version = "dev"
@@ -41,6 +43,7 @@ func app() *cli.App {
 				f.Int("rate", 10, "requests per second per outbox")
 				f.Int("burst", 20, "token bucket size per outbox")
 				f.Int("max-total", 20000, "requests per generation in its lifetime; beyond that they are shed")
+				f.String("tmux-socket", "ccsbx", "tmux -L socket the session panes live on (message delivery by send-keys)")
 				f.String("interval", "250ms", "time between scans")
 				f.Bool("once", false, "scan once and print the stats as a line, then exit")
 			},
@@ -57,10 +60,15 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ccsbx-hostd: --interval %q is not a positive duration\n", get("interval"))
 		return cli.ExitUsage
 	}
+	d := &start.Daemon{StateDir: get("state")}
+	tm := &msg.Tmux{Socket: get("tmux-socket")}
+	rt := &msg.Router{Dir: msg.DaemonDir{D: d, Alive: tm.Alive}, Out: tm, StateDir: get("state")}
+	m := &mux{}
+	m.on("msg.", msgHandler(rt))
 	lg := log.New(stderr, "ccsbx-hostd: ", log.LstdFlags)
 	h := hostd.New(hostd.Config{
 		StateDir: get("state"), FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
-		Rate: float64(num("rate")), Burst: num("burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
+		Handler: m.handle, Rate: float64(num("rate")), Burst: num("burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
 	})
 	if get("once") == "true" {
 		st := h.Scan()

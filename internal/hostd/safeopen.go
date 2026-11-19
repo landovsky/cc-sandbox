@@ -134,4 +134,3 @@ func (r *Root) ListDir(rel string, max int) (names []string, more bool, err erro
 	}
 	return names, true, nil
 }
-

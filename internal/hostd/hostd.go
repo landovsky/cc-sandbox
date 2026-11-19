@@ -69,14 +69,14 @@ var Types = map[string]bool{
 // Config holds every tunable (all reachable as ccsbx-hostd flags / CCSBX_* env vars).
 type Config struct {
 	StateDir string
-	FenceUID int           // owner uid required of every outbox file
-	MaxBytes int64         // per request file
-	Rate     float64       // requests per second per outbox
-	Burst    int           // bucket size per outbox
-	MaxList  int           // names read per outbox per scan
-	MaxTotal int           // requests per generation in its lifetime; beyond: shed silently
-	ShedRefs int           // refusal replies written per scan once the bucket is empty
-	Handler  Handler       // nil: every known type is answered error/not_built
+	FenceUID int     // owner uid required of every outbox file
+	MaxBytes int64   // per request file
+	Rate     float64 // requests per second per outbox
+	Burst    int     // bucket size per outbox
+	MaxList  int     // names read per outbox per scan
+	MaxTotal int     // requests per generation in its lifetime; beyond: shed silently
+	ShedRefs int     // refusal replies written per scan once the bucket is empty
+	Handler  Handler // nil: every known type is answered error/not_built
 	Now      func() time.Time
 	Logf     func(format string, args ...any)
 }

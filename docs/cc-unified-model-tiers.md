@@ -34,8 +34,9 @@ group (14, which can't hold on a Mac; see doc 1 §9).
 ## Solo: about 3 components, on one or several machines
 
 For: one owner on their own machines. **Tom's first build:** three machines that run sessions:
-the Mac, the hp, and one Hetzner server that's already a k3s node (which one is open, see the
-log N9). The cockpit runs on the Mac or the hp.
+the Mac, the hp, and `future-two`, a Hetzner server that's already a k3s node. How sessions run
+there (docker on the host or k3s pods) and whether the doors run there too are open (log N9).
+The cockpit runs on the Mac or the hp.
 
 | Adds | Covers | Build / buy |
 |---|---|---|
@@ -58,11 +59,12 @@ log N9). The cockpit runs on the Mac or the hp.
     given at launch;
   - keeps its event journal and replays it from the cockpit's last-seen position on reconnect;
   - queues requests meant for the cockpit (tree verbs) and delivers them in order later.
-- **A fence host that's also a k3s node.** k3s has its own containerd, so docker runs beside
-  it, not inside it. Keep docker off k3s's networks: pin docker's bridge range outside the pod
+- **`future-two`, a fence host that's also a k3s node.** If sessions run as docker on the
+  host (N9): k3s has its own containerd, so docker runs beside it, not inside it. Keep docker off k3s's networks: pin docker's bridge range outside the pod
   and service CIDRs, check that docker's iptables rules (it sets FORWARD to DROP) don't break
   flannel traffic, and reserve CPU and memory for the kubelet so sessions can't starve pods. Fences never use the
-  k3s socket. If the same server is also the central door host, the door uid and the session
+  k3s socket. (As k3s pods instead, the fence is a pod, as at the company tier.) If `future-two`
+  is also the central door host, the door uid and the session
   users are separate, and the doors listen only on the Tailscale address (invariant 27).
 
 **Billing per session.** Tom's development work uses the Claude subscription, and ops work

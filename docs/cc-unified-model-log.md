@@ -27,9 +27,10 @@ supersedes: unified-model.md v1 §4–§6
   - Doc 3's caveat "nobody steers them until it's back" is reworded.
 - **The cockpit is portable.** It runs on the Mac or the hp. "CC Flow on the Mac" and "the
   steering machine" are gone; nothing in the platform names a cockpit machine.
-- **A third machine:** one Hetzner server already joined to the k3s cluster runs sessions next to
-  the Mac and the hp. Which one is open (N9). Doc 2 has a short note on a fence host that's also
-  a k3s node (docker beside k3s, and the door host on the same server).
+- **A third machine:** `future-two`, a Hetzner server already joined to the k3s cluster, runs
+  sessions next to the Mac and the hp (Tom's choice). How it runs them and whether it also hosts
+  the doors are open (N9). Doc 2 has a short note on a fence host that's also a k3s node (docker
+  beside k3s, and the door host on the same server).
 - **New known limitation:** a message to a machine that's down is dropped (doc 1 §9).
 - **Links fixed:** the v2 docs linked to `unified-model*.md` (the v1 file). They now link to
   `cc-unified-model*.md`, and the index points at v2.
@@ -98,15 +99,11 @@ These are open, with no ❓ node yet.
   doors trust a list of machine keys. *Follows from the central doors. Confirm.*
 - **N7 · Remote sessions in CC Flow.** The pane on the cockpit machine attaches to a session on
   another machine over Tailscale SSH. *Mechanism to be settled in the first slice.*
-- **N9 · Which Hetzner k3s node runs sessions** (from `~/git/k3s/docs/HARDWARE-INVENTORY.md`, 2026-11-16). *Open, Tom picks.*
-  - `future-one`: i7-8700 6C/12T, 64 GB, 2×477 GB RAID-1. Koperníci's own, `pool=shared` worker,
-    tainted, only promtail and the planned ARC CI runners. LUKS (reboot needs a dropbear unlock).
-  - `future-two`: Xeon E3-1275V6 4C/8T, 64 GB ECC, 2×894 GB RAID-1. Koperníci's own,
-    `pool=shared` worker, only promtail so far, but likely the CNPG Postgres primary later. LUKS too.
-  - Not candidates as they stand: `k3s` (the only control plane, 8 GB), and `pharmacy-db`,
-    `pharmacy-web`, `hriste-hot`, `hriste-cold` (paid for by clients and running their workloads).
-  - Also open: whether the same server is the central door host (M1), which v2.1 put on
-    "spare Hetzner capacity".
+- **N9 · `future-two` as the third machine.** *Decided:* Tom picked `future-two` (Hetzner Robot,
+  Xeon E3-1275V6 4C/8T, 64 GB ECC, a `pool=shared` k3s worker, LUKS). *Still open* (the manager
+  is discussing them with devops):
+  - whether its sessions run as **docker on the host** beside k3s, or as **k3s pods**;
+  - whether the **central doors** (M1) run on it too, or on another Hetzner server.
 - **N10 · A manager starts workers without CC Flow.** *Proposal.* The manager's `start` goes to
   the daemon on its machine, which calls the target machine's launcher directly over Tailscale
   SSH with a profile already approved for that node. The new session shows up as an event, and
@@ -233,7 +230,7 @@ its branch through the Hetzner egress door.
 | M4 | **verb queue**: tree verbs queued in order while the cockpit is down, delivered when it's back | S | U3 |
 | M5 | **portable cockpit**: CC Flow starts on the Mac or the hp with no config change and resumes from M3 | S | M2, M3 |
 | M6 | **manager start without CC Flow** (N10, proposal): daemon → target launcher, CC Flow records it from the event | S | M2, M3, N10 |
-| K1 | **fence host on the chosen k3s node** (N9): docker beside k3s, bridge range and iptables checked against flannel, kubelet reservations, host keys | S # | N9, U0b |
+| K1 | **fence host on `future-two`** (N9): docker beside k3s, bridge range and iptables checked against flannel, kubelet reservations, host keys; or the fence as a pod, if N9 picks pods | S # | N9, U0b |
 | U4 | model door: credential injection, billing per session (API key first, subscription stub) | S 🔑 | M1, U5 |
 | U7 | resume into the same volume | XS | U2 |
 | U15 | egress door: static routes, GitHub App | S 🔑 | M1, U5, #46tt |

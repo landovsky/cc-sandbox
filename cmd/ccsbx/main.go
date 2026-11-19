@@ -53,6 +53,7 @@ func app() *cli.App {
 				Run: notBuilt("U2"),
 			},
 			selftestCmd(),
+			settingsCmd(),
 			{
 				Name:    "steering-check",
 				Summary: "flag changes to steering files in a diff (H1)",

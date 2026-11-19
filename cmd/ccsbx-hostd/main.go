@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -14,7 +16,9 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
+	"github.com/landovsky/cc-sandbox/internal/daemonapi"
 	"github.com/landovsky/cc-sandbox/internal/hostd"
+	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
@@ -30,7 +34,12 @@ func app() *cli.App {
 			Name:    "run",
 			Summary: "scan every live outbox until stopped (or once with --once)",
 			Recipes: `  ccsbx-hostd run --once                  # one pass, print what was accepted/refused/shed
-  ccsbx-hostd run --interval 250ms        # the daemon loop
+  ccsbx-hostd run --interval 250ms        # the daemon loop + the API on <state>/hostd.sock
+  ccsbx-hostd run --listen 127.0.0.1:7481 # ...and on loopback, for curl:
+    curl -s 'http://127.0.0.1:7481/v1/events?after=0'          # replay after a cursor
+    curl -s 'http://127.0.0.1:7481/v1/events?after=41&epoch=E&wait=20'   # long-poll
+    curl -N 'http://127.0.0.1:7481/v1/events/stream?after=41'  # SSE
+    curl -s -d '{"seq":41,"epoch":"E","tree_sha":"<sha>"}' http://127.0.0.1:7481/v1/cursors/production
   Direct mode (dev): the outbox is writable by the host, so T:outbox-host-write-refused is red
   until gate M, and every result is "not evidence". Requests are never echoed: refusals carry
   a rule name (too_big, not_regular, hardlink, wrong_owner, unsafe_path, bad_json, unknown_type,
@@ -44,6 +53,11 @@ func app() *cli.App {
 				f.Int("burst", 20, "token bucket size per outbox")
 				f.Int("max-total", 20000, "requests per generation in its lifetime; beyond that they are shed")
 				f.String("tmux-socket", "ccsbx", "tmux -L socket the session panes live on (message delivery by send-keys)")
+				f.String("machine", hostname(), "this machine's name, stamped on journal records")
+				f.String("journal", "", "journal directory (default <state>/journal)")
+				f.Int("retention-days", 14, "journal retention; values below 14 are refused")
+				f.String("socket", "", "unix socket for the daemon API, mode 0600 (default <state>/hostd.sock; '-' disables)")
+				f.String("listen", "", "also serve the API on this loopback address, e.g. 127.0.0.1:7481 (non-loopback is refused until M2a)")
 				f.String("interval", "250ms", "time between scans")
 				f.Bool("once", false, "scan once and print the stats as a line, then exit")
 			},
@@ -66,7 +80,17 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	m := &mux{}
 	m.on("msg.", msgHandler(rt))
 	lg := log.New(stderr, "ccsbx-hostd: ", log.LstdFlags)
-	h := hostd.New(hostd.Config{
+	jdir := get("journal")
+	if jdir == "" {
+		jdir = filepath.Join(get("state"), "journal")
+	}
+	j, err := journal.Open(jdir, get("machine"), num("retention-days"))
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx-hostd:", err)
+		return cli.ExitFail
+	}
+	defer j.Close()
+	h := hostd.New(hostd.Config{Journal: j,
 		StateDir: get("state"), FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
 		Handler: m.handle, Rate: float64(num("rate")), Burst: num("burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
 	})
@@ -75,13 +99,56 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "accepted=%d refused=%d shed=%d reasons=%v\n", st.Accepted, st.Refused, st.Shed, st.Reasons)
 		return cli.ExitOK
 	}
+	var servers []*http.Server
+	srv := &daemonapi.Server{J: j, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
+	sock := get("socket")
+	if sock == "" {
+		sock = filepath.Join(get("state"), "hostd.sock")
+	}
+	serve := func(l net.Listener, err error, what string) bool {
+		if err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: %s: %v\n", what, err)
+			return false
+		}
+		hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 5 * time.Second}
+		servers = append(servers, hs)
+		go hs.Serve(l)
+		lg.Printf("api on %s", what)
+		return true
+	}
+	if sock != "-" {
+		l, err := daemonapi.ListenUnix(sock)
+		if !serve(l, err, "unix:"+sock) {
+			return cli.ExitFail
+		}
+	}
+	if a := get("listen"); a != "" {
+		l, err := daemonapi.ListenLoopback(a)
+		if !serve(l, err, a) {
+			return cli.ExitFail
+		}
+	}
+	go func() {
+		for range time.Tick(time.Hour) {
+			if n, err := j.Prune(); err != nil {
+				lg.Printf("journal prune: %v", err)
+			} else if n > 0 {
+				lg.Printf("journal prune: %d old segments removed", n)
+			}
+		}
+	}()
 	stop := make(chan struct{})
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sig; close(stop) }()
 	lg.Printf("watching %s every %s (direct mode: results are not evidence)", get("state"), iv)
 	h.Run(iv, stop)
+	for _, hs := range servers {
+		hs.Close()
+	}
 	return cli.ExitOK
 }
+
+func hostname() string { h, _ := os.Hostname(); return h }
 
 func main() { os.Exit(app().Main(os.Args[1:], os.Stdout, os.Stderr)) }

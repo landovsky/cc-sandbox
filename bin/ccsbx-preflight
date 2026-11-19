@@ -1,0 +1,566 @@
+#!/usr/bin/env python3
+"""ccsbx-preflight: one check per prerequisite of the nightly build (plan §7.2, NB1).
+
+Every check has an id (C-R<n> after the R-step it proves), the gates it belongs to
+(evening, morning, post-M1) and what a failure does: abort (the night doesn't start), skip
+(only the dependent pieces are parked and listed) or warn.  Checks only READ.  `--help` and
+`--list` print the table and run nothing: no process, no file, no connect.
+
+Recipes:
+  ccsbx-preflight --evening                 the evening gate; exit 1 if anything failed
+  ccsbx-preflight --evening --abort-only    exit 1 only for abort-class failures
+  ccsbx-preflight --morning --post-M1       after the morning install + reboot + M1 merge
+  ccsbx-preflight --only C-R8,C-R22         just those checks (gate flags not needed)
+  ccsbx-preflight --evening --waive C-R12   an explicitly waived check shows as "waived"
+  ccsbx-preflight --evening --json          machine-readable (the night manager reads this)
+  ccsbx-preflight --evening --telegram      also send the table (--pre, <= 70 columns)
+  ccsbx-preflight --evening -v              full detail instead of one truncated line
+
+Exit: 0 = nothing failed; 1 = something failed (names are on the last line); 2 = usage.
+Tunables: etc/preflight.toml (the R1 list of ❓ node ids lives there); --config FILE or
+CCSBX_PREFLIGHT_CONFIG; CCSBX_DOORS_MODEL_URL / CCSBX_DOORS_EGRESS_URL for the post-M1 health
+checks; CCSBX_PREFLIGHT_TIMEOUT (seconds per command, default from the config).
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tomllib
+import urllib.request
+from dataclasses import dataclass, field
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+WIDTH = 70
+
+
+def _join(items):
+    return ", ".join(items)
+
+
+@dataclass
+class Check:
+    id: str
+    tags: tuple
+    fail: str  # abort | skip | warn
+    title: str
+    fn: callable = field(repr=False, default=None)
+
+
+@dataclass
+class Result:
+    status: str  # pass | FAIL | warn | manual
+    detail: str = ""
+
+
+def P(detail=""):
+    return Result("pass", detail)
+
+
+def F(detail=""):
+    return Result("FAIL", detail)
+
+
+def M(detail=""):
+    return Result("manual", detail)
+
+
+class Ctx:
+    def __init__(self, cfg, args):
+        self.cfg = cfg
+        self.args = args
+        self._cache = {}
+        self.timeout = int(os.environ.get("CCSBX_PREFLIGHT_TIMEOUT", cfg["timeouts"]["command_seconds"]))
+
+    def path(self, key):
+        return Path(os.path.expanduser(self.cfg["paths"][key]))
+
+    def sh(self, argv, cwd=None, env=None):
+        """Run a command; (rc, stdout+stderr). A missing command is rc 127, never a crash."""
+        key = (tuple(argv), str(cwd), tuple(sorted((env or {}).items())))
+        if key in self._cache:
+            return self._cache[key]
+        e = dict(os.environ)
+        e.update(env or {})
+        try:
+            p = subprocess.run(argv, cwd=cwd, env=e, capture_output=True, text=True, timeout=self.timeout)
+            out = (p.stdout or "") + (p.stderr or "")
+            res = (p.returncode, out.strip())
+        except FileNotFoundError:
+            res = (127, f"{argv[0]}: command not found")
+        except subprocess.TimeoutExpired:
+            res = (124, f"{argv[0]}: timed out after {self.timeout}s")
+        self._cache[key] = res
+        return res
+
+    def tree_show(self):
+        return self.sh(["cc-tree", "show", self.cfg["tree"]["ref"]])
+
+    def http(self, url):
+        try:
+            with urllib.request.urlopen(url, timeout=self.timeout) as r:  # noqa: S310 (config-given)
+                return r.status, r.read(65536).decode("utf-8", "replace")
+        except Exception as ex:  # noqa: BLE001
+            return 0, f"{type(ex).__name__}: {ex}"
+
+
+# ---------------------------------------------------------------- the checks
+
+def node_done(ctx, node_id):
+    rc, out = ctx.tree_show()
+    if rc != 0:
+        return None, f"cc-tree show failed: {out[:60]}"
+    for line in out.splitlines():
+        if re.search(rf"#{re.escape(node_id)}(\s|$)", line):
+            return bool(re.search(r"\[x\]", line)), line.strip()
+    return None, f"#{node_id} not in the tree"
+
+
+def c_r1(ctx):
+    bad = []
+    for q, nid in ctx.cfg["tree"]["night_blocking"].items():
+        done, why = node_done(ctx, nid)
+        if not done:
+            bad.append(f"{q} #{nid}" + ("" if done is False else f" ({why})"))
+    return F("open: " + _join(bad)) if bad else P(f"{len(ctx.cfg['tree']['night_blocking'])} answered")
+
+
+def c_r2(ctx):
+    bad = [f"{k} #{v}" for k, v in ctx.cfg["tree"]["k3s_nodes"].items() if node_done(ctx, v)[0] is not True]
+    return F("not done: " + _join(bad)) if bad else P("scope + amendments done")
+
+
+def k3s_sops(ctx, rel, needle="ENC["):
+    repo = ctx.path("k3s")
+    f = repo / rel
+    if f.is_file() and needle in f.read_text(errors="replace"):
+        return True, f"{rel} (working tree)"
+    for ref in ctx.cfg["k3s"]["refs"]:
+        rc, out = ctx.sh(["git", "-C", str(repo), "grep", "-c", "-F", needle, ref, "--", rel])
+        if rc == 0 and out.rsplit(":", 1)[-1].strip().isdigit():
+            return True, f"{rel} @ {ref}"
+    return False, f"no SOPS file {rel}"
+
+
+def c_r3(ctx):
+    ns = ctx.cfg["k3s"]["namespaces"]
+    rc, out = ctx.sh(["kubectl", "--request-timeout=10s", "get", "ns", *ns, "-o", "name"])
+    if rc != 0:
+        return F(f"namespaces: {out.splitlines()[-1][:50] if out else rc}")
+    miss = [n for n in ns if f"namespace/{n}" not in out]
+    if miss:
+        return F("missing ns " + _join(miss))
+    rc, out = ctx.sh(["kubectl", "--request-timeout=10s", "-n", ns[0], "get", "resourcequota,limitrange,networkpolicy", "-o", "name"])
+    kinds = {x.split("/")[0] for x in out.split()}
+    need = {"resourcequota", "limitrange", "networkpolicy"}
+    if rc != 0 or not need <= kinds:
+        return F("missing " + _join(sorted(need - kinds)))
+    rc, out = ctx.sh(["kubectl", "--request-timeout=10s", "-n", "flux-system", "get", "kustomization", "-o", "jsonpath={range .items[*]}{.metadata.name}={.status.conditions[?(@.type=='Ready')].status} {end}"])
+    notready = [x for x in out.split() if x.endswith("=False")]
+    return F("flux not ready: " + _join(notready)) if notready else P("ns, quota, limits, netpol, flux ok")
+
+
+def c_r4_evening(ctx):
+    rc, out = ctx.sh(["tailscale", "status", "--json"])
+    if rc != 0:
+        return F(f"tailscale status: {out[:50]}")
+    return P("tag:ccsbx seen in status") if "tag:ccsbx" in out else F("no tag:ccsbx device (ACL not pasted?)")
+
+
+def health(ctx, key, env_name, want):
+    url = os.environ.get(env_name) or ctx.cfg["doors"][key]
+    if not url:
+        return F(f"no URL: set {env_name} or [doors].{key}")
+    st, body = ctx.http(url)
+    if st != 200:
+        return F(f"{url.split('//')[-1][:25]} -> {st or body[:25]}")
+    return P("200") if all(w in body for w in want) else F("health lacks " + _join(want))
+
+
+def c_r4_post(ctx):
+    r = health(ctx, "model_health", "CCSBX_DOORS_MODEL_URL", [])
+    if r.status != "pass":
+        return r
+    r = health(ctx, "egress_health", "CCSBX_DOORS_EGRESS_URL", [])
+    return r if r.status != "pass" else M("200 from hp; the Mac leg: run the same on the Mac")
+
+
+def sops_check(rel, extra):
+    def fn(ctx):
+        ok, why = k3s_sops(ctx, rel)
+        if not ok:
+            return F(why)
+        if extra:
+            ok2, why2 = k3s_sops(ctx, rel, extra)
+            if not ok2:
+                return F(f"{rel} lacks {extra}")
+        return P(why)
+    return fn
+
+
+def c_r5_post(ctx):
+    return health(ctx, "model_health", "CCSBX_DOORS_MODEL_URL", ["apikey"])
+
+
+def c_r5b_post(ctx):
+    return health(ctx, "model_health", "CCSBX_DOORS_MODEL_URL", ["subscription"])
+
+
+def c_r6(ctx):
+    rc, out = ctx.sh(["cc-tree", "limits"])
+    return P(" | ".join(out.splitlines()[:2])[:200]) if rc == 0 else Result("warn", f"cc-tree limits: {out[:50]}")
+
+
+def c_r7_evening(ctx):
+    ok, why = k3s_sops(ctx, ctx.cfg["k3s"]["egress_env"])
+    return M(f"{why}; the JWT/installations probe runs on the Mac") if ok else F(why)
+
+
+def c_r7_post(ctx):
+    return health(ctx, "egress_health", "CCSBX_DOORS_EGRESS_URL", ["github_app"])
+
+
+def testbed(ctx):
+    t = ctx.cfg["github"]["testbed"]
+    if t:
+        return t
+    rc, out = ctx.sh(["git", "-C", str(ctx.path("cc_sandbox")), "remote", "get-url", "origin"])
+    m = re.search(r"[:/]([^/:]+)/[^/]+?(?:\.git)?$", out) if rc == 0 else None
+    return f"{m.group(1)}/cc-sandbox-testbed" if m else "cc-sandbox-testbed"
+
+
+def c_r8(ctx):
+    repo = testbed(ctx)
+    rc, out = ctx.sh(["gh", "api", f"repos/{repo}/branches/main/protection", "--jq",
+                      "[.allow_force_pushes.enabled, .required_pull_request_reviews.required_approving_review_count]|@json"])
+    if rc != 0:
+        return F(f"testbed {repo}: " + ("missing or unprotected" if "404" in out or "Not Found" in out else out.splitlines()[-1][:40] if out else "gh failed"))
+    try:
+        force, approvals = json.loads(out)
+    except ValueError:
+        return F("unreadable protection: " + out[:40])
+    if force or approvals != 1:
+        return F(f"force={force} approvals={approvals}")
+    return P(f"{repo}: no force, 1 approval")
+
+
+def c_r9(ctx):
+    repo = ctx.path("pharmacy")
+    if not (repo / ".mcp.json").is_file():
+        return P(f"no .mcp.json in {repo.name}")
+    rc, out = ctx.sh(["git", "-C", str(repo), "grep", "-c", "Authorization", "--", ".mcp.json"])
+    return F("literal Authorization still in .mcp.json (rotate #46tt)") if rc == 0 else P("no literal Authorization")
+
+
+def c_r10(ctx):
+    bad = []
+    rc, pid = ctx.sh(["pgrep", "-u", str(os.getuid()), "-o", "tmux"])
+    if rc != 0:
+        bad.append("no tmux of mine to inspect")
+    else:
+        try:
+            import grp
+            gids = re.search(r"^Groups:\s*(.*)$", Path(f"/proc/{pid}/status").read_text(), re.M).group(1).split()
+            names = {grp.getgrgid(int(g)).gr_name for g in gids}
+            names &= {"docker", "lxd"}
+            if names:
+                bad.append("tmux still in " + _join(sorted(names)) + " (reboot done?)")
+        except (OSError, AttributeError, KeyError) as ex:
+            bad.append(f"groups unreadable: {ex}")
+    rc, out = ctx.sh(["sudo", "-n", "-l"])
+    if rc != 0:
+        bad.append("sudo -n -l failed")
+    else:
+        nopass = [ln for ln in out.splitlines() if "NOPASSWD" in ln]
+        allowed = re.compile(r"/usr/local/sbin/ccsbx-(root|deploy)\s*$")
+        extra = [ln.strip() for ln in nopass if not allowed.search(ln)]
+        if extra:
+            bad.append("NOPASSWD beyond ccsbx-root: " + extra[0][:40])
+    rc, out = ctx.sh([str(ROOT / "units" / "install-linux.sh"), "check"])
+    if rc != 0:
+        bad.append("install-linux.sh check rc=%d" % rc)
+    return F("; ".join(bad)) if bad else P("no docker/lxd, sudo only ccsbx-*, check=0")
+
+
+def c_r10b(ctx):
+    rc, _ = ctx.sh(["getent", "passwd", "ccsbx-keys"])
+    if rc != 0:
+        return F("no ccsbx-keys user (R10b not done)")
+    key = ctx.path("age_key")
+    try:
+        os.stat(key)
+        readable = os.access(key, os.R_OK)
+    except FileNotFoundError:
+        return F("age key missing")
+    except PermissionError:
+        readable = False
+    return F("age key is readable by me") if readable else P("exists, unreadable as me")
+
+
+def c_r10c(ctx):
+    rc, out = ctx.sh(["sudo", "-n", "/usr/local/sbin/ccsbx-deploy", "--help"])
+    if rc != 0:
+        return F("sudo -n ccsbx-deploy --help failed (Q12 = no? then waive)")
+    rc2, out2 = ctx.sh(["sudo", "-n", "/usr/local/sbin/ccsbx-deploy", "install", "ccsbx-root"])
+    return F("ccsbx-deploy installed ccsbx-root: must be refused") if rc2 == 0 else P("--help ok; install ccsbx-root refused")
+
+
+def c_r11(ctx):
+    node = ctx.cfg["k3s"]["node"]
+    rc, out = ctx.sh(["kubectl", "--request-timeout=10s", "get", "node", node, "-o",
+                      "jsonpath={.status.conditions[?(@.type=='Ready')].status} {.status.nodeInfo.bootID}"])
+    if rc != 0:
+        return F(f"node {node}: {out.splitlines()[-1][:40] if out else rc}")
+    ready, _, boot = out.partition(" ")
+    return P(f"Ready, bootID {boot[:8]}") if ready == "True" else F(f"{node} NotReady")
+
+
+def c_r12(ctx):
+    rc, out = ctx.sh(["ccq"])
+    if rc != 0:
+        return F("ccq failed")
+    return P("k8s-mac listed (KREQ ping not sent)") if "k8s-mac" in out else F("no k8s-mac session")
+
+
+def c_r14(ctx):
+    rc, out = ctx.sh([str(ROOT / "tests" / "deny-list-check.sh")])
+    return F((out.splitlines() or ["deny list check failed"])[-1][:60]) if rc != 0 else P("deny list complete (static; live probe not run)")
+
+
+def c_r15(ctx):
+    if ctx.args.probe_telegram:
+        rc, out = ctx.sh(["notify-tomas-telegram", "devops", "cc-sandbox night: preflight probe"])
+        return P("probe sent") if rc == 0 else F(f"send failed rc={rc}")
+    return P("command present; send not probed (--probe-telegram)") if shutil.which("notify-tomas-telegram") else F("notify-tomas-telegram not on PATH")
+
+
+def c_r16(ctx):
+    rc, out = ctx.sh(["cc-tree", "armed", ctx.cfg["tree"]["arm_ref"], "--json"])
+    if rc != 0:
+        return F(f"not armed: {out[:50]}")
+    try:
+        d = json.loads(out)
+        yes = d.get("armed") if isinstance(d, dict) else None
+    except ValueError:
+        yes = None
+    return P("armed") if yes in (True, "yes") or (yes is None and re.search(r'"?(armed|yes)"?\s*[:=]?\s*(true|yes)', out)) else F("Arm! not typed: " + out[:40])
+
+
+def c_r17(ctx):
+    held = []
+    for pkg in ("docker-ce", "containerd.io"):
+        rc, out = ctx.sh(["dpkg-query", "-W", "-f=${Status}", pkg])
+        held.append(rc == 0 and out.startswith("hold"))
+    if all(held):
+        return P("docker-ce, containerd.io on hold")
+    rc, out = ctx.sh(["systemctl", "show", "apt-daily-upgrade.timer", "-p", "ActiveState", "-p", "NextElapseUSecRealtime", "--value"])
+    lines = out.splitlines()
+    if rc == 0 and lines and lines[0] != "active":
+        return P("not held, but apt-daily-upgrade.timer is inactive")
+    if rc == 0 and len(lines) > 1 and lines[1]:
+        rc2, epoch = ctx.sh(["date", "-d", lines[1], "+%s"])
+        if rc2 == 0 and epoch.isdigit():
+            nxt = datetime.datetime.fromtimestamp(int(epoch))
+            if nxt.date() > datetime.date.today() or nxt.hour >= 8:
+                return P(f"not held; apt-daily-upgrade next {nxt:%a %H:%M}")
+            return F(f"not held and apt-daily-upgrade runs {nxt:%H:%M}")
+    return F("docker not held and the apt timer is unreadable")
+
+
+def c_r18(ctx):
+    bad = []
+    for r in ctx.cfg["git"]["ls_remote_repos"]:
+        p = os.path.expanduser(r)
+        rc, out = ctx.sh(["git", "-C", p, "ls-remote", "--exit-code", "origin", "HEAD"])
+        if rc != 0:
+            bad.append(Path(p).name)
+    return F("no push access path: " + _join(bad)) if bad else P(f"{len(ctx.cfg['git']['ls_remote_repos'])} repo(s) reachable")
+
+
+def c_r19(ctx):
+    f = Path.home() / ".docker" / "config.json"
+    try:
+        auths = json.loads(f.read_text()).get("auths", {})
+    except (OSError, ValueError):
+        return F("no ~/.docker/config.json")
+    return M("ghcr.io login present; the probe push/pull runs in Actions") if "ghcr.io" in auths else F("not logged in to ghcr.io")
+
+
+def manual(msg):
+    return lambda ctx: M(msg)
+
+
+def c_r21(ctx):
+    done, why = node_done(ctx, ctx.cfg["tree"]["live_tools_node"])
+    return P("Q6 answered") if done else F("Q6 #" + ctx.cfg["tree"]["live_tools_node"] + " is open")
+
+
+def c_r22(ctx):
+    repo = ctx.path("e2e_tree_repo")
+    rc, out = ctx.sh(["cc-tree", "trees"], env={"CC_TREE_REPO": str(repo)})
+    return P("e2e tree exists") if rc == 0 and re.search(r"(^|\s)e2e(\s|$)", out) else F(f"no 'e2e' tree in {repo}")
+
+
+E, MO, PM = "evening", "morning", "post-M1"
+CHECKS = [
+    Check("C-R1", (E,), "abort", "night-blocking ❓s answered", c_r1),
+    Check("C-R2", (E,), "abort", "k3s scope + amendments done", c_r2),
+    Check("C-R3", (E,), "skip", "k3s: ns, quota, netpol, flux", c_r3),
+    Check("C-R4", (E,), "skip", "tailnet ACL pasted (tag:ccsbx)", c_r4_evening),
+    Check("C-R4p", (PM,), "skip", "doors' owner /health 200 (hp)", c_r4_post),
+    Check("C-R5", (E,), "skip", "API key SOPS file", sops_check("apps/cc-sandbox/secrets-cc-sandbox-model.env", "ANTHROPIC_API_KEY")),
+    Check("C-R5p", (PM,), "skip", "door says credential: apikey", c_r5_post),
+    Check("C-R5b", (E,), "skip", "setup-token SOPS file", sops_check("apps/cc-sandbox/secrets-cc-sandbox-model-sub.env", "CLAUDE_CODE_OAUTH_TOKEN")),
+    Check("C-R5bp", (PM,), "skip", "door says subscription: ok", c_r5b_post),
+    Check("C-R6", (E,), "warn", "subscription headroom (info)", c_r6),
+    Check("C-R7", (E,), "skip", "GitHub App SOPS file", c_r7_evening),
+    Check("C-R7p", (PM,), "skip", "door says github_app: ok", c_r7_post),
+    Check("C-R8", (E,), "skip", "testbed repo + branch protection", c_r8),
+    Check("C-R9", (E,), "warn", "#46tt token out of .mcp.json", c_r9),
+    Check("C-R10", (MO,), "skip", "hp root done: groups, sudo, check", c_r10),
+    Check("C-R10b", (E,), "skip", "ccsbx-keys uid + age key", c_r10b),
+    Check("C-R10c", (MO,), "skip", "ccsbx-deploy sudoers (Q12)", c_r10c),
+    Check("C-R10d", (MO,), "skip", "Mac root install", manual("on the Mac: install-mac.sh check")),
+    Check("C-R11", (E,), "abort", "future-two Ready, bootID", c_r11),
+    Check("C-R12", (E,), "skip", "Mac kubectl session (Q11)", c_r12),
+    Check("C-R13", (E,), "skip", "Mac awake, Docker Desktop", manual("on the Mac: pmset -g; docker version")),
+    Check("C-R14", (E,), "abort", "builders' deny list", c_r14),
+    Check("C-R15", (E,), "abort", "Telegram works", c_r15),
+    Check("C-R16", (E,), "abort", "Arm! typed", c_r16),
+    Check("C-R17", (E,), "abort", "nothing restarts docker at night", c_r17),
+    Check("C-R18", (E,), "abort", "push access (git ls-remote)", c_r18),
+    Check("C-R19", (E,), "skip", "ghcr login on hp", c_r19),
+    Check("C-R20", (E,), "skip", "overnight k3s reviewer", manual("answer a probe PR within 15 min (by hand)")),
+    Check("C-R21", (E,), "skip", "live tools approved (Q6)", c_r21),
+    Check("C-R22", (E,), "skip", "scratch e2e tree", c_r22),
+]
+GATE_FLAGS = {"evening": E, "morning": MO, "post_M1": PM}
+
+# ---------------------------------------------------------------- output
+
+
+def clip(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def table(rows, verbose=False):
+    """rows: (id, status, sev, detail). <= WIDTH columns; numbers/labels shortened, never wrapped."""
+    out = [f"{'check':<7}{'state':<7}{'if bad':<6} detail".rstrip(), "-" * WIDTH]
+    for cid, st, sev, det in rows:
+        head = f"{cid:<7}{st:<7}{sev:<6} "
+        if verbose:
+            out.append(head + str(det))
+        else:
+            out.append(head + clip(det, WIDTH - len(head)))
+    return "\n".join(out)
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(
+        prog="ccsbx-preflight",
+        description="One check per prerequisite of the nightly build (plan §7.2). Read-only; --help runs nothing.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Recipes:\n" + "\n".join(__doc__.split("Recipes:\n", 1)[1].split("\n\n", 1)[0].splitlines())
+        + "\n\nChecks (id · gates · failure effect · what):\n"
+        + "\n".join(f"  {c.id:<7}{_join(c.tags):<10} {c.fail:<6} {c.title}" for c in CHECKS)
+        + "\n\nExit: 0 nothing failed, 1 something failed (named on the ABORT:/SKIP: lines), 2 usage.",
+    )
+    ap.add_argument("--evening", action="store_true", help="the evening-gate checks")
+    ap.add_argument("--morning", action="store_true", help="the morning-gate checks (after the install + reboot)")
+    ap.add_argument("--post-M1", dest="post_M1", action="store_true", help="checks that need the doors (after the first SHARED go)")
+    ap.add_argument("--only", metavar="IDS", help="comma-separated check ids (C-R8,C-R22); overrides the gate flags")
+    ap.add_argument("--waive", metavar="IDS", default="", help="comma-separated ids to show as waived (never fail the run)")
+    ap.add_argument("--abort-only", action="store_true", help="exit 1 only when an abort-class check failed")
+    ap.add_argument("--json", action="store_true", help="print JSON instead of the table")
+    ap.add_argument("--telegram", action="store_true", help="also send the table with notify-tomas-telegram devops --pre")
+    ap.add_argument("--probe-telegram", action="store_true", help="C-R15 sends a real one-line probe message")
+    ap.add_argument("--list", action="store_true", help="list the checks and exit (same as the table above)")
+    ap.add_argument("-v", "--verbose", action="store_true", help="full detail (lines may exceed 70 columns)")
+    ap.add_argument("--config", metavar="FILE", default=os.environ.get("CCSBX_PREFLIGHT_CONFIG", str(ROOT / "etc" / "preflight.toml")),
+                    help="TOML config (default etc/preflight.toml)")
+    return ap
+
+
+def main(argv=None):
+    ap = build_parser()
+    args = ap.parse_args(argv)
+    if args.list:
+        for c in CHECKS:
+            print(f"{c.id:<7}{_join(c.tags):<10} {c.fail:<6} {c.title}")
+        return 0
+    ids = {c.id for c in CHECKS}
+    if args.only:
+        sel = [x.strip() for x in args.only.split(",") if x.strip()]
+        unknown = [x for x in sel if x not in ids]
+        if unknown:
+            ap.error("unknown check id: " + _join(unknown))
+        checks = [c for c in CHECKS if c.id in sel]
+        gates = ["only"]
+    else:
+        gates = [v for k, v in GATE_FLAGS.items() if getattr(args, k)]
+        if not gates:
+            ap.error("pick a gate: --evening, --morning, --post-M1 (or --only IDS)")
+        checks = [c for c in CHECKS if set(c.tags) & set(gates)]
+    waive = {x.strip() for x in args.waive.split(",") if x.strip()}
+    try:
+        cfg = tomllib.loads(Path(args.config).read_text())
+    except (OSError, tomllib.TOMLDecodeError) as ex:
+        print(f"ccsbx-preflight: cannot read config {args.config}: {ex}", file=sys.stderr)
+        return 2
+    ctx = Ctx(cfg, args)
+
+    results = []
+    for c in checks:
+        try:
+            r = c.fn(ctx)
+        except Exception as ex:  # noqa: BLE001  a crashing check is a failed check, not a dead run
+            r = F(f"check crashed: {type(ex).__name__}: {ex}")
+        status = r.status
+        if status == "FAIL" and c.id in waive:
+            status = "waived"
+        elif status == "FAIL" and c.fail == "warn":
+            status = "warn"
+        results.append((c, status, r.detail))
+
+    failed = [(c, s) for c, s, _ in results if s == "FAIL"]
+    abort_failed = [c.id for c, _ in failed if c.fail == "abort"]
+    skip_failed = [c.id for c, _ in failed if c.fail == "skip"]
+    passed = sum(1 for _, s, _ in results if s == "pass")
+    rows = [(c.id, s, c.fail, d) for c, s, d in results]
+    label = "+".join(gates)
+    summary = f"{label}: {passed}/{len(results)} pass"
+    tail = []
+    if abort_failed:
+        tail.append("ABORT: " + _join(abort_failed))
+    if skip_failed:
+        tail.append("SKIP: " + _join(skip_failed))
+    if not tail:
+        tail.append("nothing failed")
+
+    if args.json:
+        print(json.dumps({"gates": gates, "pass": passed, "total": len(results),
+                          "abort": abort_failed, "skip": skip_failed,
+                          "results": [{"id": c.id, "state": s, "if_bad": c.fail, "title": c.title, "detail": d} for c, s, d in results]},
+                         ensure_ascii=False, indent=1))
+    else:
+        text = table(rows, args.verbose)
+        print(text)
+        print(summary)
+        print("\n".join(tail))
+    if args.telegram:
+        body = table(rows) + "\n" + summary + "\n" + "\n".join(tail)
+        rc, out = ctx.sh(["notify-tomas-telegram", "devops", "--pre", body])
+        if rc != 0:
+            print(f"ccsbx-preflight: telegram send failed rc={rc}: {out[:80]}", file=sys.stderr)
+            return 1
+    bad = abort_failed if args.abort_only else abort_failed + skip_failed
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

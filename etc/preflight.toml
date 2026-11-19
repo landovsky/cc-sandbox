@@ -1,0 +1,54 @@
+# ccsbx-preflight config (plan §7.2). Every value can be overridden: --config FILE or
+# CCSBX_PREFLIGHT_CONFIG=FILE. Paths may start with ~.
+
+[tree]
+# The tree whose ❓ nodes gate the night, and the node to be armed (R16).
+ref = "cc-sandbox"
+arm_ref = "cc-sandbox:2f3e"
+
+# R1: night-blocking ❓ node ids (plan §12, NB column). Each must be [x] in `cc-tree show`.
+night_blocking = { Q2 = "65s2", Q3 = "42yx", Q4 = "4wws", Q6 = "2tdw", Q7 = "6qgt", Q8 = "53vd", Q9 = "2bqd", Q10 = "3y55", Q12 = "24wy" }
+
+# R2: the k3s scope node and the amendment node (Q2 is the amendment ❓; the scope itself is
+# devops:3crt, a message, so it has no node here).
+k3s_nodes = { amendments = "65s2" }
+
+# R21: the LIVE-TOOLS ❓ (Q6).
+live_tools_node = "2tdw"
+
+[paths]
+cc_sandbox = "~/git/cc-sandbox"
+k3s = "~/git/k3s"
+# R9: the repo whose .mcp.json held the pharmacy token.
+pharmacy = "~/git/pharmacy"
+# R22: the scratch tree repo for the nightly e2e.
+e2e_tree_repo = "~/cc-tree-e2e"
+# R10b: the ccsbx-keys age key.
+age_key = "/var/lib/ccsbx-keys/age.key"
+
+[k3s]
+# Refs searched for the SOPS files (R5, R5b, R7): they live "on a branch" until merged.
+refs = ["HEAD", "origin/main"]
+model_env = "apps/cc-sandbox/secrets-cc-sandbox-model.env"
+model_sub_env = "apps/cc-sandbox/secrets-cc-sandbox-model-sub.env"
+egress_env = "apps/cc-sandbox/secrets-cc-sandbox-egress.env"
+namespaces = ["cc-sandbox", "cc-sandbox-doors"]
+node = "future-two"
+
+[github]
+# R8. owner/repo of the testbed. Empty = <owner of cc-sandbox's origin>/cc-sandbox-testbed.
+testbed = ""
+
+[doors]
+# Post-M1: the owner listeners' /health. Tailnet names stay out of this public repo:
+# set them in a private config via --config, or CCSBX_DOORS_MODEL_URL / CCSBX_DOORS_EGRESS_URL.
+model_health = ""
+egress_health = ""
+
+[git]
+# R18. Tonight's builder rules forbid touching the secret-proxy repo, so only cc-sandbox is
+# listed here. Add "~/git/cc-secret-proxy" in the private config used at the evening gate.
+ls_remote_repos = ["~/git/cc-sandbox"]
+
+[timeouts]
+command_seconds = 20

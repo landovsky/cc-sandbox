@@ -1,3 +1,5 @@
 spike/.state/
 spike/results/*.log
 __pycache__/
+/bin/ccsbx
+/dist/

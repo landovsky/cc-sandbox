@@ -43,12 +43,51 @@ Run on hp in `~/git/cc-sandbox` unless a step says otherwise. Order matters: the
 | 8 | The root install (sudo, password) | `sudo units/install-linux.sh install --yes` (add `--with-deploy` only if Q12 = yes) |
 | 9 | Reboot | `sudo reboot`, then open tmux again |
 | 10 | The install is complete | `units/install-linux.sh check` (exit 0) |
-| 11 | k3s launcher check 5: the delivered kubeconfig works | decrypt as `ccsbx-keys`, never into your home: `sudo -u ccsbx-keys sh -c 'umask 077; sops -d ~/git/k3s/apps/cc-sandbox/launcher.kubeconfig.sops.yaml > /var/lib/ccsbx-keys/launcher.kubeconfig'`, then in the k3s repo `scripts/cc-sandbox-check.sh check --only 5 --launcher-kubeconfig /var/lib/ccsbx-keys/launcher.kubeconfig` (per the k3s README; the script wants an ADMIN kubeconfig in `KUBECONFIG` for its test pods, which hp does not have, so run it on the Mac with the file copied over `scp` from an `sudo -u ccsbx-keys cat`, then delete the copy; `_GAP:_` k3s to confirm the hp-only route). Expect: pods create/exec/logs/delete and events OK; 403 on secrets, PVCs and other namespaces. The file stays decryptable only to the master key until the age recipient is added (`sops updatekeys`, k3s README) |
+| 11 | k3s launcher check 5: hp only, as `ccsbx-keys`, launcher-scoped | the block below, verbatim from the k3s side |
 | 12 | The first SHARED go (M8/M1) | merge the k3s PR `_GAP:_ number from the k3s side`: `gh pr merge <n> --repo landovsky/k3s`; then `flux get kustomization cc-sandbox` on the Mac |
 | 13 | Everything green | `bin/ccsbx-preflight --morning --post-M1` (set `CCSBX_DOORS_MODEL_URL` and `CCSBX_DOORS_EGRESS_URL` first) |
 | 14 | The report | `bin/ccsbx-night-report --dry-run`, then `--send` |
 
 If a step fails: runbook §2 (rollback), and `sudo units/install-linux.sh uninstall --yes` undoes steps 8 to 9.
+
+### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
+
+```bash
+# k3s launcher check 5 (from K3s manager a09b4c, 2026-11-20 ~00:40). HP ONLY, run by Tomas.
+# Proves: ccsbx-keys can decrypt the file; the launcher RBAC and self-renewal work from hp.
+# (The admin half, which creates test pods, already passed on the Mac.)
+# Our age key is /var/lib/ccsbx-keys/age.key, not sops's default path, hence SOPS_AGE_KEY_FILE.
+git -C ~/git/k3s pull --ff-only
+install -m 644 ~/git/k3s/apps/cc-sandbox/launcher.kubeconfig.sops.yaml /tmp/ccsbx-launcher.sops.yaml
+sudo -u ccsbx-keys bash -c '
+  umask 077; cd ~
+  SOPS_AGE_KEY_FILE=/var/lib/ccsbx-keys/age.key sops -d /tmp/ccsbx-launcher.sops.yaml > ~/launcher.kubeconfig || exit 1
+  K="kubectl --kubeconfig $HOME/launcher.kubeconfig -n cc-sandbox"
+  $K auth whoami                                                   # expect system:serviceaccount:cc-sandbox:cc-sandbox-launcher
+  echo "create pods: $($K auth can-i create pods)"                 # yes
+  echo "exec:        $($K auth can-i create pods --subresource=exec)"  # yes
+  echo "secrets:     $($K auth can-i get secrets)"                 # no
+  echo "pvc:         $($K auth can-i list persistentvolumeclaims)" # no
+  echo "default ns:  $($K auth can-i list pods -n default)"        # no
+  echo "doors ns:    $($K auth can-i list pods -n cc-sandbox-doors)"   # no
+  $K get secrets 2>&1 | tail -1                                    # expect Forbidden
+  $K create token cc-sandbox-launcher --duration=10m --bound-object-kind Secret --bound-object-name cc-sandbox-launcher-anchor >/dev/null && echo "renew: OK"
+'
+rm /tmp/ccsbx-launcher.sops.yaml
+# PASS = whoami is the launcher SA, yes/yes/no/no/no/no, Forbidden, renew OK. Paste the output to the K3s manager (a09b4c), who closes the item.
+# Afterwards ~/launcher.kubeconfig stays in ccsbx-keys's home (0600); per the runbook it moves where the daemon reads it, or is deleted.
+```
+
+Notes from N1-D (checked on hp, read-only):
+- `ccsbx-keys` exists; its home is `/var/lib/ccsbx-keys`, so `~/launcher.kubeconfig` lands at
+  `/var/lib/ccsbx-keys/launcher.kubeconfig` (0600 by the `umask 077`). That is inside the key directory, which is where the
+  daemon side is meant to read keys from. **The runbook does not name a path for the kubeconfig yet**
+  (the last comment line in the block says "per the runbook"; it isn't there): decide the final path when
+  hostd/launcher code lands, and fix runbook §12.
+- **The directory is mode 0750 today, not 0700** (it was made with `useradd --create-home` in R10b). Nobody else is in group
+  `ccsbx-keys`, so tomas can't read it, but the installer's U0b step does `chmod 0700` to close the group bit.
+- The installer's U0b step is on PR #2 (`units/lib/u0b.sh`), not on main yet.
+
 
 ## The reboot and the containers with restart policy `no`
 

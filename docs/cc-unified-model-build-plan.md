@@ -729,7 +729,7 @@ deploy, Q6).
 | K8 | launcher RBAC + kubeconfig: ✅ **RBAC live**; the kubeconfig waits for R10b | **dep R10b** | the kubeconfig is SOPS-encrypted to the age key of uid `ccsbx-keys` | R10b (2) | k3s can't encrypt it to us, so F2–F5 are blocked | **SHARED**, k3s |
 | K9 | ✅ **live** emptyDir worktrees | no | — | done | — | — |
 | K10 | ghcr pull secret | no | — | R19 token | — | k3s, 🔑 R19 |
-| K11 | ✅ **live** Pod Security + VAP | no | — | done | — | the launcher-pod extension waits for the second batch |
+| K11 | ✅ **live** Pod Security + VAP, including the launcher-pod rules (role=session only, no SA token, no Secret refs) | no | — | done | — | — |
 | K13 | hostd PVC | no | — | — | — | k3s (requested) |
 | Q13 | k3s secrets-encryption | no (root on the k3s server node, done by k3s) | server config | k3s side; Tomas's go | — | k3s, SHARED; needed before R5b's Secret |
 | **Phase A** | | | | | | |

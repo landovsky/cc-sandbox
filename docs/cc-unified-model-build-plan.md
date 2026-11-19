@@ -212,7 +212,7 @@ That's about 25 dev-days plus the gates. Parallel streams:
 | Id | Piece | Size | Owner | Needs | Acceptance test (where) |
 |---|---|---|---|---|---|
 | F1 | *Dropped* (it was doc 4's K1, docker beside k3s). Kept so old references resolve | — | — | — | — |
-| F2 | **k8s backend**: fence container + native sidecar; runAsNonRoot uid 10001, readOnlyRootFilesystem, drop ALL, seccomp RuntimeDefault, no SA token, Guaranteed QoS, `dnsPolicy: None`, `shareProcessNamespace: false`, nodeSelector + toleration, an emptyDir worktree, the image by digest. Created by hp's `ccsbx-root` (REST for create, `kubectl` for exec/attach) | M | cs | U1b, U5, U0b, K2/K3/K8/K9/K11 | `ccsbx selftest --suites fence --backend k8s` green, `T:vap-rejects` (hp + Mac kubeconfig) |
+| F2 | **k8s backend** (to the live contract in §4.6: label `cc-sandbox/role=session`, nodeSelector `kubernetes.io/hostname=future-two` + toleration `pool=shared:NoSchedule`, no SA token, no Secret refs, ≤ 4Gi / 4 CPU / 40Gi ephemeral per container, emptyDir worktree with `sizeLimit`): fence container + native sidecar; runAsNonRoot uid 10001, readOnlyRootFilesystem, drop ALL, seccomp RuntimeDefault, no SA token, Guaranteed QoS, `dnsPolicy: None`, `shareProcessNamespace: false`, nodeSelector + toleration, an emptyDir worktree, the image by digest. Created by hp's `ccsbx-root` (REST for create, `kubectl` for exec/attach) | M | cs | U1b, U5, U0b, K2/K3/K8/K9/K11 | `ccsbx selftest --suites fence --backend k8s` green, `T:vap-rejects` (hp + Mac kubeconfig) |
 | F3 | **Sidecar `ccsbx side`** (uid 10002). Forwarder: gets the token and per-generation key via `pods/exec` stdin; never in the pod spec. Outbox relay with U3a's file checks. Session journal. Bus relay with a **per-generation relay credential** (B6c) in a sidecar-only volume. Clone/commit/push with H1. **Listens only on the forwarder port**; its control plane is on unix sockets in sidecar-only volumes; it never runs `tmux attach` and treats tmux output as untrusted | M | cs | F2, P2, H1, B6c | `T:no-token-in-fence`, `T:hooks-off` on k8s; `T:fence-sees-only-fwd-port` (`ss -lntx`, `/proc/net/unix` from the fence); `T:hub-cred-sidecar-only`; `T:no-ptrace-sidecar` (hp + Mac kubeconfig) |
 | F4 | **In-cluster `ccsbx-hostd`**: the same API (M2a/M3/M4), journal on K13's PVC, exposed via the operator, keyless (it verifies sidecars' signatures against `ccsbx-machines`); same-node delivery works with hp down | S | cs + k3s | F3, M2a, K13 | `T:journal-durable` across a pod deletion; two future-two sessions message each other with hp's hostd and hub stopped |
 | F5 | **Attach**: `ssh -t hp-ubuntu ccsbx attach <sid>` → `ccsbx-root attach` → `kubectl exec -it -c fence … tmux attach` with the kubeconfig under `ccsbx-keys` | XS | cs | F2 | `ccsbx attach <sid>` from the Mac lands in the pane; `/exit` ends the pod |
@@ -415,6 +415,19 @@ and a session listener that ignores identity headers.
 | 3 | **Door ports + bus route** | ClusterIP in `cc-sandbox-doors`: model `8080` (session) + `8090` (owner/health), egress `8081` (session) + `8091` (owner: decisions), package mirrors on `8081` paths. In `cc-sandbox`: hostd `7480` (session) + `7490` (owner). Tailnet exposure via the operator, tag `tag:ccsbx`, L7 ingress for the owner listeners and the hp/Mac → door session traffic. **Session pods don't talk to the bus; only the sidecar does**, with a per-generation relay credential, via an operator **egress** Service (tag `tag:ccsbx`) to the hub on hp, port 4011 (HTTP; the B11 surface). NetPol is per pod, so the agent container can reach that Service too. What locks it: B6c's per-generation, sid-bound relay role, the credential in a sidecar-only volume (different uid), and B3's rejection of unsigned `fenced` claims. **New request:** a NetPol on the operator's egress proxy pod admitting only `cc-sandbox` (K4, SHARED) | M8, F3, B7 | now |
 | 4 | **Our `artifacts/gitops.md`** for K7 review | a draft in phase 0 (O1); ready for review once M1 is live | O1 → M1 | draft before night 1; review after gate M |
 | 5 | **Scope amendments to request** | `cc-sandbox-doors` namespace (K1); K11's launcher-pod rules; K8's self-token renewal; K13's hostd PVC; K4's egress-proxy NetPol; K12 CI later | ❓ Q2 | now |
+
+**Live contract (k3s main `8aaacc0`, 2026-11-19; their check: 46 PASS).** K1 (ns `cc-sandbox`), K2,
+K3, K8, K9, K11 and the node watchdog are live. Pods we create must match:
+- label `cc-sandbox/role=session|door`;
+- `nodeSelector: kubernetes.io/hostname=future-two` and a toleration for `pool=shared:NoSchedule`;
+- launcher-created pods: `role=session` only, `automountServiceAccountToken: false`, no Secret references;
+- per container at most 4Gi memory, 4 CPU and 40Gi ephemeral storage;
+- the worktree in an `emptyDir` with a `sizeLimit`.
+
+The launcher kubeconfig (K8) is ready, and k3s encrypts it as soon as R10b's age public key
+arrives. **Still waiting for Tomas to confirm the second batch to the k3s side directly:** the
+`cc-sandbox-doors` namespace, the launcher's token renewal, the hostd PVC (K13), the egress-proxy
+NetPol, the Mac `ccsbx-ops` SA, and secrets-encryption (Q13).
 
 ## 5. Multi-machine and ops
 
@@ -706,17 +719,17 @@ deploy, Q6).
 | M7 | ACL requirements for K5 | no | — | — | runs | — |
 | O1 | gitops.md | no | — | — | runs | K7 review (k3s) |
 | O7 | ops procedures doc | no | — | — | runs | — |
-| K1 | namespaces + Flux | no (cluster, not host root) | — | merge the k3s PR (R3, 5) | — | **SHARED** |
-| K2 | placement | no | — | — | — | k3s |
-| K3 | quota, limits, default-deny | no | — | merge the PR (R3) | — | **SHARED** |
+| K1 | namespaces + Flux: ✅ **live** for `cc-sandbox`; `cc-sandbox-doors` waits for the second batch | no (cluster, not host root) | — | merge the k3s PR (R3, 5) | — | **SHARED** |
+| K2 | ✅ **live** placement | no | — | — | — | k3s |
+| K3 | ✅ **live** quota, limits, default-deny | no | — | merge the PR (R3) | — | **SHARED** |
 | K4 | SOPS + operator exposure + egress NetPol | no | — | merge the PR (R3) | — | **SHARED**, ACL, M8 |
 | K5 | ACL draft | no | — | paste it in the admin console (R4, 10) | — | **ACL** |
 | K6 | CPU fix + node alerts | no | — | — | — | k3s |
 | K7 | gitops review | no | — | — | — | k3s |
-| K8 | launcher RBAC + kubeconfig | **dep R10b** | the kubeconfig is SOPS-encrypted to the age key of uid `ccsbx-keys` | R10b (2) | k3s can't encrypt it to us, so F2–F5 are blocked | **SHARED**, k3s |
-| K9 | emptyDir worktrees | no | — | — | — | k3s |
+| K8 | launcher RBAC + kubeconfig: ✅ **RBAC live**; the kubeconfig waits for R10b | **dep R10b** | the kubeconfig is SOPS-encrypted to the age key of uid `ccsbx-keys` | R10b (2) | k3s can't encrypt it to us, so F2–F5 are blocked | **SHARED**, k3s |
+| K9 | ✅ **live** emptyDir worktrees | no | — | — | — | k3s |
 | K10 | ghcr pull secret | no | — | R19 token | — | k3s, 🔑 R19 |
-| K11 | Pod Security + VAP | no | — | merge the PR (R3) | — | **SHARED** (cluster-scoped) |
+| K11 | ✅ **live** Pod Security + VAP | no | — | merge the PR (R3) | — | **SHARED** (cluster-scoped) |
 | K13 | hostd PVC | no | — | — | — | k3s (requested) |
 | Q13 | k3s secrets-encryption | no (root on the k3s server node, done by k3s) | server config | k3s side; Tomas's go | — | k3s, SHARED; needed before R5b's Secret |
 | **Phase A** | | | | | | |
@@ -861,7 +874,7 @@ deploy, Q6).
   the Mac; the lxd removal.
 - **Pieces that need root only through a dependency:** U1b and U5 (final form), U2, U3a, U3b,
   M2c, M9, F2, F3, F5, H2, M2b, M2d, C4b, C12, C16, C20, M14, M5, C24, O5, K8.
-- **The real non-root blockers:** SHARED goes (K1, K3, K4, K11, M1), the ACL paste (K5, B7, R4),
+- **The real non-root blockers** (K1, K2, K3, K8 RBAC, K9 and K11 went live on 2026-11-19): SHARED goes (K4, M1, the second batch), the ACL paste (K5, B7, R4),
   keys (R5, R5b, R7, R8, R19), k3s work (K2, K6–K10, K13, Q13), and the human gate for live
   deploys of cc-tree and session-bus changes.
 - **Without any root at all,** everything in phases 0, A, B, E, F and H can be **built and tested

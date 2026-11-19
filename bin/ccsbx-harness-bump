@@ -1,0 +1,221 @@
+#!/usr/bin/env python3
+"""ccsbx-harness-bump: the weekly harness-bump job (plan §3 O6).
+
+Finds a newer Claude Code version, builds a candidate fence image for it (H2's candidate channel),
+runs the allow/block suite against that candidate, and opens a PR that moves the pin ONLY if the
+suite is green.  A red or broken run opens no PR and sends a Telegram that names the failing
+test(s), so a harness release that weakens a block never reaches the pins by itself.
+
+Recipes:
+  ccsbx-harness-bump --dry-run                     show every step and its command; run nothing
+  ccsbx-harness-bump                               latest version -> build -> suite -> PR or alert
+  ccsbx-harness-bump --version 9.9.9               bump to a given version (skip the lookup)
+  ccsbx-harness-bump --strict                      pending twins also count as red
+  ccsbx-harness-bump --no-notify --no-pr           run the suite only, print the verdict
+  ccsbx-harness-bump --gate-cmd 'ccsbx selftest --suites fence,settings --backend docker --json'
+
+Steps (each command is a flag, `{version}` is substituted, so the job can be tested and re-pointed
+without editing code):
+  1 --latest-cmd   prints the newest version (default: npm view, read-only)
+  2 --build-cmd    builds the candidate image for {version} (H2 candidate channel; until H2 exists
+                   the default fails, which is reported as "build failed", never as green)
+  3 --gate-cmd     the suite; must print `ccsbx selftest --json` on stdout; env
+                   CCSBX_HARNESS_CANDIDATE={version} tells it which candidate to run
+  4 PR             edits --pins in a branch `harness-bump/<version>` of --repo, commits, then --pr-cmd
+  5 --notify-cmd   Telegram on red / broken / PR opened (default: notify-tomas-telegram devops)
+
+Direct mode (night 1): the suite's results are "not evidence" (invariant 14 waived); the PR body
+and the alert say so while the gate report has evidence=false.
+
+Exit: 0 PR opened (or --no-pr and green) or already up to date; 1 suite red; 2 usage;
+3 lookup or build failed.
+Tunables: all flags below; CCSBX_REPO, CCSBX_PINS.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+VER = re.compile(r"^\d+\.\d+\.\d+([-+][\w.]+)?$")
+PIN = re.compile(r'^(claude\s*=\s*)"([^"]*)"', re.M)
+
+
+def sh(cmd, env=None, cwd=None, timeout=3600):
+    """Run a shell command string; returns (rc, stdout, stderr). A hang is a failure, not a wait."""
+    e = dict(os.environ)
+    e.update(env or {})
+    try:
+        p = subprocess.run(cmd, shell=True, capture_output=True, text=True, env=e, cwd=cwd, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except subprocess.TimeoutExpired:
+        return 124, "", f"timeout after {timeout}s"
+
+
+def tail(s, n=300):
+    s = " ".join(s.split())
+    return s if len(s) <= n else "…" + s[-n:]
+
+
+def current_pin(pins):
+    try:
+        m = PIN.search(Path(pins).read_text())
+        return m.group(2) if m else None
+    except OSError:
+        return None
+
+
+def failing(report, strict):
+    """Names of the tests that make the run red: T:<id> (<twin>)."""
+    bad = []
+    for r in report.get("results", []):
+        if r.get("status") == "fail" or (strict and r.get("status") == "pending"):
+            bad.append(f"T:{r.get('id')} ({r.get('twin')})")
+    for p in report.get("problems") or []:  # a broken table is red too
+        bad.append(f"table: {p}")
+    return bad
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ccsbx-harness-bump", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    a = ap.add_argument
+    a("--version", help="candidate version (default: --latest-cmd)")
+    a("--latest-cmd", default="npm view @anthropic-ai/claude-code version", help="prints the newest version")
+    a("--build-cmd", default="ccsbx candidate build --harness-version {version}",
+      help="build the candidate image (H2); {version} substituted")
+    a("--gate-cmd", default="ccsbx selftest --backend docker --json", help="the suite; prints selftest --json")
+    a("--repo", default=os.environ.get("CCSBX_REPO", str(HERE)), help="git repo holding the pins")
+    a("--pins", default=os.environ.get("CCSBX_PINS", "etc/pins.toml"), help="pins file, relative to --repo")
+    a("--pr-cmd", default='gh pr create --title "{title}" --body "{body}" --head "{branch}"',
+      help="open the PR; {title} {body} {branch} {version} substituted (run in --repo)")
+    a("--notify-cmd", default="notify-tomas-telegram devops", help="the message is appended as one argument")
+    a("--strict", action="store_true", help="pending twins count as red")
+    a("--no-pr", action="store_true", help="never touch git or open a PR")
+    a("--no-notify", action="store_true", help="never message anyone")
+    a("--timeout", type=int, default=3600, help="seconds allowed per step (default 3600)")
+    a("--dry-run", action="store_true", help="print the steps and commands, run nothing")
+    args = ap.parse_args(argv)
+
+    repo = Path(args.repo)
+    pins = repo / args.pins
+    steps = []
+
+    def say(s):
+        print(s, flush=True)
+
+    def notify(msg):
+        if args.no_notify:
+            say(f"(not sent) {msg}")
+            return
+        rc, _, err = sh(f"{args.notify_cmd} {shlex.quote(msg)}", timeout=120)
+        if rc != 0:
+            say(f"warning: notify failed (rc={rc}): {tail(err)}")
+
+    if args.dry_run:
+        v = args.version or "<latest>"
+        say(f"1 lookup : {args.latest_cmd}" if not args.version else f"1 lookup : skipped, version {v}")
+        say(f"2 build  : {args.build_cmd.format(version=v)}")
+        say(f"3 gate   : {args.gate_cmd}   (CCSBX_HARNESS_CANDIDATE={v})")
+        say(f"4 PR     : branch harness-bump/{v} in {repo}: set claude = \"{v}\" in {args.pins}; "
+            + ("skipped (--no-pr)" if args.no_pr else args.pr_cmd))
+        say(f"5 notify : {'skipped (--no-notify)' if args.no_notify else args.notify_cmd}")
+        say("dry run: nothing was run")
+        return 0
+
+    # 1 lookup
+    version = args.version
+    if not version:
+        rc, out, err = sh(args.latest_cmd, timeout=args.timeout)
+        version = out.strip().splitlines()[-1].strip() if out.strip() else ""
+        if rc != 0 or not VER.match(version):
+            msg = f"harness bump: version lookup failed (rc={rc}): {tail(err or out)}"
+            say(msg)
+            notify(msg)
+            return 3
+    if not VER.match(version):
+        print(f"ccsbx-harness-bump: bad version {version!r}", file=sys.stderr)
+        return 2
+    cur = current_pin(pins)
+    if cur == version:
+        say(f"harness bump: {version} is already the pin; nothing to do")
+        return 0
+    say(f"harness bump: {cur or 'unpinned'} -> {version}")
+
+    # 2 build
+    rc, out, err = sh(args.build_cmd.format(version=version), env={"CCSBX_HARNESS_CANDIDATE": version},
+                      timeout=args.timeout)
+    if rc != 0:
+        msg = f"harness bump {version}: candidate build failed (rc={rc}); no PR. {tail(err or out)}"
+        say(msg)
+        notify(msg)
+        return 3
+
+    # 3 gate
+    rc, out, err = sh(args.gate_cmd, env={"CCSBX_HARNESS_CANDIDATE": version}, timeout=args.timeout)
+    try:
+        report = json.loads(out)
+    except ValueError:
+        msg = f"harness bump {version}: the suite printed no JSON (rc={rc}); no PR. {tail(err or out)}"
+        say(msg)
+        notify(msg)
+        return 1
+    bad = failing(report, args.strict)
+    if bad or (rc != 0 and not report.get("results")):
+        shown = ", ".join(bad[:6]) + (f" +{len(bad) - 6} more" if len(bad) > 6 else "")
+        msg = f"harness bump {cur or '?'} -> {version} is RED, no PR: {shown or 'suite exited ' + str(rc)}"
+        say(msg)
+        notify(msg)
+        return 1
+    n = len(report.get("results", []))
+    evidence = bool(report.get("evidence"))
+    say(f"suite green: {n} results, evidence={evidence}")
+    if args.no_pr:
+        return 0
+
+    # 4 PR: move the pin on its own branch; never on the checked-out branch
+    branch = f"harness-bump/{version}"
+    title = f"harness: bump Claude Code {cur or 'unpinned'} -> {version}"
+    body = (f"Weekly bump by ccsbx-harness-bump. Candidate built and the suite was green "
+            f"({n} results). " + ("" if evidence else "NOT EVIDENCE: direct mode, invariant 14 waived. ")
+            + "Promotion still needs the full suite on hp and future-two (H2).")
+    git = lambda *c: subprocess.run(["git", "-C", str(repo), *c], capture_output=True, text=True)
+    prior = git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+    r = git("checkout", "-b", branch)
+    if r.returncode != 0:
+        msg = f"harness bump {version}: green, but git could not create {branch}: {tail(r.stderr)}"
+        say(msg)
+        notify(msg)
+        return 3
+    try:
+        text = pins.read_text() if pins.exists() else ""
+        text = PIN.sub(lambda m: f'{m.group(1)}"{version}"', text) if PIN.search(text) \
+            else text + f'claude = "{version}"\n'
+        pins.parent.mkdir(parents=True, exist_ok=True)
+        pins.write_text(text)
+        git("add", args.pins)
+        r = git("commit", "-m", title)
+        if r.returncode != 0:
+            raise RuntimeError(f"commit failed: {tail(r.stderr)}")
+        cmd = args.pr_cmd.format(title=title, body=body.replace('"', "'"), branch=branch, version=version)
+        rc, out, err = sh(cmd, cwd=str(repo), timeout=args.timeout)
+        if rc != 0:
+            raise RuntimeError(f"pr command failed (rc={rc}): {tail(err or out)}")
+    except RuntimeError as e:
+        msg = f"harness bump {version}: suite green but no PR: {e}"
+        say(msg)
+        notify(msg)
+        return 3
+    finally:
+        git("checkout", prior)
+    say(f"PR opened: {tail(out, 200)}")
+    notify(f"harness bump {cur or '?'} -> {version}: suite green, PR opened. {tail(out, 150)}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

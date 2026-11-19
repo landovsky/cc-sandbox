@@ -152,7 +152,7 @@
   one. If `up` was never run, cc-tree behaves as it does today (standalone).
 
 ## 7. future-two unlock after a reboot
-<!-- procedure: O3 -->
+<!-- procedure: O3 O3b -->
 
 - **When:** future-two reboots (Hetzner maintenance, a kernel update). Its disk is LUKS and waits
   for a manual unlock; until then every door and every future-two session is down. R11: no reboot

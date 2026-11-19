@@ -29,29 +29,10 @@ func app() *cli.App {
 		Summary: "fenced Claude Code sessions (cc-sandbox)",
 		Version: version,
 		Cmds: []*cli.Command{
-			{
-				Name:    "run",
-				Summary: "run one fence generation on the docker backend (U1b)",
-				Recipes: "  ccsbx run --sid s01jd7k2m9 --gen 1 --image ccsbx-fence:dev --workdir /path/to/wt\n  CCSBX_ROOT=direct ccsbx run ...   # dev mode, as the calling user (not evidence)",
-				Setup: func(f *cli.Flags) {
-					f.String("sid", "", "session id minted by the daemon")
-					f.Int("gen", 1, "generation number")
-					f.String("image", "", "fence image reference (pinned)")
-					f.String("workdir", "", "worktree to mount")
-					f.String("root", "direct", "privilege mode: direct (dev, as the caller) or helper")
-				},
-				Run: notBuilt("U1b"),
-			},
-			{
-				Name:    "start",
-				Summary: "start a session from a LaunchSpec (U2)",
-				Recipes: "  ccsbx start --spec tests/specs/hello.json --json\n  cat spec.json | ccsbx start --spec -",
-				Setup: func(f *cli.Flags) {
-					f.String("spec", "-", "LaunchSpec JSON file, or - for stdin")
-					f.Bool("json", false, "print the StartReply as JSON")
-				},
-				Run: notBuilt("U2"),
-			},
+			runCmd(),
+			pinCheckCmd(),
+			pinPromoteCmd(),
+			startCmd(),
 			selftestCmd(),
 			settingsCmd(),
 			{

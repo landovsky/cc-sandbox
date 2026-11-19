@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# e2e/06-pane — hook point 6: attach windows and remote panes (plan §9 item 7).
+# Nothing real before C2 and a fence image.
+. "$(dirname "$0")/lib.sh"; e2e_init
+skip "the launcher's tmux server has clipboard writes and pass-through off (a fenced agent controls its pane output)" "covered by U2's start/tmux_test.go; an end-to-end read-back needs a pane that stays alive (fence image); setting the options in this script would only test tmux"
+skip "Enter on a fenced node opens a working pane on hp" "needs C2 (attach windows) + fence image"
+skip "closing the attach window then cc-tree start says 'already running on hp-ubuntu'" "needs C2"
+skip "Enter on a fenced node opens a pane from the Mac" "needs the Mac leg (Q14, Mac awake)"

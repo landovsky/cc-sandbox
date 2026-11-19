@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""ccsbx-nightly-e2e: the nightly e2e run and its Telegram table (plan §3 C21).
+
+Runs `make e2e` (e2e/run: ONE TAP stream, includes e2e/00-standalone and, when it exists, S0
+`make standalone`), keeps one history line per night, and prints (or sends) a table of at most
+70 columns: a row per e2e script, every failing line by name, the skip count, and the streak of
+green nights.  The plan's bar is three green nights in a row; a night with skips is green but
+is labelled so, because a skip is a piece that is not built yet, not a pass.
+
+Recipes:
+  ccsbx-nightly-e2e --dry-run               show the command and the files, run nothing
+  ccsbx-nightly-e2e                         run, print the table, append to the history
+  ccsbx-nightly-e2e --send                  ...and send it: notify-tomas-telegram devops --pre
+  ccsbx-nightly-e2e --last                  reprint the last night's table, run nothing
+  ccsbx-nightly-e2e --run-cmd 'e2e/run 00-standalone'     a narrower run
+Scheduling (not installed by this tool): etc/nightly-selftest.jobs.yaml has the tschedule job.
+
+Exit: 0 no failing line; 1 a failing line, or the run produced no TAP (broken = red); 2 usage.
+Tunables: --run-cmd --history --bot --timeout; CCSBX_NIGHTLY_OUT (same dir as the selftest's).
+Direct mode (night 1): the table says NOT EVIDENCE (invariant 14 waived).
+"""
+import argparse
+import datetime
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent.parent
+WIDTH = 70
+NEED = 3  # green nights in a row the plan asks for
+
+
+def parse_tap(text):
+    """TAP text -> (rows per script, failing lines). A '# <script>' comment starts a script."""
+    scripts, cur, fails = {}, "?", []
+    for line in text.splitlines():
+        m = re.match(r"^# (0\d-[\w-]+)\s*$", line)
+        if m:
+            cur = m.group(1)
+            scripts.setdefault(cur, {"ok": 0, "skip": 0, "fail": 0})
+            continue
+        m = re.match(r"^(not ok|ok) \d+ - (.*)$", line)
+        if not m:
+            continue
+        row = scripts.setdefault(cur, {"ok": 0, "skip": 0, "fail": 0})
+        if m.group(1) == "not ok":
+            row["fail"] += 1
+            fails.append(f"{cur}: {m.group(2)}")
+        elif "# SKIP" in m.group(2):
+            row["skip"] += 1
+        else:
+            row["ok"] += 1
+    return scripts, fails
+
+
+def clip(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: max(n - 1, 0)] + "…"
+
+
+def streak(history, tonight_ok):
+    n = 1 if tonight_ok else 0
+    if not tonight_ok:
+        return 0
+    for h in reversed(history):
+        if h.get("fail", 1) == 0 and h.get("ran", False):
+            n += 1
+        else:
+            break
+    return n
+
+
+def table(night, streak_n):
+    L = [f"nightly e2e {night['date']} on {night['machine']}",
+         f"{'script':<16}{'ok':>5}{'skip':>6}{'fail':>6}", "-" * 33]
+    for name, r in night["scripts"].items():
+        L.append(f"{clip(name, 15):<16}{r['ok']:>5}{r['skip']:>6}{r['fail']:>6}")
+    L.append("-" * 33)
+    for f in night["failing"][:8]:
+        L.append("! " + clip(f, WIDTH - 2))
+    if len(night["failing"]) > 8:
+        L.append(f"! +{len(night['failing']) - 8} more")
+    if night.get("note"):
+        L.append(clip(night["note"], WIDTH))
+    verdict = "RED" if night["fail"] or not night["ran"] else ("GREEN" if not night["skip"] else "GREEN, with skips")
+    L.append(f"{verdict}: {night['ok']} ok, {night['skip']} skipped, {night['fail']} failed")
+    L.append(f"green streak {streak_n}/{NEED} nights" + ("" if not night["skip"] else f" ({night['skip']} skips: not built yet)"))
+    L.append("NOT EVIDENCE: direct mode, invariant 14 waived")
+    return "\n".join(L)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="ccsbx-nightly-e2e", description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    a = ap.add_argument
+    a("--run-cmd", default="make e2e", help="the e2e run; must print TAP on stdout (default: make e2e)")
+    a("--out", default=os.environ.get("CCSBX_NIGHTLY_OUT", "~/.local/state/ccsbx/nightly"), help="state dir")
+    a("--timeout", type=int, default=3600, help="seconds allowed for the run")
+    a("--bot", default="devops", help="Telegram bot for --send")
+    a("--send", action="store_true", help="send the table: notify-tomas-telegram <bot> --pre")
+    a("--last", action="store_true", help="reprint the last night's table and run nothing")
+    a("--dry-run", action="store_true", help="show what would run, run nothing")
+    args = ap.parse_args(argv)
+    out = Path(os.path.expanduser(args.out))
+    hist_f, last_f = out / "e2e-history.jsonl", out / "e2e-latest.json"
+
+    if args.dry_run:
+        print(f"run     : {args.run_cmd}   (in {HERE})")
+        print(f"history : {hist_f}")
+        print(f"send    : {'notify-tomas-telegram ' + args.bot + ' --pre' if args.send else 'no (--send)'}")
+        print("dry run: nothing was run")
+        return 0
+
+    history = []
+    try:
+        history = [json.loads(l) for l in hist_f.read_text().splitlines() if l.strip()]
+    except OSError:
+        pass
+    if args.last:
+        try:
+            night = json.loads(last_f.read_text())
+        except (OSError, ValueError):
+            print(f"ccsbx-nightly-e2e: no previous run in {out}", file=sys.stderr)
+            return 2
+        print(table(night, night.get("streak", 0)))
+        return 1 if night["fail"] or not night["ran"] else 0
+
+    try:
+        p = subprocess.run(args.run_cmd, shell=True, capture_output=True, text=True, timeout=args.timeout, cwd=str(HERE))
+        text, note = p.stdout, ""
+        if p.returncode != 0 and "not ok" not in text:
+            note = "run exited %d: %s" % (p.returncode, " ".join((p.stderr or text).split())[-80:])
+    except subprocess.TimeoutExpired:
+        text, note = "", f"timeout after {args.timeout}s"
+    scripts, fails = parse_tap(text)
+    tot = lambda k: sum(r[k] for r in scripts.values())
+    ran = bool(scripts) and tot("ok") + tot("skip") + tot("fail") > 0
+    night = {"date": datetime.datetime.now().strftime("%Y-%m-%d"), "machine": os.uname().nodename,
+             "scripts": scripts, "failing": fails, "ok": tot("ok"), "skip": tot("skip"), "fail": tot("fail"),
+             "ran": ran, "note": note if not ran or note else ""}
+    green = ran and night["fail"] == 0
+    night["streak"] = streak(history, green)
+    out.mkdir(parents=True, exist_ok=True)
+    with hist_f.open("a") as fh:
+        fh.write(json.dumps({k: night[k] for k in ("date", "ok", "skip", "fail", "ran")}) + "\n")
+    last_f.write_text(json.dumps(night, indent=1))
+    tbl = table(night, night["streak"])
+    print(tbl)
+    if args.send:
+        s = subprocess.run(["notify-tomas-telegram", args.bot, "--pre", tbl], capture_output=True, text=True)
+        if s.returncode != 0:
+            print(f"warning: send failed (rc={s.returncode}): {s.stderr.strip()[:200]}", file=sys.stderr)
+    return 0 if green else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

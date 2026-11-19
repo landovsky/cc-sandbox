@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# e2e/05-approval — hook point 5: grant requests and approvals, in the e2e realm (plan §9 item 6).
+# Nothing here can run before gate M: it needs the doors and a test approver key.
+. "$(dirname "$0")/lib.sh"; e2e_init
+for d in "a low-tier grant request appears as a card with the decision link|C17 + P7" \
+         "an answer in the tree or web changes nothing|C17" \
+         "a decision without the Telegram code, from an agent on hp, or through the forwarder is refused|P7 + P2" \
+         "a decision with the code grants for that generation only|P7 + door instance" \
+         "medium requests are refused|P7"; do
+  skip "${d%%|*}" "needs ${d##*|} (doors; gate M)"
+done

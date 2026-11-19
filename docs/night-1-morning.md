@@ -27,6 +27,29 @@
    `units/install-linux.sh check` and `bin/ccsbx-preflight --morning --post-M1`.
 4. Rollback: `sudo units/install-linux.sh uninstall --yes` (restores the backup it took).
 
+## Gate M, step by step (exact commands)
+
+Run on hp in `~/git/cc-sandbox` unless a step says otherwise. Order matters: the reboot is step 9.
+
+| # | Step | Command |
+|---|---|---|
+| 1 | Read the install PR and the plan | `gh pr view 2 --web`, then `units/install-linux.sh plan` (as of the morning; this file's copy is from last night) |
+| 2 | Push main (builders never push it; it is ahead of origin) | `git -C ~/git/cc-sandbox push origin main` |
+| 3 | Merge the install PR, then get its files | `gh pr merge 2 --squash` (or review in the browser), then `git pull --ff-only` in `~/git/cc-sandbox` |
+| 4 | P15: decide, then close the rows | `units/p15 status`; decisions are in #4vwb's Outcome; `units/p15 mark ID done\|dropped "note"`; `units/p15 check` must exit 0 |
+| 5 | Keep the restart=no containers (table above) | `docker update --restart unless-stopped messaging-hub-db-1` (and any other you want kept) |
+| 6 | B9: the hub is native | stream C's release is live and `systemctl --user is-active session-bus-hub.service` says `active` (unit name assumed; `CCSBX_B9_UNIT` overrides). The install refuses otherwise |
+| 7 | Build the binaries the installer wants | `ccsbx-root`, `ccsbx-hostd`, `ccsbx-signer`, `ccsbx` for linux/amd64 in `dist/` with a `SHA256SUMS` (`make dist` does not yet produce them: `_GAP:_` stream A) |
+| 8 | The root install (sudo, password) | `sudo units/install-linux.sh install --yes` (add `--with-deploy` only if Q12 = yes) |
+| 9 | Reboot | `sudo reboot`, then open tmux again |
+| 10 | The install is complete | `units/install-linux.sh check` (exit 0) |
+| 11 | k3s launcher check 5: the delivered kubeconfig works | decrypt as `ccsbx-keys`, never into your home: `sudo -u ccsbx-keys sh -c 'umask 077; sops -d ~/git/k3s/apps/cc-sandbox/launcher.kubeconfig.sops.yaml > /var/lib/ccsbx-keys/launcher.kubeconfig'`, then in the k3s repo `scripts/cc-sandbox-check.sh check --only 5 --launcher-kubeconfig /var/lib/ccsbx-keys/launcher.kubeconfig` (per the k3s README; the script wants an ADMIN kubeconfig in `KUBECONFIG` for its test pods, which hp does not have, so run it on the Mac with the file copied over `scp` from an `sudo -u ccsbx-keys cat`, then delete the copy; `_GAP:_` k3s to confirm the hp-only route). Expect: pods create/exec/logs/delete and events OK; 403 on secrets, PVCs and other namespaces. The file stays decryptable only to the master key until the age recipient is added (`sops updatekeys`, k3s README) |
+| 12 | The first SHARED go (M8/M1) | merge the k3s PR `_GAP:_ number from the k3s side`: `gh pr merge <n> --repo landovsky/k3s`; then `flux get kustomization cc-sandbox` on the Mac |
+| 13 | Everything green | `bin/ccsbx-preflight --morning --post-M1` (set `CCSBX_DOORS_MODEL_URL` and `CCSBX_DOORS_EGRESS_URL` first) |
+| 14 | The report | `bin/ccsbx-night-report --dry-run`, then `--send` |
+
+If a step fails: runbook §2 (rollback), and `sudo units/install-linux.sh uninstall --yes` undoes steps 8 to 9.
+
 ## The reboot and the containers with restart policy `no`
 
 The install ends with a reboot. These containers have restart policy `no`, so **they stay down

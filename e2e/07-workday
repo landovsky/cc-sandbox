@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# e2e/07-workday — C25: a fenced agent can do a typical day's work (plan §3 C25).
+# One scripted e2e session in a fence; every step must pass. Night 1: written against the stub (C18);
+# steps that need the fence image, the doors or gate M are SKIP naming the piece. A step is never run
+# unfenced and counted as a pass: an unfenced git log proves nothing about the fence.
+. "$(dirname "$0")/lib.sh"; e2e_init
+
+# 1. receives its brief — the only step that can run before the fence exists (the daemon side)
+spec e2e:workday lid-w1 's/"text":"say hi"/"text":"E2E:workday"/' > "$E2E_ROOT/w1.json"
+out="$("$CCSBX" start --launcher none --json --spec "$E2E_ROOT/w1.json" 2>&1)"; rc=$?
+[ $rc -eq 0 ] && [ -n "$(jget sid <<<"$out" 2>/dev/null)" ] \
+  && ok "the workday session starts under e2e-default and billing=stub with its brief (daemon side only; no pane)" \
+  || bad "the workday session starts with its brief" "rc=$rc $out"
+
+img="the fence image ccsbx-fence:dev (U1a, local build)"
+stub_note="C18 stub on main (stream B branch n1-b)"
+S() { skip "$1" "needs $2"; }
+S "the agent reads the repo and git (log, diff, blame) inside the fence"            "$img + $stub_note"
+S "it edits files in its worktree"                                                  "$img + $stub_note"
+S "it runs the repo's build and tests with packages through the mirrors"            "U15b package mirrors + U15 egress door (gate M)"
+S "it commits and pushes its branch (outbox -> egress door)"                        "U3a outbox + U16 git route (gate M)"
+S "a force-push is refused"                                                         "U16 git route (gate M); T:push-force-refused"
+S "it opens a PR"                                                                   "U15 egress route, GitHub App R7 (gate M)"
+S "it messages its manager and a peer and gets replies"                             "M2a/M2b hub relay + C10 scope rule"
+S "tree verbs: outcome, checkpoint, question, done land on its node"                "C5 ccf MCP + C6 verb writer"
+S "web search goes provider-side through the model door"                            "U4 model door (gate M); T:websearch-through-model-door"
+S "web fetch goes through the egress door's open fetch route and is logged (Q19)"   "U15 egress door (gate M); T:webfetch-open-logged"
+S "it runs a subagent"                                                              "$img + $stub_note (a catalog script that spawns one)"
+S "it resumes after a restart (same sid, gen+1)"                                    "$img + a live pane (U7 is unit-tested only)"
+S "it calls an MCP tool through an egress route"                                    "U15 egress route + C5 (gate M)"
+S "it makes a grant request that gets an answer"                                    "P7 solo approval (doors, Telegram code; gate M)"

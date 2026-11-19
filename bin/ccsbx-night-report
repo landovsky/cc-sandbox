@@ -1,0 +1,237 @@
+#!/usr/bin/env python3
+"""ccsbx-night-report: the morning report as ONE Telegram --pre table (plan §7.2, NB3).
+
+Rows are the night's pieces (the children of every "N1-<letter>" stream node in the tree, and
+streams that have no children), with: state, test, why.  Below the table: the window and the
+spend (7-day subscription window used, and the change since the night's baseline).  Read-only:
+it reads <CC_TREE_REPO>/<tree>/tree.md and runs `cc-tree limits`; nothing is written except
+the baseline with --snapshot.
+
+Recipes:
+  ccsbx-night-report --dry-run             print the table (also what you get with no flag)
+  ccsbx-night-report --send                send it: notify-tomas-telegram devops --pre
+  ccsbx-night-report --snapshot            record the window now (run it when the night starts)
+  ccsbx-night-report --json                the rows as JSON
+  ccsbx-night-report --dry-run --tree-md FILE --limits "hp: 7d 51%"   a fixture, no tools needed
+
+How a piece's row is read (Outcome text on its node; write these lines in the Outcome):
+  state  done = ticked [x]; blocked = an Outcome line "BLOCKED: <why>"; parked = "PARKED: <why>";
+         otherwise open.  test = "RESULT: pass|red|skip <detail>" if present; else ok for a
+         done node (cc-tree done runs its Check), red if the Outcome says FAIL, "-" otherwise.
+  why    the text after BLOCKED:/PARKED:/RESULT:/WHY:, else the first line that isn't ACCEPT.
+Night 1 waives invariant 14 (tomas is still in the docker group): the footer says so while
+CCSBX_NIGHT=1 (default) or --waived-14 is given; --no-waived-14 turns it off.
+
+Exit: 0 printed/sent; 1 send failed; 2 usage or no tree.md.
+Tunables: --tree, --streams REGEX, --bot, --baseline FILE, CC_TREE_REPO, CCSBX_NIGHT,
+CCSBX_REPORT_BASELINE.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+WIDTH = 70
+W_PIECE, W_STATE, W_TEST = 11, 8, 6
+NODE = re.compile(r"^(\s*)- \[([ x])\] (.*?)\s*<!-- n:(\w+) -->\s*$")
+
+
+def clip(s, n):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: max(n - 1, 0)] + "…"
+
+
+def parse_tree(text):
+    """tree.md -> list of dicts: depth, done, title, id, outcome (list of lines), children."""
+    nodes, stack = [], []
+    cur = None
+    in_outcome = False
+    for line in text.splitlines():
+        m = NODE.match(line)
+        if m:
+            depth = len(m.group(1)) // 2
+            cur = {"depth": depth, "done": m.group(2) == "x", "title": m.group(3).strip(), "id": m.group(4),
+                   "outcome": [], "children": []}
+            while stack and stack[-1]["depth"] >= depth:
+                stack.pop()
+            if stack:
+                stack[-1]["children"].append(cur)
+            stack.append(cur)
+            nodes.append(cur)
+            in_outcome = False
+            continue
+        if cur is None:
+            continue
+        s = line.strip()
+        if s == "Outcome:":
+            in_outcome = True
+        elif in_outcome and s:
+            cur["outcome"].append(s)
+    return nodes
+
+
+def label(title):
+    t = re.sub(r"^[^\w]+", "", title)  # drop leading emoji
+    return t.split()[0] if t.split() else title
+
+
+def read_piece(n):
+    out = [l for l in n["outcome"]]
+    state, test, why = ("done" if n["done"] else "open"), "-", ""
+    for l in out:
+        m = re.match(r"(BLOCKED|PARKED)\b[^:]*:\s*(.*)", l)
+        if m and not n["done"]:
+            state, why = m.group(1).lower(), m.group(2)
+        m = re.match(r"RESULT:\s*(pass|red|skip)\b\s*(.*)", l)
+        if m:
+            test = m.group(1)
+            why = why or m.group(2)
+        m = re.match(r"WHY:\s*(.*)", l)
+        if m and not why:
+            why = m.group(1)
+    if test == "-":
+        if n["done"]:
+            test = "ok"
+        if any(re.search(r"\bFAIL(ED)?\b", l) for l in out if not l.startswith("ACCEPT")):
+            test = "red" if not n["done"] else test
+    if not why:
+        for l in out:
+            if not l.startswith("ACCEPT") and not l.startswith("- ") and not re.match(r"(RAN|SAW)\b", l, re.I):
+                why = l
+                break
+        else:
+            why = next((l for l in out if re.match(r"(RAN|SAW)\b", l, re.I)), "")
+    return state, test, why
+
+
+def pieces(nodes, streams_re):
+    rows = []
+    for n in nodes:
+        if not re.search(streams_re, re.sub(r"^[^\w]+", "", n["title"])):
+            continue
+        for p in (n["children"] or [n]):
+            state, test, why = read_piece(p)
+            rows.append({"piece": label(p["title"]), "id": p["id"], "state": state, "test": test, "why": why,
+                         "stream": label(n["title"])})
+    return rows
+
+
+def limits_text(args):
+    if args.limits is not None:
+        return args.limits
+    try:
+        p = subprocess.run(["cc-tree", "limits"], capture_output=True, text=True, timeout=20)
+        return (p.stdout or p.stderr).strip().splitlines()[0] if p.returncode == 0 and p.stdout.strip() else "limits unavailable"
+    except (OSError, subprocess.TimeoutExpired):
+        return "limits unavailable"
+
+
+def pct(text, key):
+    m = re.search(rf"\b{key}\s+(\d+)%", text)
+    return int(m.group(1)) if m else None
+
+
+def window_lines(args, lim):
+    """The window (7d used, reset) and the spend (change since the baseline)."""
+    d7, h5 = pct(lim, "7d"), pct(lim, "5h")
+    reset = re.search(r"→\s*(.+)$", lim)
+    base_f = Path(os.path.expanduser(args.baseline))
+    base = None
+    try:
+        base = json.loads(base_f.read_text())
+    except (OSError, ValueError):
+        pass
+    win = f"window 7d {d7}%" if d7 is not None else "window n/a"
+    if h5 is not None:
+        win += f", 5h {h5}%"
+    if reset:
+        win += f", resets {reset.group(1).strip()}"
+    if base and base.get("7d") is not None and d7 is not None:
+        spend = f"spend +{d7 - base['7d']} pts of 7d since {base.get('at', '?')}"
+    else:
+        spend = "spend n/a (no baseline: run --snapshot at night start)"
+    return win, spend, d7, h5
+
+
+def render(rows, win, spend, waived14):
+    hdr = f"{'piece':<{W_PIECE}}{'state':<{W_STATE}}{'test':<{W_TEST}} why"
+    why_w = WIDTH - W_PIECE - W_STATE - W_TEST - 1
+    lines = [hdr, "-" * WIDTH]
+    for r in rows:
+        lines.append(f"{clip(r['piece'], W_PIECE - 1):<{W_PIECE}}{r['state']:<{W_STATE}}{r['test']:<{W_TEST}} {clip(r['why'], why_w)}")
+    if not rows:
+        lines.append("(no pieces found: check --streams / --tree)")
+    lines.append("-" * WIDTH)
+    done = sum(1 for r in rows if r["state"] == "done")
+    lines.append(clip(f"{done}/{len(rows)} done; " + ", ".join(f"{k} {sum(1 for r in rows if r['state'] == k)}" for k in ("blocked", "parked", "open")), WIDTH))
+    lines.append(clip(win, WIDTH))
+    lines.append(clip(spend, WIDTH))
+    if waived14:
+        lines.append(clip("fence results: invariant 14 waived, not evidence", WIDTH))
+    return "\n".join(lines)
+
+
+def build_parser():
+    ap = argparse.ArgumentParser(prog="ccsbx-night-report", description=__doc__.split("\n\n")[0],
+                                 epilog=__doc__.split("\n\n", 1)[1], formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--dry-run", action="store_true", help="print the table, send nothing (the default)")
+    ap.add_argument("--send", action="store_true", help="send the table: notify-tomas-telegram <bot> --pre")
+    ap.add_argument("--snapshot", action="store_true", help="record the 7-day window now as the night's baseline, then exit")
+    ap.add_argument("--json", action="store_true", help="print the rows as JSON")
+    ap.add_argument("--tree", default="cc-sandbox", help="tree id (default cc-sandbox)")
+    ap.add_argument("--tree-md", metavar="FILE", help="read this tree.md instead of $CC_TREE_REPO/<tree>/tree.md")
+    ap.add_argument("--streams", default=r"^N1-[A-Z0-9a-z]+\b", metavar="REGEX", help="which nodes are the night's streams (default %(default)s)")
+    ap.add_argument("--limits", metavar="TEXT", help="use this instead of `cc-tree limits` (fixture)")
+    ap.add_argument("--bot", default="devops", help="Telegram bot (default devops)")
+    ap.add_argument("--baseline", default=os.environ.get("CCSBX_REPORT_BASELINE", "~/.local/state/ccsbx/night-baseline.json"),
+                    help="baseline file (default %(default)s)")
+    g = ap.add_mutually_exclusive_group()
+    g.add_argument("--waived-14", dest="waived14", action="store_true", default=None, help="footer: invariant 14 waived, not evidence")
+    g.add_argument("--no-waived-14", dest="waived14", action="store_false")
+    return ap
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    if args.send and args.dry_run:
+        print("ccsbx-night-report: --send and --dry-run exclude each other", file=sys.stderr)
+        return 2
+    lim = limits_text(args)
+    if args.snapshot:
+        d7 = pct(lim, "7d")
+        if d7 is None:
+            print(f"ccsbx-night-report: cannot read the 7d window from: {lim}", file=sys.stderr)
+            return 2
+        f = Path(os.path.expanduser(args.baseline))
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(json.dumps({"7d": d7, "at": time.strftime("%H:%M"), "limits": lim}) + "\n")
+        print(f"baseline 7d {d7}% saved to {f}")
+        return 0
+    md = Path(args.tree_md) if args.tree_md else Path(os.path.expanduser(os.environ.get("CC_TREE_REPO", "~/cc-tree"))) / args.tree / "tree.md"
+    try:
+        nodes = parse_tree(md.read_text())
+    except OSError as ex:
+        print(f"ccsbx-night-report: cannot read {md}: {ex}", file=sys.stderr)
+        return 2
+    rows = pieces(nodes, args.streams)
+    win, spend, d7, h5 = window_lines(args, lim)
+    waived = args.waived14 if args.waived14 is not None else os.environ.get("CCSBX_NIGHT", "1") == "1"
+    if args.json:
+        print(json.dumps({"rows": rows, "window": win, "spend": spend, "invariant14_waived": waived}, ensure_ascii=False, indent=1))
+        return 0
+    table = render(rows, win, spend, waived)
+    print(table)
+    if args.send:
+        p = subprocess.run(["notify-tomas-telegram", args.bot, "--pre", table], capture_output=True, text=True)
+        if p.returncode != 0:
+            print(f"ccsbx-night-report: send failed rc={p.returncode}: {(p.stderr or p.stdout).strip()[:100]}", file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

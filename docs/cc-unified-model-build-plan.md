@@ -720,16 +720,16 @@ deploy, Q6).
 | O1 | gitops.md | no | — | — | runs | K7 review (k3s) |
 | O7 | ops procedures doc | no | — | — | runs | — |
 | K1 | namespaces + Flux: ✅ **live** for `cc-sandbox`; `cc-sandbox-doors` waits for the second batch | no (cluster, not host root) | — | merge the k3s PR (R3, 5) | — | **SHARED** |
-| K2 | ✅ **live** placement | no | — | — | — | k3s |
-| K3 | ✅ **live** quota, limits, default-deny | no | — | merge the PR (R3) | — | **SHARED** |
+| K2 | ✅ **live** placement | no | — | done | — | — |
+| K3 | ✅ **live** quota, limits, default-deny | no | — | done | — | — |
 | K4 | SOPS + operator exposure + egress NetPol | no | — | merge the PR (R3) | — | **SHARED**, ACL, M8 |
 | K5 | ACL draft | no | — | paste it in the admin console (R4, 10) | — | **ACL** |
 | K6 | CPU fix + node alerts | no | — | — | — | k3s |
 | K7 | gitops review | no | — | — | — | k3s |
 | K8 | launcher RBAC + kubeconfig: ✅ **RBAC live**; the kubeconfig waits for R10b | **dep R10b** | the kubeconfig is SOPS-encrypted to the age key of uid `ccsbx-keys` | R10b (2) | k3s can't encrypt it to us, so F2–F5 are blocked | **SHARED**, k3s |
-| K9 | ✅ **live** emptyDir worktrees | no | — | — | — | k3s |
+| K9 | ✅ **live** emptyDir worktrees | no | — | done | — | — |
 | K10 | ghcr pull secret | no | — | R19 token | — | k3s, 🔑 R19 |
-| K11 | ✅ **live** Pod Security + VAP | no | — | merge the PR (R3) | — | **SHARED** (cluster-scoped) |
+| K11 | ✅ **live** Pod Security + VAP | no | — | done | — | the launcher-pod extension waits for the second batch |
 | K13 | hostd PVC | no | — | — | — | k3s (requested) |
 | Q13 | k3s secrets-encryption | no (root on the k3s server node, done by k3s) | server config | k3s side; Tomas's go | — | k3s, SHARED; needed before R5b's Secret |
 | **Phase A** | | | | | | |

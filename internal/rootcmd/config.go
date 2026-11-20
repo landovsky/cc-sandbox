@@ -33,6 +33,7 @@ type Config struct {
 	Machine      string
 	BaseURL      string // the forwarder's model route written into managed settings
 	FetchURL     string
+	MinUID       int // a session record must belong to a uid at least this large (never root or a system user)
 	TrustedUID   int
 }
 
@@ -45,13 +46,13 @@ func Defaults() Config {
 		Verbs:    append([]string(nil), Verbs...),
 		StateDir: "/var/lib/ccsbx", RunDir: "/var/lib/ccsbx-run",
 		Docker: "/usr/bin/docker", Tmux: "/usr/bin/tmux", TmuxSocket: "/run/ccsbx/tmux.sock",
-		PinsFile: "/etc/ccsbx/pins.toml", ServiceUser: "ccsbx", BaseURL: "http://fwd:8080",
+		PinsFile: "/etc/ccsbx/pins.toml", ServiceUser: "ccsbx", BaseURL: "http://fwd:8080", MinUID: 1000,
 	}
 }
 
 var configKeys = map[string]bool{
 	"allowed_roots": true, "verbs": true, "state_dir": true, "run_dir": true, "docker": true, "tmux": true,
-	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true,
+	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true, "min_uid": true,
 }
 
 // LoadConfig reads and validates the file. The file and its directory must be owned by trustedUID
@@ -117,6 +118,18 @@ func LoadConfig(path string, trustedUID int) (*Config, error) {
 		if err := str(k, dst); err != nil {
 			return nil, err
 		}
+	}
+	if v, ok := top["min_uid"]; ok {
+		n, isInt := v.(int64)
+		if !isInt {
+			if i, ok2 := v.(int); ok2 {
+				n, isInt = int64(i), true
+			}
+		}
+		if !isInt || n < 1 || n > 1<<31 {
+			return nil, fmt.Errorf("config %s: min_uid must be a number from 1", path)
+		}
+		c.MinUID = int(n)
 	}
 	roots, _, err := list("allowed_roots")
 	if err != nil {

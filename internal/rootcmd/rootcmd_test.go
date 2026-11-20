@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
@@ -36,10 +37,57 @@ type fakeBackend struct {
 	reaped  []backend.Orphan
 	code    int
 	docker  string
+	// beforeStage runs after the checks and before the staging: the moment the owner could swap a path.
+	beforeStage func()
+	staged      bool
 }
 
-func (f *fakeBackend) Run(s backend.Spec, files map[string][]byte, _ io.Reader, _, _ io.Writer) (int, error) {
+// fakeMounter records every bind: which inode it was handed, where, and how.
+type bindCall struct {
+	ino      uint64
+	target   string
+	readonly bool
+}
+
+type fakeMounter struct {
+	binds   []bindCall
+	unbound []string
+	err     error
+	// after runs once a bind is recorded: the test's way to make the staged mountpoint look like
+	// the bound directory (a real bind shows the source's mode and owner there).
+	after func(target string)
+}
+
+func (m *fakeMounter) Bind(src *os.File, target string, ro bool) error {
+	if m.err != nil {
+		return m.err
+	}
+	st, err := src.Stat()
+	if err != nil {
+		return err
+	}
+	m.binds = append(m.binds, bindCall{st.Sys().(*syscall.Stat_t).Ino, target, ro})
+	if m.after != nil {
+		m.after(target)
+	}
+	return nil
+}
+func (m *fakeMounter) Unmount(t string) error { m.unbound = append(m.unbound, t); return nil }
+
+func (f *fakeBackend) Run(s backend.Spec, files map[string][]byte, stage Stager, _ io.Reader, _, _ io.Writer) (int, error) {
 	f.ran, f.files = append(f.ran, s), files
+	os.MkdirAll(s.GenDir(), 0o755) // what backend.Prepare does
+	if f.beforeStage != nil {
+		f.beforeStage()
+	}
+	if stage != nil {
+		undo, err := stage(s)
+		if err != nil {
+			return -1, err
+		}
+		f.staged = true
+		defer undo()
+	}
 	return f.code, nil
 }
 func (f *fakeBackend) Stop(s backend.Spec) error { f.stopped = append(f.stopped, s); return nil }
@@ -62,6 +110,7 @@ type fx struct {
 	fb                *fakeBackend
 	rec               *start.Record
 	env               map[string]string
+	mounter           *fakeMounter
 	execs             []execCall
 	dropped           [][2]int
 	dropErr           error
@@ -104,7 +153,7 @@ func put(t *testing.T, p, body string, mode os.FileMode) {
 func newFx(t *testing.T) *fx {
 	t.Helper()
 	me := os.Getuid()
-	f := &fx{t: t, dir: vtmp(t), env: map[string]string{"SUDO_UID": fmt.Sprint(me), "TERM": "xterm-256color"}, fb: &fakeBackend{code: 7}}
+	f := &fx{t: t, dir: vtmp(t), env: map[string]string{"SUDO_UID": fmt.Sprint(me), "TERM": "xterm-256color"}, fb: &fakeBackend{code: 7}, mounter: &fakeMounter{}}
 	f.roots, f.state, f.run = filepath.Join(f.dir, "roots"), filepath.Join(f.dir, "state"), filepath.Join(f.dir, "run")
 	f.wd = filepath.Join(f.roots, "git", "wt")
 	mk(t, f.wd, 0o755)
@@ -125,8 +174,8 @@ func newFx(t *testing.T) *fx {
 
 func (f *fx) writeConfig(extra string) {
 	f.t.Helper()
-	body := fmt.Sprintf("allowed_roots = [%q]\nstate_dir = %q\nrun_dir = %q\ndocker = %q\ntmux = %q\ntmux_socket = \"/run/ccsbx/tmux.sock\"\npins_file = %q\nmachine = \"hp-ubuntu\"\n%s",
-		f.roots, f.state, f.run, filepath.Join(f.dir, "bin", "docker"), filepath.Join(f.dir, "bin", "tmux"), filepath.Join(f.dir, "etc", "pins.toml"), extra)
+	body := fmt.Sprintf("allowed_roots = [%q]\nstate_dir = %q\nrun_dir = %q\ndocker = %q\ntmux = %q\ntmux_socket = \"/run/ccsbx/tmux.sock\"\npins_file = %q\nmachine = \"hp-ubuntu\"\n%s%s",
+		f.roots, f.state, f.run, filepath.Join(f.dir, "bin", "docker"), filepath.Join(f.dir, "bin", "tmux"), filepath.Join(f.dir, "etc", "pins.toml"), minUID(extra), extra)
 	p := filepath.Join(f.dir, "etc", "ccsbx-root.toml")
 	put(f.t, p, body, 0o644)
 	cfg, err := LoadConfig(p, os.Getuid())
@@ -142,7 +191,9 @@ func (f *fx) writeConfig(extra string) {
 			}
 			return svcUID, svcGID, nil
 		},
-		NewBackend: func(docker string) Backend { f.fb.docker = docker; return f.fb },
+		OpenDir: OpenDir, Mounter: f.mounter,
+		HomeOf:     func(uid int) (string, error) { return filepath.Join(f.dir, "home"), nil },
+		NewBackend: func(docker string, m Mounter) Backend { f.fb.docker = docker; return f.fb },
 		DropPrivs: func(uid, gid int) error {
 			if f.dropErr != nil {
 				return f.dropErr
@@ -304,7 +355,7 @@ func TestRunAllow(t *testing.T) {
 	if s.Workdir != f.wd || s.WorktreeRoot != f.cfg.AllowedRoots[0] || s.StateDir != f.run || s.MemoryMB != 4096 || s.Pids != 512 {
 		t.Errorf("%+v", s)
 	}
-	if strings.Join(s.Cmd, " ") != "claude --model opus" {
+	if strings.Join(s.Cmd, " ") != "claude --model=opus" {
 		t.Errorf("cmd %v", s.Cmd)
 	}
 	if f.fb.docker != filepath.Join(f.dir, "bin", "docker") {
@@ -547,11 +598,12 @@ func TestAttachAllow(t *testing.T) {
 	if e.path != filepath.Join(f.dir, "bin", "tmux") {
 		t.Errorf("exec'd %q", e.path)
 	}
-	if strings.Join(e.argv, " ") != "tmux -S /run/ccsbx/tmux.sock attach -t ="+sid+":" {
-		t.Errorf("argv %v", e.argv)
-	}
 	// the environment is rebuilt: no PATH, HOME or TMUX of the caller
 	want := "PATH=/usr/bin:/bin HOME=/nonexistent LANG=C.UTF-8 TERM=screen-256color"
+	hard := "tmux -S /run/ccsbx/tmux.sock -f /dev/null set-option -g prefix None ; set-option -g prefix2 None ; set-option -g mouse off ; unbind-key -a ; unbind-key -a -T root ; attach -t =" + sid + ":"
+	if strings.Join(e.argv, " ") != hard {
+		t.Errorf("attach does not harden the server itself: %v", e.argv)
+	}
 	if strings.Join(e.env, " ") != want {
 		t.Errorf("env %v", e.env)
 	}
@@ -621,12 +673,15 @@ func TestNotWiredVerbsRefuse(t *testing.T) {
 }
 
 func TestHarnessArgs(t *testing.T) {
-	for _, ok := range [][]string{nil, {"--continue"}, {"--model", "opus"}, {"--resume", "abc-123", "--model", "claude-opus-4"}} {
+	for _, ok := range [][]string{nil, {"--continue"}, {"--model", "opus"}, {"--resume", "abc-123", "--model", "claude-opus-4"}, {"--model=opus"}} {
 		if _, err := harnessArgs(ok); err != nil {
 			t.Errorf("%v refused: %v", ok, err)
 		}
 	}
-	for _, bad := range [][]string{{"--model"}, {"--model", "a b"}, {"--settings", "/x"}, {"--mcp-config", "x"}, {"--add-dir", "/"}, {"--dangerously-skip-permissions"}, {"-p"}, {"x"}, {"--resume", "../x"}} {
+	for _, bad := range [][]string{{"--model"}, {"--model", "a b"}, {"--settings", "/x"}, {"--mcp-config", "x"}, {"--add-dir", "/"}, {"--dangerously-skip-permissions"}, {"-p"}, {"x"}, {"--resume", "../x"},
+		// S1: a value that is itself a flag would be parsed by claude as one
+		{"--resume", "--dangerously-skip-permissions"}, {"--resume", "-p"}, {"--model", "-p"}, {"--resume=--debug"}, {"--model=-p"},
+		{"--continue=x"}, {"--model", "opus", "--settings", "/x"}, {"--resume", "abc", "--add-dir", "/"}, {"--MODEL", "x"}} {
 		if _, err := harnessArgs(bad); err == nil {
 			t.Errorf("%v accepted", bad)
 		}
@@ -646,7 +701,7 @@ func TestGitdirAndWorkdirOwnerChecks(t *testing.T) {
 	if _, err := f.cfg.gitdir(gd, me+1); err == nil || !strings.Contains(err.Error(), "not owned") {
 		t.Errorf("a gitdir owned by someone else was accepted: %v", err)
 	}
-	if _, _, err := f.cfg.workdir(f.wd, me+1); err == nil || !strings.Contains(err.Error(), "not owned") {
+	if _, _, err := f.cfg.workdir(f.wd, me+1, ""); err == nil || !strings.Contains(err.Error(), "not owned") {
 		t.Errorf("a workdir owned by someone else was accepted: %v", err)
 	}
 }
@@ -668,5 +723,195 @@ func TestHelpText(t *testing.T) {
 		if v != "" && !strings.Contains(out, "sudo -n /usr/local/sbin/ccsbx-root "+v) {
 			t.Errorf("%s --help has no recipe", v)
 		}
+	}
+}
+
+// ---- M1: what is checked is what is mounted ----
+
+// The directories root validated are opened by root and bound by descriptor onto root-owned
+// staging mountpoints; docker is told to mount those, never the owner's paths.
+func TestRunStagesPinnedDirectories(t *testing.T) {
+	f := newFx(t)
+	gd := filepath.Join(f.roots, "git", "repo", ".git", "worktrees", "wt")
+	mk(t, gd, 0o755)
+	f.rec.GitDir = gd
+	f.writeRecord()
+	wst, _ := os.Stat(f.wd)
+	gst, _ := os.Stat(gd)
+	if c, out := f.call("run", sid); c != 7 {
+		t.Fatalf("%d %s", c, out)
+	}
+	s := f.fb.ran[0]
+	if s.MountWorkdir != filepath.Join(s.GenDir(), "wt") || s.MountGitDir != filepath.Join(s.GenDir(), "gd") {
+		t.Fatalf("docker would mount %q and %q", s.MountWorkdir, s.MountGitDir)
+	}
+	if len(f.mounter.binds) != 2 {
+		t.Fatalf("binds %+v", f.mounter.binds)
+	}
+	w, g := f.mounter.binds[0], f.mounter.binds[1]
+	if w.ino != wst.Sys().(*syscall.Stat_t).Ino || w.target != s.MountWorkdir || w.readonly {
+		t.Errorf("workdir bind %+v", w)
+	}
+	if g.ino != gst.Sys().(*syscall.Stat_t).Ino || g.target != s.MountGitDir || !g.readonly {
+		t.Errorf("gitdir bind %+v (must be read-only)", g)
+	}
+	if len(f.mounter.unbound) != 2 {
+		t.Errorf("the staging was not undone: %v", f.mounter.unbound)
+	}
+}
+
+// The race: the owner replaces the workdir (and the gitdir) with a symlink to somewhere else after
+// every check and before the mount. What is mounted must still be the directory that was checked.
+func TestSwappedWorkdirIsNotWhatGetsMounted(t *testing.T) {
+	f := newFx(t)
+	gd := filepath.Join(f.roots, "git", "repo", ".git", "worktrees", "wt")
+	mk(t, gd, 0o755)
+	f.rec.GitDir = gd
+	f.writeRecord()
+	wst, _ := os.Stat(f.wd)
+	gst, _ := os.Stat(gd)
+	target := filepath.Join(f.dir, "victim") // a directory the owner must never get mounted
+	mk(t, target, 0o755)
+	f.fb.beforeStage = func() {
+		for _, p := range []string{f.wd, gd} {
+			if err := os.Rename(p, p+".moved"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, p); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	if c, out := f.call("run", sid); c != 7 {
+		t.Fatalf("%d %s", c, out)
+	}
+	vst, _ := os.Stat(target)
+	for _, b := range f.mounter.binds {
+		if b.ino == vst.Sys().(*syscall.Stat_t).Ino {
+			t.Fatalf("the swapped-in directory was mounted: %+v", b)
+		}
+	}
+	if f.mounter.binds[0].ino != wst.Sys().(*syscall.Stat_t).Ino || f.mounter.binds[1].ino != gst.Sys().(*syscall.Stat_t).Ino {
+		t.Errorf("the mounts are not the inodes that were checked: %+v", f.mounter.binds)
+	}
+}
+
+// A symlink that is already there when root opens the directory (not just a later swap) fails the
+// open at that component, and so does a directory that is not the owner's by the descriptor's
+// own stat.
+func TestPinRefusesWhatTheDescriptorSays(t *testing.T) {
+	f := newFx(t)
+	me := os.Getuid()
+	if _, err := pin(OpenDir, f.wd, me); err != nil {
+		t.Fatalf("the owner's directory was refused: %v", err)
+	}
+	if _, err := pin(OpenDir, f.wd, me+1); err == nil || !strings.Contains(err.Error(), "not owned") {
+		t.Errorf("a directory of another owner was pinned: %v", err)
+	}
+	os.Symlink(f.wd, filepath.Join(f.roots, "git", "ln"))
+	if _, err := pin(OpenDir, filepath.Join(f.roots, "git", "ln"), me); err == nil {
+		t.Error("a symlink was followed by the pinned open")
+	}
+	os.Symlink(filepath.Join(f.roots, "git"), filepath.Join(f.roots, "mid"))
+	if _, err := pin(OpenDir, filepath.Join(f.roots, "mid", "wt"), me); err == nil {
+		t.Error("a symlink in the middle of the path was followed by the pinned open")
+	}
+	put(t, filepath.Join(f.roots, "git", "afile"), "x", 0o644)
+	if _, err := pin(OpenDir, filepath.Join(f.roots, "git", "afile"), me); err == nil {
+		t.Error("a file was pinned as a directory")
+	}
+	if _, err := pin(OpenDir, "relative/path", me); err == nil {
+		t.Error("a relative path was opened")
+	}
+}
+
+func TestRunStopsWhenTheMountFails(t *testing.T) {
+	f := newFx(t)
+	f.mounter.err = fmt.Errorf("mount: operation not permitted")
+	if c, _ := f.call("run", sid); c == 7 || f.fb.staged {
+		t.Error("the fence was run although the mounts failed")
+	}
+}
+
+func TestStopUnmountsTheStaging(t *testing.T) {
+	f := newFx(t)
+	// the real dockerBackend unmounts; the fake records that Stop was asked with a GenDir to find them under
+	f.call("stop", sid)
+	if len(f.fb.stopped) != 1 || f.fb.stopped[0].GenDir() != filepath.Join(f.run, "s", sid, "g2") {
+		t.Errorf("stop was not given the generation directory: %+v", f.fb.stopped)
+	}
+}
+
+func TestDockerBackendUnstageUnmountsBothMountpoints(t *testing.T) {
+	m := &fakeMounter{}
+	d := &dockerBackend{docker: "/x", mounter: m}
+	d.unstage(backend.Spec{Sid: sid, Gen: 3, StateDir: "/run-dir"})
+	if strings.Join(m.unbound, ",") != "/run-dir/s/"+sid+"/g3/wt,/run-dir/s/"+sid+"/g3/gd" {
+		t.Errorf("%v", m.unbound)
+	}
+}
+
+// ---- S3: hidden directories of the owner's home, whatever $HOME is ----
+
+func TestHiddenHomeDirectoryIsNeverAWorkdir(t *testing.T) {
+	f := newFx(t)
+	home := filepath.Join(f.dir, "home")
+	hidden := filepath.Join(home, ".ssh", "proj")
+	mk(t, hidden, 0o755)
+	mk(t, filepath.Join(home, "proj"), 0o755)
+	f.writeConfig("")
+	f.cfg.AllowedRoots = []string{home} // the operator allowed the whole home
+	me := os.Getuid()
+	if _, _, err := f.cfg.workdir(filepath.Join(home, "proj"), me, home); err != nil {
+		t.Fatalf("an ordinary directory of the home was refused: %v", err)
+	}
+	if _, _, err := f.cfg.workdir(hidden, me, home); err == nil || !strings.Contains(err.Error(), "hidden directory") {
+		t.Errorf("a hidden directory of the home was accepted: %v", err)
+	}
+	// and with the home as a parent of the root
+	f.cfg.AllowedRoots = []string{f.dir}
+	if _, _, err := f.cfg.workdir(hidden, me, home); err == nil {
+		t.Error("a hidden directory below a root above the home was accepted")
+	}
+}
+
+// ---- N2: a record must belong to a login user ----
+
+func TestRecordUidMustBeALoginUser(t *testing.T) {
+	for _, uid := range []int{0, svcUID} {
+		f := newFx(t)
+		f.rec.Uid = uid
+		f.writeRecord()
+		f.env["SUDO_UID"] = fmt.Sprint(uid)
+		f.wantRefusedMsg(fmt.Sprintf("a record of uid %d", uid), "not a login user", "run", sid)
+	}
+	f := newFx(t)
+	f.writeConfig("min_uid = 100000\n")
+	f.wantRefusedMsg("a uid below min_uid", "not a login user", "run", sid)
+}
+
+// minUID is the default min_uid line of the test config unless the test sets its own.
+func minUID(extra string) string {
+	if strings.Contains(extra, "min_uid") {
+		return ""
+	}
+	return "min_uid = 1\n"
+}
+
+// The gitdir is checked again on the STAGED mount, which is what the fence will see: a gitdir
+// the fence (or anyone) could write is refused even if it looked fine when the record was made.
+func TestStagedGitdirIsCheckedForOwnershipAndMode(t *testing.T) {
+	f := newFx(t)
+	gd := filepath.Join(f.roots, "git", "repo", ".git", "worktrees", "wt")
+	mk(t, gd, 0o755)
+	f.rec.GitDir = gd
+	f.writeRecord()
+	f.mounter.after = func(target string) {
+		if strings.HasSuffix(target, "/gd") {
+			os.Chmod(target, 0o777) // what the bound gitdir would look like
+		}
+	}
+	if c, out := f.call("run", sid); c != 2 || !strings.Contains(out, "world-writable") || f.fb.staged {
+		t.Errorf("%d %s", c, out)
 	}
 }

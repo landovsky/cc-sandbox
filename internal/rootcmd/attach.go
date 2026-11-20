@@ -58,7 +58,17 @@ func (e *env) attach(sid string) error {
 		term = "xterm-256color"
 	}
 	env := []string{"PATH=/usr/bin:/bin", "HOME=/nonexistent", "LANG=C.UTF-8", "TERM=" + term}
-	argv := []string{"tmux", "-S", e.cfg.TmuxSocket, "attach", "-t", "=" + sid + ":"}
+	// The server's own settings are not trusted: with a prefix key or a mouse menu the caller could
+	// run tmux commands as the service uid. Every attach sets the keys off on the running server
+	// first, in the same invocation, and -f /dev/null keeps a server started here from reading
+	// any config.
+	argv := []string{"tmux", "-S", e.cfg.TmuxSocket, "-f", "/dev/null",
+		"set-option", "-g", "prefix", "None", ";",
+		"set-option", "-g", "prefix2", "None", ";",
+		"set-option", "-g", "mouse", "off", ";",
+		"unbind-key", "-a", ";",
+		"unbind-key", "-a", "-T", "root", ";",
+		"attach", "-t", "=" + sid + ":"}
 	if err := e.d.DropPrivs(uid, gid); err != nil {
 		return fmt.Errorf("cannot become %s: %v", e.cfg.ServiceUser, err)
 	}

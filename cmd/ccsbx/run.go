@@ -77,7 +77,7 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 	spec := backend.Spec{
 		Sid: rec.Sid, Label: rec.Label, Gen: rec.Gen, Image: get("image"), StateDir: d.StateDir,
 		Workdir: rec.Spec.Workdir.Path, GitDir: rec.GitDir, Uid: rec.Uid, WorktreeRoot: d.WorktreeRoot,
-		MemoryMB: p.MemoryMB, Pids: p.Pids, Cmd: cmd, TTY: tty, NotEvid: d.Root != "helper",
+		MemoryMB: p.MemoryMB, Pids: p.Pids, Cmd: cmd, TTY: tty, NotEvid: d.Root != "helper", Class: backend.ClassOf(p.E2E),
 	}
 	if spec.NotEvid {
 		fmt.Fprintln(stderr, "ccsbx run: direct mode, NOT EVIDENCE (invariant 14 waived)")

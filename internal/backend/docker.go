@@ -26,6 +26,14 @@ import (
 	"syscall"
 )
 
+// ClassOf names the home class of a profile: "e2e" (may run unreviewed candidate images) or "prod".
+func ClassOf(e2e bool) string {
+	if e2e {
+		return "e2e"
+	}
+	return "prod"
+}
+
 // FenceUID is the uid and gid inside the fence.
 const FenceUID = 10001
 
@@ -47,6 +55,12 @@ type Spec struct {
 	Uid          int  // the host user who owns the session (record uid); the gitdir must be theirs
 	// Chown makes a helper-mode directory the fence's; nil means os.Lchown. Tests replace it.
 	Chown func(path string, uid, gid int) error
+	// Class is "e2e" or "prod": part of the home's key.
+	Class string
+	// MountWorkdir and MountGitDir, when set, are the host paths docker mounts instead of Workdir and
+	// GitDir (the container still sees the original paths). ccsbx-root sets them to staging mounts of
+	// directories it opened and checked itself, so a path swapped after the check is never mounted.
+	MountWorkdir, MountGitDir string
 }
 
 // Names derived from the sid and gen, so cleanup targets exactly what this run created.
@@ -58,9 +72,11 @@ func (s Spec) GenDir() string {
 	return filepath.Join(s.StateDir, "s", s.Sid, "g"+strconv.Itoa(s.Gen))
 }
 
-// HomeDir is the per-node home, shared by every generation of the same label.
+// HomeDir is the per-node home, shared by every generation of the same owner, class and label. The
+// owner and the class (e2e or production) are part of the key so one owner's session cannot open
+// another's transcripts and an unreviewed candidate image never shares a production node's home.
 func (s Spec) HomeDir() string {
-	h := sha256.Sum256([]byte(s.Label))
+	h := sha256.Sum256([]byte(fmt.Sprintf("%d|%s|%s", s.Uid, s.Class, s.Label)))
 	return filepath.Join(s.StateDir, "home", hex.EncodeToString(h[:6]))
 }
 
@@ -92,10 +108,10 @@ func (s Spec) RunArgs() []string {
 		"--dns", "127.0.0.1", // no resolver: names never leave the container (T:no-dns-exfil)
 		"--tmpfs", "/tmp:rw,nosuid,nodev,size=512m",
 		"--workdir", s.Workdir,
-		"--mount", bind(s.Workdir, s.Workdir, false),
+		"--mount", bind(s.mountSrc(s.Workdir, s.MountWorkdir), s.Workdir, false),
 	}
 	if s.GitDir != "" {
-		a = append(a, "--mount", bind(s.GitDir, s.GitDir, true))
+		a = append(a, "--mount", bind(s.mountSrc(s.GitDir, s.MountGitDir), s.GitDir, true))
 	}
 	g := s.GenDir()
 	a = append(a,
@@ -120,7 +136,7 @@ func (s Spec) RunArgs() []string {
 //
 // Direct mode (NotEvid): everything is made by the calling user, the leaves are 0777 because uid
 // 10001 in the fence is not the owner, and the 0700 parent keeps other host users out.
-// Helper mode (ccsbx-root, running as root): the parents are root-owned 0755, out/ and the home are
+// Helper mode (ccsbx-root, running as root): the parents are root-owned 0711, out/ and the home are
 // 10001:10001 0700, in/ and managed/ are root-owned 0755 (the fence reads them and can never write
 // them, with or without the read-only mount), and nothing is world-writable. Every directory is
 // created fresh with Mkdir (never followed through a symlink) before it is chowned.
@@ -141,7 +157,7 @@ func (s Spec) Prepare() error {
 	g := s.GenDir()
 	parent := 0o700
 	if helper {
-		parent = 0o755
+		parent = 0o711 // others may traverse by name but not list the session ids
 	}
 	if err := os.MkdirAll(filepath.Dir(g), os.FileMode(parent)); err != nil {
 		return err
@@ -181,7 +197,7 @@ func (s Spec) Prepare() error {
 	}
 	h := s.HomeDir()
 	if helper {
-		if err := os.MkdirAll(filepath.Dir(h), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(h), 0o711); err != nil {
 			return err
 		}
 		if err := os.Mkdir(h, 0o700); err == nil {
@@ -198,6 +214,13 @@ func (s Spec) Prepare() error {
 		return err
 	}
 	return os.Chmod(h, 0o777)
+}
+
+func (s Spec) mountSrc(orig, staged string) string {
+	if staged != "" {
+		return staged
+	}
+	return orig
 }
 
 func (s Spec) chown(path string, uid, gid int) error {
@@ -410,6 +433,10 @@ func (o owner) checkMode(p string, perm fs.FileMode, uid, gid int) error {
 	}
 	return nil
 }
+
+// CheckGitDirOwned is the ownership and mode walk of a gitdir for a caller outside this package
+// (ccsbx-root runs it on the staged mount it is about to hand to docker).
+func CheckGitDirOwned(gd string, uid int) error { return hostOwnedGitDir(gd, uid) }
 
 func isGitDir(d string) bool {
 	st, err := os.Lstat(filepath.Join(d, "HEAD"))

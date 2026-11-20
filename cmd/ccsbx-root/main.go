@@ -42,7 +42,7 @@ func realMain(args []string) int {
 			fmt.Fprintln(os.Stderr, "ccsbx-root: refused:", err)
 			return 2
 		}
-		cfg = &rootcmd.Config{Verbs: rootcmd.Verbs}
+		cfg = &rootcmd.Config{} // inert: no verb is enabled, only help and version run
 	}
 	app := rootcmd.App(cfg, rootcmd.Real(getenv), getenv)
 	app.Version = version

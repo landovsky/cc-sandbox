@@ -1,4 +1,6 @@
-// The verbs of ccsbx-root: run, stop, gc, attach, and the two that are not wired yet. Each takes
+// The verbs of ccsbx-root: run, stop, gc, attach, and the two that are not wired yet. They exist as
+// separate fixed verbs, rather than a general "run docker" door, so that what root can be asked to
+// do is a list a reviewer can read in one sitting. Each takes
 // at most one session id and a flag or two; a flag nobody listed is a usage error (exit 64), a
 // policy refusal is exit 2.
 package rootcmd
@@ -7,7 +9,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
+	"strings"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/cli"
@@ -41,27 +45,49 @@ func (e *env) runCmd() *cli.Command {
 	}
 }
 
-// harness arguments root will pass to claude: a short allowlist, because the record is less
-// trusted than root and an argument can switch the harness's own safety off.
-var harnessFlagValue = map[string]*regexp.Regexp{
-	"--model":  regexp.MustCompile(`^[A-Za-z0-9._:-]{1,64}$`),
-	"--resume": regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`),
-}
-var harnessFlagOnly = map[string]bool{"--continue": true}
+// Harness arguments root will pass to claude. The record is less trusted than root and an
+// argument can switch the harness's own safety off, so the list is short and parsed per flag:
+// a value never starts with a dash (it cannot be read as another flag), and every value is passed
+// as `--flag=value` so it cannot be split. Any other token, wherever it appears, is refused.
+var (
+	modelRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$`)
+	resumeRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9-]{0,63}$`)
+)
 
 func harnessArgs(in []string) ([]string, error) {
 	var out []string
+	bad := func(a string) ([]string, error) {
+		return nil, refuse("harness argument %q is not allowed (allowed: --continue, --model NAME, --resume ID)", a)
+	}
 	for i := 0; i < len(in); i++ {
 		a := in[i]
-		switch {
-		case harnessFlagOnly[a]:
-			out = append(out, a)
-		case harnessFlagValue[a] != nil && i+1 < len(in) && harnessFlagValue[a].MatchString(in[i+1]):
-			out = append(out, a, in[i+1])
-			i++
+		name, val, hasVal := strings.Cut(a, "=")
+		var re *regexp.Regexp
+		switch name {
+		case "--continue":
+			if hasVal {
+				return bad(a)
+			}
+			out = append(out, "--continue")
+			continue
+		case "--model":
+			re = modelRe
+		case "--resume":
+			re = resumeRe
 		default:
-			return nil, refuse("harness argument %q is not allowed (allowed: --continue, --model NAME, --resume ID)", a)
+			return bad(a)
 		}
+		if !hasVal {
+			if i+1 >= len(in) {
+				return bad(a)
+			}
+			i++
+			val = in[i]
+		}
+		if !re.MatchString(val) {
+			return bad(a + " " + val)
+		}
+		out = append(out, name+"="+val)
 	}
 	return out, nil
 }
@@ -98,7 +124,11 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	if _, err := pins.Check(pl, nil, image, p, false); err != nil {
 		return 0, refuse("%v", err)
 	}
-	wd, root, err := e.cfg.workdir(rec.Spec.Workdir.Path, rec.Uid)
+	home, err := e.d.HomeOf(rec.Uid)
+	if err != nil {
+		return 0, refuse("no home directory for uid %d: %v", rec.Uid, err)
+	}
+	wd, root, err := e.cfg.workdir(rec.Spec.Workdir.Path, rec.Uid, home)
 	if err != nil {
 		return 0, err
 	}
@@ -107,6 +137,19 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 		if gd, err = e.cfg.gitdir(rec.GitDir, rec.Uid); err != nil {
 			return 0, err
 		}
+	}
+	// From here on the directories are held open: what is checked is what is mounted.
+	wpin, err := pin(e.d.OpenDir, wd, rec.Uid)
+	if err != nil {
+		return 0, err
+	}
+	defer wpin.close()
+	var gpin *pinned
+	if gd != "" {
+		if gpin, err = pin(e.d.OpenDir, gd, rec.Uid); err != nil {
+			return 0, err
+		}
+		defer gpin.close()
 	}
 	extra, err := harnessArgs(rec.Spec.HarnessArgs)
 	if err != nil {
@@ -127,10 +170,53 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 		Sid: rec.Sid, Label: rec.Label, Gen: rec.Gen, Image: image, StateDir: e.cfg.RunDir,
 		Workdir: wd, GitDir: gd, Uid: rec.Uid, WorktreeRoot: root,
 		MemoryMB: p.MemoryMB, Pids: p.Pids, Cmd: append([]string{"claude"}, extra...), TTY: tty,
-		NotEvid: false, Chown: e.d.Chown,
+		NotEvid: false, Chown: e.d.Chown, Class: backend.ClassOf(p.E2E),
 	}
+	// docker mounts these root-owned staging paths, not the owner's paths
+	spec.MountWorkdir = filepath.Join(spec.GenDir(), "wt")
+	if gd != "" {
+		spec.MountGitDir = filepath.Join(spec.GenDir(), "gd")
+	}
+	stage := func(s backend.Spec) (func(), error) { return e.stage(s, wpin, gpin) }
 	files := rec.FenceFiles(e.cfg.Machine, res.Settings, res.MCP)
-	return e.d.NewBackend(docker).Run(spec, files, e.d.Stdin, stdout, stderr)
+	return e.d.NewBackend(docker, e.d.Mounter).Run(spec, files, stage, e.d.Stdin, stdout, stderr)
+}
+
+// stage makes the two mountpoints under the generation directory and binds the pinned
+// directories onto them: nosuid, nodev, the gitdir read-only. The gitdir's ownership and mode
+// walk then runs on the staged mount, which is the inode that will be mounted into the fence.
+func (e *env) stage(s backend.Spec, w, g *pinned) (func(), error) {
+	var undo []func()
+	rollback := func() {
+		for i := len(undo) - 1; i >= 0; i-- {
+			undo[i]()
+		}
+	}
+	bind := func(p *pinned, target string, ro bool) error {
+		if err := os.Mkdir(target, 0o755); err != nil {
+			return err
+		}
+		if err := e.d.Mounter.Bind(p.f, target, ro); err != nil {
+			os.Remove(target)
+			return err
+		}
+		undo = append(undo, func() { e.d.Mounter.Unmount(target); os.Remove(target) })
+		return nil
+	}
+	if err := bind(w, s.MountWorkdir, false); err != nil {
+		return nil, err
+	}
+	if g != nil {
+		if err := bind(g, s.MountGitDir, true); err != nil {
+			rollback()
+			return nil, err
+		}
+		if err := backend.CheckGitDirOwned(s.MountGitDir, s.Uid); err != nil {
+			rollback()
+			return nil, refuse("%v", err)
+		}
+	}
+	return rollback, nil
 }
 
 // ensureRunDir makes root's own tree: a real directory, root-owned, nobody else's to write.
@@ -171,7 +257,7 @@ func (e *env) stopCmd() *cli.Command {
 			if err != nil {
 				return fail(stderr, "stop", err)
 			}
-			if err := e.d.NewBackend(docker).Stop(backend.Spec{Sid: rec.Sid, Gen: rec.Gen}); err != nil {
+			if err := e.d.NewBackend(docker, e.d.Mounter).Stop(backend.Spec{Sid: rec.Sid, Gen: rec.Gen, StateDir: e.cfg.RunDir}); err != nil {
 				return fail(stderr, "stop", err)
 			}
 			fmt.Fprintf(stdout, "stopped %s g%d\n", rec.Sid, rec.Gen)
@@ -201,7 +287,7 @@ func (e *env) gcCmd() *cli.Command {
 			if err != nil {
 				return fail(stderr, "gc", err)
 			}
-			b := e.d.NewBackend(docker)
+			b := e.d.NewBackend(docker, e.d.Mounter)
 			orphans, err := b.Orphans(e.cfg.RunDir, e.cfg.StateDir+"/sessions")
 			if err != nil {
 				return fail(stderr, "gc", err)
@@ -246,15 +332,30 @@ func (e *env) notWired(verb, what string) *cli.Command {
 }
 
 // dockerBackend is the production Backend: backend.Runner with the validated docker binary.
-type dockerBackend struct{ docker string }
-
-func (d *dockerBackend) runner(sessions string) *backend.Runner {
-	return &backend.Runner{Docker: d.docker, SessionsDir: sessions}
+type dockerBackend struct {
+	docker  string
+	mounter Mounter
 }
 
-func (d *dockerBackend) Run(s backend.Spec, files map[string][]byte, in io.Reader, out, errw io.Writer) (int, error) {
+func (d *dockerBackend) runner(sessions string) *backend.Runner {
+	return &backend.Runner{Docker: d.docker, SessionsDir: sessions, Unstage: d.unstage}
+}
+
+// unstage unmounts the two staging mountpoints of a generation (a run that died leaves them).
+func (d *dockerBackend) unstage(s backend.Spec) {
+	if d.mounter == nil {
+		return
+	}
+	for _, n := range []string{"wt", "gd"} {
+		t := filepath.Join(s.GenDir(), n)
+		d.mounter.Unmount(t)
+		os.Remove(t)
+	}
+}
+
+func (d *dockerBackend) Run(s backend.Spec, files map[string][]byte, stage Stager, in io.Reader, out, errw io.Writer) (int, error) {
 	r := d.runner("")
-	r.Stdin, r.Stdout, r.Stderr, r.Files = in, out, errw, files
+	r.Stdin, r.Stdout, r.Stderr, r.Files, r.Stage = in, out, errw, files, stage
 	return r.Run(s)
 }
 func (d *dockerBackend) Stop(s backend.Spec) error { return d.runner("").Stop(s) }

@@ -65,7 +65,7 @@ func ownerUID(p string) (int, error) {
 // workdir validates a record's workdir and returns it with the root that contains it. It must be
 // a real directory, strictly inside an allowed root, with no symlink in its path, owned by the
 // session's owner, and not overlap the daemon's or root's state or a fixed fence mount.
-func (c *Config) workdir(p string, owner int) (string, string, error) {
+func (c *Config) workdir(p string, owner int, home string) (string, string, error) {
 	rp, err := cleanPath(p)
 	if err != nil {
 		return "", "", err
@@ -80,6 +80,13 @@ func (c *Config) workdir(p string, owner int) (string, string, error) {
 	}
 	if u, err := ownerUID(rp); err != nil || u != owner {
 		return "", "", refuse("workdir %s is not owned by the session's owner (uid %d)", rp, owner)
+	}
+	// a hidden directory of the owner's home (.ssh, .config, .claude ...) is never a workdir, and
+	// this does not depend on $HOME, which root's environment does not have
+	if home != "" {
+		if rel, ok := strings.CutPrefix(rp, filepath.Clean(home)+string(filepath.Separator)); ok && strings.HasPrefix(rel, ".") {
+			return "", "", refuse("workdir %s is in a hidden directory of the home (%s)", rp, strings.SplitN(rel, "/", 2)[0])
+		}
 	}
 	for _, s := range []string{c.StateDir, c.RunDir} {
 		if rp == s || strings.HasPrefix(rp, s+"/") || strings.HasPrefix(s, rp+"/") {
@@ -116,4 +123,36 @@ func (c *Config) binary(p string) (string, error) {
 		return "", refuse("binary %s: %v", p, err)
 	}
 	return filepath.EvalSymlinks(p)
+}
+
+// pinned is a directory root has opened itself (no symlink followed at any component) and checked
+// on the descriptor: the type and the owner are those of the inode that will be mounted.
+type pinned struct {
+	f    *os.File
+	path string
+}
+
+func (p *pinned) close() {
+	if p != nil && p.f != nil {
+		p.f.Close()
+	}
+}
+
+// pin opens path through open (O_NOFOLLOW at every component) and checks the fd.
+func pin(open func(string) (*os.File, error), path string, owner int) (*pinned, error) {
+	f, err := open(path)
+	if err != nil {
+		return nil, refuse("%v", err)
+	}
+	st, err := f.Stat()
+	if err != nil || !st.IsDir() {
+		f.Close()
+		return nil, refuse("%q is not a directory", path)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok || int(sys.Uid) != owner {
+		f.Close()
+		return nil, refuse("%q is not owned by the session's owner (uid %d)", path, owner)
+	}
+	return &pinned{f: f, path: path}, nil
 }

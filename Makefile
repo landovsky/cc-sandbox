@@ -38,11 +38,11 @@ dist:
 
 dist-linux:
 	@mkdir -p dist
-	@for b in $(INSTALL_BINS); do \
-	  if [ -d cmd/$$b ]; then CGO_ENABLED=0 GOOS=linux GOARCH=$(LINUX_ARCH) $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$$b ./cmd/$$b || exit 1; \
-	  else echo "dist-linux: cmd/$$b does not exist yet, so the installer's binaries gate will refuse"; fi; \
-	done
-	@cd dist && sha256sum $$(for b in $(INSTALL_BINS); do [ -f $$b ] && echo $$b; done) > SHA256SUMS && cat SHA256SUMS
+	@built=""; for b in $(INSTALL_BINS); do \
+	  if [ -d cmd/$$b ]; then CGO_ENABLED=0 GOOS=linux GOARCH=$(LINUX_ARCH) $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o dist/$$b ./cmd/$$b || exit 1; built="$$built $$b"; \
+	  else echo "dist-linux: cmd/$$b does not exist yet, so the installer's binaries gate will refuse (a file of that name left in dist/ is NOT listed)"; fi; \
+	done; cd dist && sha256sum $$built > SHA256SUMS && cat SHA256SUMS
+	@echo "dist-linux: SHA256SUMS lists only what this run built. It sits next to the binaries, so it guards against accidents, not against a writer of dist/: compare it with a build you trust (CI, a second machine) before 'install --yes'."
 
 e2e: build
 	CCSBX_BIN=$(CURDIR)/bin/ccsbx e2e/run

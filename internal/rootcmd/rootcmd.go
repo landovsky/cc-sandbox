@@ -27,10 +27,23 @@ import (
 // Backend is what run, stop and gc need from docker. Production wraps backend.Runner; tests pass a
 // fake, so the suite needs neither root nor docker.
 type Backend interface {
-	Run(s backend.Spec, files map[string][]byte, stdin io.Reader, stdout, stderr io.Writer) (int, error)
+	// Run runs one generation. stage makes the mounts docker will use (see run); it runs after the
+	// directories exist and before docker is asked for anything.
+	Run(s backend.Spec, files map[string][]byte, stage Stager, stdin io.Reader, stdout, stderr io.Writer) (int, error)
 	Stop(s backend.Spec) error
 	Orphans(runDir, sessionsDir string) ([]backend.Orphan, error)
 	Reap(runDir string, o []backend.Orphan) error
+}
+
+// Stager is backend.Runner.Stage: it returns the function that undoes the staging.
+type Stager = func(s backend.Spec) (undo func(), err error)
+
+// Mounter binds an open directory onto a root-owned mountpoint (nosuid, nodev, and read-only when
+// asked) and takes it away again. The real one is in pin_linux.go; tests use a fake that records
+// what it was handed, and mount_root_test.go is the root-only test of the real one.
+type Mounter interface {
+	Bind(src *os.File, target string, readonly bool) error
+	Unmount(target string) error
 }
 
 // Deps is everything outside the policy: the OS facts and the programs. Production fills it with
@@ -40,12 +53,17 @@ type Deps struct {
 	Getenv     func(string) string // SUDO_UID and TERM only
 	LookupUser func(name string) (uid, gid int, err error)
 	// NewBackend builds the backend for a validated docker binary.
-	NewBackend func(docker string) Backend
+	NewBackend func(docker string, m Mounter) Backend
 	// DropPrivs becomes uid:gid for good (and proves it cannot get root back); Exec replaces the process.
 	DropPrivs func(uid, gid int) error
 	Exec      func(path string, argv, env []string) error
 	Chown     func(path string, uid, gid int) error
 	Stdin     io.Reader
+	// OpenDir opens a directory without following any symlink; Mounter stages it; HomeOf is a
+	// user's passwd home (for the hidden-directory rule, independent of HOME).
+	OpenDir func(path string) (*os.File, error)
+	Mounter Mounter
+	HomeOf  func(uid int) (string, error)
 }
 
 // App builds the command table for a loaded config.
@@ -111,6 +129,9 @@ func (e *env) session(w who, sid string) (*start.Record, error) {
 	if !w.mayAct(rec) {
 		return nil, refuse("uid %d may not act on session %s", w.uid, sid)
 	}
+	if rec.Uid < e.cfg.MinUID || rec.Uid == w.service {
+		return nil, refuse("session %s belongs to uid %d, which is not a login user (min_uid %d, not the service user)", sid, rec.Uid, e.cfg.MinUID)
+	}
 	if rec.Spec.Machine != e.cfg.Machine {
 		return nil, refuse("session %s is for machine %q, this is %q", sid, rec.Spec.Machine, e.cfg.Machine)
 	}
@@ -145,9 +166,18 @@ func oneSid(verb string, args []string, stderr io.Writer) (string, bool) {
 func Real(getenv func(string) string) *Deps {
 	return &Deps{
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
-		NewBackend: func(docker string) Backend { return &dockerBackend{docker: docker} },
+		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf,
 	}
+}
+
+func homeOf(uid int) (string, error) {
+	u, err := user.LookupId(strconv.Itoa(uid))
+	if err != nil {
+		return "", err
+	}
+	return u.HomeDir, nil
 }
 
 func lookupUser(name string) (int, int, error) {

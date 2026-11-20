@@ -1647,3 +1647,13 @@ invariants = [5]
 backends = ["unit"]
 where = "hp"
 
+[[rule]]
+id = "hubsend-shared-sender"
+title = "the sender hostd and a pod's sidecar share: it posts exactly the stamp the receiver verifies, picks the one entry the sender's record places the node on (a squatter elsewhere gets nothing and cannot make the real one ambiguous), and returns the hub's 401/403 as they were"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/hubsend TestSendPostsAStampTheReceiverVerifiesWithTheRelaysToken"
+block = "tests/twin-go.sh ./internal/hubsend TestResolveChoosesTheOneEntryTheRecordPlacesTheNodeOn"
+invariants = [13]
+backends = ["unit"]
+where = "hp"
+

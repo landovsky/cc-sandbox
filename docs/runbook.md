@@ -767,3 +767,13 @@ only a directory of its own). Repository, branch and base are checked by `intern
 uses (branch required, at most 100 characters, never main, master, HEAD or trunk). Disk: the worktree, snapshot and git volumes are
 each as large as the worktree: size the pod's ephemeral storage for their sum plus home, out and journal (a node eviction
 comes before any one limit).
+
+**worktree-check (R-H).** `sudo -n ccsbx-root worktree-check -- <path>` is what hostd asks, read-only, before it records a REMOTE
+start's workdir in helper mode (spec: docs/m2c-remote-start.md (4b)). Exit 0 and one line (the resolved absolute path) when
+the path is a git worktree root run would accept: strictly inside an allowed root, no symlink in it, a login user's own
+directory (never root's or a system user's), no hidden home directory, its own `.git` (a directory, or a linked worktree's
+file naming a host-owned gitdir inside a root whose back-reference names this worktree), and no overlap with a live session's
+workdir (equal, containing or inside). Exit 2: refused, with one fixed line on stderr (never the path or OS text). Exit 3: could
+not tell (a read error, an unreadable record, a config that cannot be believed). Only the service user (hostd) and root may ask;
+it writes nothing and takes no lock. Not covered by a test (it needs root): a `.git` owned by another user, refused through the
+pinned descriptor's owner check.

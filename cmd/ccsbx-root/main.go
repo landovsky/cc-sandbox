@@ -15,6 +15,9 @@ import (
 
 var version = "dev"
 
+// configPath is the root-owned config; a test points it elsewhere.
+var configPath = rootcmd.DefaultConfigPath
+
 func main() { os.Exit(realMain(os.Args[1:])) }
 
 func realMain(args []string) int {
@@ -35,9 +38,14 @@ func realMain(args []string) int {
 	_ = syscall.Setrlimit(syscall.RLIMIT_CORE, &syscall.Rlimit{})
 	getenv := func(k string) string { return keep[k] }
 
-	cfg, err := rootcmd.LoadConfig(rootcmd.DefaultConfigPath, 0)
+	cfg, err := rootcmd.LoadConfig(configPath, 0)
 	if err != nil {
 		// --help and version run nothing, so they need no config; everything else refuses
+		if len(args) > 0 && args[0] == "worktree-check" {
+			// hostd treats anything but 0 as a refusal; a root config that cannot be believed is "could not tell"
+			fmt.Fprintln(os.Stderr, "ccsbx-root worktree-check: cannot tell")
+			return 3
+		}
 		if !runsNothing(args) {
 			fmt.Fprintln(os.Stderr, "ccsbx-root: refused:", err)
 			return 2

@@ -347,6 +347,16 @@ backends = ["unit"]
 where = "hp"
 
 [[rule]]
+id = "worktree-check-read-only"
+title = "ccsbx-root worktree-check -- <path> (R-H) says, read-only and with one fixed stderr line that never holds the path, whether a path is a git worktree root run would accept (inside an allowed root, no symlink, a login user's own directory, its own .git derived through a pinned descriptor, no overlap with a live session's workdir); one argument after --, nothing else; the service user and root only; exit 0/2/3 (a config or record that cannot be read is 3, never ok); it writes nothing"
+suite = "keys"
+allow = "tests/twin-go.sh ./internal/rootcmd TestAGoodWorktreeRootIsAnsweredWithItsPathAndNothingElse"
+block = "tests/twin-go.sh ./internal/rootcmd TestEveryRefusalIsOneFixedLineWithNoPath && tests/twin-go.sh ./internal/rootcmd TestAWorktreeThatOverlapsALiveSessionIsRefused && tests/twin-go.sh ./internal/rootcmd TestWorktreeCheckTakesExactlyOneArgumentAfterTheDashes && tests/twin-go.sh ./internal/rootcmd TestWorktreeCheckIsForHostdAndRootOnlyAndOnlyWhenEnabled && tests/twin-go.sh ./internal/rootcmd TestWorktreeCheckWritesNothing && tests/twin-go.sh ./cmd/ccsbx-root TestWorktreeCheckWithoutABelievableConfigIsCouldNotTell"
+invariants = [8]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
 id = "root-attach-as-service-uid"
 title = "ccsbx-root attach drops to the service uid before it execs tmux, sets the prefix, prefix2, mouse and key bindings off itself, for the session's owner only, with a rebuilt environment; ccsbx attach reaches it through sudo"
 suite = "keys"

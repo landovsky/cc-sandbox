@@ -26,6 +26,7 @@ type LaunchSpec struct {
 	Workdir     Workdir         `json:"workdir"`
 	Profile     string          `json:"profile"`
 	Billing     string          `json:"billing"`
+	Grants      []string        `json:"grants"` // the grant names the node's Grants: line asks for (decided at the doors, M1)
 	MsgScope    json.RawMessage `json:"msg_scope"`
 	Client      json.RawMessage `json:"client"`
 	Brief       *Brief          `json:"brief"`

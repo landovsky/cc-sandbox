@@ -202,6 +202,9 @@ func (d *Daemon) lock() (func(), error) {
 
 func (d *Daemon) records() ([]*Record, error) {
 	ents, err := os.ReadDir(d.path("sessions"))
+	if os.IsNotExist(err) {
+		return nil, nil // nothing was ever started here: an empty list, not an error
+	}
 	if err != nil {
 		return nil, err
 	}

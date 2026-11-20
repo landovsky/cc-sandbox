@@ -239,3 +239,24 @@ func TestFailedLaunch(t *testing.T) {
 		}
 	})
 }
+
+// context: cc-tree's LaunchSpec carries the node's Grants: line as "grants". The daemon refuses
+// unknown fields (a typo must not weaken a spec), so the field must be a known one.
+func TestSpecAcceptsGrantsFromCCTree(t *testing.T) {
+	b, _ := os.ReadFile("../../tests/specs/hello.json")
+	b = []byte(strings.Replace(string(b), `"billing":"stub",`, `"billing":"stub","grants":["g1","g2"],`, 1))
+	s, err := ParseSpec(b)
+	if err != nil || len(s.Grants) != 2 {
+		t.Fatalf("%v %+v", err, s)
+	}
+}
+
+// context: the cockpit asks `ccsbx ls` on a machine where nothing was ever started: an empty
+// list, not an error.
+func TestNoSessionsDirIsAnEmptyListNotAnError(t *testing.T) {
+	d := &Daemon{StateDir: t.TempDir()}
+	recs, err := d.Records()
+	if err != nil || len(recs) != 0 {
+		t.Fatalf("%v %v", recs, err)
+	}
+}

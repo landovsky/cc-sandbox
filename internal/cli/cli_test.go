@@ -68,3 +68,28 @@ func TestCLI(t *testing.T) {
 		}
 	})
 }
+
+// context: cc-tree calls `ccsbx cursor get NAME --json`: flags after the positionals. A command
+// that opts in takes them; one that doesn't (run -- cmd args) keeps everything after the first
+// positional for itself.
+func TestInterleavedFlagsOnlyForCommandsThatAskForThem(t *testing.T) {
+	var got []string
+	var jsonSet string
+	mk := func(inter bool) *App {
+		return &App{Name: "x", Cmds: []*Command{{Name: "c", Interleave: inter,
+			Setup: func(f *Flags) { f.Bool("json", false, "j") },
+			Run: func(f *Flags, args []string, _, _ io.Writer) int {
+				got, jsonSet = args, f.Lookup("json").Value.String()
+				return 0
+			}}}, Getenv: func(string) string { return "" }}
+	}
+	var out, errb bytes.Buffer
+	mk(true).Main([]string{"c", "get", "NAME", "--json"}, &out, &errb)
+	if strings.Join(got, ",") != "get,NAME" || jsonSet != "true" {
+		t.Fatalf("interleaved: %v json=%s", got, jsonSet)
+	}
+	mk(false).Main([]string{"c", "get", "NAME", "--json"}, &out, &errb)
+	if strings.Join(got, ",") != "get,NAME,--json" || jsonSet != "false" {
+		t.Fatalf("plain: %v json=%s", got, jsonSet)
+	}
+}

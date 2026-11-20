@@ -187,8 +187,9 @@ func eventsCmd() *cli.Command {
 
 func cursorCmd() *cli.Command {
 	return &cli.Command{
-		Name:    "cursor",
-		Summary: "get or set a named journal cursor (kept at the daemon)",
+		Name:       "cursor",
+		Interleave: true,
+		Summary:    "get or set a named journal cursor (kept at the daemon)",
 		Recipes: `  ccsbx cursor get cockpit-hp-ubuntu --json                         {"seq","epoch","tree_sha"} ({"seq":0} if never set)
   ccsbx cursor set cockpit-hp-ubuntu --seq 41 --epoch E --tree-sha <sha>
   ccsbx cursor list                                                 {"epoch","head","cursors":[...]} newest first
@@ -312,8 +313,9 @@ func saveLease(state string, l heldLease) error {
 
 func cockpitCmd() *cli.Command {
 	return &cli.Command{
-		Name:    "cockpit",
-		Summary: "the cockpit lease and verb results: up | down | status | requests | result",
+		Name:       "cockpit",
+		Interleave: true,
+		Summary:    "the cockpit lease and verb results: up | down | status | requests | result",
 		Recipes: `  ccsbx cockpit up [--realm production] [--holder hp-ubuntu/cc-tree] [--steal]
         take (or renew) the realm's lease; the token is kept in <state>/cockpit/<realm>.lease.
         Exit 4 if another holder has it (they are named), unless --steal.

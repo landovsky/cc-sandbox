@@ -205,6 +205,22 @@ func (s Spec) Prepare() error {
 			if err := s.chown(p, own, grp); err != nil {
 				return err
 			}
+			if d == "out" {
+				// out/requests: where the fence's git shim and every request writer put their files, and where hostd
+				// reads them (<out>/requests/<rid>.json). The shim only checks that it exists, never makes it, so a
+				// backend that did not create it left every request writer failing with "is this a ccsbx fence?".
+				// Same modes as out/ itself.
+				rq := filepath.Join(p, "requests")
+				if err := os.Mkdir(rq, mode); err != nil {
+					return err
+				}
+				if err := os.Chmod(rq, mode); err != nil {
+					return err
+				}
+				if err := s.chown(rq, own, grp); err != nil {
+					return err
+				}
+			}
 			if d == "in" {
 				// in/ is root's (the fence reads it, nobody but root can replace what root wrote
 				// there); only in/replies belongs to the daemon, which cannot rename or delete the
@@ -232,6 +248,15 @@ func (s Spec) Prepare() error {
 		// parent keeps other host users out. A mount cannot change this in direct mode.
 		if err := os.Chmod(p, 0o777); err != nil {
 			return err
+		}
+		if d == "out" {
+			rq := filepath.Join(p, "requests") // see the helper branch: the shim never creates it
+			if err := os.Mkdir(rq, 0o700); err != nil {
+				return err
+			}
+			if err := os.Chmod(rq, 0o777); err != nil {
+				return err
+			}
 		}
 	}
 	if !helper {

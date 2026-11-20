@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
@@ -317,5 +318,24 @@ func TestOnlyALoginUsersDirectoryCounts(t *testing.T) {
 		if loginUID(c.uid, c.min, c.svc) != c.ok {
 			t.Errorf("uid %d (min %d, service %d): %v", c.uid, c.min, c.svc, !c.ok)
 		}
+	}
+}
+
+// N4: root and hostd must agree on which linked worktrees exist. hostd's backend.CheckGitDirLexical only takes
+// <repo>/.git/worktrees/<name>; a bare repository's <bare>/worktrees/<name> used to pass root's checks, so a start
+// hostd would never send could still be run by hand. Refusing the bare layout is the shared answer.
+func TestALinkedWorktreeOfABareRepositoryIsRefusedByRootAsHostdDoes(t *testing.T) {
+	f := wcFx(t)
+	os.RemoveAll(filepath.Join(f.wd, ".git"))
+	gd := filepath.Join(f.roots, "git", "bare.git", "worktrees", "wt")
+	mk(t, gd, 0o755)
+	put(t, filepath.Join(gd, "HEAD"), "ref: refs/heads/x\n", 0o644)
+	put(t, filepath.Join(gd, "gitdir"), filepath.Join(f.wd, ".git")+"\n", 0o644)
+	put(t, filepath.Join(f.wd, ".git"), "gitdir: "+gd+"\n", 0o644)
+	if err := backend.CheckGitDirLexical(gd, f.wd, f.roots); err == nil {
+		t.Fatal("hostd's own check accepts the bare layout: this test no longer describes a disagreement")
+	}
+	if code, out, _ := f.check("--", f.wd); code != 2 || out != "" {
+		t.Errorf("worktree-check passed a layout hostd refuses: %d %q", code, out)
 	}
 }

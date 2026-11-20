@@ -278,7 +278,8 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 			return nil, refuse(code, "%v", cause)
 		}
 		// The pod is deleted WITHOUT the daemon's lock (a delete can take a minute and every other start waits
-		// for it): the record still says Starting, so nothing else acts on this session meanwhile.
+		// for it): the record still says Starting, so a sweep or a resume leaves it alone, but a stop or gc may still move the
+		// session on, which is why the delete names this generation and root refuses a stale one.
 		var stopErr error
 		if rec.PodUID != "" {
 			stopErr = d.PodRoot.Stop(sid, rec.Gen)

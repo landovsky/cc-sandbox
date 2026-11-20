@@ -1307,3 +1307,28 @@ func TestRunningAsksByTheExactNameAndFailsClosed(t *testing.T) {
 		}
 	}
 }
+
+// The fence's git shim (and every request writer) only checks that <out>/requests exists; hostd reads it there.
+// A backend that never made it left every request failing with "is this a ccsbx fence?", so Prepare makes it,
+// with the outbox's own modes in both modes.
+func TestPrepareMakesTheRequestsDirectoryWithTheOutboxModes(t *testing.T) {
+	d := spec(t)
+	if err := d.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if st, err := os.Stat(filepath.Join(d.GenDir(), "out", "requests")); err != nil || !st.IsDir() || st.Mode().Perm() != 0o777 {
+		t.Errorf("direct mode: %v %v", st, err)
+	}
+	h := spec(t)
+	h.NotEvid, h.OutGid, h.ServiceUID = false, 4243, 4242
+	owners := map[string][2]int{}
+	h.Chown = func(p string, uid, gid int) error { owners[p] = [2]int{uid, gid}; return nil }
+	if err := h.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	rq := filepath.Join(h.GenDir(), "out", "requests")
+	st, err := os.Stat(rq)
+	if err != nil || st.Mode().Perm() != 0o750 || st.Mode()&os.ModeSetgid == 0 || owners[rq] != [2]int{FenceUID, 4243} {
+		t.Errorf("helper mode: %v %v %v", st, err, owners[rq])
+	}
+}

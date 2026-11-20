@@ -291,7 +291,7 @@ func TestPodLoadWaitsThenMintsThenLoadsWithTheRecordedUID(t *testing.T) {
 	}
 	var rb map[string]any
 	json.Unmarshal([]byte(pf.hub[0].body), &rb)
-	if rb["role"] != "relay" || rb["sid"] != sid || rb["gen"] != "2" || rb["pub"] != relayPub || fmt.Sprint(rb["may_reach"]) != "[]" {
+	if rb["role"] != "relay" || rb["sid"] != sid || rb["gen"] != "2" || rb["pub"] != relayPub || fmt.Sprint(rb["may_reach"]) != "[]" || rb["manager"] != "" {
 		t.Errorf("relay request %s", pf.hub[0].body)
 	}
 	if !strings.Contains(string(pf.pod.loaded), `"relay_token":"sbp1.RELAYTOKEN"`) || strings.Contains(pf.audit.String(), "RELAYTOKEN") || strings.Contains(pf.audit.String(), hubSecretText) {
@@ -642,7 +642,7 @@ func TestPodCreateBuildsTheSidecarCommandFromTheRecordAndConfig(t *testing.T) {
 		t.Fatalf("%d %s", code, out)
 	}
 	got := strings.Join(pf.pod.created[0].SideCmd, " ")
-	want := "ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
+	want := "/usr/local/bin/ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
 		"--out /run/ccsbx/out --in /run/ccsbx/in --fence-uid 10001 --sid " + sid + " --gen 2 --label cc-sandbox:x --full-id tomas/future-two/" + sid + "/g2 --machine future-two " +
 		`--scope {"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":["p1"],"peer_machines":{"p1":"mac"}} ` +
 		"--hub-url http://hub-egress.cc-sandbox.svc:4011 --door model=http://ccsp-model.cc-sandbox-doors.svc:8080"

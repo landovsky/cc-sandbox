@@ -141,7 +141,7 @@ func (e *env) relayMint(sid, genS, pub string, after401 bool, stdout io.Writer) 
 // reach from the record's scope. The secret is the caller's, already read from its trusted file. The
 // token comes back to the caller only (the verb prints it; pod-load puts it in the sidecar's payload).
 func (e *env) registerRelay(ctx context.Context, secret string, scope json.RawMessage, sid string, gen int, pub string) (string, error) {
-	body, _ := json.Marshal(map[string]any{"role": "relay", "sid": sid, "gen": strconv.Itoa(gen), "pub": pub, "may_reach": mayReach(scope)})
+	body, _ := json.Marshal(map[string]any{"role": "relay", "sid": sid, "gen": strconv.Itoa(gen), "pub": pub, "may_reach": mayReach(scope), "manager": managerOf(scope)})
 	code, resp, err := e.hubCall(ctx, "POST", "/v1/principals", secret, body)
 	if errors.Is(err, errHubUntrusted) {
 		e.audit("relay-mint", sid, gen, pub, "refused: "+err.Error())
@@ -161,6 +161,19 @@ func (e *env) registerRelay(ctx context.Context, secret string, scope json.RawMe
 }
 
 var sidMintRe = regexp.MustCompile(`^s[0-9a-z]{4,32}$`)
+
+// managerOf is the session's manager as <machine>/<node> from the record's msg_scope.manager, "" when it is
+// not placed (no machine, or a malformed machine or node). The hub cannot tell the manager from the order
+// of may_reach: it allows an UNFENCED target only to this one, and a fenced one only within may_reach.
+func managerOf(scope json.RawMessage) string {
+	var s struct {
+		Manager struct{ Node, Machine string }
+	}
+	if json.Unmarshal(scope, &s) != nil || !mrMachine.MatchString(s.Manager.Machine) || !mrNode.MatchString(s.Manager.Node) {
+		return ""
+	}
+	return s.Manager.Machine + "/" + s.Manager.Node
+}
 
 // maxMayReach is the hub's own limit on the list.
 const maxMayReach = 32

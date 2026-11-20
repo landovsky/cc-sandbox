@@ -476,8 +476,8 @@ func (c Config) CheckContract(p *Pod) error {
 			bad("the sidecar declares only the forwarder port %d", SidePort)
 		}
 		if ct.Name == "side" && len(ct.Command) > 0 {
-			if len(ct.Command) < 3 || ct.Command[0] != "ccsbx" || ct.Command[1] != "side" || ct.Command[2] != "serve" || len(ct.Command) > 64 {
-				bad("the sidecar runs ccsbx side serve and nothing else (at most 64 arguments)")
+			if len(ct.Command) < 3 || ct.Command[0] != SideBinary || ct.Command[1] != "side" || ct.Command[2] != "serve" || len(ct.Command) > 64 {
+				bad("the sidecar runs %s side serve and nothing else (at most 64 arguments)", SideBinary)
 			}
 			for _, a := range ct.Command {
 				if len(a) > maxScope+256 || strings.ContainsRune(a, 0) {

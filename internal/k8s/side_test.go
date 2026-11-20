@@ -20,7 +20,7 @@ func TestSideArgvIsExactlyWhatTheSidecarsPathsAndRecordSay(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
+	want := "/usr/local/bin/ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
 		"--out /run/ccsbx/out --in /run/ccsbx/in --fence-uid 10001 --sid s0abcdefgh --gen 2 --label cc-sandbox:x --full-id tomas/future-two/s0abcdefgh/g2 " +
 		`--machine future-two --scope {"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":[]} ` +
 		"--hub-url http://hub-egress.cc-sandbox.svc:4011 --door model=http://ccsp-model.cc-sandbox-doors.svc:8080"
@@ -93,8 +93,10 @@ func TestThePodCarriesTheSidecarCommandAndTheContractHoldsItToServe(t *testing.T
 	for why, mod := range map[string]func(*Pod){
 		"a sidecar that runs a shell":   func(p *Pod) { sd(p).Command = []string{"/bin/sh", "-c", "x"} },
 		"a sidecar that runs ccsbx fwd": func(p *Pod) { sd(p).Command = []string{"ccsbx", "fwd"} },
-		"a sidecar with 65 arguments":   func(p *Pod) { sd(p).Command = append([]string{"ccsbx", "side", "serve"}, make([]string, 62)...) },
-		"an argument holding a NUL":     func(p *Pod) { sd(p).Command = []string{"ccsbx", "side", "serve", "a\x00b"} },
+		"a sidecar with 65 arguments": func(p *Pod) {
+			sd(p).Command = append([]string{"/usr/local/bin/ccsbx", "side", "serve"}, make([]string, 62)...)
+		},
+		"an argument holding a NUL": func(p *Pod) { sd(p).Command = []string{"/usr/local/bin/ccsbx", "side", "serve", "a\x00b"} },
 	} {
 		q, _ := PodFor(s)
 		mod(q)

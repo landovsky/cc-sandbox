@@ -37,7 +37,7 @@ func LoadInto(ctx context.Context, x Execer, ref k8s.Ref, secrets []byte) error 
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second) // a stdin that never closes must not hang the launcher
 	defer cancel()
 	var out, errb bytes.Buffer
-	code, err := x.Exec(ctx, ref, "side", []string{"ccsbx", "side", "load", "--control", ControlPath},
+	code, err := x.Exec(ctx, ref, "side", []string{k8s.SideBinary, "side", "load", "--control", ControlPath},
 		k8s.IO{Stdin: bytes.NewReader(secrets), Stdout: &out, Stderr: &errb})
 	if err != nil {
 		return err

@@ -701,10 +701,13 @@ Systemd sockets of the signer are picked **by name**, never by order: the main s
 unless `LISTEN_FDNAMES` is exactly those two names (either order) with `LISTEN_FDS=2`.
 
 **The sidecar's command line.** `pod-create` builds the sidecar's `ccsbx side serve ...` from the record and root's
-config (`internal/k8s/side.go`): `--sid --gen --label --full-id --machine --scope` (the record's `msg_scope`,
+config (`internal/k8s/side.go`), run as `/usr/local/bin/ccsbx` (an absolute path: the image is FROM scratch, so no PATH; the load exec uses it too): `--sid --gen --label --full-id --machine --scope` (the record's `msg_scope`,
 compacted, an object of at most 8 KiB) and the fixed paths (`--control /run/ccsbx/side/ctl/ctl.sock`, `--state
 /run/ccsbx/side/state`, `--journal-dir /run/ccsbx/journal/s`, `--out /run/ccsbx/out`, `--in /run/ccsbx/in`,
 `--fence-uid 10001`, `--listen 127.0.0.1:8080`), plus `--hub-url` from root config `k8s_hub_url` (empty until the
 operator egress Service exists, then the flag is left out) and one `--door NAME=URL` per entry of `k8s_doors`.
 Every value is checked again before it goes in the pod spec, and the pod contract holds the sidecar to
 `ccsbx side serve`. No secret is in the spec: the relay token travels in the one load. The `relay-cred` volume is gone.
+
+The relay mint body also carries `manager` = `<machine>/<node>` from `msg_scope.manager` (`""` when it is not placed),
+separate from `may_reach`: the hub allows an unfenced target only to the manager and a fenced one only within `may_reach`.

@@ -20,6 +20,10 @@ import (
 	"unicode"
 )
 
+// SideBinary is the sidecar image's ccsbx, by absolute path: the image is FROM scratch, so there is no PATH
+// to find it by, for the container's own command and for `kubectl exec ... ccsbx side load` alike.
+const SideBinary = "/usr/local/bin/ccsbx"
+
 // Where the sidecar keeps things: the control socket and ledger under the side-state volume, the journal
 // under its own sidecar-only volume, and the outbox (read only) and inbox (read-write) it shares with the fence.
 const (
@@ -72,7 +76,7 @@ func SideArgv(i SideInfo) ([]string, error) {
 	if strings.ContainsRune(scope.String(), 0) {
 		return nil, fmt.Errorf("sidecar: msg_scope holds a NUL")
 	}
-	args := []string{"ccsbx", "side", "serve",
+	args := []string{SideBinary, "side", "serve",
 		"--listen", "127.0.0.1:" + strconv.Itoa(SidePort),
 		"--control", SideControl, "--state", SideState, "--journal-dir", SideJournalDir,
 		"--out", SideOut, "--in", SideIn, "--fence-uid", strconv.Itoa(FenceUID),

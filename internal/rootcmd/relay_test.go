@@ -139,7 +139,7 @@ func TestRelayMintRegistersTheKeyWithTheManagerAsTheOnlyReach(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(reqs[0].body), &body)
 	reach, _ := body["may_reach"].([]any)
-	if body["role"] != "relay" || body["sid"] != sid || body["gen"] != "2" || body["pub"] != relayPub || len(reach) != 2 || reach[0] != "hp-ubuntu/cc-sandbox:#6b3s" || reach[1] != "mac/cc-sandbox:#aaaa" || len(body) != 5 {
+	if body["role"] != "relay" || body["sid"] != sid || body["gen"] != "2" || body["pub"] != relayPub || len(reach) != 2 || reach[0] != "hp-ubuntu/cc-sandbox:#6b3s" || reach[1] != "mac/cc-sandbox:#aaaa" || body["manager"] != "hp-ubuntu/cc-sandbox:#6b3s" || len(body) != 6 {
 		t.Errorf("body %s (the relay reaches the manager, then the placed peers, each as <machine>/<node> from the record, and nobody else)", reqs[0].body)
 	}
 	if strings.Contains(r.audit.String(), "TOKENVALUE") || strings.Contains(r.audit.String(), hubSecretText) || !strings.Contains(r.audit.String(), "relay-mint") || !strings.Contains(r.audit.String(), "sid="+sid) {
@@ -171,10 +171,24 @@ func TestMayReachComesFromTheRecordAndIsEmptyWithoutAManagerMachine(t *testing.T
 		}
 		var body struct {
 			MayReach json.RawMessage `json:"may_reach"`
+			Manager  *string         `json:"manager"`
 		}
 		json.Unmarshal([]byte(r.hubCalls()[0].body), &body)
 		if string(body.MayReach) != c.want {
 			t.Errorf("%s: may_reach %s, want %s", why, body.MayReach, c.want)
+		}
+		// the manager is its own field (never inferred from the order of may_reach): <machine>/<node>, or ""
+		// when the record does not place it, even if a peer is placed
+		wantMgr := ""
+		var sc struct {
+			Manager struct{ Node, Machine string }
+		}
+		json.Unmarshal([]byte(c.scope), &sc)
+		if sc.Manager.Machine != "" && sc.Manager.Node != "" && strings.HasPrefix(c.want, `["`+sc.Manager.Machine+"/"+sc.Manager.Node+`"`) {
+			wantMgr = sc.Manager.Machine + "/" + sc.Manager.Node
+		}
+		if body.Manager == nil || *body.Manager != wantMgr {
+			t.Errorf("%s: manager %v, want %q", why, body.Manager, wantMgr)
 		}
 	}
 }

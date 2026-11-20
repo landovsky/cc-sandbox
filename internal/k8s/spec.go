@@ -20,6 +20,9 @@ import (
 const (
 	FenceUID = 10001
 	SideUID  = 10002
+	// WorkGID is the pod's fsGroup (ccsbx-work): neither user's primary group, held by both, so that what the
+	// sidecar checks out into /work the fence can write and the other way round. Any other fsGroup is refused.
+	WorkGID = 10003
 	// RoleLabel is the label the cluster's admission policy keys on.
 	RoleLabel = "cc-sandbox/role"
 	// SidePort is the one port the pod declares: the forwarder's, on the sidecar.
@@ -52,9 +55,11 @@ func DefaultConfig() Config {
 // same name is accepted only if it is this very one.
 const HashAnnotation = "ccsbx.landovsky/spec-hash"
 
-// Spec is one generation. Label and OwnerUID are the caller's own bookkeeping and are NOT written
-// to the pod (the cluster has no business knowing them). FenceCmd and SideCmd must carry no
-// credential: tokens and keys reach the sidecar by exec stdin, never in the spec.
+// Spec is one generation. OwnerUID is the caller's own bookkeeping and is NOT written to the pod. The label
+// (a pod label value and the sidecar's --label), the full id and the message scope are written to the pod:
+// the sidecar takes them from its command line, so anyone who can `get` the pod (the launcher's service
+// account, cluster admins) reads them; that is accepted. FenceCmd and SideCmd must carry no credential:
+// tokens and keys reach the sidecar by exec stdin, never in the spec.
 type Spec struct {
 	Sid, Label     string
 	Gen            int
@@ -168,7 +173,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			ShareProcessNamespace:         ptr(false),
 			DNSPolicy:                     "None",
 			DNSConfig:                     &DNSConfig{Nameservers: []string{c.DNS}},
-			SecurityContext:               &PodSecurity{RunAsNonRoot: ptr(true), SeccompProfile: &Seccomp{Type: "RuntimeDefault"}},
+			SecurityContext:               &PodSecurity{RunAsNonRoot: ptr(true), SeccompProfile: &Seccomp{Type: "RuntimeDefault"}, FSGroup: ptr(int64(WorkGID))},
 			InitContainers: []Container{{
 				Name: "side", Image: s.SideImage, Command: s.SideCmd, RestartPolicy: "Always",
 				Ports:           []Port{{Name: "fwd", ContainerPort: SidePort, Protocol: "TCP"}},
@@ -177,7 +182,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 				VolumeMounts: []VolumeMount{
 					{Name: "worktree", MountPath: "/work"}, {Name: "out", MountPath: "/run/ccsbx/out", ReadOnly: true},
 					{Name: "in", MountPath: "/run/ccsbx/in"}, {Name: "managed", MountPath: "/etc/claude-code"},
-					{Name: "side-state", MountPath: "/run/ccsbx/side"},
+					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "snapshot", MountPath: "/run/ccsbx/side/snapshot"},
 					{Name: "side-tmp", MountPath: "/tmp"}, {Name: "journal", MountPath: "/run/ccsbx/journal"},
 				},
 			}},
@@ -193,7 +198,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			}},
 			Volumes: []Volume{
 				vol("worktree", s.WorktreeMB, false), vol("out", 64, false), vol("in", 16, false), vol("managed", 8, false),
-				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("journal", 16, false),
+				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("journal", 16, false), vol("snapshot", s.WorktreeMB, false),
 			},
 		},
 	}
@@ -315,7 +320,7 @@ const (
 // place for the process that holds the token.
 var volumeOwner = map[string]string{
 	"worktree": "both", "out": "both", "in": "both", "managed": "both",
-	"side-state": "side", "side-tmp": "side", "journal": "side",
+	"side-state": "side", "side-tmp": "side", "journal": "side", "snapshot": "side",
 	"home": "fence", "tmp": "fence",
 }
 
@@ -383,6 +388,9 @@ func (c Config) CheckContract(p *Pod) error {
 	if s.SecurityContext == nil || s.SecurityContext.RunAsNonRoot == nil || !*s.SecurityContext.RunAsNonRoot ||
 		s.SecurityContext.SeccompProfile == nil || s.SecurityContext.SeccompProfile.Type != "RuntimeDefault" {
 		bad("pod securityContext: runAsNonRoot and seccomp RuntimeDefault")
+	}
+	if s.SecurityContext == nil || s.SecurityContext.FSGroup == nil || *s.SecurityContext.FSGroup != WorkGID {
+		bad("pod securityContext: fsGroup is %d (ccsbx-work), nothing else", WorkGID)
 	}
 	if len(s.Containers) != 1 || s.Containers[0].Name != "fence" {
 		bad("exactly one container, named fence")
@@ -475,7 +483,11 @@ func (c Config) CheckContract(p *Pod) error {
 		if ct.Name == "side" && (len(ct.Ports) != 1 || ct.Ports[0].ContainerPort != SidePort) {
 			bad("the sidecar declares only the forwarder port %d", SidePort)
 		}
-		if ct.Name == "side" && len(ct.Command) > 0 {
+		if len(ct.Args) != 0 {
+			bad("%s has args: Kubernetes appends them to the command, so they could override its flags", ct.Name)
+		}
+		if ct.Name == "side" {
+			// always: with no command the image's entrypoint would run, with no identity and no scope
 			if len(ct.Command) < 3 || ct.Command[0] != SideBinary || ct.Command[1] != "side" || ct.Command[2] != "serve" || len(ct.Command) > 64 {
 				bad("the sidecar runs %s side serve and nothing else (at most 64 arguments)", SideBinary)
 			}

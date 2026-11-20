@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -65,33 +66,32 @@ func SideArgv(i SideInfo) ([]string, error) {
 	if !machineRe.MatchString(i.Machine) {
 		return nil, fmt.Errorf("sidecar: machine %q", i.Machine)
 	}
-	var obj map[string]json.RawMessage
-	if len(i.Scope) == 0 || len(i.Scope) > maxScope || json.Unmarshal(i.Scope, &obj) != nil || obj == nil {
-		return nil, fmt.Errorf("sidecar: msg_scope must be a JSON object of at most %d bytes", maxScope)
-	}
-	var scope strings.Builder
-	if err := compact(&scope, i.Scope); err != nil {
+	scope, err := canonicalScope(i.Scope)
+	if err != nil {
 		return nil, fmt.Errorf("sidecar: msg_scope: %v", err)
-	}
-	if strings.ContainsRune(scope.String(), 0) {
-		return nil, fmt.Errorf("sidecar: msg_scope holds a NUL")
 	}
 	args := []string{SideBinary, "side", "serve",
 		"--listen", "127.0.0.1:" + strconv.Itoa(SidePort),
 		"--control", SideControl, "--state", SideState, "--journal-dir", SideJournalDir,
 		"--out", SideOut, "--in", SideIn, "--fence-uid", strconv.Itoa(FenceUID),
 		"--sid", i.Sid, "--gen", strconv.Itoa(i.Gen), "--label", i.Label, "--full-id", i.FullID,
-		"--machine", i.Machine, "--scope", scope.String()}
+		"--machine", i.Machine, "--scope", scope}
 	if i.HubURL != "" {
 		if err := checkHTTPURL(i.HubURL); err != nil {
 			return nil, fmt.Errorf("sidecar: hub url: %v", err)
 		}
 		args = append(args, "--hub-url", i.HubURL)
 	}
+	names := map[string]bool{}
 	for _, d := range i.Doors {
 		if !doorRe.MatchString(d) {
 			return nil, fmt.Errorf("sidecar: door %q must be NAME=URL", d)
 		}
+		name := d[:strings.Index(d, "=")]
+		if names[name] {
+			return nil, fmt.Errorf("sidecar: door %q is named twice", name)
+		}
+		names[name] = true
 		if err := checkHTTPURL(d[strings.Index(d, "=")+1:]); err != nil {
 			return nil, fmt.Errorf("sidecar: door %q: %v", d, err)
 		}
@@ -100,12 +100,92 @@ func SideArgv(i SideInfo) ([]string, error) {
 	return args, nil
 }
 
-func compact(b *strings.Builder, raw json.RawMessage) error {
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, raw); err != nil {
+// scopeDoc is the message scope the sidecar understands (internal/msg.Scope). The sidecar's own parser
+// is not the place to catch a duplicated or wrong-case key, so the launcher builds the flag from this
+// struct: what is written is exactly these fields, in this order, once each.
+type scopeDoc struct {
+	Manager      scopeNode         `json:"manager"`
+	Peers        []string          `json:"peers"`
+	PeerMachines map[string]string `json:"peer_machines,omitempty"`
+	ReplyWindowS int               `json:"reply_window_s,omitempty"`
+}
+
+type scopeNode struct {
+	Node    string `json:"node"`
+	Machine string `json:"machine,omitempty"`
+}
+
+// canonicalScope refuses anything that is not a JSON object with exactly the known keys, each once and in
+// its exact spelling (no duplicates, no "Manager", no extras, no null), and returns the compact JSON
+// of the typed struct.
+func canonicalScope(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || len(raw) > maxScope {
+		return "", fmt.Errorf("must be a JSON object of at most %d bytes", maxScope)
+	}
+	if err := strictKeys(raw, map[string]bool{"manager": true, "peers": true, "peer_machines": true, "reply_window_s": true}, false); err != nil {
+		return "", err
+	}
+	var d scopeDoc
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&d); err != nil {
+		return "", err
+	}
+	// the manager object is held to the same rule
+	var top map[string]json.RawMessage
+	json.Unmarshal(raw, &top)
+	if m, ok := top["manager"]; ok {
+		if err := strictKeys(m, map[string]bool{"node": true, "machine": true}, false); err != nil {
+			return "", fmt.Errorf("manager: %v", err)
+		}
+	}
+	if pm, ok := top["peer_machines"]; ok {
+		if err := strictKeys(pm, nil, true); err != nil {
+			return "", fmt.Errorf("peer_machines: %v", err)
+		}
+	}
+	if d.Peers == nil {
+		d.Peers = []string{}
+	}
+	out, err := json.Marshal(d)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// strictKeys walks one JSON object's top-level keys: each must be exactly spelled, listed (when free is
+// false) and not repeated. A value that is not an object (null included) is refused.
+func strictKeys(raw json.RawMessage, allowed map[string]bool, free bool) error {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return fmt.Errorf("not a JSON object")
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		kt, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		k, _ := kt.(string)
+		if seen[k] {
+			return fmt.Errorf("key %q appears twice", k)
+		}
+		seen[k] = true
+		if !free && !allowed[k] {
+			return fmt.Errorf("key %q is not one the sidecar knows (keys are exact and lower-case)", k)
+		}
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return err
+		}
+	}
+	if _, err := dec.Token(); err != nil { // the closing brace
 		return err
 	}
-	b.Write(buf.Bytes())
+	if _, err := dec.Token(); err != io.EOF {
+		return fmt.Errorf("data after the object")
+	}
 	return nil
 }
 

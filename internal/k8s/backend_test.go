@@ -452,7 +452,7 @@ func TestTheFakeClusterRefusesWhatTheContractRefuses(t *testing.T) {
 
 // oursAlone names the contract cases the cluster's list does not cover: they are this design's.
 func oursAlone(name string) bool {
-	for _, w := range []string{"uid", "root", "group", "sidecar", "fence", "mount", "write", "port", "credential", "key in", "environment", "derived", "ends in a dash", "state", "relay", "volume that is not an emptyDir", "no worktree", "init container", "unset", "pod not", "extra node selector", "toleration of everything", "hostUsers", "DNS", "nameserver", "dropped with another", "requests below"} {
+	for _, w := range []string{"uid", "root", "group", "sidecar", "fence", "mount", "write", "port", "credential", "key in", "environment", "derived", "ends in a dash", "state", "relay", "volume that is not an emptyDir", "no worktree", "init container", "unset", "pod not", "extra node selector", "toleration of everything", "hostUsers", "DNS", "nameserver", "dropped with another", "requests below", "fsGroup"} {
 		if strings.Contains(name, w) {
 			return true
 		}

@@ -711,3 +711,14 @@ Every value is checked again before it goes in the pod spec, and the pod contrac
 
 The relay mint body also carries `manager` = `<machine>/<node>` from `msg_scope.manager` (`""` when it is not placed),
 separate from `may_reach`: the hub allows an unfenced target only to the manager and a fenced one only within `may_reach`.
+
+**Round 5 of the pod spec.** The sidecar's command is always `/usr/local/bin/ccsbx side serve ...` (a pod with no
+command, a different binary, or any `args` on either container is refused: Kubernetes appends args to the command, so
+they could override a flag). `--scope` is rebuilt from the typed message scope (exact, lower-case keys, each once; null,
+duplicates, unknown keys and trailing data are refused) and door names are unique. The label, full id and scope are in
+the pod spec and so readable by whoever can `get` the pod (the launcher's service account, cluster admins): accepted.
+The pod's `fsGroup` is 10003 (`ccsbx-work`, neither user's primary group; the contract refuses any other), so the fence
+(10001) and the sidecar (10002) share `/work`; the files themselves are group-writable only if the process that makes
+them has a group-writable umask (the sidecar's checkout must use 002). A sidecar-only `snapshot` volume (disk-backed,
+as large as the worktree) is mounted at `/run/ccsbx/side/snapshot`, nested in the side-state volume's path. Whether the
+cluster's admission accepts `fsGroup` and the nested mount is a Gate M question.

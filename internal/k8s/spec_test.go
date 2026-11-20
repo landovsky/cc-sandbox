@@ -15,7 +15,12 @@ const (
 )
 
 func goodSpec() Spec {
-	return Spec{Sid: "s0abcdefgh", Gen: 2, Label: "cc-sandbox:x", OwnerUID: 1000, FenceImage: fenceImg, SideImage: sideImg,
+	cmd, err := SideArgv(SideInfo{Sid: "s0abcdefgh", Gen: 2, Label: "cc-sandbox:x", FullID: "tomas/future-two/s0abcdefgh/g2", Machine: "future-two",
+		Scope: []byte(`{"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":[]}`)})
+	if err != nil {
+		panic(err)
+	}
+	return Spec{Sid: "s0abcdefgh", Gen: 2, Label: "cc-sandbox:x", OwnerUID: 1000, FenceImage: fenceImg, SideImage: sideImg, SideCmd: cmd,
 		MemoryMB: 4096, CPU: 2, EphemeralMB: 20480, WorktreeMB: 10240}
 }
 
@@ -185,6 +190,14 @@ func contractCases() []contractCase {
 		{"the fence mounting the sidecar's state", func(p *Pod) {
 			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "side-state", MountPath: "/s"})
 		}, "alone"},
+		{"the fence mounting the snapshot", func(p *Pod) {
+			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "snapshot", MountPath: "/snap"})
+		}, "alone"},
+		{"no fsGroup", func(p *Pod) { p.Spec.SecurityContext.FSGroup = nil }, "fsGroup"},
+		{"fsGroup root", func(p *Pod) { g := int64(0); p.Spec.SecurityContext.FSGroup = &g }, "fsGroup"},
+		{"fsGroup the fence's own group", func(p *Pod) { g := int64(FenceUID); p.Spec.SecurityContext.FSGroup = &g }, "fsGroup"},
+		{"fsGroup the sidecar's own group", func(p *Pod) { g := int64(SideUID); p.Spec.SecurityContext.FSGroup = &g }, "fsGroup"},
+		{"another fsGroup", func(p *Pod) { g := int64(WorkGID + 1); p.Spec.SecurityContext.FSGroup = &g }, "fsGroup"},
 		{"the fence mounting the sidecar's journal", func(p *Pod) {
 			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "journal", MountPath: "/j"})
 		}, "alone"},
@@ -371,5 +384,46 @@ func TestThePodHasASidecarOnlyJournalVolume(t *testing.T) {
 	}
 	if volumeOwner["journal"] != "side" {
 		t.Error("the journal is not in the sidecar-only allow-list")
+	}
+}
+
+// F3c: the sidecar checks the repository out into /work and the fence writes it, so they share a group
+// (the pod's fsGroup, neither one's primary group); the sidecar keeps what it fetched in a volume of its own,
+// as large as the worktree, that the fence never sees.
+func TestTheSharedWorktreeGroupAndTheSnapshotVolume(t *testing.T) {
+	p := goodPod(t)
+	if g := p.Spec.SecurityContext.FSGroup; g == nil || *g != WorkGID || WorkGID == FenceUID || WorkGID == SideUID {
+		t.Errorf("fsGroup %v", g)
+	}
+	var snap *Volume
+	for i := range p.Spec.Volumes {
+		if p.Spec.Volumes[i].Name == "snapshot" {
+			snap = &p.Spec.Volumes[i]
+		}
+	}
+	if snap == nil || snap.EmptyDir == nil || snap.EmptyDir.Medium != "" || snap.EmptyDir.SizeLimit != miQty(10240) {
+		t.Fatalf("snapshot volume %+v (disk-backed, as large as the worktree)", snap)
+	}
+	for _, c := range append(append([]Container{}, p.Spec.InitContainers...), p.Spec.Containers...) {
+		for _, m := range c.VolumeMounts {
+			if m.Name == "snapshot" && (c.Name != "side" || m.MountPath != "/run/ccsbx/side/snapshot" || m.ReadOnly) {
+				t.Errorf("%s mounts the snapshot at %s", c.Name, m.MountPath)
+			}
+		}
+	}
+	if volumeOwner["snapshot"] != "side" {
+		t.Error("the snapshot is not sidecar-only")
+	}
+	// it follows the worktree's size
+	s := goodSpec()
+	s.WorktreeMB = 2048
+	q, err := PodFor(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range q.Spec.Volumes {
+		if v.Name == "snapshot" && v.EmptyDir.SizeLimit != "2Gi" {
+			t.Errorf("snapshot %s for a 2 GiB worktree", v.EmptyDir.SizeLimit)
+		}
 	}
 }

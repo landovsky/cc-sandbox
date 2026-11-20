@@ -61,6 +61,9 @@ type DNSConfig struct {
 type PodSecurity struct {
 	RunAsNonRoot   *bool    `json:"runAsNonRoot,omitempty"`
 	SeccompProfile *Seccomp `json:"seccompProfile,omitempty"`
+	// FSGroup makes every volume of the pod group-owned by this gid (with the setgid bit on its directories),
+	// and adds it to every container's groups: how the fence (10001) and the sidecar (10002) share /work.
+	FSGroup *int64 `json:"fsGroup,omitempty"`
 }
 
 type Seccomp struct {

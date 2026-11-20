@@ -118,3 +118,68 @@ func TestThereIsNoRelayCredentialVolume(t *testing.T) {
 		t.Error("relay-cred is in the volume-owner list")
 	}
 }
+
+// a pod made with no sidecar command is refused at PodFor, not left to the image's entrypoint
+func TestPodForRefusesASidecarWithNoCommand(t *testing.T) {
+	s := goodSpec()
+	s.SideCmd = nil
+	if p, err := PodFor(s); err == nil {
+		t.Errorf("a pod with no sidecar command was built: %v", p.Spec.InitContainers[0].Command)
+	}
+}
+
+// the --scope value is built from a typed struct: the sidecar sees exactly the known keys, once, spelled
+// exactly, whatever the record held
+func TestTheScopeIsBuiltFromTheTypedStructOrRefused(t *testing.T) {
+	scopeOf := func(raw string) (string, error) {
+		i := goodSide()
+		i.Scope = json.RawMessage(raw)
+		a, err := SideArgv(i)
+		if err != nil {
+			return "", err
+		}
+		for k, x := range a {
+			if x == "--scope" {
+				return a[k+1], nil
+			}
+		}
+		return "", nil
+	}
+	for why, raw := range map[string]string{
+		"null":                        `null`,
+		"an array":                    `[]`,
+		"a duplicate manager":         `{"manager":{"node":"a","machine":"hp"},"manager":{"node":"b","machine":"mac"}}`,
+		"a wrong-case key":            `{"Manager":{"node":"a","machine":"hp"}}`,
+		"an unknown key":              `{"manager":{"node":"a","machine":"hp"},"extra":1}`,
+		"a duplicate key in manager":  `{"manager":{"node":"a","node":"b","machine":"hp"}}`,
+		"a wrong-case key in manager": `{"manager":{"Node":"a","machine":"hp"}}`,
+		"a duplicate peer machine":    `{"manager":{"node":"a","machine":"hp"},"peers":["p"],"peer_machines":{"p":"mac","p":"hp"}}`,
+		"peer_machines as a list":     `{"manager":{"node":"a","machine":"hp"},"peer_machines":[]}`,
+		"a manager that is a string":  `{"manager":"a/b"}`,
+		"trailing garbage":            `{"manager":{"node":"a","machine":"hp"}} {}`,
+	} {
+		if got, err := scopeOf(raw); err == nil {
+			t.Errorf("%s was accepted: %s", why, got)
+		}
+	}
+	got, err := scopeOf(`{ "reply_window_s": 3600, "peer_machines": {"p": "mac"}, "peers": ["p"], "manager": { "machine": "hp", "node": "a" } }`)
+	if err != nil || got != `{"manager":{"node":"a","machine":"hp"},"peers":["p"],"peer_machines":{"p":"mac"},"reply_window_s":3600}` {
+		t.Errorf("canonical form: %q %v", got, err)
+	}
+	// a record with no peers still gives peers:[] (never null)
+	if got, _ := scopeOf(`{"manager":{"node":"a","machine":"hp"}}`); got != `{"manager":{"node":"a","machine":"hp"},"peers":[]}` {
+		t.Errorf("%q", got)
+	}
+}
+
+func TestADoorNameIsUsedOnce(t *testing.T) {
+	i := goodSide()
+	i.Doors = []string{"model=http://a:1", "model=http://b:2"}
+	if a, err := SideArgv(i); err == nil {
+		t.Errorf("two doors named model: %v", a)
+	}
+	i.Doors = []string{"model=http://a:1", "egress=http://b:2"}
+	if _, err := SideArgv(i); err != nil {
+		t.Error(err)
+	}
+}

@@ -82,6 +82,12 @@ func app() *cli.App {
 				f.Duration("pod-load-wait", 0, "pod sessions: how long hostd waits for `ccsbx-root pod-load` (0: its worst case, 600 s ready deadline plus load and API time, plus 30 s)")
 				f.String("cc-version", "", "Claude Code version recorded in a started session's pin")
 				f.Int("max-live", 8, "session starts: machine_full above this many live sessions")
+				f.String("owner-user", "", "the local account sessions run as (e.g. tomas): a REMOTE start (POST /v1/sessions on the tailnet, owner class only) runs as this user and its spec's owner must equal it. Empty: remote start is off")
+				f.String("peers", "", "the OTHER machines of this deployment as name=url pairs (name = the hub machine id, url = its daemon's tailnet listener, e.g. hp-ubuntu=http://hp-ubuntu.<tailnet>.ts.net:7480). Every start, remote or local, asks each of them whether the label is live or being started, and refuses unless all answer: one peer down refuses every start on every machine. The list must be the same on every machine (each daemon checks its peers' set); empty: no cross-machine label check")
+				f.Int("remote-max-per-hour", 10, "remote session starts per hour, counted apart from the local --max-per-hour")
+				f.Int("remote-per-user-minute", 3, "remote session starts a minute for one caller (started_by)")
+				f.Int("remote-per-machine-minute", 10, "remote session starts a minute from one calling machine")
+				f.String("peer-ask-timeout", "3s", "the one total deadline for asking every peer about a label (a Go duration)")
 				f.String("known-machines", "", "comma-separated machines of this deployment (hub machine ids): a session start whose msg_scope puts its manager or a peer on any other machine is refused (bad_spec) before anything is published. Empty: only the shape is checked")
 				f.Int("max-per-hour", 20, "session starts: rate_capped above this many starts per caller per hour")
 				f.String("tmux-socket", "ccsbx", "tmux server the session panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (a socket shared between uids; hostd makes it 0660)")
@@ -255,12 +261,23 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	}
 	// Session start for helper mode: the owner's `ccsbx start` asks here; hostd writes the record in
 	// its state dir and launches the pane. The caller's uid is the socket peer's, not the spec's.
-	srv.Start = startHandler(sd, startPolicy{
+	pol := startPolicy{
 		Pins: get("pins"), WorktreeRoots: get("worktree-root"), Image: get("image"),
 		CCVersion: get("cc-version"), TmuxSocket: get("tmux-socket"), RunDir: runDir,
 		MaxLive: num("max-live"), MaxPerHour: num("max-per-hour"), MinUID: num("min-uid"), LookupID: user.LookupId,
-		KnownMachines: splitList(get("known-machines")),
-	})
+		KnownMachines: splitList(get("known-machines")), RemoteMaxPerHour: num("remote-max-per-hour"),
+	}
+	srv.Start = startHandler(sd, pol)
+	svc, rc := remoteService(get, num, sd, pol, stderr)
+	if rc != 0 {
+		return rc
+	}
+	if svc != nil {
+		srv.Remote = svc
+		srv.Info["peer_set"] = svc.PeerSet()
+		// every start, local ones included, asks the peers first (one live generation per label across machines)
+		srv.Start = startHandlerBy2(sd, pol, svc)
+	}
 	sock := get("local-socket")
 	if sock == "" {
 		sock = get("socket")

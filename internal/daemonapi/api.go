@@ -32,6 +32,7 @@ import (
 
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
+	"github.com/landovsky/cc-sandbox/internal/remotestart"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
 )
@@ -47,7 +48,10 @@ type Server struct {
 	// Start is session start (helper mode): the owner's `ccsbx start` sends its LaunchSpec here and
 	// hostd records and launches the session. uid is the CALLER's, from the socket's peer
 	// credentials, never from the body. A policy refusal is a *start.Refusal. nil: 404.
-	Start   func(uid int, spec []byte) (*start.StartReply, error)
+	Start func(uid int, spec []byte) (*start.StartReply, error)
+	// Remote is the remote start (M2c: POST /v1/sessions on the tailnet, owner only; GET /v1/resolve?v=2 for
+	// the peer label check). nil: both answer 404.
+	Remote  *remotestart.Service
 	Token   string        // bearer token the TCP listener requires (the unix socket needs none: it is 0600)
 	MaxWait time.Duration // longest long-poll
 	Info    map[string]any
@@ -552,6 +556,10 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request) {
 // input prompt. Owner class (socket only) or, on the tailnet listener, a peer daemon (another machine's
 // hostd asks it, M2c), like the session list.
 func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Query().Get("v") == "2" {
+		s.resolveV2(w, r)
+		return
+	}
 	if s.Msg == nil || s.Dir == nil {
 		writeJSON(w, 404, map[string]any{"error": "no_messaging"})
 		return
@@ -651,6 +659,10 @@ func (s *Server) pending(w http.ResponseWriter, r *http.Request) {
 
 // sessions: GET /v1/sessions — the sessions the daemon runs now, as a JSON array.
 func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		s.createSession(w, r)
+		return
+	}
 	if s.Dir == nil {
 		writeJSON(w, 404, map[string]any{"error": "no_directory"})
 		return

@@ -143,9 +143,9 @@ type routePolicy struct{ Owner, Peer []string }
 var tailnetRoutes = map[string]routePolicy{
 	"/v1/info":              {Owner: []string{"GET"}, Peer: []string{"GET"}},
 	"/v1/resolve":           {Owner: []string{"GET"}, Peer: []string{"GET"}},
-	"/v1/sessions":          {Owner: []string{"GET"}, Peer: []string{"GET"}}, // M2c adds POST here: remote start, owner only
-	"/v1/sessions/":         {},                                              // deliver, prompt, replace: local only
-	"/v1/start":             {},                                              // needs the caller's uid: local socket only
+	"/v1/sessions":          {Owner: []string{"GET", "POST"}, Peer: []string{"GET"}}, // POST: remote start (M2c), owner only
+	"/v1/sessions/":         {},                                                      // deliver, prompt, replace: local only
+	"/v1/start":             {},                                                      // needs the caller's uid: local socket only
 	"/v1/events":            {},
 	"/v1/events/stream":     {},
 	"/v1/cursors/":          {},
@@ -190,6 +190,23 @@ func allowed(c Class, r *http.Request) bool {
 		}
 	}
 	return false
+}
+
+// maxStartRequest bounds a remote session start (POST /v1/sessions): the peers are asked and a container launched.
+var maxStartRequest = 5 * time.Minute
+
+type identKey struct{}
+
+// identOf is who the tailnet said the caller is (set only on the tailnet listener).
+func identOf(r *http.Request) whois.Identity {
+	i, _ := r.Context().Value(identKey{}).(whois.Identity)
+	return i
+}
+
+// refuse writes the contract's one refusal shape (docs/m2c-remote-start.md §1): {"refused":<code>,"message":...}.
+// "error" repeats the code for the clients that read the older field.
+func refuse(w http.ResponseWriter, status int, code, message string) {
+	writeJSON(w, status, map[string]any{"refused": code, "error": code, "message": message})
 }
 
 // maxTailnetRequest bounds a streaming or long-poll request: access is checked once at the start, so how
@@ -266,17 +283,18 @@ func (s *Server) TailnetHandler(who whois.Resolver, cc ClassConfig) http.Handler
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ip, code, why := cc.screen(r)
 		if code != 0 {
-			writeJSON(w, code, map[string]any{"error": why})
+			refuse(w, code, why, "refused before the caller was identified")
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 6*time.Second)
 		class := ClassNone
+		var ident whois.Identity
 		if id, err := who.WhoIs(ctx, r.RemoteAddr); err == nil && id.Owns(ip) {
-			class = cc.Classify(id)
+			class, ident = cc.Classify(id), id
 		}
 		cancel()
 		if !allowed(class, r) {
-			writeJSON(w, 403, map[string]any{"error": "forbidden"})
+			refuse(w, 403, "forbidden", "not allowed for this caller")
 			return
 		}
 		// Identity headers are never read here; strip them so nothing downstream can.
@@ -285,9 +303,14 @@ func (s *Server) TailnetHandler(who whois.Resolver, cc ClassConfig) http.Handler
 				r.Header.Del(k)
 			}
 		}
-		rctx, rcancel := context.WithTimeout(r.Context(), maxTailnetRequest)
+		// a stream or long poll ends at the cap; a session start (it launches a container: minutes) gets longer
+		limit := maxTailnetRequest
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/sessions" {
+			limit = maxStartRequest
+		}
+		rctx, rcancel := context.WithTimeout(r.Context(), limit)
 		defer rcancel()
-		r = r.WithContext(context.WithValue(rctx, classKey{}, class))
+		r = r.WithContext(context.WithValue(context.WithValue(rctx, classKey{}, class), identKey{}, ident))
 		if class == ClassOwner {
 			ownerH.ServeHTTP(w, r)
 			return
@@ -338,7 +361,7 @@ func CheckListenAddr(addr string, self []netip.Addr) (netip.AddrPort, error) {
 // ListenTailnet listens on one tailnet address (never a wildcard, never a LAN address): an exposed
 // listener elsewhere would be a door nobody asked for. maxConns bounds the open connections (0 = 64): an
 // idle connection costs a descriptor, and any node the ACL lets in could open thousands.
-func ListenTailnet(addr string, self []netip.Addr, maxConns int) (net.Listener, error) {
+func ListenTailnet(addr string, self []netip.Addr, maxConns int, perSource ...int) (net.Listener, error) {
 	if _, err := CheckListenAddr(addr, self); err != nil {
 		return nil, err
 	}
@@ -349,23 +372,58 @@ func ListenTailnet(addr string, self []netip.Addr, maxConns int) (net.Listener, 
 	if maxConns <= 0 {
 		maxConns = 64
 	}
-	return &limitListener{Listener: l, sem: make(chan struct{}, maxConns)}, nil
+	per := 16
+	if len(perSource) > 0 && perSource[0] > 0 {
+		per = perSource[0]
+	}
+	return &limitListener{Listener: l, sem: make(chan struct{}, maxConns), perSrc: per, bySrc: map[string]int{}}, nil
 }
 
 // limitListener caps concurrent accepted connections (a slot frees when the connection closes).
 type limitListener struct {
 	net.Listener
-	sem chan struct{}
+	sem    chan struct{}
+	perSrc int // most open connections from one source address (0 = no limit)
+	mu     sync.Mutex
+	bySrc  map[string]int
 }
 
+// Accept returns connections up to the global cap (it waits for a slot) and drops, at once, any connection
+// from a source that already holds perSrc: one node cannot fill the cap and starve the others.
 func (l *limitListener) Accept() (net.Conn, error) {
-	l.sem <- struct{}{}
-	c, err := l.Listener.Accept()
-	if err != nil {
-		<-l.sem
-		return nil, err
+	for {
+		l.sem <- struct{}{}
+		c, err := l.Listener.Accept()
+		if err != nil {
+			<-l.sem
+			return nil, err
+		}
+		src := ""
+		if ta, ok := c.RemoteAddr().(*net.TCPAddr); ok {
+			src = ta.IP.String()
+		}
+		l.mu.Lock()
+		if l.perSrc > 0 && l.bySrc != nil && l.bySrc[src] >= l.perSrc {
+			l.mu.Unlock()
+			c.Close()
+			<-l.sem
+			continue
+		}
+		if l.bySrc != nil {
+			l.bySrc[src]++
+		}
+		l.mu.Unlock()
+		return &limitConn{Conn: c, release: func() {
+			l.mu.Lock()
+			if l.bySrc != nil {
+				if l.bySrc[src]--; l.bySrc[src] <= 0 {
+					delete(l.bySrc, src)
+				}
+			}
+			l.mu.Unlock()
+			<-l.sem
+		}}, nil
 	}
-	return &limitConn{Conn: c, release: func() { <-l.sem }}, nil
 }
 
 type limitConn struct {

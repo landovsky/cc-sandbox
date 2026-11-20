@@ -12,6 +12,7 @@ import (
 	"os/user"
 	"regexp"
 	"strconv"
+	"strings"
 )
 
 // LaunchSpec is the request body (§4.1). Unknown fields are refused so a typo can't weaken it.
@@ -155,7 +156,18 @@ var (
 	ridRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_.-]{0,99}$`)
 	sidRe   = regexp.MustCompile(`^s[0-9a-z]{6,16}$`)
 	userRe  = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+	// the repo form (docs/m2c-remote-start.md §4): validated now so a later git route cannot receive a bad value
+	repoRe = regexp.MustCompile(`^github\.com/[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
+	refRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$`)
 )
+
+// validRef: a base or branch name that is safe to hand to git as ONE argv element (after --end-of-options): no
+// "..", no "//", no trailing "/" or ".lock" or ".".
+func validRef(s string) bool {
+	return refRe.MatchString(s) && !strings.Contains(s, "..") && !strings.Contains(s, "//") &&
+		!strings.HasSuffix(s, "/") && !strings.HasSuffix(s, ".lock") && !strings.HasSuffix(s, ".")
+}
 
 // ParseSpec decodes and shape-checks a LaunchSpec. It does not apply policy.
 func ParseSpec(b []byte) (*LaunchSpec, error) {
@@ -180,6 +192,11 @@ func ParseSpec(b []byte) (*LaunchSpec, error) {
 		return nil, refuse(BadSpec, "harness must be claude, got %q", s.Harness)
 	case s.Profile == "":
 		return nil, refuse(BadSpec, "profile is required")
+	}
+	if w := s.Workdir; w.Repo != "" || w.Base != "" || w.Branch != "" {
+		if !repoRe.MatchString(w.Repo) || !validRef(w.Base) || !validRef(w.Branch) {
+			return nil, refuse(BadSpec, "workdir repo/base/branch: repo github.com/<owner>/<repo>, base and branch plain ref names")
+		}
 	}
 	// One normalised realm everywhere (journal, verb queue, directory): an empty one is the
 	// production realm, and anything the verb queue would refuse is refused here, at start.

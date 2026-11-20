@@ -366,6 +366,36 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	return &rep, nil
 }
 
+// LiveByLabel are this machine's live sessions of a label (a record not ended whose pane is alive), read-only.
+func (d *Daemon) LiveByLabel(label string) ([]*Record, error) {
+	recs, err := d.records()
+	if err != nil {
+		return nil, err
+	}
+	var out []*Record
+	for _, r := range recs {
+		if r.Ended == nil && r.Spec.Label == label && d.Launcher.Alive(r.Sid) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// Seen reports whether this caller already started a session with this request_id (so a retry is answered by
+// Start's own idempotency, not refused because the label it started is now live).
+func (d *Daemon) Seen(requestID string) bool {
+	recs, err := d.records()
+	if err != nil {
+		return false
+	}
+	for _, r := range recs {
+		if r.Uid == d.Uid && (r.RequestID == requestID || contains(r.RequestIDs, requestID)) {
+			return true
+		}
+	}
+	return false
+}
+
 // Load reads one record, for `ccsbx run --sid`.
 func (d *Daemon) Load(sid string) (*Record, error) {
 	if !sidRe.MatchString(sid) {

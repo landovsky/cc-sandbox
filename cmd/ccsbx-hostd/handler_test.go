@@ -4,7 +4,9 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
@@ -16,6 +18,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
+	"github.com/landovsky/cc-sandbox/internal/remotestart"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
 	"github.com/landovsky/cc-sandbox/profiles"
@@ -315,5 +318,135 @@ func TestAHubWarningIsLoggedOncePerMessage(t *testing.T) {
 	w("another")
 	if n != 2 {
 		t.Fatalf("logged %d times, want 2", n)
+	}
+}
+
+// context (R2-C1): the cross-machine label check runs for EVERY start, a local `ccsbx start` on the unix socket
+// included. Otherwise a remote start from the Mac and a local start on hp, one second apart, would both launch the
+// same label, and the reservation protocol would protect nothing.
+func TestALocalStartAsksThePeersToo(t *testing.T) {
+	w := wdir(t)
+	sd, p := policyFor(t, "tomas")
+	var asked []string
+	svc, err := remotestart.New(remotestart.Config{
+		Machine: "hp-ubuntu", OwnerUser: "tomas", PeerSet: "S", StateDir: t.TempDir(),
+		Peers:    []remotestart.Peer{{Name: "mac-tomas", URL: "http://mac"}},
+		Profiles: profiles.Load, LookupUID: func(string) (int, error) { return 4000, nil },
+		Starter: func(int, []byte, string) (*start.StartReply, error) { return nil, errors.New("unused") },
+		Live:    func(string) []remotestart.View { return nil },
+		AskPeer: func(_ context.Context, pe remotestart.Peer, label string) (remotestart.Answer, error) {
+			asked = append(asked, pe.Name+" "+label)
+			return remotestart.Answer{Live: []remotestart.View{{Machine: "mac-tomas", Sid: "s0there", State: "running"}}, PeerSet: "S"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startHandlerBy2(sd, p, svc)
+	_, err = h(4000, []byte(fmt.Sprintf(specOf, "tomas", w)))
+	if r, ok := err.(*start.Refusal); !ok || r.Code != start.AlreadyRunning || r.Machine != "mac-tomas" {
+		t.Fatalf("a local start of a label that is live on a peer: %v", err)
+	}
+	if len(asked) != 1 || !strings.Contains(asked[0], "cc-sandbox:x") {
+		t.Fatalf("the peer was not asked: %v", asked)
+	}
+	// nothing was recorded or launched
+	if recs, _ := os.ReadDir(filepath.Join(sd.StateDir, "sessions")); len(recs) != 0 {
+		t.Fatalf("a refused start left %d records", len(recs))
+	}
+}
+
+func remoteRig(t *testing.T) (*start.Daemon, startPolicy, *remotestart.Service) {
+	t.Helper()
+	sd, p := policyFor(t, "tomas")
+	p.RemoteMaxPerHour = 2
+	svc, err := remotestart.New(remotestart.Config{
+		Machine: "hp-ubuntu", OwnerUser: "tomas", PeerSet: "S", StateDir: t.TempDir(),
+		Profiles: profiles.Load, LookupUID: func(string) (int, error) { return 4000, nil },
+		Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
+			return startHandlerBy(sd, p, nil)(uid, spec, by)
+		},
+		Live: func(label string) []remotestart.View {
+			recs, _ := sd.LiveByLabel(label)
+			var out []remotestart.View
+			for _, r := range recs {
+				out = append(out, remotestart.View{Machine: "hp-ubuntu", Sid: r.Sid, Gen: r.Gen, State: "running"})
+			}
+			return out
+		},
+		PerUserMinute: 100, PerMachineMinute: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sd, p, svc
+}
+
+// context (M2c end to end, path form): the owner's other machine starts a session HERE; it goes through the same
+// start as a local one (profile, worktree root, pins), is recorded with who asked, and a retry after a lost answer
+// is the same session.
+func TestARemoteStartIsRecordedWithWhoAskedAndRetriesAreIdempotent(t *testing.T) {
+	w := wdir(t)
+	sd, _, svc := remoteRig(t)
+	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac-tomas.example.ts.net"}
+	body := []byte(fmt.Sprintf(specOf, "tomas", w))
+	rep, ref := svc.Start(context.Background(), me, body)
+	if ref != nil {
+		t.Fatalf("%v", ref)
+	}
+	rec, err := sd.Load(rep.Sid)
+	if err != nil || rec.StartedBy != me.StartedBy {
+		t.Fatalf("the record does not say who asked: %+v %v", rec, err)
+	}
+	again, ref := svc.Start(context.Background(), me, body)
+	if ref != nil || again.Sid != rep.Sid {
+		t.Fatalf("a retry started a second session: %v %v", again, ref)
+	}
+	// a path outside the worktree root is refused exactly as a local start refuses it (nothing remote widens it)
+	out := []byte(fmt.Sprintf(specOf, "tomas", "/etc"))
+	out = []byte(strings.Replace(string(out), `"r1"`, `"r2"`, 1))
+	out = []byte(strings.Replace(string(out), "cc-sandbox:x", "cc-sandbox:y", 1))
+	if _, ref := svc.Start(context.Background(), me, out); ref == nil || ref.Code != start.BadSpec {
+		t.Fatalf("a remote workdir outside the worktree root: %v", ref)
+	}
+}
+
+// context (C2): a remote caller may resume only a session it started; the owner's local sessions, and another
+// device's, are not its to take over.
+func TestARemoteCallerCannotResumeASessionItDidNotStart(t *testing.T) {
+	w := wdir(t)
+	sd, _, svc := remoteRig(t)
+	a := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
+	b := remotestart.Caller{StartedBy: "owner:tomas@example.com@old-laptop", Machine: "laptop"}
+	rep, ref := svc.Start(context.Background(), a, []byte(fmt.Sprintf(specOf, "tomas", w)))
+	if ref != nil {
+		t.Fatal(ref)
+	}
+	sd.Launcher = start.NoLauncher{}
+	resume := strings.Replace(fmt.Sprintf(specOf, "tomas", w), `"request_id":"r1"`, `"request_id":"r2","resume":{"sid":"`+rep.Sid+`"}`, 1)
+	if _, ref := svc.Start(context.Background(), b, []byte(resume)); ref == nil || ref.Code != start.ResumeNotYours {
+		t.Fatalf("another device resumed it: %v", ref)
+	}
+}
+
+// context (C8): the remote hourly budget is its own: using it up leaves the owner's local starts alone, and the
+// other way round.
+func TestTheRemoteHourlyBudgetIsSeparateFromTheLocalOne(t *testing.T) {
+	w := wdir(t)
+	sd, p, svc := remoteRig(t)
+	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
+	label := func(i int) string {
+		return strings.NewReplacer(`"r1"`, fmt.Sprintf(`"r%d"`, i), "cc-sandbox:x", fmt.Sprintf("cc-sandbox:x%d", i)).Replace(fmt.Sprintf(specOf, "tomas", w))
+	}
+	for i := 1; i <= 2; i++ {
+		if _, ref := svc.Start(context.Background(), me, []byte(label(i))); ref != nil {
+			t.Fatalf("remote start %d: %v", i, ref)
+		}
+	}
+	if _, ref := svc.Start(context.Background(), me, []byte(label(3))); ref == nil || ref.Code != start.RateCapped {
+		t.Fatalf("the 3rd remote start in the hour: %v", ref)
+	}
+	if _, err := startHandler(sd, p)(4000, []byte(label(4))); err != nil {
+		t.Fatalf("a LOCAL start was refused because remote starts used up the remote budget: %v", err)
 	}
 }

@@ -88,6 +88,7 @@ type Config struct {
 	Now              func() time.Time
 	Rand             func(n int) int
 	HTTP             *http.Client
+	Logf             func(string, ...any) // the daemon's log (a failed start's real error goes here, never to the caller)
 }
 
 // Service is the remote start.
@@ -138,6 +139,9 @@ func New(c Config) (*Service, error) {
 	return s, nil
 }
 
+// PeerSet is the hash of the set of machines this daemon is configured with (every daemon must agree).
+func (s *Service) PeerSet() string { return s.c.PeerSet }
+
 // PeerSetHash is the identity of the shared list of machines: every daemon must be configured with the same set.
 func PeerSetHash(machines []string) string {
 	l := append([]string(nil), machines...)
@@ -161,6 +165,8 @@ func Status(code string) int {
 		return 415
 	case start.BillingUnavailable, start.ImageNotPinned, start.WrongMachine, start.RequestIDReused, start.NotBuilt:
 		return 422
+	case Internal:
+		return 500
 	}
 	return 400 // bad_spec and anything unnamed
 }
@@ -261,11 +267,15 @@ func (s *Service) policy(spec *start.LaunchSpec, p *profile.Profile) *start.Refu
 	return nil
 }
 
+// Internal is the code of a start that failed for a reason that is not the caller's: the message says nothing of
+// it (the daemon's log has it), because an error text can carry paths and request content.
+const Internal = "internal"
+
 func asRefusal(err error) *start.Refusal {
 	if r, ok := err.(*start.Refusal); ok {
 		return r
 	}
-	return refusal(start.BadSpec, "%v", err)
+	return refusal(Internal, "the start failed on this machine (see the daemon's log)")
 }
 
 // ---- rates ----
@@ -532,6 +542,9 @@ func (s *Service) Guard(ctx context.Context, label, requestID, startedBy string,
 	close(stop)
 	<-renewed
 	if err != nil {
+		if _, ok := err.(*start.Refusal); !ok && s.c.Logf != nil {
+			s.c.Logf("remote start of %s failed: %v", label, err)
+		}
 		return nil, asRefusal(err)
 	}
 	return rep, nil

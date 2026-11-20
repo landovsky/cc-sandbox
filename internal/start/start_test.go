@@ -598,3 +598,32 @@ func TestHelperModeRefusesAGitdirOutsideTheWorktreeRoots(t *testing.T) {
 		t.Fatalf("%v", err)
 	}
 }
+
+// context (docs/m2c-remote-start.md §4): the repo form is refused not_built until the git route exists, but its
+// values are validated NOW, at parse time, so that route can never receive an option, a path or a revision
+// range in place of a name.
+func TestTheRepoFormIsValidatedAtParseTimeBlock(t *testing.T) {
+	spec := func(repo, base, branch string) []byte {
+		return []byte(fmt.Sprintf(`{"v":1,"request_id":"r1","owner":"tomas","machine":"hp-ubuntu","label":"cc-sandbox:x","harness":"claude","profile":"dev-default","billing":"api","workdir":{"repo":%q,"base":%q,"branch":%q}}`, repo, base, branch))
+	}
+	if _, err := ParseSpec(spec("github.com/landovsky/cc-sandbox", "main", "ccsbx/326q")); err != nil {
+		t.Fatalf("a good repo form: %v", err)
+	}
+	for name, c := range map[string][3]string{
+		"a base that is an option":    {"github.com/a/b", "--upload-pack=x", "br"},
+		"a branch that is an option":  {"github.com/a/b", "main", "-b"},
+		"a revision range":            {"github.com/a/b", "a..b", "br"},
+		"a doubled slash":             {"github.com/a/b", "main", "x//y"},
+		"a lock suffix":               {"github.com/a/b", "main", "x.lock"},
+		"a trailing slash":            {"github.com/a/b", "main/", "br"},
+		"an @{ reflog form":           {"github.com/a/b", "main@{1}", "br"},
+		"a repo that is another host": {"gitlab.com/a/b", "main", "br"},
+		"a repo that is a url":        {"https://github.com/a/b", "main", "br"},
+		"a repo with a path escape":   {"github.com/../b", "main", "br"},
+		"an empty base":               {"github.com/a/b", "", "br"},
+	} {
+		if _, err := ParseSpec(spec(c[0], c[1], c[2])); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}

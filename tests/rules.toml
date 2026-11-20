@@ -1677,3 +1677,13 @@ block = "tests/go-test.sh ./internal/side 'TestRefusesAnAddressThatWidensWhatThe
 invariants = [12]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "side-outbox-relay-file-checks"
+title = "the sidecar reads the fence's outbox with the daemon's file checks, stamps identity itself, never replays, and sheds a flood"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/side 'TestRelayStampsIdentityFromTheSidecarNotTheFile$'"
+block = "tests/go-test.sh ./internal/side 'TestRelayRefusesWhatTheOutboxChecksRefuse$|TestRelayRefusesAFileThatIsNotTheFencesOwn$|TestRelayDoesNotReplayAfterARestart$|TestRelayScansTwiceForwardOnce$|TestRelayShedsAFlood$|TestRelayLifetimeCap$|TestRelayNeedsAnIdentityAndAnUpstream$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"

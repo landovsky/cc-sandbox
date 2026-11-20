@@ -74,6 +74,7 @@ Step 8 in detail (changed after the PR #2 review):
 - P15's file is read from the owner's home, not root's (`plan` prints the path).
 - `install` prints `DONE` only after hostd and the signer are really up (it waits up to 10 s). A
   crash-looping hostd gives `NOT DONE` and the undo hint, not a false DONE;
+- known limit after the gate: hostd has no `--ccmsg-bin` (uid `ccsbx` cannot use the owner's bus sockets), so fenced to unfenced-manager messages wait for the hub spoke (B10/B11/M2b);
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)

@@ -55,6 +55,9 @@ type Spec struct {
 	Uid          int  // the host user who owns the session (record uid); the gitdir must be theirs
 	// Chown makes a helper-mode directory the fence's; nil means os.Lchown. Tests replace it.
 	Chown func(path string, uid, gid int) error
+	// Seccomp, when set, is the path of the seccomp profile docker runs the fence with (ccsbx-root
+	// sets it to a verified profile that refuses setuid/setgid chmod); "" means docker's default.
+	Seccomp string
 	// Class is "e2e" or "prod": part of the home's key.
 	Class string
 	// MountWorkdir and MountGitDir, when set, are the host paths docker mounts instead of Workdir and
@@ -122,6 +125,9 @@ func (s Spec) RunArgs() []string {
 		// The environment is explicit and short: no host env is inherited.
 		"-e", "HOME=/home/agent", "-e", "CCSBX_SID="+s.Sid, "-e", "CCSBX_GEN="+strconv.Itoa(s.Gen),
 	)
+	if s.Seccomp != "" {
+		a = append(a, "--security-opt", "seccomp="+s.Seccomp)
+	}
 	if s.TTY {
 		a = append(a, "-it")
 	} else {

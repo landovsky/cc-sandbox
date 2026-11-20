@@ -29,6 +29,7 @@ type Config struct {
 	Docker, Tmux string   // absolute binaries
 	TmuxSocket   string   // the service uid's tmux socket
 	PinsFile     string
+	SeccompFile  string // the fence's seccomp profile (Docker's default plus the setid rule), root-owned
 	ServiceUser  string // the uid hostd and the panes run as
 	Machine      string
 	BaseURL      string // the forwarder's model route written into managed settings
@@ -46,13 +47,13 @@ func Defaults() Config {
 		Verbs:    append([]string(nil), Verbs...),
 		StateDir: "/var/lib/ccsbx", RunDir: "/var/lib/ccsbx-run",
 		Docker: "/usr/bin/docker", Tmux: "/usr/bin/tmux", TmuxSocket: "/run/ccsbx/tmux.sock",
-		PinsFile: "/etc/ccsbx/pins.toml", ServiceUser: "ccsbx", BaseURL: "http://fwd:8080", MinUID: 1000,
+		PinsFile: "/etc/ccsbx/pins.toml", SeccompFile: "/etc/ccsbx/seccomp.json", ServiceUser: "ccsbx", BaseURL: "http://fwd:8080", MinUID: 1000,
 	}
 }
 
 var configKeys = map[string]bool{
 	"allowed_roots": true, "verbs": true, "state_dir": true, "run_dir": true, "docker": true, "tmux": true,
-	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true, "min_uid": true,
+	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true, "min_uid": true, "seccomp_profile": true,
 }
 
 // LoadConfig reads and validates the file. The file and its directory must be owned by trustedUID
@@ -114,7 +115,7 @@ func LoadConfig(path string, trustedUID int) (*Config, error) {
 		return out, true, nil
 	}
 	for k, dst := range map[string]*string{"state_dir": &c.StateDir, "run_dir": &c.RunDir, "docker": &c.Docker, "tmux": &c.Tmux,
-		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "service_user": &c.ServiceUser, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
+		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "seccomp_profile": &c.SeccompFile, "service_user": &c.ServiceUser, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
 		if err := str(k, dst); err != nil {
 			return nil, err
 		}
@@ -175,7 +176,7 @@ func (c *Config) validate(roots []string) error {
 			return fmt.Errorf("unknown verb %q", v)
 		}
 	}
-	for name, p := range map[string]string{"state_dir": c.StateDir, "run_dir": c.RunDir, "docker": c.Docker, "tmux": c.Tmux, "tmux_socket": c.TmuxSocket, "pins_file": c.PinsFile} {
+	for name, p := range map[string]string{"state_dir": c.StateDir, "run_dir": c.RunDir, "docker": c.Docker, "tmux": c.Tmux, "tmux_socket": c.TmuxSocket, "pins_file": c.PinsFile, "seccomp_profile": c.SeccompFile} {
 		if err := backend.CheckPath(p); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}

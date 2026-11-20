@@ -17,6 +17,7 @@ import (
 	"testing"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
+	"github.com/landovsky/cc-sandbox/internal/seccomp"
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
@@ -47,6 +48,14 @@ type bindCall struct {
 	ino      uint64
 	target   string
 	readonly bool
+}
+
+// stripCall records a setid strip: which directory, for which owner, and how many mounts had been
+// made when it ran (it must be before the first).
+type stripCall struct {
+	ino   uint64
+	owner int
+	binds int
 }
 
 type fakeMounter struct {
@@ -111,6 +120,8 @@ type fx struct {
 	rec               *start.Record
 	env               map[string]string
 	mounter           *fakeMounter
+	strips            []stripCall
+	stripErr          error
 	execs             []execCall
 	dropped           [][2]int
 	dropErr           error
@@ -160,6 +171,7 @@ func newFx(t *testing.T) *fx {
 	mk(t, filepath.Join(f.state, "sessions"), 0o700)
 	mk(t, filepath.Join(f.dir, "bin"), 0o755)
 	mk(t, filepath.Join(f.dir, "etc"), 0o755)
+	put(t, filepath.Join(f.dir, "etc", "seccomp.json"), goodProfile(t), 0o644)
 	put(t, filepath.Join(f.dir, "bin", "docker"), "#!/bin/sh\n", 0o755)
 	put(t, filepath.Join(f.dir, "bin", "tmux"), "#!/bin/sh\n", 0o755)
 	put(t, filepath.Join(f.dir, "etc", "pins.toml"), "[[pin]]\nref = \""+goodImage+"\"\ncc = \"2.1.0\"\n", 0o644)
@@ -174,8 +186,8 @@ func newFx(t *testing.T) *fx {
 
 func (f *fx) writeConfig(extra string) {
 	f.t.Helper()
-	body := fmt.Sprintf("allowed_roots = [%q]\nstate_dir = %q\nrun_dir = %q\ndocker = %q\ntmux = %q\ntmux_socket = \"/run/ccsbx/tmux.sock\"\npins_file = %q\nmachine = \"hp-ubuntu\"\n%s%s",
-		f.roots, f.state, f.run, filepath.Join(f.dir, "bin", "docker"), filepath.Join(f.dir, "bin", "tmux"), filepath.Join(f.dir, "etc", "pins.toml"), minUID(extra), extra)
+	body := fmt.Sprintf("allowed_roots = [%q]\nstate_dir = %q\nrun_dir = %q\ndocker = %q\ntmux = %q\ntmux_socket = \"/run/ccsbx/tmux.sock\"\npins_file = %q\nseccomp_profile = %q\nmachine = \"hp-ubuntu\"\n%s%s",
+		f.roots, f.state, f.run, filepath.Join(f.dir, "bin", "docker"), filepath.Join(f.dir, "bin", "tmux"), filepath.Join(f.dir, "etc", "pins.toml"), filepath.Join(f.dir, "etc", "seccomp.json"), minUID(extra), extra)
 	p := filepath.Join(f.dir, "etc", "ccsbx-root.toml")
 	put(f.t, p, body, 0o644)
 	cfg, err := LoadConfig(p, os.Getuid())
@@ -192,6 +204,11 @@ func (f *fx) writeConfig(extra string) {
 			return svcUID, svcGID, nil
 		},
 		OpenDir: OpenDir, Mounter: f.mounter,
+		Strip: func(root *os.File, owner int, _ func(string, ...any)) (int, error) {
+			st, _ := root.Stat()
+			f.strips = append(f.strips, stripCall{st.Sys().(*syscall.Stat_t).Ino, owner, len(f.mounter.binds)})
+			return 0, f.stripErr
+		},
 		HomeOf:     func(uid int) (string, error) { return filepath.Join(f.dir, "home"), nil },
 		NewBackend: func(docker string, m Mounter) Backend { f.fb.docker = docker; return f.fb },
 		DropPrivs: func(uid, gid int) error {
@@ -913,5 +930,76 @@ func TestStagedGitdirIsCheckedForOwnershipAndMode(t *testing.T) {
 	}
 	if c, out := f.call("run", sid); c != 2 || !strings.Contains(out, "world-writable") || f.fb.staged {
 		t.Errorf("%d %s", c, out)
+	}
+}
+
+func goodProfile(t *testing.T) string {
+	t.Helper()
+	b, err := seccomp.Overlay([]byte(`{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["read"],"action":"SCMP_ACT_ALLOW"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// ---- S2: the fence's seccomp profile and the host's setid strip ----
+
+func TestRunUsesTheVerifiedSeccompProfile(t *testing.T) {
+	f := newFx(t)
+	if c, out := f.call("run", sid); c != 7 || f.fb.ran[0].Seccomp != f.cfg.SeccompFile {
+		t.Fatalf("%d %s %q", c, out, f.fb.ran[0].Seccomp)
+	}
+}
+
+func TestRunRefusesWithoutAGoodSeccompProfile(t *testing.T) {
+	cases := map[string]func(f *fx){
+		"no profile installed":             func(f *fx) { os.Remove(f.cfg.SeccompFile) },
+		"a world-writable profile":         func(f *fx) { os.Chmod(f.cfg.SeccompFile, 0o666) },
+		"a profile that allows by default": func(f *fx) { put(f.t, f.cfg.SeccompFile, `{"defaultAction":"SCMP_ACT_ALLOW"}`, 0o644) },
+		"docker's default alone (no setid rule)": func(f *fx) {
+			put(f.t, f.cfg.SeccompFile, `{"defaultAction":"SCMP_ACT_ERRNO","syscalls":[{"names":["chmod"],"action":"SCMP_ACT_ALLOW"}]}`, 0o644)
+		},
+	}
+	for why, mod := range cases {
+		f := newFx(t)
+		mod(f)
+		f.wantRefused(why, "run", sid)
+	}
+}
+
+// Before the new generation's mounts, the worktree is cleaned of what the last one left.
+func TestRunStripsSetidBitsBeforeStaging(t *testing.T) {
+	f := newFx(t)
+	wst, _ := os.Stat(f.wd)
+	if c, out := f.call("run", sid); c != 7 {
+		t.Fatalf("%d %s", c, out)
+	}
+	if len(f.strips) != 1 || f.strips[0].ino != wst.Sys().(*syscall.Stat_t).Ino || f.strips[0].owner != os.Getuid() || f.strips[0].binds != 0 {
+		t.Errorf("%+v (must be the workdir, for its owner, before any mount)", f.strips)
+	}
+	f2 := newFx(t)
+	f2.stripErr = fmt.Errorf("boom")
+	if c, _ := f2.call("run", sid); c == 7 || f2.fb.staged {
+		t.Error("the fence started although the strip failed")
+	}
+}
+
+func TestStopAndGcStripSetidBits(t *testing.T) {
+	f := newFx(t)
+	if c, out := f.call("stop", sid); c != 0 || len(f.strips) != 1 {
+		t.Fatalf("stop: %d %s %+v", c, out, f.strips)
+	}
+	f.stripErr = fmt.Errorf("boom")
+	if c, _ := f.call("stop", sid); c != 1 {
+		t.Errorf("a failed strip at stop was reported as success: %d", c)
+	}
+	g := newFx(t)
+	g.fb.orphans = []backend.Orphan{{Kind: "container", Name: "ccsbx-" + sid + "-g1", Sid: sid, Gen: 1}, {Kind: "network", Name: "ccsbx-net-" + sid + "-g1", Sid: sid, Gen: 1}}
+	if c, out := g.call("gc"); c != 0 || len(g.strips) != 1 {
+		t.Fatalf("gc: %d %s %+v (one strip per session)", c, out, g.strips)
+	}
+	g.stripErr = fmt.Errorf("boom")
+	if c, _ := g.call("gc"); c != 1 {
+		t.Error("a failed strip at gc was reported as success")
 	}
 }

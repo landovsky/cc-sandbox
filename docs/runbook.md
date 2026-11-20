@@ -122,6 +122,16 @@
   `ccsbx-clients`, `/var/lib/ccsbx` (the journal) and the keys directory (`--purge-keys` deletes the
   keys and `ccsbx-keys`: rotate M9 first). `--backup DIR` must be under `/var/backups/ccsbx-install/`,
   root-owned and not group- or world-writable.
+- **Seccomp profile for `ccsbx-root run` (Gate M step).** `ccsbx-root run` refuses to start a fence
+  without `/etc/ccsbx/seccomp.json`: Docker's default profile plus the rule that refuses setuid and
+  setgid `chmod`. Build it from the default profile of the installed docker version:
+  `ccsbx seccomp-profile --base default.json --out /tmp/seccomp.json`, then
+  `sudo install -o root -g root -m 0644 /tmp/seccomp.json /etc/ccsbx/seccomp.json`. Check with
+  `tests/seccomp-setuid-test.sh --base default.json --image <pinned fence image>` (needs docker).
+- **Real bind-mount test (Gate M).** `sudo unshare -m go test -tags rootmount -run TestRealMounter ./internal/rootcmd`.
+- **Known: orphaned direct-mode homes.** The node home is now keyed by owner, class and label, so
+  homes made by direct mode before this change are not found again: `--resume` of such a session
+  starts without its old transcript. Nothing important lives there yet; they can be deleted by hand.
 
 ## 4. Night auto-start and stop
 <!-- procedure: NB4 -->

@@ -16,7 +16,9 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/pins"
+	"github.com/landovsky/cc-sandbox/internal/seccomp"
 	"github.com/landovsky/cc-sandbox/internal/settings"
+	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/profiles"
 )
 
@@ -166,11 +168,15 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	if err := e.ensureRunDir(); err != nil {
 		return 0, err
 	}
+	seccompFile, err := e.seccomp()
+	if err != nil {
+		return 0, err
+	}
 	spec := backend.Spec{
 		Sid: rec.Sid, Label: rec.Label, Gen: rec.Gen, Image: image, StateDir: e.cfg.RunDir,
 		Workdir: wd, GitDir: gd, Uid: rec.Uid, WorktreeRoot: root,
 		MemoryMB: p.MemoryMB, Pids: p.Pids, Cmd: append([]string{"claude"}, extra...), TTY: tty,
-		NotEvid: false, Chown: e.d.Chown, Class: backend.ClassOf(p.E2E),
+		NotEvid: false, Chown: e.d.Chown, Class: backend.ClassOf(p.E2E), Seccomp: seccompFile,
 	}
 	// docker mounts these root-owned staging paths, not the owner's paths
 	spec.MountWorkdir = filepath.Join(spec.GenDir(), "wt")
@@ -186,6 +192,10 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 // directories onto them: nosuid, nodev, the gitdir read-only. The gitdir's ownership and mode
 // walk then runs on the staged mount, which is the inode that will be mounted into the fence.
 func (e *env) stage(s backend.Spec, w, g *pinned) (func(), error) {
+	// before the new generation sees the worktree: whatever the last one left with a setid bit
+	if _, err := e.d.Strip(w.f, s.Uid, e.logf); err != nil {
+		return nil, fmt.Errorf("clearing setid bits in the workdir: %w", err)
+	}
 	var undo []func()
 	rollback := func() {
 		for i := len(undo) - 1; i >= 0; i-- {
@@ -261,6 +271,10 @@ func (e *env) stopCmd() *cli.Command {
 				return fail(stderr, "stop", err)
 			}
 			fmt.Fprintf(stdout, "stopped %s g%d\n", rec.Sid, rec.Gen)
+			if err := e.stripSession(rec); err != nil {
+				fmt.Fprintf(stderr, "ccsbx-root stop: the container is gone, but the workdir was not cleaned of setid bits: %v\n", err)
+				return cli.ExitFail
+			}
 			return cli.ExitOK
 		},
 	}
@@ -303,6 +317,26 @@ func (e *env) gcCmd() *cli.Command {
 				return fail(stderr, "gc", err)
 			}
 			fmt.Fprintf(stdout, "removed %d orphan(s)\n", len(orphans))
+			failed := false
+			seen := map[string]bool{}
+			for _, o := range orphans {
+				if seen[o.Sid] {
+					continue
+				}
+				seen[o.Sid] = true
+				w, _ := e.prelude("gc")
+				rec, err := loadRecord(e.cfg.StateDir, o.Sid, w.service, e.cfg.TrustedUID)
+				if err == nil {
+					err = e.stripSession(rec)
+				}
+				if err != nil {
+					fmt.Fprintf(stderr, "ccsbx-root gc: session %s: workdir not cleaned of setid bits: %v\n", o.Sid, err)
+					failed = true
+				}
+			}
+			if failed {
+				return cli.ExitFail
+			}
 			return cli.ExitOK
 		},
 	}
@@ -364,4 +398,46 @@ func (d *dockerBackend) Orphans(runDir, sessions string) ([]backend.Orphan, erro
 }
 func (d *dockerBackend) Reap(runDir string, o []backend.Orphan) error {
 	return d.runner("").Reap(runDir, o)
+}
+
+// logf is the audit line for each file whose setid bits were cleared.
+func (e *env) logf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "ccsbx-root: "+format+"\n", a...)
+}
+
+// seccomp returns the verified seccomp profile the fence runs with. Without one that is root-owned
+// and carries the rule that refuses setuid/setgid chmod, the fence does not start.
+func (e *env) seccomp() (string, error) {
+	p := e.cfg.SeccompFile
+	if err := trustedFile(p, e.cfg.TrustedUID, true); err != nil {
+		return "", refuse("seccomp profile %s: %v (build it with: ccsbx seccomp-profile --base <docker default.json>)", p, err)
+	}
+	b, err := os.ReadFile(p)
+	if err != nil {
+		return "", refuse("seccomp profile: %v", err)
+	}
+	if err := seccomp.Verify(b); err != nil {
+		return "", refuse("%v", err)
+	}
+	return p, nil
+}
+
+// stripSession clears setid bits in a session's workdir after its fence is gone (stop, gc). The
+// workdir is re-validated like any other: a path that no longer passes is reported, not walked.
+func (e *env) stripSession(rec *start.Record) error {
+	home, err := e.d.HomeOf(rec.Uid)
+	if err != nil {
+		return err
+	}
+	wd, _, err := e.cfg.workdir(rec.Spec.Workdir.Path, rec.Uid, home)
+	if err != nil {
+		return err
+	}
+	pw, err := pin(e.d.OpenDir, wd, rec.Uid)
+	if err != nil {
+		return err
+	}
+	defer pw.close()
+	_, err = e.d.Strip(pw.f, rec.Uid, e.logf)
+	return err
 }

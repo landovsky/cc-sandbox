@@ -9,6 +9,7 @@
 package backend
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -829,5 +830,81 @@ func TestHelperRunSweepsTheHomeInGo(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(s.HomeDir(), ".bashrc")); err == nil {
 		t.Error("the steering file is still in the home")
+	}
+}
+
+// S2 host layer: a fence that left a setuid or setgid file in the worktree has the bits cleared,
+// by walking with directory fds, without following links and without touching the owner's own files.
+func TestStripSetidClearsPlantedBits(t *testing.T) {
+	d := vt(t)
+	os.MkdirAll(filepath.Join(d, "a", "b"), 0o755)
+	planted := []string{"x", "a/y", "a/b/z"}
+	for _, p := range planted {
+		os.WriteFile(filepath.Join(d, p), []byte("#!/bin/sh\n"), 0o755)
+		os.Chmod(filepath.Join(d, p), os.ModeSetuid|os.ModeSetgid|0o755)
+	}
+	os.WriteFile(filepath.Join(d, "mine"), nil, 0o755)
+	os.Chmod(filepath.Join(d, "mine"), os.ModeSetuid|0o755)
+	outside := filepath.Join(vt(t), "target")
+	os.WriteFile(outside, nil, 0o755)
+	os.Chmod(outside, os.ModeSetuid|0o755)
+	os.Symlink(outside, filepath.Join(d, "link"))
+	os.Symlink(filepath.Dir(outside), filepath.Join(d, "dirlink"))
+	os.MkdirAll(filepath.Join(d, "sgdir"), 0o755)
+	os.Chmod(filepath.Join(d, "sgdir"), os.ModeSetgid|0o755)
+	root, err := os.Open(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	// "owner" is someone else, so every file of this test user counts as planted by the fence...
+	var logged []string
+	n, err := StripSetid(root, os.Getuid()+1, func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) })
+	if err != nil || n != 4 { // x, a/y, a/b/z and mine
+		t.Fatalf("cleared %d: %v", n, err)
+	}
+	for _, p := range append(planted, "mine") {
+		if st, _ := os.Stat(filepath.Join(d, p)); st.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
+			t.Errorf("%s still has a setid bit", p)
+		}
+	}
+	if len(logged) != 4 || !strings.Contains(logged[0], "cleared setuid/setgid") {
+		t.Errorf("not every change was logged: %q", logged)
+	}
+	if st, _ := os.Stat(outside); st.Mode()&os.ModeSetuid == 0 {
+		t.Error("the sweep followed a symlink out of the worktree")
+	}
+	if st, _ := os.Stat(filepath.Join(d, "sgdir")); st.Mode()&os.ModeSetgid == 0 {
+		t.Error("a directory's setgid bit was cleared (only regular files are)")
+	}
+	if st, _ := os.Stat(filepath.Join(d, "x")); st.Mode().Perm() != 0o755 {
+		t.Errorf("the other mode bits changed: %v", st.Mode())
+	}
+}
+
+// The owner's own files are left alone: a setuid binary the owner built is theirs to keep.
+func TestStripSetidLeavesTheOwnersFiles(t *testing.T) {
+	d := vt(t)
+	os.WriteFile(filepath.Join(d, "mine"), nil, 0o755)
+	os.Chmod(filepath.Join(d, "mine"), os.ModeSetuid|0o755)
+	root, _ := os.Open(d)
+	defer root.Close()
+	if n, err := StripSetid(root, os.Getuid(), nil); err != nil || n != 0 {
+		t.Fatalf("%d %v", n, err)
+	}
+	if st, _ := os.Stat(filepath.Join(d, "mine")); st.Mode()&os.ModeSetuid == 0 {
+		t.Error("the owner's own setuid file was changed")
+	}
+}
+
+// Run's seccomp flag is present only when a profile is given.
+func TestRunArgsSeccomp(t *testing.T) {
+	s := spec(t)
+	if has(s.RunArgs(), "--security-opt", "seccomp=/etc/ccsbx/seccomp.json") {
+		t.Error("a seccomp flag without a profile")
+	}
+	s.Seccomp = "/etc/ccsbx/seccomp.json"
+	if !has(s.RunArgs(), "--security-opt", "seccomp=/etc/ccsbx/seccomp.json") {
+		t.Errorf("%v", s.RunArgs())
 	}
 }

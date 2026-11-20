@@ -62,6 +62,8 @@ type Deps struct {
 	// OpenDir opens a directory without following any symlink; Mounter stages it; HomeOf is a
 	// user's passwd home (for the hidden-directory rule, independent of HOME).
 	OpenDir func(path string) (*os.File, error)
+	// Strip clears setuid/setgid bits a fence left in a worktree (backend.StripSetid).
+	Strip   func(root *os.File, owner int, logf func(string, ...any)) (int, error)
 	Mounter Mounter
 	HomeOf  func(uid int) (string, error)
 }
@@ -168,7 +170,7 @@ func Real(getenv func(string) string) *Deps {
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
 		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
-		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid,
 	}
 }
 

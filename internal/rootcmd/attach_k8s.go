@@ -16,40 +16,58 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
+// k8sCtx is everything a pod verb needs once the record and the files have been checked: where
+// kubectl is, who to become, and the cluster connection (server and CA from the root-owned file).
+type k8sCtx struct {
+	kubectl          string
+	keysUID, keysGID int
+	conn             *k8s.ConnConfig
+}
+
+// k8sSetup is the part every pod verb shares. Nothing here runs kubectl or reads the token: it
+// checks, as root, that everything the keys user is about to read is something the owner cannot
+// change, and that the keys user is not the caller, the record's owner or the service user.
+func (e *env) k8sSetup(w who, rec *start.Record) (*k8sCtx, error) {
+	kubectl, err := e.cfg.binary(e.cfg.Kubectl)
+	if err != nil {
+		return nil, err
+	}
+	keysUID, keysGID, err := e.d.LookupUser(e.cfg.KeysUser)
+	if err != nil {
+		return nil, refuse("keys user %s: %v", e.cfg.KeysUser, err)
+	}
+	if keysUID == w.uid || keysUID == w.service || keysUID == rec.Uid {
+		return nil, refuse("keys user %s must be neither the caller nor the service user", e.cfg.KeysUser)
+	}
+	if err := trustedFile(e.cfg.K8sConn, e.cfg.TrustedUID, true); err != nil {
+		return nil, refuse("k8s connection file: %v", err)
+	}
+	conn, err := k8s.LoadConnConfig(e.cfg.K8sConn)
+	if err != nil {
+		return nil, refuse("k8s connection file: %v", err)
+	}
+	if err := trustedFile(conn.CAFile, e.cfg.TrustedUID, true); err != nil {
+		return nil, refuse("cluster CA: %v", err)
+	}
+	for name, p := range map[string]string{"kubeconfig": e.cfg.Kubeconfig, "launcher token": conn.TokenFile} {
+		if err := keysFile(p, keysUID, e.cfg.TrustedUID); err != nil {
+			return nil, refuse("%s %s: %v", name, p, err)
+		}
+	}
+	return &k8sCtx{kubectl: kubectl, keysUID: keysUID, keysGID: keysGID, conn: conn}, nil
+}
+
 func (e *env) attachK8s(w who, rec *start.Record) error {
 	if rec.PodUID == "" {
 		return refuse("session %s has no pod UID recorded, so its pod cannot be told from another under the same name", rec.Sid)
 	}
-	kubectl, err := e.cfg.binary(e.cfg.Kubectl)
+	kc, err := e.k8sSetup(w, rec)
 	if err != nil {
 		return err
 	}
-	keysUID, keysGID, err := e.d.LookupUser(e.cfg.KeysUser)
-	if err != nil {
-		return refuse("keys user %s: %v", e.cfg.KeysUser, err)
-	}
-	if keysUID == w.uid || keysUID == w.service || keysUID == rec.Uid {
-		return refuse("keys user %s must be neither the caller nor the service user", e.cfg.KeysUser)
-	}
-	// what kubectl reads, as the keys user, must not be something the owner can change
-	if err := trustedFile(e.cfg.K8sConn, e.cfg.TrustedUID, true); err != nil {
-		return refuse("k8s connection file: %v", err)
-	}
-	conn, err := k8s.LoadConnConfig(e.cfg.K8sConn)
-	if err != nil {
-		return refuse("k8s connection file: %v", err)
-	}
-	if err := trustedFile(conn.CAFile, e.cfg.TrustedUID, true); err != nil {
-		return refuse("cluster CA: %v", err)
-	}
-	for name, p := range map[string]string{"kubeconfig": e.cfg.Kubeconfig, "launcher token": conn.TokenFile} {
-		if err := keysFile(p, keysUID, e.cfg.TrustedUID); err != nil {
-			return refuse("%s %s: %v", name, p, err)
-		}
-	}
 	b := k8s.NewBackend(nil, nil, k8s.DefaultConfig())
 	b.Cfg.Namespace = e.cfg.K8sNamespace
-	b.Kubectl, b.Kubeconfig, b.Server, b.CAFile = kubectl, e.cfg.Kubeconfig, conn.Server, conn.CAFile
+	b.Kubectl, b.Kubeconfig, b.Server, b.CAFile = kc.kubectl, e.cfg.Kubeconfig, kc.conn.Server, kc.conn.CAFile
 	argv, err := b.AttachArgv(rec.Sid, rec.Gen) // the pod name is derived from sid and generation here
 	if err != nil {
 		return refuse("%v", err)
@@ -59,11 +77,14 @@ func (e *env) attachK8s(w who, rec *start.Record) error {
 		term = "xterm-256color"
 	}
 	env := []string{"PATH=/usr/bin:/bin", "HOME=/nonexistent", "LANG=C.UTF-8", "TERM=" + term}
-	if err := e.d.DropPrivs(keysUID, keysGID); err != nil {
+	if err := e.d.DropPrivs(kc.keysUID, kc.keysGID); err != nil {
 		return fmt.Errorf("cannot become %s: %v", e.cfg.KeysUser, err)
 	}
-	// the live pod must be the one we created; this is read with the keys user's token, after the drop
-	live, err := e.d.LivePodUID(conn, e.cfg.K8sNamespace, rec.Sid, rec.Gen)
+	// The record is hostd's (it writes pod_uid), so it is believed only as far as it can be checked:
+	// the pod is looked up again by the name derived from sid and generation, with the keys user's
+	// token, and its live UID must be the recorded one. A pod someone else put under that name has
+	// another UID and never gets the owner's terminal.
+	live, err := e.d.LivePodUID(kc.conn, e.cfg.K8sNamespace, rec.Sid, rec.Gen)
 	if err != nil {
 		return fmt.Errorf("cannot read the pod of session %s: %v", rec.Sid, err)
 	}
@@ -71,7 +92,7 @@ func (e *env) attachK8s(w who, rec *start.Record) error {
 		return refuse("pod_conflict: pod %s/%s is not the pod created for session %s (UID differs); delete exactly that pod and start again",
 			e.cfg.K8sNamespace, k8s.PodName(rec.Sid, rec.Gen), rec.Sid)
 	}
-	return e.d.Exec(kubectl, argv[:], env)
+	return e.d.Exec(kc.kubectl, argv[:], env)
 }
 
 // keysFile: a regular file, in a directory, both owned by the keys user or root and writable by

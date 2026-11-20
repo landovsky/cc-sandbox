@@ -602,3 +602,19 @@ in a directory likewise], `k8s_conn` [/etc/ccsbx/k8s-conn.json, root-owned JSON 
 is exec'd the pod's live UID (read with the keys user's token) must equal the `pod_uid` the launcher recorded
 when it created the pod; otherwise: `pod_conflict`, and the owner deletes exactly the named pod. The launcher
 (not built yet) is what writes `backend` and `pod_uid`. Not run against a cluster (Gate M).
+
+## Starting a pod session (F2w)
+
+`ccsbx-hostd --root helper --pod-machines future-two` places specs for future-two as pods. hostd writes the
+record (`backend: k8s`), runs `sudo -n ccsbx-root pod-create <sid>` (one pod per generation; prints the pod's
+UID), writes `pod_uid` into the record, then `pod-load <sid>`: wait for both containers (config
+`k8s_ready_seconds`, default 120, max 600; exit 4 = never ready, nothing minted), mint the token in the
+keys-user process through the signer socket, send `{token,key}` to the sidecar on exec stdin (the live pod's
+UID must equal the recorded one first). A failed start deletes the pod by name and UID; a stop
+(`Daemon.StopPod`, generation expiry) does the same through `pod-stop`. Root config keys added: `k8s_machine`
+(future-two), `k8s_ready_seconds`, `k8s_side_image` (required), `k8s_cpu`, `k8s_ephemeral_mb`,
+`k8s_worktree_mb`, `k8s_token_hours` (8, max 12), `k8s_audiences`, `signer_socket`. The signer needs
+`--keys-peer-user ccsbx-keys --keys-peer-machines future-two`: that uid may sign only for those machines and
+only with a generation key, and they are closed to hostd's uid. Not built: resume of a pod session, the
+git clone inside the pod (F3c), a hostd revoke client (`Daemon.Revoke` is nil in hostd), a pod-aware
+`ccsbx stop`. Not run against a cluster (Gate M).

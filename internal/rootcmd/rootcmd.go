@@ -11,6 +11,8 @@
 package rootcmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -18,11 +20,13 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/k8s"
 	"github.com/landovsky/cc-sandbox/internal/start"
+	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
 // Backend is what run, stop and gc need from docker. Production wraps backend.Runner; tests pass a
@@ -75,16 +79,22 @@ type Deps struct {
 	// LivePodUID reads the UID of a session's pod from the API server (called after the drop to the
 	// keys user, who alone can read the launcher token).
 	LivePodUID func(conn *k8s.ConnConfig, namespace, sid string, gen int) (string, error)
+	// NewPod builds the pod API (REST + kubectl) and Mint the sidecar's secrets; both are used only
+	// after the drop to the keys user, who holds the token, the kubeconfig and the signer socket.
+	NewPod func(cfg *Config, kc *k8sCtx) (PodAPI, error)
+	Mint   func(ctx context.Context, cfg *Config, c token.Claims) ([]byte, error)
+	Sleep  func(time.Duration)
+	Now    func() time.Time
 }
 
 // App builds the command table for a loaded config.
 func App(cfg *Config, d *Deps, getenv func(string) string) *cli.App {
 	e := &env{cfg: cfg, d: d}
 	return &cli.App{
-		Name: "ccsbx-root", Summary: "the fixed-verb root door for the fence (U0): run stop renew gc attach exec-token",
+		Name: "ccsbx-root", Summary: "the fixed-verb root door for the fence (U0): run stop renew gc attach exec-token pod-create pod-load pod-stop",
 		Version: "dev", Getenv: getenv, EnvPrefix: "CCSBX_ROOT_",
 		Cmds: []*cli.Command{
-			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(),
+			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(), e.podCreateCmd(), e.podLoadCmd(), e.podStopCmd(),
 			e.notWired("renew", "renew the machine's credentials (needs the signer, U0b)"),
 			e.notWired("exec-token", "mint an exec token for one session (needs the signer, U0b)"),
 		},
@@ -163,14 +173,24 @@ func (e *env) sessionAny(w who, sid string) (*start.Record, error) {
 	if rec.Uid < e.cfg.MinUID || rec.Uid == w.service {
 		return nil, refuse("session %s belongs to uid %d, which is not a login user (min_uid %d, not the service user)", sid, rec.Uid, e.cfg.MinUID)
 	}
-	if rec.Spec.Machine != e.cfg.Machine {
-		return nil, refuse("session %s is for machine %q, this is %q", sid, rec.Spec.Machine, e.cfg.Machine)
+	// a pod session is placed on the pod machine (future-two), launched from this one
+	wantMachine := e.cfg.Machine
+	if rec.Backend == "k8s" {
+		wantMachine = e.cfg.K8sMachine
+	}
+	if rec.Spec.Machine != wantMachine {
+		return nil, refuse("session %s is for machine %q, this is %q", sid, rec.Spec.Machine, wantMachine)
 	}
 	return rec, nil
 }
 
 // fail turns an error into an exit code and a message.
 func fail(stderr io.Writer, verb string, err error) int {
+	var ce *codeError
+	if errors.As(err, &ce) {
+		fmt.Fprintf(stderr, "ccsbx-root %s: %s\n", verb, ce.msg)
+		return ce.code
+	}
 	if r, ok := err.(*Refusal); ok {
 		fmt.Fprintf(stderr, "ccsbx-root %s: refused: %s\n", verb, r.Msg)
 		return cli.ExitRefused
@@ -199,7 +219,7 @@ func Real(getenv func(string) string) *Deps {
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
 		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
-		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, Sleep: time.Sleep, Now: time.Now,
 	}
 }
 

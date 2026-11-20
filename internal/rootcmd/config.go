@@ -19,7 +19,7 @@ import (
 
 // Verbs is every verb there is. The config's `verbs` lists the ones that are on (and `status = "off"`
 // turns that one off by itself); nothing outside this list can be switched on.
-var Verbs = []string{"run", "stop", "renew", "gc", "attach", "exec-token", "status"}
+var Verbs = []string{"run", "stop", "renew", "gc", "attach", "exec-token", "status", "pod-create", "pod-load", "pod-stop"}
 
 // Config is the policy. TrustedUID is who must own the files root believes; it is 0 in production
 // and is never read from the file.
@@ -43,8 +43,18 @@ type Config struct {
 	K8sConn      string // root-owned JSON {server, ca_file, token_file}; the server and CA are passed to kubectl on its command line
 	KeysUser     string // the user that holds the kubeconfig and the launcher token
 	K8sNamespace string
-	MinUID       int // a session record must belong to a uid at least this large (never root or a system user)
-	TrustedUID   int
+	// the pod launcher (F2w)
+	K8sMachine      string // the machine name pod sessions are placed on (their record's spec.machine)
+	K8sReadySeconds int    // how long pod-load waits for both containers (1..600)
+	K8sSideImage    string // ghcr.io/landovsky/ccsbx@sha256:..., the sidecar image (required by pod-create)
+	K8sCPU          int
+	K8sEphemeralMB  int
+	K8sWorktreeMB   int
+	K8sTokenHours   int      // lifetime of the pod session's token (1..12)
+	K8sAudiences    []string // the token's audiences
+	SignerSocket    string   // the signer's unix socket, asked as the keys user
+	MinUID          int      // a session record must belong to a uid at least this large (never root or a system user)
+	TrustedUID      int
 }
 
 // DefaultConfigPath is where the installer puts the file.
@@ -57,6 +67,8 @@ func Defaults() Config {
 		StateDir: "/var/lib/ccsbx", RunDir: "/var/lib/ccsbx-run",
 		Docker: "/usr/bin/docker", Tmux: "/usr/bin/tmux", TmuxSocket: "/run/ccsbx/tmux.sock",
 		PinsFile: "/etc/ccsbx/pins.toml", SeccompFile: "/etc/ccsbx/seccomp.json", Kubectl: "/usr/local/bin/kubectl", Kubeconfig: "/var/lib/ccsbx-keys/launcher.kubeconfig", K8sConn: "/etc/ccsbx/k8s-conn.json", KeysUser: "ccsbx-keys", K8sNamespace: "cc-sandbox",
+		K8sMachine: "future-two", K8sReadySeconds: 120, K8sCPU: 2, K8sEphemeralMB: 20480, K8sWorktreeMB: 10240, K8sTokenHours: 8,
+		K8sAudiences: []string{"ccsbx-model", "ccsbx-egress"}, SignerSocket: "/run/ccsbx-signer/sign.sock",
 		ServiceUser: "ccsbx", BaseURL: "http://fwd:8080", MinUID: 1000,
 	}
 }
@@ -65,6 +77,8 @@ var configKeys = map[string]bool{
 	"allowed_roots": true, "verbs": true, "state_dir": true, "run_dir": true, "docker": true, "tmux": true,
 	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true, "min_uid": true, "seccomp_profile": true, "status": true,
 	"kubectl": true, "kubeconfig": true, "k8s_conn": true, "keys_user": true, "k8s_namespace": true,
+	"k8s_machine": true, "k8s_ready_seconds": true, "k8s_side_image": true, "k8s_cpu": true, "k8s_ephemeral_mb": true, "k8s_worktree_mb": true,
+	"k8s_token_hours": true, "k8s_audiences": true, "signer_socket": true,
 }
 
 // LoadConfig reads and validates the file. The file and its directory must be owned by trustedUID
@@ -126,7 +140,7 @@ func LoadConfig(path string, trustedUID int) (*Config, error) {
 		return out, true, nil
 	}
 	for k, dst := range map[string]*string{"state_dir": &c.StateDir, "run_dir": &c.RunDir, "docker": &c.Docker, "tmux": &c.Tmux,
-		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "seccomp_profile": &c.SeccompFile, "service_user": &c.ServiceUser, "kubectl": &c.Kubectl, "kubeconfig": &c.Kubeconfig, "k8s_conn": &c.K8sConn, "keys_user": &c.KeysUser, "k8s_namespace": &c.K8sNamespace, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
+		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "seccomp_profile": &c.SeccompFile, "service_user": &c.ServiceUser, "kubectl": &c.Kubectl, "kubeconfig": &c.Kubeconfig, "k8s_conn": &c.K8sConn, "keys_user": &c.KeysUser, "k8s_namespace": &c.K8sNamespace, "k8s_machine": &c.K8sMachine, "k8s_side_image": &c.K8sSideImage, "signer_socket": &c.SignerSocket, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
 		if err := str(k, dst); err != nil {
 			return nil, err
 		}
@@ -149,6 +163,25 @@ func LoadConfig(path string, trustedUID int) (*Config, error) {
 			return nil, fmt.Errorf("config %s: min_uid must be a number from 1", path)
 		}
 		c.MinUID = int(n)
+	}
+	for k, dst := range map[string]*int{"k8s_ready_seconds": &c.K8sReadySeconds, "k8s_cpu": &c.K8sCPU, "k8s_ephemeral_mb": &c.K8sEphemeralMB, "k8s_worktree_mb": &c.K8sWorktreeMB, "k8s_token_hours": &c.K8sTokenHours} {
+		if v, ok := top[k]; ok {
+			n, isInt := v.(int64)
+			if !isInt {
+				if i, ok2 := v.(int); ok2 {
+					n, isInt = int64(i), true
+				}
+			}
+			if !isInt || n < 1 || n > 1<<31 {
+				return nil, fmt.Errorf("config %s: %s must be a positive number", path, k)
+			}
+			*dst = int(n)
+		}
+	}
+	if as, ok, err := list("k8s_audiences"); err != nil {
+		return nil, err
+	} else if ok {
+		c.K8sAudiences = as
 	}
 	roots, _, err := list("allowed_roots")
 	if err != nil {
@@ -194,7 +227,7 @@ func (c *Config) validate(roots []string) error {
 			return fmt.Errorf("unknown verb %q", v)
 		}
 	}
-	for name, p := range map[string]string{"state_dir": c.StateDir, "run_dir": c.RunDir, "docker": c.Docker, "tmux": c.Tmux, "tmux_socket": c.TmuxSocket, "pins_file": c.PinsFile, "seccomp_profile": c.SeccompFile, "kubectl": c.Kubectl, "kubeconfig": c.Kubeconfig, "k8s_conn": c.K8sConn} {
+	for name, p := range map[string]string{"state_dir": c.StateDir, "run_dir": c.RunDir, "docker": c.Docker, "tmux": c.Tmux, "tmux_socket": c.TmuxSocket, "pins_file": c.PinsFile, "seccomp_profile": c.SeccompFile, "signer_socket": c.SignerSocket, "kubectl": c.Kubectl, "kubeconfig": c.Kubeconfig, "k8s_conn": c.K8sConn} {
 		if err := backend.CheckPath(p); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
@@ -213,6 +246,21 @@ func (c *Config) validate(roots []string) error {
 	}
 	if !nsRe.MatchString(c.K8sNamespace) {
 		return fmt.Errorf("k8s_namespace %q is not a DNS label", c.K8sNamespace)
+	}
+	if c.K8sReadySeconds < 1 || c.K8sReadySeconds > 600 {
+		return fmt.Errorf("k8s_ready_seconds %d must be 1..600", c.K8sReadySeconds)
+	}
+	if c.K8sTokenHours < 1 || c.K8sTokenHours > 12 {
+		return fmt.Errorf("k8s_token_hours %d must be 1..12", c.K8sTokenHours)
+	}
+	if len(c.K8sAudiences) == 0 {
+		return fmt.Errorf("k8s_audiences is empty")
+	}
+	if c.K8sMachine == "" || strings.ContainsAny(c.K8sMachine, "/ :\n") || c.K8sMachine == c.Machine {
+		return fmt.Errorf("k8s_machine %q must be a name other than this machine", c.K8sMachine)
+	}
+	if c.K8sSideImage != "" && !sideImageRe.MatchString(c.K8sSideImage) {
+		return fmt.Errorf("k8s_side_image %q must be ghcr.io/landovsky/ccsbx@sha256:<64 hex>", c.K8sSideImage)
 	}
 	if c.Machine == "" {
 		return fmt.Errorf("machine is empty (set machine = \"...\")")
@@ -275,3 +323,5 @@ func trustedFile(path string, uid int, wantRegular bool) error {
 }
 
 var nsRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
+
+var sideImageRe = regexp.MustCompile(`^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$`)

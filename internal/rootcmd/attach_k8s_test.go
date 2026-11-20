@@ -46,7 +46,7 @@ func newK8sFx(t *testing.T) (*fx, *k8sCalls) {
 		filepath.Join(f.dir, "bin", "kubectl"), filepath.Join(keys, "launcher.kubeconfig"), filepath.Join(etc, "k8s-conn.json")))
 	owner := me + 7 // the session's owner is neither root, the service user nor the keys user
 	f.env["SUDO_UID"] = fmt.Sprint(owner)
-	f.rec.Uid, f.rec.Backend, f.rec.PodUID = owner, "k8s", podUID
+	f.rec.Uid, f.rec.Backend, f.rec.PodUID, f.rec.Spec.Machine = owner, "k8s", podUID, "future-two"
 	f.writeRecord()
 	calls := &k8sCalls{uid: podUID}
 	lookup := f.d.LookupUser

@@ -77,8 +77,15 @@ type Daemon struct {
 	// then does a reply claim evidence; the mere presence of ccsbx-root proves nothing (invariants 12, 14).
 	HelperProven bool
 	// Runtime says whether a generation's container is running (the stopped proof asks it).
-	Runtime     Runtime
-	Launcher    Launcher
+	Runtime  Runtime
+	Launcher Launcher
+	// Placements maps a machine name to how sessions are placed on it ("k8s": a pod, started through
+	// ccsbx-root's pod verbs). A spec for a machine in the map is a pod session; PodRoot runs the verbs.
+	Placements map[string]string
+	PodRoot    PodRoot
+	// Revoke is called when a pod session's token may exist and the start is abandoned or the
+	// generation ends (the doors then refuse it; plan U5). Optional.
+	Revoke      func(sid string, gen int)
 	ReplaceWait time.Duration // how long Replace waits for the old fence to shut down (default 15s)
 	Now         func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
@@ -177,6 +184,9 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		}
 	}
 
+	if d.Placements[s.Machine] == "k8s" {
+		return d.startPod(s, recs)
+	}
 	if s.Machine != d.Machine {
 		return nil, refuse(WrongMachine, "spec is for %s, this is %s (the pane lives on the session's machine)", s.Machine, d.Machine)
 	}
@@ -238,6 +248,12 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 
 	live, started := 0, 0
 	for _, r := range recs {
+		if r.Backend == "k8s" {
+			if r.Ended == nil {
+				live++ // a pod session lives until it is stopped; there is no pane to ask
+			}
+			continue
+		}
 		if r.Ended == nil && d.Launcher.Alive(r.Sid) {
 			live++
 			if r.Spec.Label == s.Label {

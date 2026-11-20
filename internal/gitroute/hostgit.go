@@ -39,6 +39,9 @@ const (
 type Runner struct {
 	GitDir   string // host-owned gitdir, outside Worktree
 	Worktree string
+	// AllowIncludes lets a gitdir config carry include settings. Only steering-check sets it: it
+	// reads them to flag changes under the files they pull in, instead of refusing to look.
+	AllowIncludes bool
 	// AllowGitDirInWorktree is for a developer's own repo (steering-check on a normal checkout).
 	// A fenced session's gitdir is never inside its worktree.
 	AllowGitDirInWorktree bool
@@ -328,6 +331,9 @@ func (r *Runner) checkRepo() error {
 	// overrides do not set. No includes, in the gitdir config or the common one.
 	for _, dir := range []string{r.GitDir, gd} {
 		for _, f := range []string{"config", "config.worktree"} {
+			if r.AllowIncludes {
+				break
+			}
 			if err := r.noIncludes(filepath.Join(dir, f)); err != nil {
 				return err
 			}

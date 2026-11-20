@@ -1530,3 +1530,13 @@ block = "tests/twin-go.sh ./internal/rootcmd TestPlainRepoWithAnEmptyGitDirIsRef
 invariants = [24, 25]
 backends = ["unit"]
 where = "hp"
+
+[[rule]]
+id = "steering-owner-git-trust"
+title = "steering-check flags what the owner's own git would trust in a fenced worktree: changes under core.hooksPath and include.path inside it, .husky/, and nested repositories (exit 3)"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestKnownSubmodulesAreNotReported && tests/twin-go.sh ./internal/gitroute TestCommittedChangesUnderHooksPathAreSteering"
+block = "tests/twin-go.sh ./internal/gitroute TestChangesUnderHooksPathAreSteering && tests/twin-go.sh ./internal/gitroute TestChangesToAnIncludedConfigAreSteering && tests/twin-go.sh ./internal/gitroute TestHuskyIsSteeringByName && tests/twin-go.sh ./internal/gitroute TestNestedReposAreSteering && tests/twin-go.sh ./internal/gitroute TestOversizedConfigOutputIsRefused && tests/twin-go.sh ./cmd/ccsbx TestSteeringCheckSeesHooksPathAndNestedRepos"
+invariants = [24, 25]
+backends = ["unit"]
+where = "hp"

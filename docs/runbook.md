@@ -160,6 +160,13 @@
 - **Known: orphaned direct-mode homes.** The node home is now keyed by owner, class and label, so
   homes made by direct mode before this change are not found again: `--resume` of such a session
   starts without its old transcript. Nothing important lives there yet; they can be deleted by hand.
+- **Known limit: your own git in a worktree a fence wrote to.** The fence has the worktree read-write.
+  ccsbx-root mounts the repository's own gitdir read-only, and H1 keeps the HOST's git away from
+  anything the fence wrote, but your own `git commit` in that worktree trusts what it finds there:
+  hooks that `core.hooksPath` or an `include.path` of the repository's config point into the worktree
+  (Husky's `.husky/pre-commit` is the common case), and nested repositories (`sub/.git`). Before you run
+  your own git in such a worktree, run `ccsbx steering-check --base <base>`: it lists changes under those
+  paths and every nested repository, and exits 3 if there are any. Do not commit until it says exit 0.
 
 ## 4. Night auto-start and stop
 <!-- procedure: NB4 -->

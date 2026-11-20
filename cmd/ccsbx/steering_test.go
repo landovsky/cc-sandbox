@@ -50,3 +50,35 @@ func TestSteeringCheckRefusesOldGit(t *testing.T) {
 		t.Fatalf("exit %d, stderr %q", code, errb.String())
 	}
 }
+
+// Husky-style: the repository's own config makes git run hooks from a directory inside the worktree.
+// A fence's edit there is what the owner's next `git commit` would run, so the check says exit 3.
+func TestSteeringCheckSeesHooksPathAndNestedRepos(t *testing.T) {
+	wt := devRepo(t)
+	g := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = wt
+		if b, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, b)
+		}
+	}
+	g("config", "core.hooksPath", "tools/hooks")
+	var out, errb strings.Builder
+	a := []string{"steering-check", "--worktree", wt, "--base", "HEAD", "--state", t.TempDir()}
+	if code := app().Main(a, &out, &errb); code != 0 {
+		t.Fatalf("a clean repo with a hooksPath: exit %d %s", code, errb.String())
+	}
+	os.MkdirAll(filepath.Join(wt, "tools", "hooks"), 0o755)
+	os.WriteFile(filepath.Join(wt, "tools", "hooks", "pre-commit"), []byte("#!/bin/sh\n"), 0o755)
+	out.Reset()
+	if code := app().Main(a, &out, &errb); code != 3 || !strings.Contains(out.String(), "tools/hooks/pre-commit") {
+		t.Fatalf("hooksPath change: exit %d out %q err %q", code, out.String(), errb.String())
+	}
+	os.Remove(filepath.Join(wt, "tools", "hooks", "pre-commit"))
+	g("config", "--unset", "core.hooksPath")
+	g("init", "-q", "nested")
+	out.Reset()
+	if code := app().Main(a, &out, &errb); code != 3 || !strings.Contains(out.String(), "nested/.git") {
+		t.Fatalf("nested repo: exit %d out %q err %q", code, out.String(), errb.String())
+	}
+}

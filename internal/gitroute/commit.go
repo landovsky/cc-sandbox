@@ -97,7 +97,20 @@ func (r *Runner) SteeringSince(base string) ([]string, error) {
 		return nil, err
 	}
 	st, err := r.SteeringFiles(append(files, pend...))
-	return withLinks(st, links), err
+	if err != nil {
+		return nil, err
+	}
+	// what the OWNER's own git would run: changes under core.hooksPath and include.path, nested repos
+	guards, err := r.configGuards()
+	if err != nil {
+		return nil, err
+	}
+	extra := underAny(append(append([]string{}, files...), pend...), guards)
+	nested, err := r.NestedRepos()
+	if err != nil {
+		return nil, err
+	}
+	return withLinks(st, append(append(links, extra...), nested...)), nil
 }
 
 // withLinks adds the changed symlink and gitlink paths to a steering list: a link can point a

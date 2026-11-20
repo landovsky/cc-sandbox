@@ -31,7 +31,11 @@ func steeringCheckCmd() *cli.Command {
   npm config, .gitattributes, .gitmodules (see internal/gitroute/steering.go). Also reported: a symlink
   or gitlink that is new or changed, edits behind a steering symlink (.claude -> docs/notes), and
   steering files that are untracked, modified or git-ignored in the worktree (CLAUDE.local.md,
-  .claude/settings.local.json). Paths with odd characters are printed quoted.
+  .claude/settings.local.json). Also reported, because your OWN git trusts them: changed files under
+  core.hooksPath or an include.path of the repository's config that point into the worktree (Husky's
+  .husky/pre-commit), and any nested repository (a .git directory or file below the worktree, other than
+  a submodule HEAD already has). Do not run your own git commit in a worktree a fence wrote to before this
+  says exit 0. Paths with odd characters are printed quoted.
   Needs git >= 2.41 (Apple's /usr/bin/git 2.39 is refused): ccsbx steering-check --git /opt/homebrew/bin/git
   Exit 2: refused (old git, a fenced session's own .git, an unsafe gitdir).`,
 		Setup: func(f *cli.Flags) {
@@ -54,7 +58,7 @@ func steeringCheckCmd() *cli.Command {
 				fmt.Fprintln(stderr, "ccsbx steering-check: --timeout:", err)
 				return cli.ExitUsage
 			}
-			r := &gitroute.Runner{GitDir: get("gitdir"), Worktree: wt, Git: get("git"), Timeout: to}
+			r := &gitroute.Runner{GitDir: get("gitdir"), Worktree: wt, Git: get("git"), Timeout: to, AllowIncludes: true}
 			if r.GitDir == "" {
 				if sid, fenced := start.SessionForWorkdir(get("state"), wt); fenced {
 					fmt.Fprintf(stderr, "ccsbx steering-check: %s is the worktree of session %s; its .git is agent-writable, so pass the host-owned --gitdir\n", wt, sid)

@@ -2,9 +2,10 @@
 # tests/fence-cleanup-test.sh checks that the fence tests' cleanup refuses empty or foreign values
 # before any docker call. It exists because that cleanup removes containers and networks, and an
 # empty sid or STATE must never turn into a broad removal. docker is a stub that records its calls.
-# Usage: tests/fence-cleanup-test.sh [--help]
-case "${1:-}" in -h|--help) sed -n 2,5p "$0" | sed 's/^# \{0,1\}//'; exit 0;; esac
+# Usage: tests/fence-cleanup-test.sh [allow|block]   (both by default; --help)
+case "${1:-}" in -h|--help) sed -n 2,6p "$0" | sed 's/^# \{0,1\}//'; exit 0;; esac
 set -u
+mode=${1:-both}
 here=$(cd "$(dirname "$0")" && pwd)
 bin=$(mktemp -d); calls=$bin/calls
 printf '#!/bin/sh\necho "$@" >> %s\nexit 0\n' "$calls" > "$bin/docker"; chmod +x "$bin/docker"
@@ -12,6 +13,7 @@ export PATH="$bin:$PATH" IMG=img; PIDS=()
 . "$here/fence-cleanup.sh"
 fail=0
 check() { # name, expect refuse|ok
+  case "$mode:$2" in allow:refuse|block:ok) return;; esac
   : > "$calls"; ( cleanup ) >/dev/null 2>&1; rc=$?
   if [ "$2" = refuse ]; then
     { [ $rc -ne 0 ] && [ ! -s "$calls" ]; } || { echo "FAIL $1: rc=$rc docker calls: $(cat "$calls")"; fail=1; }

@@ -135,9 +135,9 @@ func TestDoorsLoadPublicKeysOnly(t *testing.T) {
 	}
 	for name, line := range map[string]string{
 		"no scope":       k.KID + " " + b64s(k.Public),
-		"empty machines": k.KID + " " + b64s(k.Public) + " owners=tomas machines=",
-		"kid mismatch":   "deadbeefdeadbeef " + b64s(k.Public) + " owners=tomas machines=hp-ubuntu",
-		"seed not pub":   k.KID + " " + b64s(k.Private.Seed()) + " owners=tomas machines=hp-ubuntu",
+		"empty machines": k.KID + " " + b64s(k.Public) + " owners=tomas machines= profiles=* billings=api",
+		"kid mismatch":   "deadbeefdeadbeef " + b64s(k.Public) + " owners=tomas machines=hp-ubuntu profiles=* billings=api",
+		"seed not pub":   k.KID + " " + b64s(k.Private.Seed()) + " owners=tomas machines=hp-ubuntu profiles=* billings=api",
 	} {
 		p := filepath.Join(dir, strings.ReplaceAll(name, " ", "_"))
 		os.WriteFile(p, []byte(line+"\n"), 0o644)
@@ -207,6 +207,7 @@ func TestRevocationFailsClosed(t *testing.T) {
 		t.Fatalf("door did not recover: %v", err)
 	}
 	// And the revocation is on disk now: a restarted door refuses the revoked generation.
+	v.Close() // the door stops, a new one starts
 	v2 := NewVerifier(ring, "ccsbx-model")
 	if err := v2.PersistTo(state); err != nil {
 		t.Fatal(err)
@@ -408,5 +409,49 @@ func TestRevokeEndpoint(t *testing.T) {
 	}
 	if err := use(); err != ErrGenRevoked {
 		t.Fatalf("token still works after revoke: %v", err)
+	}
+}
+
+// Review N-scope: a keyring line without its tier limits is refused, so a key can't sign any tier
+// by omission (T:mac-key-above-mac-max).
+func TestKeyringLineWithoutTierLimitsIsRefused(t *testing.T) {
+	k := newKey(t)
+	f := filepath.Join(t.TempDir(), "ring")
+	base := k.KID + " " + base64.StdEncoding.EncodeToString(k.Public) + " owners=tomas machines=mac"
+	for name, line := range map[string]string{
+		"no limits":     base,
+		"no billings":   base + " profiles=dev-*",
+		"no profiles":   base + " billings=api",
+	} {
+		os.WriteFile(f, []byte(line+"\n"), 0o600)
+		if _, err := LoadPublicKeyring(f); err == nil {
+			t.Fatalf("%s: accepted", name)
+		}
+	}
+	os.WriteFile(f, []byte(base+" profiles=dev-* billings=api\n"), 0o600)
+	if _, err := LoadPublicKeyring(f); err != nil {
+		t.Fatalf("allow twin: %v", err)
+	}
+}
+
+// Review N-state: two doors must not share one state file. A second PersistTo on a path another
+// instance holds is refused, and temp files are unique, so one door can't overwrite the other's
+// revocations.
+func TestTwoDoorsCannotShareAStateFile(t *testing.T) {
+	k := newKey(t)
+	ring := k.Ring([]string{"tomas"}, []string{"hp-ubuntu"})
+	state := filepath.Join(t.TempDir(), "state.json")
+	a, b := NewVerifier(ring, "ccsbx-stub"), NewVerifier(ring, "ccsbx-stub")
+	if err := a.PersistTo(state); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.PersistTo(state); err == nil {
+		t.Fatal("a second door took over a state file that is in use")
+	}
+	if err := a.Revoke("tomas", "hp-ubuntu", "sX", 1); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := filepath.Glob(state + ".*.tmp"); len(left) != 0 {
+		t.Fatalf("temp files left behind: %v", left)
 	}
 }

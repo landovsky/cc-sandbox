@@ -187,7 +187,7 @@ no-token-in-fence/allow|no-token-in-fence/block)
   "$BIN" token mint --key-file "$STATE/dev.key" --sub "tomas/hp-ubuntu/$sid/g1" --label nt --billing stub --profile e2e-test \
       --aud ccsbx-stub --fwd-secrets > "$STATE/secrets.json" || fail "mint"
   chmod 0600 "$STATE/dev.key"
-  "$BIN" token pubkey --key-file "$STATE/dev.key" --owners tomas --machines hp-ubuntu > "$STATE/keyring" || fail "pubkey"
+  "$BIN" token pubkey --key-file "$STATE/dev.key" --owners tomas --machines hp-ubuntu --profiles 'e2e-*' --billings stub > "$STATE/keyring" || fail "pubkey"
   docker run --rm -i --name "ccsbx-fwd-$$" --network "$net" --network-alias fwd \
       -v "$BINABS:/ccsbx:ro" -v "$STATE/keyring:/keyring:ro" "$IMG" sh -c \
       '/ccsbx stub --listen 127.0.0.1:8081 --keyring /keyring --state /tmp/stub-state.json & exec /ccsbx fwd --listen :8080 --door stub=http://127.0.0.1:8081' \

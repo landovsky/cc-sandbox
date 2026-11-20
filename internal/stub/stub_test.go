@@ -210,10 +210,10 @@ func TestStubRefusesToRunWithoutDurableState(t *testing.T) {
 	xdg := t.TempDir()
 	t.Setenv("XDG_STATE_HOME", xdg)
 	rg, _ := token.LoadPublicKeyring(ring)
-	if err := persist(token.NewVerifier(rg, "ccsbx-stub"), "", "ccsbx-stub"); err != nil {
+	if err := persist(token.NewVerifier(rg, "ccsbx-stub"), "", "ccsbx-stub", "127.0.0.1:7777"); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(xdg, "ccsbx", "ccsbx-stub.json")); err != nil {
+	if _, err := os.Stat(filepath.Join(xdg, "ccsbx", "ccsbx-stub-7777.json")); err != nil {
 		t.Fatalf("no default state file: %v", err)
 	}
 }

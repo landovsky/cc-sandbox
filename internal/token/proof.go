@@ -84,6 +84,7 @@ type Verifier struct {
 	revoked map[string]int // generations ≤ this are revoked
 
 	statePath string
+	lock      *os.File // held for the life of the process: one door per state file
 	stateErr  error // set when the last save failed; the door refuses requests until it clears
 }
 
@@ -224,7 +225,11 @@ func (v *Verifier) Verify(tok, proofHdr, method, path string, body []byte, now t
 func (v *Verifier) PersistTo(path string) error {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.statePath = path
+	lock, err := lockState(path)
+	if err != nil {
+		return err
+	}
+	v.lock, v.statePath = lock, path
 	b, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return v.saveLocked() // prove now that we can write, not at the first revocation
@@ -265,23 +270,28 @@ func (v *Verifier) saveLocked() error {
 
 func writeDurable(path string, maxGen, revoked map[string]int) error {
 	b, _ := json.Marshal(persisted{maxGen, revoked})
-	tmp := path + ".tmp"
-	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	// A unique temp name: two writers can never rename each other's half-written file into place.
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
 	if err != nil {
 		return err
 	}
+	tmp := f.Name()
 	if _, err := f.Write(b); err != nil {
 		f.Close()
+		os.Remove(tmp)
 		return err
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
+		os.Remove(tmp)
 		return err
 	}
 	if err := f.Close(); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
 		return err
 	}
 	d, err := os.Open(filepath.Dir(path))

@@ -191,7 +191,8 @@ func TestMaxGenSurvivesRestart(t *testing.T) {
 	c4.Sub = "tomas/hp-ubuntu/s01jd7k2m9/g4"
 	c4.Cnf = CnfOf(g4.Public)
 	r.call(t, r.mint(t, c4), g4, t0)
-	r.v = NewVerifier(r.key.Ring([]string{"tomas"}, []string{"hp-ubuntu"}), "ccsbx-model") // door restarts
+	r.v.Close() // door stops
+	r.v = NewVerifier(r.key.Ring([]string{"tomas"}, []string{"hp-ubuntu"}), "ccsbx-model") // and restarts
 	if err := r.v.PersistTo(state); err != nil {
 		t.Fatal(err)
 	}

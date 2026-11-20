@@ -267,9 +267,9 @@ func (c *Claims) validBilling() error {
 
 // KeyScope is what one trusted key may sign for (invariant 27): sessions whose sub names an
 // owner in Owners and a machine in Machines. An empty list allows nothing, so a scope can't be
-// "forgotten" into allow-all. Profiles (glob patterns, e.g. "e2e-*") and Billings, when set,
-// narrow it further: a Mac key limited to profiles=dev-* billings=api,stub can't sign a
-// subscription session (T:mac-key-above-mac-max). Unset means no narrowing.
+// "forgotten" into allow-all. Profiles (glob patterns, e.g. "e2e-*") and Billings narrow it
+// further: a Mac key limited to profiles=dev-* billings=api,stub can't sign a subscription
+// session (T:mac-key-above-mac-max). A keyring file must state both for every key.
 type KeyScope struct {
 	Pub      ed25519.PublicKey
 	Owners   []string
@@ -319,7 +319,7 @@ func (k KeyScope) allows(owner, machine string) bool {
 type Keyring map[string]KeyScope
 
 // LoadPublicKeyring reads a keyring file for a door. Lines: `<kid> <base64 public key>
-// owners=a,b machines=x,y`; `#` starts a comment. Doors load only this, never a seed
+// owners=a,b machines=x,y profiles=P,.. billings=B,..`; `#` starts a comment. Doors load only this, never a seed
 // (invariant 12: only the signer holds signing keys). A line whose key is a 32-byte seed
 // can't be told from a public key by length, so the kid must equal KIDOf(public key).
 func LoadPublicKeyring(path string) (Keyring, error) {
@@ -364,6 +364,11 @@ func LoadPublicKeyring(path string) (Keyring, error) {
 		if len(sc.Owners) == 0 || len(sc.Machines) == 0 {
 			return nil, fmt.Errorf("token: keyring %s:%d: owners= and machines= are required", path, i+1)
 		}
+		// A key with no stated tier would sign any tier by omission, so both limits are required;
+		// "profiles=*" says out loud that every profile is meant.
+		if sc.Profiles == nil || sc.Billings == nil {
+			return nil, fmt.Errorf("token: keyring %s:%d: profiles= and billings= are required (profiles=* for any)", path, i+1)
+		}
 		if _, dup := ring[f[0]]; dup {
 			return nil, fmt.Errorf("token: keyring %s:%d: kid %s appears twice", path, i+1, f[0])
 		}
@@ -376,11 +381,13 @@ func LoadPublicKeyring(path string) (Keyring, error) {
 }
 
 // KeyringLine is the line a host writes for a key it has the seed of.
+// It states the widest tier on purpose (any profile, any billing), for dev keys and tests; a real
+// machine key is written with KeyringLineScoped and its own limits.
 func (k *Key) KeyringLine(owners, machines []string) string {
-	return k.KeyringLineScoped(owners, machines, nil, nil)
+	return k.KeyringLineScoped(owners, machines, []string{"*"}, []string{"api", "subscription", "stub"})
 }
 
-// KeyringLineScoped is KeyringLine with the optional profile and billing narrowing.
+// KeyringLineScoped is the keyring line for a key limited to these profiles (globs) and billings.
 func (k *Key) KeyringLineScoped(owners, machines, profiles, billings []string) string {
 	line := fmt.Sprintf("%s %s owners=%s machines=%s", k.KID, base64.StdEncoding.EncodeToString(k.Public),
 		strings.Join(owners, ","), strings.Join(machines, ","))

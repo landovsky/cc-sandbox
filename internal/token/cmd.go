@@ -20,7 +20,7 @@ const Usage = `ccsbx token — mint and check session tokens (U5, dev key file, 
 Usage:
   ccsbx token mint   --sub S --label L --billing B --profile P --aud A [flags]
   ccsbx token verify --keyring FILE --token T --aud A [--proof P --method M --path PATH --body-file F]
-  ccsbx token pubkey --key-file F --owners a,b --machines x,y [--profiles P,..] [--billings B,..]
+  ccsbx token pubkey --key-file F --owners a,b --machines x,y --profiles P,.. --billings B,..
                                                                   (a keyring line for doors)
   ccsbx token kid    [--key-file F]
 
@@ -28,7 +28,7 @@ Flags: (each also CCSBX_TOKEN_<NAME>; --key-file also reads CCSBX_KEY_FILE)
   --key-file FILE   dev signing key, base64 seed, mode 0600 (mint creates it if absent;
                     pubkey and kid never do). Doors never get this file, only a keyring.
   --keyring FILE    public keys a door trusts: "<kid> <pubkey> owners=a machines=x" per line
-  pubkey: --profiles globs (e2e-*) and --billings narrow what the key may sign (default: any)
+  pubkey: --profiles (globs, e2e-*; * for any) and --billings are required: the tier the key may sign
   mint:
     --sub S         owner/machine/sid/g<gen>, e.g. tomas/hp-ubuntu/s01jd7k2m9/g1  (required)
     --label L       node label                       --billing api|subscription|stub (required)
@@ -44,7 +44,7 @@ Flags: (each also CCSBX_TOKEN_<NAME>; --key-file also reads CCSBX_KEY_FILE)
 Recipes:
   start a forwarder for a test session:
     ccsbx token mint --sub tomas/hp-ubuntu/sX/g1 --label t --billing stub --profile e2e-test \
-       --aud ccsbx-model --fwd-secrets | ccsbx fwd --listen unix:/run/user/$UID/fwd.sock --door model=http://127.0.0.1:8080
+       --aud ccsbx-stub --fwd-secrets | ccsbx fwd --listen unix:/run/user/$UID/fwd.sock --door stub=http://127.0.0.1:8080
   give a door its trust root:  ccsbx token pubkey --key-file $CCSBX_KEY_FILE --owners tomas \
                                  --machines hp-ubuntu > keyring
 Exit codes: 0 ok, 1 failure, 2 token refused, 64 usage.
@@ -122,11 +122,11 @@ func Main(args []string, stdout, stderr io.Writer) int {
 
 	case "pubkey":
 		k, err := LoadKeyFile(*keyFile)
-		if err != nil || *owners == "" || *machines == "" {
+		if err != nil || *owners == "" || *machines == "" || *profiles == "" || *billings == "" {
 			if err != nil {
 				fmt.Fprintln(stderr, "token:", err)
 			} else {
-				fmt.Fprintln(stderr, "token pubkey: --owners and --machines are required (a key with no scope is refused)")
+				fmt.Fprintln(stderr, "token pubkey: --owners, --machines, --profiles and --billings are required (a key with no scope or tier is refused)")
 			}
 			return 64
 		}

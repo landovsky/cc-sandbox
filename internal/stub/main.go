@@ -39,7 +39,7 @@ Flags: (each also CCSBX_STUB_<NAME>)
                      'ccsbx token pubkey'. A door never gets a signing key. (default $CCSBX_KEYRING)
   --aud NAME         audience the token must list            (default ccsbx-stub)
   --state FILE       persist max_gen/revocations here; the stub refuses to start if it can't
-                     (default $XDG_STATE_HOME/ccsbx/<aud>.json, else ~/.local/state/ccsbx/<aud>.json)
+                     (default $XDG_STATE_HOME/ccsbx/<aud>-<port>.json, else under ~/.local/state; one door per file)
   --owner-listen ADDR  loopback host:port serving POST /_ccsbx/revoke for hostd (signed by a machine
                      key in the keyring); never route it through the forwarder. Default: off
   --print-catalog    print the scripts as JSON and exit (starts nothing)
@@ -93,7 +93,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	v := token.NewVerifier(ring, *aud)
-	if err := persist(v, *state, *aud); err != nil {
+	if err := persist(v, *state, *aud, *listen); err != nil {
 		fmt.Fprintln(stderr, "stub: cannot keep state, refusing to start:", err)
 		return 2
 	}
@@ -127,22 +127,24 @@ func isLoopback(h string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
-// defaultState is where a door keeps max_gen and revocations when --state is not given.
-func defaultState(aud string) string {
+// defaultState is where a door keeps max_gen and revocations when --state is not given. The listen
+// port is part of the name: two stubs with one audience must not share a file.
+func defaultState(aud, listen string) string {
+	_, port, _ := net.SplitHostPort(listen)
 	base := os.Getenv("XDG_STATE_HOME")
 	if base == "" {
 		h, _ := os.UserHomeDir()
 		base = filepath.Join(h, ".local", "state")
 	}
-	return filepath.Join(base, "ccsbx", aud+".json")
+	return filepath.Join(base, "ccsbx", aud+"-"+port+".json")
 }
 
 // persist gives the verifier durable state. Review S5: a door that forgets revocations and max_gen
 // on restart fails open against T:token-gen-bump and T:token-after-exit, so there is no
 // memory-only mode: an empty path means the default one.
-func persist(v *token.Verifier, state, aud string) error {
+func persist(v *token.Verifier, state, aud, listen string) error {
 	if state == "" {
-		state = defaultState(aud)
+		state = defaultState(aud, listen)
 	}
 	if err := os.MkdirAll(filepath.Dir(state), 0o700); err != nil {
 		return err

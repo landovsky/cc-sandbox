@@ -99,6 +99,16 @@ backends = ["docker", "k8s"]
 where = "hp"
 
 [[rule]]
+id = "fence-cleanup-guard"
+title = "the fence tests' cleanup refuses empty or foreign values before any docker call"
+suite = "fence"
+allow = "tests/fence-cleanup-test.sh allow"
+block = "tests/fence-cleanup-test.sh block"
+invariants = [23]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
 id = "fence-sees-only-fwd"
 title = "the fence reaches only the forwarder port, nothing else on the host"
 suite = "fence"

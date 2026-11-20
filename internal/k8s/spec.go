@@ -20,6 +20,9 @@ import (
 const (
 	FenceUID = 10001
 	SideUID  = 10002
+	// SideEphemeralMB is the sidecar's ephemeral-storage limit. The pod's ephemeral storage is the sum of its
+	// containers' limits, and every disk-backed emptyDir is charged to it.
+	SideEphemeralMB = 1024
 	// WorkGID is the pod's fsGroup (ccsbx-work): neither user's primary group, held by both, so that what the
 	// sidecar checks out into /work the fence can write and the other way round. Any other fsGroup is refused.
 	WorkGID = 10003
@@ -177,7 +180,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			InitContainers: []Container{{
 				Name: "side", Image: s.SideImage, Command: s.SideCmd, RestartPolicy: "Always",
 				Ports:           []Port{{Name: "fwd", ContainerPort: SidePort, Protocol: "TCP"}},
-				Resources:       guaranteed(256, 1, 1024),
+				Resources:       guaranteed(256, 1, SideEphemeralMB),
 				SecurityContext: sec(SideUID),
 				VolumeMounts: []VolumeMount{
 					{Name: "worktree", MountPath: "/work"}, {Name: "out", MountPath: "/run/ccsbx/out", ReadOnly: true},
@@ -414,6 +417,21 @@ func (c Config) CheckContract(p *Pod) error {
 		bad("no worktree volume")
 	}
 	all := append(append([]Container{}, s.InitContainers...), s.Containers...)
+	// the disk-backed volumes must fit in what the containers may use of the node's ephemeral storage
+	var diskMi, limitMi int64
+	for _, v := range vols {
+		if v.EmptyDir != nil && v.EmptyDir.Medium == "" {
+			n, _ := toMi(v.EmptyDir.SizeLimit)
+			diskMi += n
+		}
+	}
+	for _, ct := range all {
+		n, _ := toMi(ct.Resources.Limits["ephemeral-storage"])
+		limitMi += n
+	}
+	if diskMi > limitMi {
+		bad("the disk-backed volumes total %d Mi but the containers may use only %d Mi of ephemeral storage: the pod would be evicted before any volume reached its own limit", diskMi, limitMi)
+	}
 	for _, ct := range all {
 		uid := int64(FenceUID)
 		if ct.Name == "side" {
@@ -554,3 +572,13 @@ done
 exec tmux -f /dev/null new-session -s "$1" claude`
 	return []string{"/bin/sh", "-c", script, "ccsbx-fence", sid}
 }
+
+// DiskVolumesMB is the sum of the sizeLimits of the pod's disk-backed volumes for a worktree of worktreeMB: the
+// worktree, the sidecar's snapshot and git directory (each as large as the worktree), and home, out, in, managed
+// and the journal. The kubelet evicts a pod whose ephemeral storage use passes the sum of its containers' limits,
+// so those limits must cover this or the pod is evicted before any one volume reaches its own limit.
+func DiskVolumesMB(worktreeMB int) int { return 3*worktreeMB + 512 + 64 + 16 + 8 + 16 }
+
+// SnapshotLimitBytes is what the sidecar may put in the snapshot volume: 90% of the volume, so a commit that
+// fills it up to the limit cannot make the pod's volume overflow and the pod be evicted.
+func SnapshotLimitBytes(worktreeMB int) int64 { return int64(worktreeMB) << 20 / 10 * 9 }

@@ -48,6 +48,8 @@ type SideInfo struct {
 	Doors                       []string        // NAME=URL, the doors the forwarder may reach
 	// the repository the sidecar clones into the empty /work after the load (F3c), from the record's workdir
 	GitRepo, GitBase, GitBranch string
+	// GitMaxBytes is what a commit's snapshot may hold (--git-max-bytes); 0 leaves the sidecar's own default
+	GitMaxBytes int64
 }
 
 var (
@@ -92,6 +94,12 @@ func SideArgv(i SideInfo) ([]string, error) {
 		args = append(args, "--git-base", i.GitBase)
 	}
 	args = append(args, "--git-branch", i.GitBranch, "--git-dir", SideGitDir)
+	if i.GitMaxBytes < 0 {
+		return nil, fmt.Errorf("sidecar: git max bytes %d", i.GitMaxBytes)
+	}
+	if i.GitMaxBytes > 0 {
+		args = append(args, "--git-max-bytes", strconv.FormatInt(i.GitMaxBytes, 10))
+	}
 	if i.HubURL != "" {
 		if err := checkHTTPURL(i.HubURL); err != nil {
 			return nil, fmt.Errorf("sidecar: hub url: %v", err)

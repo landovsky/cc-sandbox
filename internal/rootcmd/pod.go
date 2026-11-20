@@ -151,7 +151,7 @@ func (e *env) podCreate(sid string, stdout io.Writer) error {
 	// config, never from anything the fence can write
 	sideCmd, err := k8s.SideArgv(k8s.SideInfo{Sid: rec.Sid, Gen: rec.Gen, Label: rec.Label, FullID: rec.Reply.ID, Machine: rec.Spec.Machine,
 		Scope: rec.Spec.MsgScope, HubURL: e.cfg.K8sHubURL, Doors: e.cfg.K8sDoors,
-		GitRepo: rec.Spec.Workdir.Repo, GitBase: rec.Spec.Workdir.Base, GitBranch: rec.Spec.Workdir.Branch})
+		GitMaxBytes: k8s.SnapshotLimitBytes(e.cfg.K8sWorktreeMB), GitRepo: rec.Spec.Workdir.Repo, GitBase: rec.Spec.Workdir.Base, GitBranch: rec.Spec.Workdir.Branch})
 	if err != nil {
 		return refuse("%v", err)
 	}

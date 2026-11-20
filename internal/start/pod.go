@@ -43,6 +43,10 @@ var (
 	ErrPodRefused = errors.New("pod_refused")
 )
 
+// DefaultLoadWait is how long hostd waits for pod-load by default: the verb's own worst case (a 600 s ready
+// deadline, 30 s of load retries, 90 s of API) plus 30 s.
+const DefaultLoadWait = 12*time.Minute + 30*time.Second
+
 // SudoPodRoot asks `sudo -n ccsbx-root pod-<verb> -- <sid>`.
 type SudoPodRoot struct {
 	// LoadWait bounds pod-load; default is the verb's own worst case (600 s ready deadline, 30 s of load
@@ -101,7 +105,7 @@ func (r SudoPodRoot) Create(sid string) (string, error) {
 func (r SudoPodRoot) Load(sid string) error {
 	w := r.LoadWait
 	if w <= 0 {
-		w = 12*time.Minute + 30*time.Second
+		w = DefaultLoadWait
 	}
 	_, err := r.run("pod-load", sid, w)
 	return err
@@ -186,7 +190,7 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 			return nil, refuse(BadSpec, "resume: the repository must be the same (%s)", old.Spec.Workdir.Repo)
 		case old.Gen >= 9999:
 			return nil, refuse(BadSpec, "resume: session %s is at its last generation", old.Sid)
-		case (old.Starting || (old.Ended == nil && old.PodUID == "")) && d.now().Sub(old.Started) < abandonedAfter:
+		case (old.Starting || (old.Ended == nil && old.PodUID == "")) && d.now().Sub(old.Started) < d.startingLimit():
 			return nil, refuse(SessionBusy, "resume: a start of session %s (generation %d) is still in progress", old.Sid, old.Gen)
 		}
 	}
@@ -255,16 +259,26 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 		if err != nil {
 			return nil, refuse(code, "%v", cause)
 		}
-		defer unlock()
-		if !d.owns(rec) {
+		mine := d.owns(rec)
+		unlock()
+		if !mine {
 			d.logf("start of %s generation %d failed (%v) but the session record is no longer that generation's: nothing was deleted", sid, rec.Gen, cause)
 			return nil, refuse(code, "%v", cause)
 		}
+		// The pod is deleted WITHOUT the daemon's lock (a delete can take a minute and every other start waits
+		// for it): the record still says Starting, so nothing else acts on this session meanwhile.
 		var stopErr error
 		if rec.PodUID != "" {
 			stopErr = d.PodRoot.Stop(sid)
 		}
-		d.finishFailed(rec, old, stopErr != nil)
+		unlock, err = d.lock()
+		if err != nil {
+			return nil, refuse(code, "%v", cause)
+		}
+		if d.owns(rec) {
+			d.finishFailed(rec, old, stopErr != nil)
+		}
+		unlock()
 		if stopErr != nil {
 			return nil, fmt.Errorf("%s: %v (and the pod could not be deleted: %v; it is recorded as ended, retry `ccsbx-root pod-stop %s`)", code, cause, stopErr, sid)
 		}
@@ -310,7 +324,7 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 		}
 	}
 	if err != nil {
-		d.logf("pod %s is loaded but its record could not be marked started (%v): the sweep will treat it as stuck after %s; stop and start again", PodName(sid, rec.Gen), err, abandonedAfter)
+		d.logf("pod %s is loaded but its record could not be marked started (%v): the sweep will treat it as stuck after %s; stop and start again", PodName(sid, rec.Gen), err, d.startingLimit())
 	}
 	rep := rec.Reply
 	return &rep, nil
@@ -392,13 +406,14 @@ func (d *Daemon) finishFailed(rec, old *Record, keep bool) {
 		rec.Ended, rec.Starting = &now, false
 		_ = d.save(rec)
 	default:
-		failed := *old
-		failed.Gen, failed.Ended, failed.Starting, failed.Starts = rec.Gen, &now, false, rec.Starts
-		failed.PodUID = ""
+		failed := failedGeneration(old, rec.Gen, now)
+		failed.Starts = rec.Starts
 		if keep {
 			failed.PodUID = rec.PodUID // a pod that could not be deleted stays named, for a later pod-stop
+		} else {
+			failed.PodUID = ""
 		}
-		_ = d.save(&failed)
+		_ = d.save(failed)
 	}
 }
 
@@ -456,6 +471,16 @@ func (d *Daemon) logf(format string, a ...any) {
 	}
 }
 
+// startingLimit is how long a start may be in flight before a resume stops being refused and the sweep gives up
+// on it: what the verbs may take (hostd sets StartLimit from --pod-load-wait plus the create and a margin),
+// abandonedAfter when it has not been set.
+func (d *Daemon) startingLimit() time.Duration {
+	if d.StartLimit > 0 {
+		return d.StartLimit
+	}
+	return abandonedAfter
+}
+
 // abandonedAfter is how long a pod record may sit with no UID before the sweep gives up on it: a start
 // that died between its first save and its create.
 const abandonedAfter = 15 * time.Minute
@@ -481,11 +506,11 @@ func (d *Daemon) SweepPods(ttl time.Duration) {
 		age := now.Sub(r.Started)
 		switch {
 		case r.PodUID == "":
-			if age > abandonedAfter {
+			if age > d.startingLimit() {
 				d.logf("pod session %s never recorded a pod UID: pod %s may exist, delete exactly that pod by hand; the record is ended", r.Sid, PodName(r.Sid, r.Gen))
 				d.endRecord(r.Sid)
 			}
-		case age > ttl || (r.Starting && age > abandonedAfter):
+		case age > ttl || (r.Starting && age > d.startingLimit()):
 			// expired, or a start that never finished (hostd died in the middle of it): the pod is deleted
 			if err := d.StopPod(r.Sid); err != nil {
 				d.logf("pod sweep: stopping %s: %v", r.Sid, err)

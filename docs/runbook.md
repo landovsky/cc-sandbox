@@ -777,3 +777,11 @@ workdir (equal, containing or inside). Exit 2: refused, with one fixed line on s
 not tell (a read error, an unreadable record, a config that cannot be believed). Only the service user (hostd) and root may ask;
 it writes nothing and takes no lock. Not covered by a test (it needs root): a `.git` owned by another user, refused through the
 pinned descriptor's owner check.
+
+**F2x round 2 NITs.** `--git-max-bytes` is 90% of the snapshot volume (`SnapshotLimitBytes`), so a commit cannot overflow it and get the pod
+evicted. The containers' ephemeral-storage limits must cover every disk-backed volume together (worktree, snapshot and git
+directory are each worktree-sized, plus home, out, in, managed, journal): the pod contract and root's config check it
+(`k8s_ephemeral_mb` + 1024 for the sidecar >= `k8s.DiskVolumesMB(k8s_worktree_mb)`), so `k8s_ephemeral_mb` now defaults to
+32768. A failed resume (pod or docker) keeps the failed generation's number AND full id, ended. How long a pod start may be
+in flight follows `--pod-load-wait` (plus the create and 2 minutes): a resume is refused until then and the sweep stops what is
+left after it. A failed start's pod is deleted without holding the daemon's lock.

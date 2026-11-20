@@ -247,6 +247,13 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		}
 		sd.PodRoot = start.SudoPodRoot{LoadWait: dur("pod-load-wait")}
 		sd.PodVerbsRevoke = true
+		// a start may be in flight as long as the create (90 s) and the load can take, plus a margin: after
+		// that a resume is no longer refused and the sweep stops what is left
+		lw := dur("pod-load-wait")
+		if lw <= 0 {
+			lw = start.DefaultLoadWait
+		}
+		sd.StartLimit = lw + 90*time.Second + 2*time.Minute
 		sd.Logf = lg.Printf
 		if every := dur("pod-sweep"); every > 0 {
 			ttl := dur("pod-ttl")

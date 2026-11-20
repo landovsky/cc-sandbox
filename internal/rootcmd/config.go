@@ -80,7 +80,7 @@ func Defaults() Config {
 		StateDir: "/var/lib/ccsbx", RunDir: "/var/lib/ccsbx-run",
 		Docker: "/usr/bin/docker", Tmux: "/usr/bin/tmux", TmuxSocket: "/run/ccsbx/tmux.sock",
 		PinsFile: "/etc/ccsbx/pins.toml", SeccompFile: "/etc/ccsbx/seccomp.json", Kubectl: "/usr/local/bin/kubectl", Kubeconfig: "/var/lib/ccsbx-launch/launcher.kubeconfig", K8sConn: "/etc/ccsbx/k8s-conn.json", LaunchUser: "ccsbx-launch", K8sNamespace: "cc-sandbox", HubURL: "http://127.0.0.1:4011", HubSecret: "/etc/ccsbx/hub-admin.secret", TermUser: "ccsbx-term", SignerUser: "ccsbx-keys",
-		K8sMachine: "future-two", K8sReadySeconds: 120, K8sCPU: 2, K8sEphemeralMB: 20480, K8sWorktreeMB: 10240, K8sTokenHours: 8,
+		K8sMachine: "future-two", K8sReadySeconds: 120, K8sCPU: 2, K8sEphemeralMB: 32768, K8sWorktreeMB: 10240, K8sTokenHours: 8,
 		K8sAudiences: []string{"ccsbx-model", "ccsbx-egress"}, SignerSocket: "/run/ccsbx-signer/launch.sock",
 		ServiceUser: "ccsbx", BaseURL: "http://fwd:8080", MinUID: 1000,
 	}
@@ -280,6 +280,9 @@ func (c *Config) validate(roots []string) error {
 	}
 	if c.HubUser != "" && (strings.ContainsAny(c.HubUser, ":/ \n") || len(c.HubUser) > 64) {
 		return fmt.Errorf("hub_user %q", c.HubUser)
+	}
+	if need := k8s.DiskVolumesMB(c.K8sWorktreeMB); need > c.K8sEphemeralMB+k8s.SideEphemeralMB {
+		return fmt.Errorf("k8s_ephemeral_mb %d (+%d for the sidecar) does not cover the pod's disk volumes (%d Mi for a worktree of %d Mi): the pod would be evicted", c.K8sEphemeralMB, k8s.SideEphemeralMB, need, c.K8sWorktreeMB)
 	}
 	if c.K8sReadySeconds < 1 || c.K8sReadySeconds > 600 {
 		return fmt.Errorf("k8s_ready_seconds %d must be 1..600", c.K8sReadySeconds)

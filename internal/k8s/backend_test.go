@@ -26,6 +26,8 @@ type fakeAPI struct {
 	log      []string
 	auth     []string
 	failNext int // answer this status once
+	nextUID  int
+	noUID    bool // the server leaves the UID out (a broken or hostile answer)
 }
 
 func newAPI(t *testing.T) (*fakeAPI, *REST) {
@@ -73,6 +75,10 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		p["status"] = map[string]any{"phase": "Pending"}
+		f.nextUID++
+		if !f.noUID {
+			p["metadata"].(map[string]any)["uid"] = fmt.Sprintf("uid-%d", f.nextUID)
+		}
 		// what the server's own admission adds: its default tolerations
 		spec := p["spec"].(map[string]any)
 		spec["tolerations"] = append(spec["tolerations"].([]any),
@@ -247,7 +253,9 @@ func TestCreateGetListDeleteAgainstTheFakeAPI(t *testing.T) {
 		t.Fatalf("%+v %v", st, err)
 	}
 	// idempotent: the same generation again is the answer, not an error and not a second pod
-	if ref2, err := b.Create(ctx, goodSpec()); err != nil || ref2.Name != ref.Name || len(f.pods) != 1 {
+	again := goodSpec()
+	again.KnownUID = ref.UID
+	if ref2, err := b.Create(ctx, again); err != nil || ref2.Name != ref.Name || ref2.UID != ref.UID || len(f.pods) != 1 {
 		t.Errorf("a second create: %+v %v (%d pods)", ref2, err, len(f.pods))
 	}
 	other := goodSpec()
@@ -351,12 +359,15 @@ func TestAPIErrorsAreReportedWithTheirStatus(t *testing.T) {
 func TestCreateOnAConflictAcceptsOnlyTheSamePod(t *testing.T) {
 	ctx := context.Background()
 	b, f := newBackend(t)
-	if _, err := b.Create(ctx, goodSpec()); err != nil {
-		t.Fatal(err)
+	first, err := b.Create(ctx, goodSpec())
+	if err != nil || first.UID == "" {
+		t.Fatalf("%+v %v", first, err)
 	}
 	name := PodName("s0abcdefgh", 2)
-	if _, err := b.Create(ctx, goodSpec()); err != nil {
-		t.Errorf("the same pod again (with the server's default tolerations): %v", err)
+	again := goodSpec()
+	again.KnownUID = first.UID // what the session record holds after a restart
+	if r, err := b.Create(ctx, again); err != nil || r.UID != first.UID {
+		t.Errorf("the same pod again (recorded UID, server's default tolerations): %+v %v", r, err)
 	}
 	cases := map[string]func(m map[string]any){
 		"another generation's labels": func(m map[string]any) { dig(m, "metadata", "labels").(map[string]any)["ccsbx.gen"] = "9" },
@@ -385,7 +396,7 @@ func TestCreateOnAConflictAcceptsOnlyTheSamePod(t *testing.T) {
 		json.Unmarshal(b2, &cp)
 		mod(cp)
 		f.pods[name] = cp
-		if _, err := b.Create(ctx, goodSpec()); err == nil {
+		if _, err := b.Create(ctx, again); err == nil {
 			t.Errorf("%s was accepted as ours", why)
 		}
 		f.pods[name] = orig
@@ -578,4 +589,86 @@ func TestStatusReadsTheFenceContainer(t *testing.T) {
 // pemOf is the certificate a TLS test server presents, as PEM.
 func pemOf(srv *httptest.Server) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
+}
+
+// The UID from our own 201 is the identity of the pod. A planted pod can copy the labels, the hash
+// annotation and every field we model, and carry a lifecycle hook we cannot see; it cannot copy the
+// UID. With no recorded UID, or another one, the pod is refused as pod_conflict, naming the pod.
+func TestAPlantedPodIsRefusedByUID(t *testing.T) {
+	ctx := context.Background()
+	b, f := newBackend(t)
+	name := PodName("s0abcdefgh", 2)
+	// the owner's real pod, made by us, then replaced by a plant that copies everything but the UID
+	real, err := b.Create(ctx, goodSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	plant := map[string]any{}
+	raw, _ := json.Marshal(f.pods[name])
+	json.Unmarshal(raw, &plant)
+	dig(plant, "metadata").(map[string]any)["uid"] = "uid-planted"
+	list(dig(plant, "spec", "containers"))[1-1].(map[string]any)["lifecycle"] = map[string]any{
+		"postStart": map[string]any{"exec": map[string]any{"command": []any{"x"}}}}
+	f.pods[name] = plant
+
+	var ce *ConflictError
+	noUID := goodSpec()
+	if _, err := b.Create(ctx, noUID); !errors.As(err, &ce) || ce.Pod != name || !strings.Contains(err.Error(), "pod_conflict") || !strings.Contains(err.Error(), name) {
+		t.Errorf("no recorded UID: %v", err)
+	}
+	wrong := goodSpec()
+	wrong.KnownUID = real.UID
+	if _, err := b.Create(ctx, wrong); !errors.As(err, &ce) {
+		t.Errorf("a different UID: %v", err)
+	}
+	// and nothing is exec'd into it, with its stdin never read
+	fx := &fakeExecer{}
+	b.X = fx
+	in := &readCounter{r: strings.NewReader("TOKEN")}
+	if _, err := b.Exec(ctx, *real, "side", []string{"cat"}, IO{Stdin: in}); !errors.As(err, &ce) || fx.calls != 0 || in.n != 0 {
+		t.Errorf("exec into a pod with another UID: %v (calls %d, stdin %d)", err, fx.calls, in.n)
+	}
+	// the restart path: the same pod, UID recorded, goes through and execs
+	f.pods[name] = func() map[string]any {
+		var m map[string]any
+		r, _ := json.Marshal(plant)
+		json.Unmarshal(r, &m)
+		dig(m, "metadata").(map[string]any)["uid"] = real.UID
+		delete(list(dig(m, "spec", "containers"))[0].(map[string]any), "lifecycle")
+		return m
+	}()
+	ok := goodSpec()
+	ok.KnownUID = real.UID
+	r, err := b.Create(ctx, ok)
+	if err != nil || r.UID != real.UID {
+		t.Fatalf("restart with the recorded UID: %+v %v", r, err)
+	}
+	if _, err := b.Exec(ctx, *r, "side", []string{"cat"}, IO{}); err != nil || fx.calls != 1 {
+		t.Errorf("exec into our pod: %v (calls %d)", err, fx.calls)
+	}
+	// a Ref with no UID is never exec'd into
+	noRef := *r
+	noRef.UID = ""
+	if _, err := b.Exec(ctx, noRef, "side", []string{"cat"}, IO{}); err == nil || fx.calls != 1 {
+		t.Errorf("a ref with no UID: %v", err)
+	}
+}
+
+// Empty must never equal empty: a pod with no UID is neither created-by-us nor a match for "no UID recorded".
+func TestAnEmptyUIDNeverMatches(t *testing.T) {
+	ctx := context.Background()
+	b, f := newBackend(t)
+	f.noUID = true
+	if r, err := b.Create(ctx, goodSpec()); err == nil {
+		t.Errorf("a 201 without a UID was accepted: %+v", r)
+	}
+	// the pod is there now, without a UID; "no UID recorded" does not match it
+	if _, err := b.Create(ctx, goodSpec()); err == nil {
+		t.Error("a pod with no UID matched an empty recorded UID")
+	}
+	b.X = &fakeExecer{}
+	ref, _ := b.ref("s0abcdefgh", 2)
+	if _, err := b.Exec(ctx, ref, "side", []string{"cat"}, IO{}); err == nil {
+		t.Error("exec into a pod with no UID, with a Ref with no UID")
+	}
 }

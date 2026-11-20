@@ -12,11 +12,11 @@
 // THE INTERFACE (fixed; F3 builds on it):
 //
 //	type Backend struct{ ... }                                  // NewBackend(Client, Execer, Config)
-//	func (b *Backend) Create(ctx, Spec) (*Ref, error)           // PodFor + POST; idempotent per (sid, gen)
+//	func (b *Backend) Create(ctx, Spec) (*Ref, error)           // PodFor + POST; Ref.UID from the 201 (persist it); on a 409 only Spec.KnownUID matches, else *ConflictError (pod_conflict)
 //	func (b *Backend) Get(ctx, sid string, gen int) (*Status, error)
 //	func (b *Backend) Delete(ctx, sid string, gen int) error    // by exact name, grace <= 60 s; absent = ok
 //	func (b *Backend) List(ctx) ([]Status, error)               // role=session pods of this namespace
-//	func (b *Backend) Exec(ctx, ref Ref, container string, cmd []string, io IO) (exit int, err error)
+//	func (b *Backend) Exec(ctx, ref Ref, container string, cmd []string, io IO) (exit int, err error)  // live pod UID must equal ref.UID, checked just before the exec
 //	func (b *Backend) AttachArgv(sid string, gen int) ([]string, error) // kubectl exec -it -c fence ... tmux attach; derives the pod, refuses non-absolute kubectl/kubeconfig
 //	func NewKubectl(bin, kubeconfig, server, ca string) (Kubectl, error) // the production Execer; absolute paths, kubeconfig and CA must exist, server https; server+CA are passed on the command line
 //	func PodFor(Spec) (*Pod, error)                             // pure; the contract is checked here
@@ -26,6 +26,7 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 	"io"
 )
 
@@ -58,4 +59,20 @@ type Ref struct {
 	Namespace, Name string
 	Sid             string
 	Gen             int
+	// UID is the server-assigned identity of THIS pod, taken from the 201 of Create (or checked
+	// against the recorded one on a 409). The caller persists it in the session record. Exec sends
+	// nothing to a pod whose live UID is not this one.
+	UID string
+}
+
+// ConflictError is "pod_conflict": a pod under the generation's name that is not the one we created
+// (or cannot be shown to be). It names the exact pod so the owner can delete it; nothing deletes it
+// for them, and no secret goes to it.
+type ConflictError struct {
+	Namespace, Pod, Why string
+}
+
+func (e *ConflictError) Error() string {
+	return fmt.Sprintf("pod_conflict: pod %s/%s %s; if it is not yours, the owner can delete exactly that pod (kubectl -n %s delete pod %s) and start again",
+		e.Namespace, e.Pod, e.Why, e.Namespace, e.Pod)
 }

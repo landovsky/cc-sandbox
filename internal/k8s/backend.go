@@ -77,7 +77,7 @@ func (b *Backend) Create(ctx context.Context, s Spec) (*Ref, error) {
 		return nil, err
 	}
 	ref, _ := b.ref(s.Sid, s.Gen)
-	_, err = b.C.CreatePod(ctx, b.Cfg.Namespace, pod)
+	made, err := b.C.CreatePod(ctx, b.Cfg.Namespace, pod)
 	var ae *APIError
 	if errors.As(err, &ae) && ae.Status == 409 {
 		// A pod of this name is already there. It is "ours" only if it is THIS pod: built from the
@@ -87,6 +87,18 @@ func (b *Backend) Create(ctx context.Context, s Spec) (*Ref, error) {
 		got, gerr := b.C.GetPod(ctx, b.Cfg.Namespace, pod.Metadata.Name)
 		if gerr != nil {
 			return nil, gerr
+		}
+		// The UID is the identity: the annotation and the labels can be copied onto a planted pod,
+		// and the typed subset cannot see every field of it. Only the UID we recorded from our own
+		// 201 says this is the pod we made.
+		conflict := func(why string) error {
+			return &ConflictError{Namespace: b.Cfg.Namespace, Pod: pod.Metadata.Name, Why: why}
+		}
+		switch {
+		case s.KnownUID == "":
+			return nil, conflict("exists, and no UID is recorded for this generation, so it cannot be shown to be ours")
+		case got.Metadata.UID != s.KnownUID:
+			return nil, conflict("exists with a different UID than the one recorded for this generation")
 		}
 		switch {
 		case !roundTrips(got, s.Sid, s.Gen):
@@ -104,11 +116,16 @@ func (b *Backend) Create(ctx context.Context, s Spec) (*Ref, error) {
 		if h, herr := specHash(got); herr != nil || h != pod.Metadata.Annotations[HashAnnotation] {
 			return nil, fmt.Errorf("pod %s exists and carries this spec's hash, but is not this spec", pod.Metadata.Name)
 		}
+		ref.UID = got.Metadata.UID
 		return &ref, nil
 	}
 	if err != nil {
 		return nil, err
 	}
+	if made == nil || made.Metadata.UID == "" {
+		return nil, fmt.Errorf("pod %s was created but the API returned no UID", pod.Metadata.Name)
+	}
+	ref.UID = made.Metadata.UID
 	return &ref, nil
 }
 
@@ -178,6 +195,21 @@ func (b *Backend) Exec(ctx context.Context, ref Ref, container string, cmd []str
 		if strings.ContainsRune(a, 0) {
 			return -1, errors.New("NUL in a command argument")
 		}
+	}
+	// Whatever goes to stdin (the token, the generation key) goes only to the pod we created: its
+	// live UID must be the one recorded, checked right before the exec and before any stdin is read.
+	if ref.UID == "" {
+		return -1, errors.New("exec refused: no pod UID recorded for this generation")
+	}
+	if b.C == nil {
+		return -1, errors.New("no API client to check the pod's UID")
+	}
+	live, err := b.C.GetPod(ctx, ref.Namespace, ref.Name)
+	if err != nil {
+		return -1, fmt.Errorf("exec refused: cannot read the pod to check its UID: %v", err)
+	}
+	if live.Metadata.UID != ref.UID || !roundTrips(live, ref.Sid, ref.Gen) || live.Metadata.DeletionTimestamp != nil {
+		return -1, &ConflictError{Namespace: ref.Namespace, Pod: ref.Name, Why: "is not the pod that was created for this generation (UID, name or state differs)"}
 	}
 	return b.X.Exec(ctx, ref.Namespace, ref.Name, container, cmd, io)
 }

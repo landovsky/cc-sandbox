@@ -68,6 +68,10 @@ type Spec struct {
 	FenceCmd       []string
 	SideCmd        []string
 	HostUsersFalse bool
+	// KnownUID is the pod UID the session record holds for this generation ("" = none recorded:
+	// the first create). It is not written to the pod. A pod that already exists under the name is
+	// this generation's only if its UID is this one.
+	KnownUID string
 }
 
 var (

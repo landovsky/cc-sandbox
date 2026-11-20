@@ -67,9 +67,16 @@ func (f *fakeExecer) Exec(context.Context, string, string, string, []string, IO)
 
 func TestBackendExecChecksBeforeRunning(t *testing.T) {
 	fx := &fakeExecer{}
-	b := NewBackend(nil, fx, DefaultConfig())
-	ref := Ref{Namespace: "cc-sandbox", Name: PodName("s0abcdefgh", 1), Sid: "s0abcdefgh", Gen: 1}
 	ctx := context.Background()
+	_, rest := newAPI(t)
+	b := NewBackend(rest, fx, DefaultConfig())
+	s := goodSpec()
+	s.Gen = 1
+	made, err := b.Create(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := *made
 	if code, err := b.Exec(ctx, ref, "side", []string{"true"}, IO{}); err != nil || code != 0 || fx.calls != 1 {
 		t.Fatalf("%d %v", code, err)
 	}

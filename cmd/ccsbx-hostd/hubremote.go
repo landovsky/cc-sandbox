@@ -96,9 +96,11 @@ type hubRemote struct {
 	// between typing and a successful ack does not type the same message again.
 	handledPath string
 
-	mu      sync.Mutex
-	keys    map[string]*relayKey // "<sid>/<gen>" -> its key and relay token
-	handled map[string]time.Time
+	lastNodeCheck time.Time
+	mintMu        sync.Mutex // serializes relay mints
+	mu            sync.Mutex
+	keys          map[string]*relayKey // "<sid>/<gen>" -> its key and relay token
+	handled       map[string]time.Time
 }
 
 const (
@@ -228,11 +230,6 @@ func (h *hubRemote) vet(ctx context.Context, d hubc.Deliver) (rs msg.RemoteSende
 	if d.UID == "" {
 		return rs, "", "no target"
 	}
-	if d.Trust != "fenced" {
-		// An unfenced sender is whoever wrote `from`: a claim nobody authenticates (every owner CC session
-		// holds the hub secret and can write any id). It must not pass a scope check on that claim.
-		return rs, "", "an unfenced sender cannot be identified, so it is not heard; a fenced sender or the owner's socket can reach this session"
-	}
 	entries, err := h.hub.Sessions(ctx)
 	if err != nil {
 		return rs, "", "the hub's presence list could not be read: " + err.Error()
@@ -241,6 +238,9 @@ func (h *hubRemote) vet(ctx context.Context, d hubc.Deliver) (rs msg.RemoteSende
 	te := uniqueEntry(entries, d.UID)
 	if te == nil || te["machine"] != h.machine || !addressNames(te, d.To) {
 		return rs, "", "the address in the stamp does not name this target"
+	}
+	if d.Trust != "fenced" {
+		return h.vetUnfenced(d)
 	}
 	sid := d.From["sid"]
 	if d.Sig == "" || d.Pub == "" || sid == "" {
@@ -277,6 +277,33 @@ func (h *hubRemote) vet(ctx context.Context, d hubc.Deliver) (rs msg.RemoteSende
 		return rs, "", "the hub has no node for the sender's session"
 	}
 	return msg.RemoteSender{Node: node, Sid: sid, Machine: machine, Fenced: true}, d.Body, ""
+}
+
+// vetUnfenced hears an unfenced sender only on what the HUB authenticated: the deliver must have come in on
+// a principal that itself tracked the entry named by from.id, on the machine from claims (`bound`), and the
+// entry must not be a fenced one (a fenced identity speaks only signed). The hub cannot say more without
+// a signature: ANY session holding the same credential on that machine (every owner-uid session, for the
+// shared secret) can still name another session tracked under it. That is the trust local ccmsg already
+// has, which is why the line is typed visibly as "unfenced (hub)"; it must never let anyone claim a fenced
+// identity, or a session of another machine. Absent or negative binding means refuse.
+func (h *hubRemote) vetUnfenced(d hubc.Deliver) (rs msg.RemoteSender, text, verdict string) {
+	if !d.Bound || d.FromEntry == nil {
+		return rs, "", "an unfenced sender the hub did not bind to the credential it posted with is not heard"
+	}
+	if d.From["fenced"] == "true" || d.FromEntry["fenced"] == true || d.Sig != "" {
+		return rs, "", "a fenced identity is claimed without a relay signature"
+	}
+	node, _ := d.FromEntry["node"].(string)
+	machine, _ := d.FromEntry["machine"].(string)
+	uid, _ := d.FromEntry["uid"].(string)
+	if node == "" || machine == "" || (d.From["machine"] != "" && d.From["machine"] != machine) {
+		return rs, "", "the hub's entry for the unfenced sender has no node, or is not from the machine it claims"
+	}
+	body := d.Body
+	if body == "" {
+		body = d.Text
+	}
+	return msg.RemoteSender{Node: node, Sid: uid, Machine: machine}, body, ""
 }
 
 // uniqueEntry is the hub entry whose uid is sid, only if there is exactly one: two entries for one sid
@@ -328,20 +355,23 @@ func (h *hubRemote) SendRemote(sender msg.Session, node, kind, text string) (boo
 	}
 	to, _ := e["id"].(string)
 	toSid, _ := e["uid"].(string)
-	if to == "" || e["fenced"] != true {
-		// The hub lets a relay reach only fenced sessions: do not spend a root mint on a certain 403.
-		return false, "", fmt.Errorf("the node is not a fenced session on the hub: a signed message can reach only fenced sessions")
+	if to == "" {
+		return false, "", fmt.Errorf("the hub's entry for that node has no id")
 	}
 	if !kindRe.MatchString(kind) {
 		kind = "message"
 	}
+	stale := ""
 	for attempt := 0; attempt < 2; attempt++ {
-		k, err := h.relayFor(ctx, sender, attempt > 0)
+		priv, token, err := h.relayFor(ctx, sender, stale)
 		if err != nil {
 			return false, toSid, err
 		}
-		sig := stamp.Sign(k.priv, stamp.Fields{From: sender.Sid, To: to, Kind: kind, Body: text}, h.now())
-		c := &hubc.Client{URL: h.url, Token: func() (string, error) { return k.token, nil }}
+		sig := stamp.Sign(priv, stamp.Fields{From: sender.Sid, To: to, Kind: kind, Body: text}, h.now())
+		for i := range priv { // this send's own copy: nothing shared is left behind
+			priv[i] = 0
+		}
+		c := &hubc.Client{URL: h.url, Token: func() (string, error) { return token, nil }}
 		res, err := c.Send(ctx, hubc.SendReq{To: to, Text: text, Kind: kind, Sig: sig,
 			From: map[string]string{"sid": sender.Sid, "fenced": "true", "label": sender.Label, "machine": h.machine, "id": "ccsbx:" + sender.Sid}})
 		switch {
@@ -351,7 +381,8 @@ func (h *hubRemote) SendRemote(sender msg.Session, node, kind, text string) (boo
 			}
 			return true, toSid, nil
 		case hubc.IsUnauthorized(err) && attempt == 0:
-			continue // the relay credential expired or was revoked: mint a new one, once
+			stale = token // the relay credential expired or was revoked: ONE send mints a new one
+			continue
 		case hubc.IsForbidden(err):
 			// a refusal of THIS message (scope, stamp, sender): a new credential would not change it
 			h.logf("hub: message from %s to %s refused by the hub: %v", sender.Sid, node, err)
@@ -363,30 +394,47 @@ func (h *hubRemote) SendRemote(sender msg.Session, node, kind, text string) (boo
 	return false, toSid, fmt.Errorf("the hub refused the relay credential twice")
 }
 
-// relayFor returns the generation's key and relay token, minting them once (or again when fresh).
-func (h *hubRemote) relayFor(ctx context.Context, s msg.Session, fresh bool) (*relayKey, error) {
+// relayFor returns a COPY of the generation's private key and its relay token, minting them once. stale is
+// the token a send just had refused with 401: only the first send that sees it mints a new pair, the
+// others (which hold the same stale token) find the new one already stored. The stored key is wiped by
+// pruneKeys when its generation ends; a send never uses the stored slice itself, so that cannot zero a key
+// that is mid-signature.
+func (h *hubRemote) relayFor(ctx context.Context, s msg.Session, stale string) (ed25519.PrivateKey, string, error) {
 	k := s.Sid + "/" + strconv.Itoa(s.Gen)
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if rk := h.keys[k]; rk != nil && !fresh {
-		return rk, nil
+	get := func() (ed25519.PrivateKey, string, bool) {
+		h.mu.Lock()
+		defer h.mu.Unlock()
+		if rk := h.keys[k]; rk != nil && rk.token != stale {
+			return append(ed25519.PrivateKey(nil), rk.priv...), rk.token, true
+		}
+		return nil, "", false
+	}
+	if priv, tok, ok := get(); ok {
+		return priv, tok, nil
 	}
 	if h.mint == nil {
-		return nil, fmt.Errorf("no way to mint a relay credential (ccsbx-root relay-mint)")
+		return nil, "", fmt.Errorf("no way to mint a relay credential (ccsbx-root relay-mint)")
+	}
+	h.mintMu.Lock() // one mint at a time: a burst of sends after an expiry asks root once
+	defer h.mintMu.Unlock()
+	if priv, tok, ok := get(); ok { // another send minted while we waited
+		return priv, tok, nil
 	}
 	pub, priv, err := stamp.NewKey()
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	tok, err := h.mint(ctx, s.Sid, s.Gen, pub, fresh)
+	tok, err := h.mint(ctx, s.Sid, s.Gen, pub, stale != "")
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
+	h.mu.Lock()
 	if old := h.keys[k]; old != nil {
 		wipe(old)
 	}
 	h.keys[k] = &relayKey{priv: priv, token: tok}
-	return h.keys[k], nil
+	h.mu.Unlock()
+	return append(ed25519.PrivateKey(nil), priv...), tok, nil
 }
 
 func wipe(k *relayKey) {
@@ -394,6 +442,39 @@ func wipe(k *relayKey) {
 		k.priv[i] = 0
 	}
 	k.token = ""
+}
+
+// warnNodeless logs, at most once an hour, when the hub returns our own fenced entries without their
+// node: the hub drops a node unless the machine's spoke principal was minted with `trees` that include
+// the node's tree, and without nodes no cross-machine message can be scoped or addressed (M2b). The
+// symptom is otherwise silent.
+func (h *hubRemote) warnNodeless(ctx context.Context, own []map[string]any) {
+	h.mu.Lock()
+	if h.now().Sub(h.lastNodeCheck) < time.Hour && !h.lastNodeCheck.IsZero() {
+		h.mu.Unlock()
+		return
+	}
+	h.lastNodeCheck = h.now()
+	h.mu.Unlock()
+	if len(own) == 0 {
+		h.mu.Lock()
+		h.lastNodeCheck = time.Time{} // nothing to check yet: look again next time
+		h.mu.Unlock()
+		return
+	}
+	entries, err := h.hub.Sessions(ctx)
+	if err != nil {
+		return
+	}
+	for _, o := range own {
+		sid, _ := o["uid"].(string)
+		if e := uniqueEntry(entries, sid); e != nil {
+			if n, _ := e["node"].(string); n == "" {
+				h.logf("hub: WARNING: the hub keeps no node for %s: mint this machine's spoke credential with trees (for example [\"cc-sandbox\"]), or cross-machine messages cannot be scoped or addressed", sid)
+				return
+			}
+		}
+	}
 }
 
 // pruneKeys drops (and wipes) the keys of generations that are not live any more: a key is for the life

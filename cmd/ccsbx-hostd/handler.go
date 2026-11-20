@@ -267,6 +267,11 @@ func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router
 		OnDeliver: func(ctx context.Context, f hubc.Frame, d hubc.Deliver) hubspoke.Result {
 			return hr.onDeliver(ctx, f, d)
 		},
+		AfterTrack: func(ctx context.Context) {
+			if all, err := rt.Dir.Sessions(); err == nil {
+				hr.warnNodeless(ctx, fencedEntries(machine, all, rt.Idle.IdleSince))
+			}
+		},
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})

@@ -54,7 +54,14 @@ sudo -n /usr/local/sbin/ccsbx-root relay-mint -- <sid> <gen> <pub>
 - Hub address: `hub_url` in `ccsbx-root.toml` (default `http://127.0.0.1:4011`, loopback only; a non-loopback
   host is refused at config load). No redirects followed. Timeout 10 s.
 - Request: `POST <hub_url>/v1/principals` with `Authorization: Bearer <admin secret>` and body
-  `{"role":"relay","sid":"<sid>","gen":"<gen>","pub":"<pub>"}`. The reply's `token` is printed. A hub that
+  `{"role":"relay","sid":"<sid>","gen":"<gen>","pub":"<pub>","may_reach":[<nodes>]}`.
+- **`may_reach` is derived by root, never supplied.** It is the session's manager node plus its peer nodes,
+  read by root from the SAME record it just validated (`msg_scope.manager.node` and `msg_scope.peers`, at most
+  32, each matching `[A-Za-z0-9._#:/-]{1,128}`). The verb has no argument for it: a `--may-reach` option, or
+  any argument other than `--after-401` and `-- <sid> <gen> <pub>`, is refused with exit 2 before anything is
+  read or sent. The hub lets a relay deliver to an UNFENCED target only when that target's node is in the
+  relay's `may_reach` (typed there with the fenced stamp); everything else is 403. A relay minted with an
+  empty list reaches fenced sessions only. (Hub side: dotfiles `n1-g-hub2`, `Principals` and `scope!`.) The reply's `token` is printed. A hub that
   answers anything but 201 with a token: exit 3, the status code (not the body) on stderr.
 
 ## Revoke
@@ -75,6 +82,8 @@ result. Never the token, never the secret.
 | 3 | the hub or the secret: unreachable, 401/403, no secret, secret not trusted |
 
 ## Tests this needs
+(plus: `may_reach` equals manager + peers from the record; a caller-supplied `--may-reach` or extra argument is
+refused and no hub call is made; a record with more than 32 peers is refused rather than truncated.)
 Each refusal above; the secret never appears in stdout, stderr, the audit line or a child process's
 arguments; a symlinked or group-readable secret is refused; a fake hub that answers 201 / 401 / 500 / hangs;
 the revoke runs in `run`'s cleanup and in `gc` (a stub hub records the DELETE).

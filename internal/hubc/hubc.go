@@ -65,6 +65,13 @@ type Deliver struct {
 	Body  string            `json:"body,omitempty"`
 	// RecvTS is when the HUB received the message (unix seconds): a stamp's skew is judged at that time.
 	RecvTS int64 `json:"recv_ts,omitempty"`
+	// Via is the principal the deliver came in on, as the hub AUTHENTICATED it ("spoke:<m>", "legacy" for the
+	// shared owner secret, "relay:<sid>/<gen>"). Bound is true only when From.id is an entry TRACKED BY THAT
+	// SAME principal on the machine From claims, and never for a fenced entry; FromEntry is then that entry.
+	// Absent (an old hub) means unbound.
+	Via       string         `json:"via,omitempty"`
+	Bound     bool           `json:"bound,omitempty"`
+	FromEntry map[string]any `json:"from_entry,omitempty"`
 }
 
 // Error is a non-2xx answer from the hub.

@@ -56,7 +56,10 @@ type Config struct {
 	OnDeliver func(ctx context.Context, f hubc.Frame, d hubc.Deliver) Result
 	// PollWait is the long-poll length (default 25 s, the hub caps it at 30).
 	PollWait time.Duration
-	Logf     func(format string, args ...any)
+	// AfterTrack, when set, runs after every successful track (outside any lock); hostd uses it to check
+	// that the hub kept the node of its own entries.
+	AfterTrack func(ctx context.Context)
+	Logf       func(format string, args ...any)
 	// Backoff is the wait after a failed call (default 2 s growing to 30 s). Tests shorten it.
 	Backoff time.Duration
 }
@@ -138,6 +141,9 @@ func (s *Spoke) trackLoop(ctx context.Context) {
 			s.mu.Lock()
 			s.st.Tracked, s.st.Renewals = len(keys), s.st.Renewals+1
 			s.mu.Unlock()
+			if s.cfg.AfterTrack != nil {
+				s.cfg.AfterTrack(ctx)
+			}
 			back = s.cfg.Backoff
 		} else {
 			wait = back // grows while it keeps failing: a refused credential must not hit the hub every 2 s

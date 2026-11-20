@@ -437,11 +437,20 @@ record, never from the fence) and polls `spoke:<machine>/ccsbx`.
   record (manager, peers, reply-to-sender). An unfenced sender is delivered as `unfenced (hub)` under the same
   scope. The typed text is rendered by hostd from the verified body, and the hub's own line must carry the
   same flattened body or the message is refused.
-- **Unfenced senders are not heard.** An unfenced sender's `from.id` is a claim nobody authenticates (every
-  owner Claude session holds the hub secret and can write any id), so a message from one is refused by the
-  receiving hostd instead of passing the scope check as "the manager". A fenced sender, or the owner's own
-  socket (`ccsbx deliver`), reaches a fenced pane. (Decision for later: let a target's record name an
-  unfenced manager explicitly.)
+- **Unfenced senders** (an ordinary Mac manager using ccmsg) are heard only on what the HUB authenticated: the
+  deliver must have come in on a credential that itself tracked the entry named by `from.id`, on the machine
+  `from` claims, and the entry must not be a fenced one (the hub marks this `bound`; hostd refuses any
+  unfenced message whose binding is absent or negative). The line is typed visibly as `unfenced (hub)` and
+  the normal scope check runs on the BOUND node. Residual: any owner-uid session on that machine (they
+  all hold the same credential) can still claim another session tracked under it. That is the trust local
+  ccmsg has today, which is why it is labelled unfenced. It never lets anyone claim a fenced identity (that
+  needs a relay signature) or a session of another machine.
+- **Fenced to unfenced.** A relay reaches an unfenced target only if that target's node is in the relay's
+  `may_reach`, fixed at mint by root from the session's record (manager and peers).
+- **Minting the machine's spoke credential** (once, as the hub admin, on the hub host; the file is root-owned,
+  0640, group ccsbx): `curl -X POST -H "authorization: Bearer $ADMIN" -d '{"role":"spoke","machine":"<machine>","trees":["cc-sandbox"]}' http://127.0.0.1:4011/v1/principals`.
+  Without `trees` the hub drops every node and nothing can be scoped or addressed; hostd logs a warning
+  when its own entries come back without one.
 - **Node bound.** The hub keeps a fenced entry's `node` only for the trees the machine's spoke principal was
   minted for (`trees`), so a fence cannot publish an owner's unrelated tree node.
 - **Known limit: the public key is supplied by the hub.** hostd verifies the stamp against the `pub` the hub

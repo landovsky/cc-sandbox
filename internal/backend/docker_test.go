@@ -323,6 +323,7 @@ func TestDirectModeLeavesAre0777(t *testing.T) {
 func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
 	h := spec(t)
 	h.NotEvid = false // helper mode
+	h.OutGid = 4243
 	owners := map[string][2]int{}
 	h.Chown = func(p string, uid, gid int) error { owners[p] = [2]int{uid, gid}; return nil }
 	if err := h.Prepare(); err != nil {
@@ -332,14 +333,14 @@ func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
 		mode os.FileMode
 		own  [2]int
 	}{
-		filepath.Join(h.GenDir(), "out"):     {0o700, [2]int{FenceUID, FenceUID}},
+		filepath.Join(h.GenDir(), "out"):     {os.ModeSetgid | 0o770, [2]int{FenceUID, 4243}},
 		filepath.Join(h.GenDir(), "in"):      {0o755, [2]int{0, 0}},
 		filepath.Join(h.GenDir(), "managed"): {0o755, [2]int{0, 0}},
 		h.HomeDir():                          {0o700, [2]int{FenceUID, FenceUID}},
 	}
 	for p, w := range want {
 		st, err := os.Stat(p)
-		if err != nil || st.Mode().Perm() != w.mode {
+		if err != nil || st.Mode()&(os.ModePerm|os.ModeSetgid|os.ModeSetuid) != w.mode {
 			t.Errorf("%s: %v %v, want %v", p, st, err, w.mode)
 		}
 		if owners[p] != w.own {
@@ -651,6 +652,7 @@ func TestRunArgsMountTheStagedSources(t *testing.T) {
 func TestHelperModeNeverBuildsTheContainerSweep(t *testing.T) {
 	h := spec(t)
 	h.NotEvid = false
+	h.OutGid = 4243
 	defer func() {
 		if recover() == nil {
 			t.Error("SweepArgs was built in helper mode")
@@ -671,6 +673,7 @@ func TestSweepScriptDoesNotChmod(t *testing.T) {
 func TestSweepHomeGo(t *testing.T) {
 	s := spec(t)
 	s.NotEvid = false
+	s.OutGid = 4243
 	s.Chown = func(string, int, int) error { return nil }
 	if err := s.Prepare(); err != nil {
 		t.Fatal(err)
@@ -724,6 +727,7 @@ func TestSweepHomeGo(t *testing.T) {
 func TestSweepHomeGoParentSymlink(t *testing.T) {
 	s := spec(t)
 	s.NotEvid = false
+	s.OutGid = 4243
 	s.Chown = func(string, int, int) error { return nil }
 	if err := s.Prepare(); err != nil {
 		t.Fatal(err)
@@ -775,6 +779,7 @@ func TestHelperRunHasNoSweepContainerAndStagesFirst(t *testing.T) {
 	os.WriteFile(fake, []byte("#!/bin/sh\necho \"$@\" >> "+log+"\n"), 0o755)
 	s := spec(t)
 	s.NotEvid = false
+	s.OutGid = 4243
 	s.Chown = func(string, int, int) error { return nil }
 	var order []string
 	r := &Runner{Docker: fake, Stage: func(Spec) (func(), error) {
@@ -800,6 +805,7 @@ func TestHelperRunHasNoSweepContainerAndStagesFirst(t *testing.T) {
 	// a staging failure stops the run before docker is touched
 	s2 := spec(t)
 	s2.NotEvid = false
+	s2.OutGid = 4243
 	s2.Chown = func(string, int, int) error { return nil }
 	os.Remove(log)
 	r2 := &Runner{Docker: fake, Stage: func(Spec) (func(), error) { return nil, os.ErrPermission }}
@@ -819,6 +825,7 @@ func TestHelperRunSweepsTheHomeInGo(t *testing.T) {
 	os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755)
 	s := spec(t)
 	s.NotEvid = false
+	s.OutGid = 4243
 	s.Chown = func(string, int, int) error { return nil }
 	os.MkdirAll(s.HomeDir(), 0o700)
 	os.WriteFile(filepath.Join(s.HomeDir(), ".bashrc"), []byte("evil"), 0o644)
@@ -932,5 +939,16 @@ func TestStripSetidLeavesHardlinkedFilesOfOthers(t *testing.T) {
 	}
 	if FenceUID != 10001 {
 		t.Error("the production strip must be the fence's uid")
+	}
+}
+
+// Helper mode cannot make an outbox hostd could not read: without the service group Prepare refuses
+// rather than leave a 10001-only directory nobody can scan.
+func TestHelperPrepareNeedsTheOutboxGroup(t *testing.T) {
+	h := spec(t)
+	h.NotEvid = false
+	h.Chown = func(string, int, int) error { return nil }
+	if err := h.Prepare(); err == nil || !strings.Contains(err.Error(), "OutGid") {
+		t.Fatalf("a helper-mode Prepare without the service gid was accepted: %v", err)
 	}
 }

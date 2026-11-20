@@ -7,6 +7,7 @@
 set -u
 case "${1:-}" in -h|--help|"") sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; esac
 MODE=$1; IMG=${CCSBX_TEST_IMAGE:-python:3.12-slim}; BIN=${CCSBX_BIN:-bin/ccsbx}
+export CCSBX_ROOT=direct   # these twins are DIRECT-mode checks: never let the mode resolve to helper (auto) on a machine that has ccsbx-root
 docker image inspect "$IMG" >/dev/null 2>&1 || { echo "FAIL: image $IMG not present locally (not pulling)"; exit 1; }
 mkdir -p /var/tmp/ccsbx-hello; STATE=$(mktemp -d); PIDS=()
 . "$(dirname "$0")/fence-cleanup.sh"   # cleanup: exact names only, refuses empty or foreign values

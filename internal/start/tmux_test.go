@@ -142,7 +142,7 @@ func TestHelperPaneRunsSudoRootRunTty(t *testing.T) {
 		t.Fatal(err)
 	}
 	j := strings.Join(got, " ")
-	want := "new-session -d -s s0abcdefgh -c /w " + SudoBin + " -n " + RootBin + " run --tty s0abcdefgh"
+	want := "new-session -d -s s0abcdefgh -c / " + SudoBin + " -n " + RootBin + " run --tty s0abcdefgh"
 	if !strings.Contains(j, want) {
 		t.Errorf("pane command not as expected:\n got %s\nwant it to contain %s", j, want)
 	}

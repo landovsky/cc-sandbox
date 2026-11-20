@@ -30,7 +30,10 @@ func SetTestRootUID(uid int) func() {
 
 // HelperInstalled reports whether the helper is there and trustworthy: a regular file (not a
 // symlink) owned by root and not writable by group or others. A file the caller could replace is
-// not a helper.
+// not a helper. This check is advice for choosing a mode (and for failing early with a clear
+// message), not the security boundary: only the last path component is examined, and what really
+// decides who may run what as root is the sudoers rule and ccsbx-root's own checks. (The installer's
+// `check` is where the directories above it are asserted root-owned and closed.)
 func HelperInstalled() bool { return helperProblem() == "" }
 
 func helperProblem() string {

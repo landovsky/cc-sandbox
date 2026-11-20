@@ -372,6 +372,9 @@ func TestRunAllow(t *testing.T) {
 	if s.Sid != sid || s.Gen != 2 || s.Image != goodImage || s.NotEvid || s.Uid != os.Getuid() || s.TTY {
 		t.Errorf("%+v", s)
 	}
+	if s.OutGid != svcGID {
+		t.Errorf("the outbox group is %d, want the service user's %d", s.OutGid, svcGID)
+	}
 	if s.Workdir != f.wd || s.WorktreeRoot != f.cfg.AllowedRoots[0] || s.StateDir != f.run || s.MemoryMB != 4096 || s.Pids != 512 {
 		t.Errorf("%+v", s)
 	}

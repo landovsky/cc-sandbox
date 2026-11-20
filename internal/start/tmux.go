@@ -27,6 +27,16 @@ type TmuxLauncher struct {
 	Helper bool
 }
 
+// paneDir is the pane's working directory. In helper mode it is "/": ccsbx-root takes the workdir
+// from the record and never from its cwd, and a service uid that cannot enter the owner's worktree
+// would otherwise land in whatever directory tmux falls back to.
+func (t *TmuxLauncher) paneDir(r *Record) string {
+	if t.Helper {
+		return "/"
+	}
+	return r.Spec.Workdir.Path
+}
+
 // paneCmd is what the pane runs.
 func (t *TmuxLauncher) paneCmd(r *Record) []string {
 	if t.Helper {
@@ -59,7 +69,7 @@ func (t *TmuxLauncher) Launch(r *Record) error {
 			return fmt.Errorf("%s (socket %s)", tmuxsock.ErrNoServer, t.Socket)
 		}
 	}
-	args := append([]string{"new-session", "-d", "-s", r.Sid, "-c", r.Spec.Workdir.Path}, t.paneCmd(r)...)
+	args := append([]string{"new-session", "-d", "-s", r.Sid, "-c", t.paneDir(r)}, t.paneCmd(r)...)
 	args = append(args, ";", "set-option", "-g", "set-clipboard", "off", ";", "set-option", "-g", "allow-passthrough", "off",
 		// A pane is a window onto a fence, not a tmux session to drive: no status line, no prefix
 		// key (so a keystroke never reaches tmux's own command mode), no escape delay.

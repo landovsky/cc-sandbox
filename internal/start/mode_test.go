@@ -57,6 +57,11 @@ func TestAutoIsDirectWithoutATrustworthyHelper(t *testing.T) {
 	if _, err := ResolveRoot("helper"); err == nil {
 		t.Error("--root helper accepted a world-writable helper")
 	}
+	// writable by the group only (a 0775 helper is replaceable by group members)
+	withHelper(t, 0o775)
+	if got, _ := ResolveRoot("auto"); got != "direct" {
+		t.Errorf("a group-writable helper was used: %q", got)
+	}
 	// installed but not owned by root
 	withHelper(t, 0o755)
 	restore := SetTestRootUID(os.Getuid() + 1)

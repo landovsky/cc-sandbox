@@ -58,6 +58,9 @@ type Spec struct {
 	// Seccomp, when set, is the path of the seccomp profile docker runs the fence with (ccsbx-root
 	// sets it to a verified profile that refuses setuid/setgid chmod); "" means docker's default.
 	Seccomp string
+	// OutGid is the group of the service user (ccsbx) that owns hostd: helper mode makes out/
+	// 10001:OutGid 02770 so hostd can read what the fence writes there (the files inherit the group).
+	OutGid int
 	// Class is "e2e" or "prod": part of the home's key.
 	Class string
 	// MountWorkdir and MountGitDir, when set, are the host paths docker mounts instead of Workdir and
@@ -177,9 +180,14 @@ func (s Spec) Prepare() error {
 	for _, d := range []string{"out", "in", "managed"} {
 		p := filepath.Join(g, d)
 		if helper {
-			mode, own := os.FileMode(0o755), 0
+			mode, own, grp := os.FileMode(0o755), 0, 0
 			if d == "out" {
-				mode, own = 0o700, FenceUID
+				// 10001 writes, the service group reads (setgid: new files take its group). The
+				// daemon still requires every file's uid to be 10001.
+				if s.OutGid <= 0 {
+					return fmt.Errorf("helper mode needs the service user's gid for the outbox (OutGid)")
+				}
+				mode, own, grp = os.ModeSetgid|0o770, FenceUID, s.OutGid
 			}
 			if err := os.Mkdir(p, mode); err != nil {
 				return err
@@ -187,7 +195,7 @@ func (s Spec) Prepare() error {
 			if err := os.Chmod(p, mode); err != nil { // umask must not narrow or widen it
 				return err
 			}
-			if err := s.chown(p, own, own); err != nil {
+			if err := s.chown(p, own, grp); err != nil {
 				return err
 			}
 			continue

@@ -170,7 +170,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Helper: mode == "helper", Env: []string{"--state", abs(get("state")),
 			"--profiles", abs(get("profiles")), "--machine", get("machine"), "--image", get("image"), "--root", mode}}}
 	var servers []*http.Server
-	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": mode != "helper"}}
+	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
 	srv.Replace = func(sid, brief string) (int, error) {
 		rec, err := sd.Replace(sid, brief)
 		if err != nil {

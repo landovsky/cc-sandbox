@@ -28,6 +28,10 @@ STATE=$(mktemp -d); printf 'sab3cd9fgh2\n\n' > "$STATE/sids";    check "empty li
 STATE=$(mktemp -d); printf 'ab3cd9fgh2\n' > "$STATE/sids";       check "sid without the s prefix" refuse
 STATE=$(mktemp -d); printf 'sab3cd9fgh2 x\n' > "$STATE/sids";    check "sid with trailing junk" refuse
 STATE=$(mktemp -d); printf '*\n' > "$STATE/sids";                check "glob as sid" refuse
+STATE=$(mktemp -d); printf 'sab3cd9fgh2\n' > "$STATE/sids"; printf '/var/tmp/ccsbx-cc-aB3x9Z\n' > "$STATE/trash"; check "a trash dir of the exact shape" ok
+for t in '/var/tmp/ccsbx-cc-ab/../' '/var/tmp/ccsbx-cc-abc12/..' '/var/tmp/ccsbx-cc-a/b123' '/var/tmp/ccsbx-cc-*' '/var/tmp/ccsbx-cc-abc12' '/var/tmp/ccsbx-cc-abc1234' '/var/tmp/' '' '/etc'; do
+  STATE=$(mktemp -d); printf 'sab3cd9fgh2\n' > "$STATE/sids"; printf '%s\n' "$t" > "$STATE/trash"; check "trash line '$t'" refuse
+done
 STATE="";                                                         check "empty STATE" refuse
 STATE=/;                                                          check "STATE is /" refuse
 STATE=$HOME;                                                      check "STATE is the home" refuse

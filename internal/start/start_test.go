@@ -488,3 +488,23 @@ func TestParseSpecNormalisesTheRealm(t *testing.T) {
 		t.Fatal("a realm the queue would refuse was accepted")
 	}
 }
+
+// A reply claims evidence only when the helper has actually run on a machine without the docker
+// group; the helper merely being installed (or the mode being "helper") proves nothing.
+func TestReplyDoesNotClaimEvidenceFromTheModeAlone(t *testing.T) {
+	d, _ := newDaemon(t)
+	d.Root, d.Image = "helper", "ghcr.io/landovsky/ccsbx-fence@sha256:"+strings.Repeat("a", 64)
+	os.WriteFile(d.PinsFile, []byte("[[pin]]\nref = \""+d.Image+"\"\ncc = \"2.1\"\n"), 0o644)
+	rep, err := d.Start(spec(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rep.NotEv {
+		t.Error("a helper-mode reply claimed evidence before the helper was proven")
+	}
+	d2, _ := newDaemon(t)
+	d2.Root, d2.HelperProven, d2.Image, d2.PinsFile = "helper", true, d.Image, d.PinsFile
+	if rep2, err := d2.Start(spec(nil)); err != nil || rep2.NotEv {
+		t.Errorf("a proven helper does not get evidence: %v %v", rep2, err)
+	}
+}

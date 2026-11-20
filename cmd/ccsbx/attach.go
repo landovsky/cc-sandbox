@@ -11,11 +11,11 @@ import (
 	"net"
 	"os"
 	"os/exec"
-	"regexp"
 	"syscall"
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
+	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
 // socketReachable: this user can connect to the unix socket.
@@ -28,15 +28,8 @@ func socketReachable(path string) bool {
 	return true
 }
 
-// attachSudo and attachRoot are where sudo and the root door are (the installer puts the door at
-// attachRoot); attachExec replaces the process. Tests replace them.
-var (
-	attachSudo = "/usr/bin/sudo"
-	attachRoot = "/usr/local/sbin/ccsbx-root"
-	attachExec = syscall.Exec
-)
-
-var attachSid = regexp.MustCompile(`^s[0-9a-z]{4,32}$`)
+// attachExec replaces the process; tests replace it.
+var attachExec = syscall.Exec
 
 func attachCmd() *cli.Command {
 	return &cli.Command{
@@ -49,34 +42,46 @@ func attachCmd() *cli.Command {
 		Setup: func(f *cli.Flags) {
 			f.String("tmux-socket", "ccsbx", "the tmux server the panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (the service uid's socket: reached through ccsbx-root attach, exit 2 if that is not installed)")
 			f.Bool("read-only", false, "attach read-only (no keys reach the session)")
+			f.String("root", "auto", modeFlagHelp)
 		},
 		Run: func(f *cli.Flags, args []string, _, stderr io.Writer) int {
-			if len(args) != 1 || !attachSid.MatchString(args[0]) {
+			if len(args) != 1 || !start.ValidSid(args[0]) {
 				fmt.Fprintln(stderr, "usage: ccsbx attach <sid>   (a session id like s0k1dry66qg; ccsbx ls lists them)")
 				return cli.ExitUsage
 			}
+			mode, err := resolveMode(f)
+			if err != nil {
+				fmt.Fprintln(stderr, "ccsbx attach:", err)
+				return cli.ExitRefused
+			}
 			sock := f.Lookup("tmux-socket").Value.String()
-			// A shared socket path is the service uid's tmux (0600, owned by that uid): the owner's
-			// uid can't, and must not be able to, talk to it directly. The way in is
-			// `ccsbx-root attach <sid>`, a narrow entry that checks the sid against the daemon's
-			// record and attaches that one session as the service uid. Only when the socket is
-			// reachable (a dev run as the same uid) is it attached directly.
-			if tmuxsock.IsPath(sock) && !socketReachable(sock) {
-				if _, err := os.Stat(attachRoot); err == nil {
-					if f.Lookup("read-only").Value.String() == "true" {
-						fmt.Fprintln(stderr, "ccsbx attach: --read-only is not available through ccsbx-root attach")
-						return cli.ExitUsage
-					}
-					// ccsbx-root is the one NOPASSWD sudo target and refuses to run unless it is root,
-					// so it is reached through sudo, by absolute path (not through the caller's PATH).
-					if err := attachExec(attachSudo, []string{"sudo", "-n", attachRoot, "attach", args[0]}, os.Environ()); err != nil {
-						fmt.Fprintln(stderr, "ccsbx attach:", err)
-						return cli.ExitFail
-					}
-					return cli.ExitOK
+			if mode == "helper" {
+				// The panes live in the service uid's tmux (socket 0600): the owner's uid can't, and
+				// must not be able to, talk to it. The way in is `ccsbx-root attach <sid>`, which
+				// checks the sid against the daemon's record and attaches that one session. It is
+				// reached through sudo, by absolute path, whatever --tmux-socket says.
+				if f.Lookup("read-only").Value.String() == "true" {
+					fmt.Fprintln(stderr, "ccsbx attach: --read-only is not available through ccsbx-root attach")
+					return cli.ExitUsage
 				}
+				if !start.HelperInstalled() {
+					fmt.Fprintf(stderr, "ccsbx attach: --root helper, but %s is not installed and root-owned\n", start.RootBin)
+					return cli.ExitRefused
+				}
+				if why := sudoPreflight(); why != "" {
+					fmt.Fprintf(stderr, "ccsbx attach: %s. Not falling back to direct mode.\n", why)
+					return cli.ExitRefused
+				}
+				env := []string{"PATH=/usr/bin:/bin", "TERM=" + os.Getenv("TERM"), "LANG=C.UTF-8"}
+				if err := attachExec(start.SudoBin, []string{"sudo", "-n", start.RootBin, "attach", "--", args[0]}, env); err != nil {
+					fmt.Fprintln(stderr, "ccsbx attach:", err)
+					return cli.ExitFail
+				}
+				return cli.ExitOK
+			}
+			if tmuxsock.IsPath(sock) && !socketReachable(sock) {
 				fmt.Fprintf(stderr, "ccsbx attach: the tmux socket %s is not reachable by this user (it belongs to the service uid, mode 0600).\n"+
-					"  The way in is:  sudo -n ccsbx-root attach %s\n  but ccsbx-root is not installed here (Gate M).\n", sock, args[0])
+					"  The way in is:  ccsbx attach --root helper %s   (sudo -n ccsbx-root attach), once ccsbx-root is installed (Gate M).\n", sock, args[0])
 				return 2
 			}
 			bin, err := exec.LookPath("tmux")

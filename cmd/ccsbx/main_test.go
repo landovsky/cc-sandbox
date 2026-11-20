@@ -56,12 +56,9 @@ func TestSteeringCheckRefusesFencedWorktreeFallback(t *testing.T) {
 // not exec tmux against a socket it cannot reach.
 func TestAttachToAnUnreachableServiceSocketNamesTheCommandAndExits2(t *testing.T) {
 	t.Setenv("PATH", t.TempDir()) // no tmux
-	old := attachRoot
-	attachRoot = "/nonexistent/ccsbx-root" // not installed
-	defer func() { attachRoot = old }()
 	var out, errb bytes.Buffer
-	code := app().Main([]string{"attach", "--tmux-socket", "/nonexistent/ccsbx/tmux.sock", "s0abcd1"}, &out, &errb)
-	if code != 2 || !strings.Contains(errb.String(), "ccsbx-root attach s0abcd1") {
+	code := app().Main([]string{"attach", "--root", "direct", "--tmux-socket", "/nonexistent/ccsbx/tmux.sock", "s0abcd1"}, &out, &errb)
+	if code != 2 || !strings.Contains(errb.String(), "ccsbx attach --root helper s0abcd1") {
 		t.Fatalf("exit %d: %s", code, errb.String())
 	}
 }

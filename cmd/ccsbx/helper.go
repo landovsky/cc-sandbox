@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
@@ -23,7 +24,7 @@ import (
 // dockerSocket is where direct mode reaches docker; tests replace it.
 var dockerSocket = "/var/run/docker.sock"
 
-// modeFlag is the shared --root flag text.
+// modeFlagHelp is the shared --root flag text.
 const modeFlagHelp = "privilege mode: auto (helper if /usr/local/sbin/ccsbx-root is installed and root-owned, else direct), direct (the caller drives docker; dev; results are not evidence) or helper (through sudo -n ccsbx-root; no docker for the caller)"
 
 // resolveMode applies the flag/env value.
@@ -49,44 +50,85 @@ func directDockerReachable() error {
 	return nil
 }
 
-// sudoProblem recognises sudo's own refusals in its stderr so they are explained, not mistaken for
-// the helper's exit codes (sudo exits 1 for them, like ccsbx-root's own failures).
-func sudoProblem(stderr string) string {
+// sudoPreflight asks sudo, before anything runs, whether this user may run the helper without a
+// password (`sudo -n -l <helper>` exits 0 exactly then). Everything sudo says to refuse is said here,
+// in output that is sudo's alone: the helper's and the fence's output is never read for sudo
+// errors, so a fence that prints "sudo: a password is required" cannot turn its own exit code into
+// a refusal. It returns the explanation, or "" when sudo permits.
+func sudoPreflight() string {
+	c := exec.Command(start.SudoBin, "-n", "-l", start.RootBin)
+	c.Env = []string{"PATH=/usr/bin:/bin", "LANG=C"}
+	var out cappedBuffer
+	c.Stdout, c.Stderr = &out, &out
+	err := c.Run()
+	if err == nil {
+		return ""
+	}
+	if _, ok := err.(*exec.ExitError); !ok {
+		return fmt.Sprintf("cannot run %s: %v", start.SudoBin, err)
+	}
+	return sudoProblem(out.String())
+}
+
+// cappedBuffer keeps the first 4 KiB written to it.
+type cappedBuffer struct{ b bytes.Buffer }
+
+func (c *cappedBuffer) Write(p []byte) (int, error) {
+	if room := 4096 - c.b.Len(); room > 0 {
+		if len(p) < room {
+			room = len(p)
+		}
+		c.b.Write(p[:room])
+	}
+	return len(p), nil
+}
+func (c *cappedBuffer) String() string { return c.b.String() }
+
+// sudoProblem explains sudo's own refusal from its own output (the formats of sudo 1.9: lines
+// "sudo: ..." and "Sorry, user X is not allowed to execute ..."). It always returns something for
+// a failed `sudo -n -l`: an unknown failure is still a refusal.
+func sudoProblem(out string) string {
 	switch {
-	case strings.Contains(stderr, "a password is required"), strings.Contains(stderr, "a terminal is required"):
+	case strings.Contains(out, "a password is required"), strings.Contains(out, "a terminal is required"):
 		return "sudo asks for a password: this user has no passwordless rule for ccsbx-root (the installer's /etc/sudoers.d/90-ccsbx-root is missing or does not name this user)"
-	case strings.Contains(stderr, "is not allowed to execute"), strings.Contains(stderr, "is not in the sudoers"), strings.Contains(stderr, "may not run sudo"), strings.Contains(stderr, "not allowed"):
+	case strings.Contains(out, "command not found"):
+		return "sudo could not find " + start.RootBin + " (is ccsbx-root installed?)"
+	case strings.Contains(out, "is not allowed to execute"), strings.Contains(out, "is not in the sudoers"), strings.Contains(out, "may not run sudo"):
 		return "sudo does not permit this user to run ccsbx-root (see /etc/sudoers.d/90-ccsbx-root)"
-	case strings.Contains(stderr, "command not found"), strings.Contains(stderr, "No such file or directory"):
-		return "sudo could not run " + start.RootBin + " (is ccsbx-root installed?)"
-	case strings.HasPrefix(strings.TrimSpace(stderr), "sudo:") || strings.Contains(stderr, "\nsudo:"):
-		return "sudo refused: " + strings.TrimSpace(firstSudoLine(stderr))
+	}
+	if l := firstSudoLine(out); l != "" {
+		return "sudo refused: " + l
+	}
+	return "sudo refused to list the helper (is ccsbx-root installed, and is this user in /etc/sudoers.d/90-ccsbx-root?)"
+}
+
+// firstSudoLine is the first non-empty line, which is where sudo says why.
+func firstSudoLine(s string) string {
+	for _, l := range strings.Split(s, "\n") {
+		if l = strings.TrimSpace(l); l != "" {
+			return l
+		}
 	}
 	return ""
 }
 
-func firstSudoLine(s string) string {
-	for _, l := range strings.Split(s, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(l), "sudo:") {
-			return l
-		}
-	}
-	return s
-}
-
-// runHelper runs `sudo -n ccsbx-root <verb> <args...>` with this process's stdin/stdout, passes the
-// helper's stderr through, and returns the exit code. A sudo failure is turned into exit 2 and a
-// clear message; any other code is the helper's own (0 ok, 1 failed, 2 refused, 64 usage).
+// runHelper runs `sudo -n ccsbx-root <verb> <args...>` with this process's stdin/stdout/stderr and
+// returns the exit code: the helper's own (0 ok, 1 failed, 2 refused, 64 usage), or 128+signal when
+// it was killed. Whether sudo permits is asked first (sudoPreflight): a refusal there is exit 2 and
+// is never followed by a fallback to direct mode.
 func runHelper(cmdName, verb string, args []string, stdout, stderr io.Writer) int {
-	if p := start.HelperInstalled(); !p {
+	if !start.HelperInstalled() {
 		fmt.Fprintf(stderr, "ccsbx %s: --root helper, but %s is not installed and root-owned (units/install-linux.sh)\n", cmdName, start.RootBin)
+		return cli.ExitRefused
+	}
+	if why := sudoPreflight(); why != "" {
+		fmt.Fprintf(stderr, "ccsbx %s: %s. Not falling back to direct mode.\n", cmdName, why)
 		return cli.ExitRefused
 	}
 	argv := append([]string{"-n", start.RootBin, verb}, args...)
 	c := exec.Command(start.SudoBin, argv...)
 	c.Env = []string{"PATH=/usr/bin:/bin", "TERM=" + os.Getenv("TERM"), "LANG=C.UTF-8"}
-	var errb bytes.Buffer
-	c.Stdin, c.Stdout, c.Stderr = os.Stdin, stdout, io.MultiWriter(stderr, &errb)
+	c.Stdin, c.Stdout, c.Stderr = os.Stdin, stdout, stderr
 	err := c.Run()
 	if err == nil {
 		return cli.ExitOK
@@ -96,13 +138,8 @@ func runHelper(cmdName, verb string, args []string, stdout, stderr io.Writer) in
 		fmt.Fprintf(stderr, "ccsbx %s: cannot run %s: %v\n", cmdName, start.SudoBin, err)
 		return cli.ExitRefused
 	}
-	// the helper's own refusals and failures always begin "ccsbx-root <verb>:"; anything else on
-	// stderr that sudo said is sudo's
-	if !strings.Contains(errb.String(), "ccsbx-root ") {
-		if why := sudoProblem(errb.String()); why != "" {
-			fmt.Fprintf(stderr, "ccsbx %s: %s. Not falling back to direct mode.\n", cmdName, why)
-			return cli.ExitRefused
-		}
+	if ws, ok := ee.Sys().(syscall.WaitStatus); ok && ws.Signaled() {
+		return 128 + int(ws.Signal())
 	}
 	return ee.ExitCode()
 }

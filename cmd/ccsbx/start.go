@@ -66,9 +66,15 @@ func startCmd() *cli.Command {
   cat spec.json | ccsbx start --spec -
   Refusals exit 2 and print the code: profile_not_approved, rate_capped, billing_unavailable,
   machine_full, already_running, wrong_machine, bad_spec, not_built.
-  Direct mode: the pane runs in 'tmux -L ccsbx' as you; replies carry not_evidence=true.`,
+  Direct mode: the pane runs in 'tmux -L ccsbx' as you; replies carry not_evidence=true.
+  Helper mode (--root helper, or auto once ccsbx-root is installed): the spec is sent to ccsbx-hostd
+  (POST /v1/start on --socket), which writes the record in its own state directory and launches the
+  pane (sudo -n ccsbx-root run). Nothing is written under your home. hostd not running is exit 2.
+  --launcher, --run-cmd, --image, --profiles, --pins, --worktree-root and --max-* are dev/direct
+  flags: hostd uses its own settings, and --launcher/--run-cmd are refused in helper mode.`,
 		Setup: func(f *cli.Flags) {
 			stateFlags(f)
+			f.String("socket", defaultHostdSocket, "helper mode: ccsbx-hostd's local unix socket; the daemon writes the record and launches the pane (CCSBX_SOCKET)")
 			f.String("spec", "-", "LaunchSpec JSON file, or - for stdin")
 			f.Bool("json", false, "print the StartReply (or the refusal) as JSON")
 			f.String("image", "ccsbx-fence:dev", "fence image recorded in the pin and run by the pane")
@@ -96,6 +102,16 @@ func runStart(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		fmt.Fprintln(stderr, "ccsbx start:", err)
 		return cli.ExitFail
+	}
+	mode, err := resolveMode(f)
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx start:", err)
+		return cli.ExitRefused
+	}
+	if mode == "helper" {
+		// The record must be written by the daemon (uid ccsbx, /var/lib/ccsbx), which is what
+		// ccsbx-root reads: never by this process under the caller's home.
+		return startViaHostd(f, in, asJSON, stdout, stderr)
 	}
 	d, err := daemonFrom(f)
 	if err != nil {

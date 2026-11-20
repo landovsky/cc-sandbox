@@ -8,6 +8,7 @@
 # Exit 0: both twins hold. Exit 1: a twin failed. Exit 64: usage.
 set -u
 BASE=""; IMAGE=""; CCSBX="${CCSBX:-bin/ccsbx}"
+export CCSBX_ROOT=direct   # these twins are DIRECT-mode checks: never let the mode resolve to helper (auto) on a machine that has ccsbx-root
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;

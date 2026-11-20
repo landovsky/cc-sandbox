@@ -40,15 +40,21 @@ code=$(cat `+d+`/helper_exit 2>/dev/null || echo 0)
 exit "$code"
 `)
 	sudo := write("sudo", `echo "sudo $*" >> `+s.log+`
+if [ "$2" = "-l" ]; then   # the preflight: sudo -n -l <helper>, in sudo's real wording
 case "$(cat `+d+`/sudo_mode 2>/dev/null)" in
   pw) echo "sudo: a password is required" >&2; exit 1 ;;
-  notallowed) echo "sudo: tomas is not allowed to execute '/usr/local/sbin/ccsbx-root' as root on hp" >&2; exit 1 ;;
+  notallowed) echo "Sorry, user tomas is not allowed to execute '/usr/local/sbin/ccsbx-root run s0abcdefgh' as root on hp." >&2; exit 1 ;;
   notfound) echo "sudo: /usr/local/sbin/ccsbx-root: command not found" >&2; exit 1 ;;
-  other) echo "sudo: unable to resolve host" >&2; exit 1 ;;
+  other) echo "sudo: unable to resolve host hp: Name or service not known" >&2; exit 1 ;;
 esac
+exit 0
+fi
 shift   # -n
 exec "$@"
 `)
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("CCSBX_ROOT", "")
+	t.Setenv("CCSBX_STATE", filepath.Join(d, "state")) // never the developer's real state
 	oldS, oldR, oldD := start.SudoBin, start.RootBin, dockerSocket
 	start.SudoBin, start.RootBin, dockerSocket = sudo, root, filepath.Join(d, "no-docker.sock")
 	restore := start.SetTestRootUID(os.Getuid())
@@ -59,7 +65,13 @@ exec "$@"
 func (s *stubs) set(name, v string) { os.WriteFile(filepath.Join(s.dir, name), []byte(v), 0o644) }
 func (s *stubs) calls() []string {
 	b, _ := os.ReadFile(s.log)
-	return strings.Split(strings.TrimSpace(string(b)), "\n")
+	var out []string
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if !strings.HasPrefix(l, "sudo -n -l ") { // the preflight is not a call of the helper
+			out = append(out, l)
+		}
+	}
+	return out
 }
 
 func run(args ...string) (int, string) {
@@ -74,8 +86,8 @@ func TestRunStopGcGoThroughSudoToTheHelper(t *testing.T) {
 		args []string
 		want string
 	}{
-		{[]string{"run", "--root", "helper", "--sid", stubSid}, "sudo -n " + start.RootBin + " run " + stubSid},
-		{[]string{"stop", "--root", "helper", stubSid}, "sudo -n " + start.RootBin + " stop " + stubSid},
+		{[]string{"run", "--root", "helper", "--sid", stubSid}, "sudo -n " + start.RootBin + " run -- " + stubSid},
+		{[]string{"stop", "--root", "helper", stubSid}, "sudo -n " + start.RootBin + " stop -- " + stubSid},
 		{[]string{"gc", "--root", "helper"}, "sudo -n " + start.RootBin + " gc"},
 		{[]string{"gc", "--root", "helper", "--dry-run"}, "sudo -n " + start.RootBin + " gc --dry-run"},
 	} {
@@ -117,10 +129,10 @@ func TestEveryRefusalIsPassedThroughAndNeverFallsBack(t *testing.T) {
 		wantText                   string
 	}{
 		{"sudo wants a password", "pw", "", 2, "password"},
-		{"sudo does not permit the user", "notallowed", "", 2, "does not permit"},
+		{"sudo does not permit the user (its real wording, which quotes the command)", "notallowed", "", 2, "does not permit"},
 		{"sudo cannot find the helper", "notfound", "", 2, "ccsbx-root installed"},
 		{"another sudo error", "other", "", 2, "sudo refused"},
-		{"the helper refuses", "", "2", 2, "refused: the image is not pinned"},
+		{"the helper refuses (its message contains sudo-like words)", "", "2", 2, "refused: the image is not pinned"},
 		{"the helper fails", "", "1", 1, ""},
 		{"the helper's usage error", "", "64", 64, ""},
 	}
@@ -143,8 +155,12 @@ func TestEveryRefusalIsPassedThroughAndNeverFallsBack(t *testing.T) {
 				n++
 			}
 		}
-		if n != 1 {
-			t.Errorf("%s: %d sudo calls, want 1 (a retry or fallback ran something)", c.name, n)
+		want := 1
+		if c.sudoMode != "" {
+			want = 0 // sudo refused at the preflight: the helper was never asked to run
+		}
+		if n != want {
+			t.Errorf("%s: %d sudo calls, want %d (a retry or fallback ran something)", c.name, n, want)
 		}
 	}
 }
@@ -189,19 +205,50 @@ func TestDirectModeRefusesWhenDockerIsUnreachable(t *testing.T) {
 
 func TestSudoProblem(t *testing.T) {
 	for in, want := range map[string]string{
-		"sudo: a password is required":                "password",
-		"sudo: a terminal is required to read":        "password",
-		"sudo: x is not in the sudoers file":          "does not permit",
-		"sudo: sorry, user x may not run sudo on hp":  "does not permit",
-		"sudo: ccsbx-root: command not found":         "installed",
-		"sudo: unable to resolve host hp":             "sudo refused",
-		"ccsbx-root run: refused: not pinned":         "",
-		"":                                            "",
-		"some docker error without sudo in it at all": "",
+		"sudo: a password is required":                                  "password",
+		"sudo: a terminal is required to read the password":             "password",
+		"sudo: x is not in the sudoers file":                            "does not permit",
+		"sudo: sorry, user x may not run sudo on hp":                    "does not permit",
+		"Sorry, user x is not allowed to execute '/y z' as root on hp.": "does not permit",
+		"sudo: ccsbx-root: command not found":                           "installed",
+		"sudo: unable to resolve host hp":                               "sudo refused: sudo: unable",
+		"":                                                              "sudo refused to list",
 	} {
-		got := sudoProblem(in)
-		if (want == "") != (got == "") || !strings.Contains(got, want) {
+		if got := sudoProblem(in); !strings.Contains(got, want) {
 			t.Errorf("%q -> %q, want to contain %q", in, got, want)
 		}
+	}
+}
+
+// A fence (or helper) whose output looks like sudo's, with its own exit code, is passed through as
+// the fence's: sudo errors are read only from sudo's own preflight, never from what the run prints.
+func TestFenceOutputThatLooksLikeSudoIsNotClassified(t *testing.T) {
+	s := newStubs(t)
+	os.WriteFile(start.RootBin, []byte("#!/bin/sh\necho 'sudo: a password is required' >&2; echo 'Operation not allowed' >&2; exit 3\n"), 0o755)
+	code, out := run("run", "--root", "helper", "--sid", stubSid)
+	if code != 3 || strings.Contains(out, "Not falling back") {
+		t.Errorf("exit %d (want the fence's 3): %s", code, out)
+	}
+	_ = s
+}
+
+// A helper killed by a signal (the pane was closed) is 128+signal, not 255.
+func TestSignalledHelperExitCode(t *testing.T) {
+	newStubs(t)
+	os.WriteFile(start.RootBin, []byte("#!/bin/sh\nkill -TERM $$\n"), 0o755)
+	if code, out := run("run", "--root", "helper", "--sid", stubSid); code != 143 {
+		t.Errorf("exit %d: %s", code, out)
+	}
+}
+
+func TestRunValidatesTheSidItSends(t *testing.T) {
+	s := newStubs(t)
+	for _, sid := range []string{"-h", "--tty", "S0ABCDEFGH", "s0abc;id", "../x", "s0", "s0abcdefgh\n"} {
+		if code, _ := run("run", "--root", "helper", "--sid="+sid); code != 64 {
+			t.Errorf("--sid %q: exit %d, want 64", sid, code)
+		}
+	}
+	if _, err := os.Stat(s.log); err == nil {
+		t.Error("sudo or the helper was called with a bad sid")
 	}
 }

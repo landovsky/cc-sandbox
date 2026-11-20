@@ -5,6 +5,7 @@
 #
 # Needs: STATE (the mktemp -d this run created), IMG, PIDS (array), $$; $STATE/sids lists this run's sids.
 
+TRASH_RE='^/var/tmp/ccsbx-cc-[A-Za-z0-9]{6}$' # the exact shape of a scratch dir a test made: a glob's ? would also match / and ..
 SID_RE='^s[0-9a-hjkmnp-tv-z]{10}$' # what mintSid in internal/start makes: "s" + 10 base32 characters
 
 # cleanup_guard prints why and returns 1 if the cleanup must not touch docker.
@@ -20,6 +21,9 @@ cleanup_guard() {
   while IFS= read -r s; do
     [[ "$s" =~ $SID_RE ]] || { echo "cleanup refused: bad sid line '$s'" >&2; return 1; }
   done < <(cat "$STATE/sids" 2>/dev/null)
+  while IFS= read -r s; do
+    [[ "$s" =~ $TRASH_RE ]] || { echo "cleanup refused: bad trash line '$s'" >&2; return 1; }
+  done < <(cat "$STATE/trash" 2>/dev/null)
   return 0
 }
 
@@ -28,7 +32,7 @@ rmstate() {
   # Dirs a test made outside STATE (listed in $STATE/trash): only /var/tmp/ccsbx-cc-<6 chars>, nothing else.
   local d
   for d in $(cat "$STATE/trash" 2>/dev/null); do
-    case "$d" in /var/tmp/ccsbx-cc-??????) docker run --rm --user 0 -v "$d:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$d";; esac
+    if [[ "$d" =~ $TRASH_RE ]]; then docker run --rm --user 0 -v "$d:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$d"; fi
   done
   docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"
 }

@@ -254,10 +254,10 @@ merged**, it waits for Tomas). A tightening of the rules above for launcher-crea
 
 | Change | Rule | Why |
 |---|---|---|
-| `priorityClassName: ccsbx-session` is **required** (new class, value 500, `preemptionPolicy: Never`, filled in from the class by the Priority plugin, so the pod doesn't set it); `default-priority` and `low-priority` are for non-launcher pods only | new | per #5dxt |
-| no `runtimeClassName`, no finalizers | new | per #5dxt |
-| `terminationGracePeriodSeconds` at most 60 (unset = 30 is fine) | new | per #5dxt |
-| ephemeral containers (`kubectl debug`) refused in **both namespaces, for everyone** | widens rule 8 | F5 attach and any debugging use `exec` |
+| `priorityClassName: ccsbx-session` is **required** (new class, value 500, `preemptionPolicy: Never`, filled in from the class by the Priority plugin, so the pod doesn't set it); `default-priority` and `low-priority` are for non-launcher pods only | new | an independent k3s review found session pods could pick `system-node-critical` and evict other apps on future-two; 500 + `Never` means a session never preempts anything |
+| no `runtimeClassName`, no finalizers | new | no `runtimeClassName`: a session can't pick a runtime with weaker isolation than the default. No finalizers: a session pod can't block its own deletion (cleanup and quota stay in the launcher's hands) |
+| `terminationGracePeriodSeconds` at most 60 (unset = 30 is fine) | new | a stopping session can't hold the node's resources for long |
+| ephemeral containers (`kubectl debug`) refused in **both namespaces, for everyone** | widens rule 8 | F5 attach and any debugging use `exec` || `kubectl debug` would inject a container that bypasses the pod spec's fences (and could reach the sidecar's token); attach is exec only |
 | `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | per #5dxt; Tomas's call |
 
 ---

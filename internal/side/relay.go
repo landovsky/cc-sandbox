@@ -29,6 +29,7 @@ type RelayConfig struct {
 	Gen            int
 	Label, FullID  string
 	FenceUID       int     // owner uid every request file must have (10001)
+	OwnUID         int     // uid in/replies must belong to (default: this process's uid; settable so a test can lie)
 	MaxBytes       int64   // per request file (default 64 KiB)
 	Rate           float64 // requests per second (default 5)
 	Burst          int     // bucket size (default 20)
@@ -97,11 +98,14 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 	}
 	// In the pod, in/ is an emptyDir only the sidecar can write (the fence mounts it read-only), so the
 	// sidecar makes in/replies itself, and checks that what it finds there is its own plain directory.
+	if cfg.OwnUID == 0 {
+		cfg.OwnUID = os.Getuid()
+	}
 	rd := filepath.Join(cfg.In, "replies")
 	if err := os.Mkdir(rd, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 		return nil, fmt.Errorf("side relay: %w", err)
 	}
-	if fi, err := os.Lstat(rd); err != nil || !fi.IsDir() || !ownedBy(fi, os.Getuid()) {
+	if fi, err := os.Lstat(rd); err != nil || !fi.IsDir() || !ownedBy(fi, cfg.OwnUID) {
 		return nil, fmt.Errorf("side relay: %s is not a plain directory of ours", rd)
 	}
 	r := &Relay{cfg: cfg, seen: map[string]bool{}, tokens: float64(cfg.Burst), last: cfg.Now()}

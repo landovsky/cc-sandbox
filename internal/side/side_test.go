@@ -3,6 +3,7 @@
 package side
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/ed25519"
@@ -520,5 +521,34 @@ func TestLoadClientStopsReadingAtTheCap(t *testing.T) {
 	}
 	if cr.n > MaxSecrets+64<<10 {
 		t.Fatalf("read %d bytes of an endless stream", cr.n)
+	}
+}
+
+// context "a fence asks for a protocol switch (Upgrade: websocket) on a route a door allows": the proxy would
+// hijack the connection and copy bytes both ways, past every door rule, so the forwarder refuses it itself
+// and the door never sees the request.
+func TestTheForwarderRefusesAProtocolUpgrade(t *testing.T) {
+	r := newRig(t, nil)
+	_, in := r.secrets(time.Hour)
+	if err := Load(r.ctl, in); err != nil {
+		t.Fatal(err)
+	}
+	for _, hdr := range []string{"Upgrade: websocket\r\nConnection: Upgrade\r\n", "Connection: keep-alive, Upgrade\r\n", "Upgrade: h2c\r\n"} {
+		c, err := net.Dial("tcp", r.port)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.SetDeadline(time.Now().Add(5 * time.Second))
+		io.WriteString(c, "POST /model/v1/messages HTTP/1.1\r\nHost: x\r\n"+hdr+"Content-Length: 2\r\n\r\n{}")
+		line, _ := bufio.NewReader(c).ReadString('\n')
+		c.Close()
+		if !strings.Contains(line, " 403 ") {
+			t.Errorf("%q: got %q, want 403", hdr, line)
+		}
+	}
+	select {
+	case q := <-r.seen:
+		t.Fatalf("the door saw %s %s", q.Method, q.URL.Path)
+	default:
 	}
 }

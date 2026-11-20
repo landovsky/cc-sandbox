@@ -212,6 +212,12 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deny(http.StatusForbidden, "method must be upper case")
 		return
 	}
+	// A protocol switch would turn the connection into a tunnel the door rules never see (the proxy hijacks
+	// it and copies bytes both ways), so it is refused here rather than left to the proxy's defaults.
+	if r.Header.Get("Upgrade") != "" || headerHasToken(r.Header, "Connection", "upgrade") {
+		deny(http.StatusForbidden, "protocol upgrade refused")
+		return
+	}
 	clean, ok := CleanPath(r.URL)
 	if !ok {
 		deny(http.StatusForbidden, "unclean path")
@@ -376,4 +382,16 @@ func (b *scrubBody) Close() error {
 	err := b.ReadCloser.Close()
 	b.t.scrub(b.resp.Trailer)
 	return err
+}
+
+// headerHasToken reports whether any value of header k lists token (comma separated, case-insensitive).
+func headerHasToken(h http.Header, k, token string) bool {
+	for _, v := range h.Values(k) {
+		for _, t := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(t), token) {
+				return true
+			}
+		}
+	}
+	return false
 }

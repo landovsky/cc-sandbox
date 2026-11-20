@@ -207,7 +207,8 @@ var ulidRe = regexp.MustCompile(`^[0-9A-HJKMNP-TV-Z]{26}$`)
 // neither through the file name nor through an "id" field in the body.
 func TestRelayMintsTheRequestIDItself(t *testing.T) {
 	r := newRelayRig(t)
-	r.put("01ABCDEFGHJKMNPQRSTVWXYZ00.json", `{"type":"msg.send","id":"01ABCDEFGHJKMNPQRSTVWXYZ99"}`)
+	const planted = "01ABCDEFGHJKMNPQRSTVWXYZ99"
+	r.put("01ABCDEFGHJKMNPQRSTVWXYZ00.json", `{"type":"msg.send","id":"`+planted+`"}`)
 	r.put("second.json", `{"type":"msg.send"}`)
 	r.relay(nil).Scan(context.Background())
 	if len(r.forwarded) != 2 {
@@ -215,7 +216,7 @@ func TestRelayMintsTheRequestIDItself(t *testing.T) {
 	}
 	a, b := r.forwarded[0], r.forwarded[1]
 	for _, q := range r.forwarded {
-		if !ulidRe.MatchString(q.ID) || q.ID == q.Rid || strings.HasSuffix(q.ID, "99") {
+		if !ulidRe.MatchString(q.ID) || q.ID == q.Rid || q.ID == planted {
 			t.Errorf("id %q (rid %q) is not minted by the relay", q.ID, q.Rid)
 		}
 	}
@@ -258,5 +259,20 @@ func TestRelayMakesItsOwnReplyDirectory(t *testing.T) {
 	if _, err := NewRelay(RelayConfig{Out: r2.out, In: r2.in, State: r2.state, Sid: "s", Gen: 1, FenceUID: 1,
 		Forward: func(context.Context, hostd.Request) hostd.Reply { return hostd.Reply{} }}); err == nil {
 		t.Fatal("a symlinked in/replies was accepted")
+	}
+}
+
+// context "in/replies exists but belongs to someone else": replies would go into a directory another uid
+// controls, so the relay refuses to start. The uid is injected because a test can't chown.
+func TestRelayRefusesARepliesDirectoryOfAnotherOwner(t *testing.T) {
+	r := newRelayRig(t)
+	cfg := RelayConfig{Out: r.out, In: r.in, State: r.state, Sid: "s", Gen: 1, FenceUID: 1,
+		Forward: func(context.Context, hostd.Request) hostd.Reply { return hostd.Reply{} }}
+	if _, err := NewRelay(cfg); err != nil {
+		t.Fatalf("own directory refused: %v", err)
+	}
+	cfg.OwnUID = os.Getuid() + 1
+	if _, err := NewRelay(cfg); err == nil {
+		t.Fatal("a replies directory owned by another uid was accepted")
 	}
 }

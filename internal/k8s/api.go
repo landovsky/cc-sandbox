@@ -36,7 +36,7 @@ type Client interface {
 	CreatePod(ctx context.Context, ns string, p *Pod) (*Pod, error)
 	GetPod(ctx context.Context, ns, name string) (*Pod, error) // ErrNotFound if absent
 	ListPods(ctx context.Context, ns, labelSelector string) ([]Pod, error)
-	DeletePod(ctx context.Context, ns, name string, graceSeconds int) error // absent is not an error
+	DeletePod(ctx context.Context, ns, name, uid string, graceSeconds int) error // uid is a precondition (409 if the live pod has another); absent is not an error
 }
 
 // IO is the streams of one exec. Stdin may be nil. TTY joins stderr into stdout.

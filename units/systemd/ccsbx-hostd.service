@@ -1,0 +1,55 @@
+# ccsbx-hostd.service (U3a/U0). The per-machine daemon: journal, stamping, start API on loopback 127.0.0.1:7480 (token file).
+# Why: the daemon runs unprivileged so a bug in it is not root; it asks ccsbx-root for the few things that need it.
+# It runs as uid ccsbx, can reach the signer's socket (group ccsbx) but never the key directory,
+# and reaches docker only through `sudo -n /usr/local/sbin/ccsbx-root <verb>`.
+# --ccmsg-bin is deliberately UNSET: hostd as uid ccsbx cannot use the owner's bus sockets, so messages to an
+# unfenced manager wait for the hub spoke (B10/B11/M2b). Every flag also reads CCSBX_<FLAG>; unknown flags are fatal.
+# The command line is `ccsbx-hostd run ...` with exactly the flags the U3a/G builder adds on n1-g (review R1):
+# --local-socket, --socket-group, --signer, --listen (loopback only), --listen-token-file. An unknown flag is
+# fatal in hostd, so confirm them with `ccsbx-hostd run --help` before the gate. The token file (0600, ccsbx) is made by the installer. hostd sends messages with `send-keys` into the
+# tmux server it owns on --tmux-socket (an absolute path, `tmux -S`, in /run/ccsbx, 0700 ccsbx: reached by `sudo ccsbx-root attach`, never directly).
+# SupplementaryGroups=ccsbx-clients: hostd may chgrp its local socket to that group (a process can only
+# chgrp to a group it is in), so the owner's `ccsbx` CLI can connect (review M1).
+# The sandbox below is inherited by `sudo ccsbx-root` (it stays in this mount namespace), review M2.
+# Chosen: ccsbx-root stays under hostd and the sandbox is widened by exactly what it needs:
+# /home READ-ONLY (it must see the workdirs under the allowed roots to realpath them; dockerd, outside
+# this namespace, does the real mount) and writes only under /var/lib/ccsbx and /run/ccsbx.
+# Why not a separate root unit: that needs ccsbx-root to be a service, which is its own design; to be
+# agreed with the U3a/hostd builder before the gate. Anything else ccsbx-root writes must be added here.
+[Unit]
+Description=ccsbx hostd (journal, stamping, start API)
+After=network-online.target ccsbx-signer.socket ccsbx-tmux.service
+Wants=network-online.target
+Requires=ccsbx-signer.socket ccsbx-tmux.service
+
+[Service]
+Type=simple
+User=ccsbx
+Group=ccsbx
+SupplementaryGroups=ccsbx-clients
+ExecStart=/usr/local/libexec/ccsbx/ccsbx-hostd run --state /var/lib/ccsbx --local-socket /run/ccsbx-api/hostd.sock --socket-group ccsbx-clients --signer /run/ccsbx-signer/sign.sock --listen 127.0.0.1:7480 --listen-token-file /var/lib/ccsbx/listen.token --tmux-socket /run/ccsbx/tmux.sock
+StateDirectory=ccsbx
+StateDirectoryMode=0750
+RuntimeDirectory=ccsbx-api
+RuntimeDirectoryMode=0700
+# /run/ccsbx (the tmux socket, 0600) belongs to ccsbx-tmux.service; hostd only connects to it and never starts the server.
+# NOTE: uid ccsbx can open a tmux window on that socket, outside this sandbox, so the sandbox does not contain a compromised
+# hostd (a known cost, see ccsbx-tmux.service); what it limits is accidents and the rest of the system's files.
+# The API socket needs a directory the owner can traverse, so it lives in /run/ccsbx-api (made 0755 below); the
+# socket itself is ccsbx:ccsbx-clients 0660 (--socket-group), so the directory mode grants nothing by itself.
+ExecStartPre=+/usr/bin/chmod 0755 /run/ccsbx-api
+Restart=on-failure
+RestartSec=2
+# NoNewPrivileges must stay OFF: hostd calls sudo for ccsbx-root. Everything else is closed.
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+ReadWritePaths=/var/lib/ccsbx /run/ccsbx /run/ccsbx-api
+
+[Install]
+WantedBy=multi-user.target

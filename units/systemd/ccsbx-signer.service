@@ -1,0 +1,38 @@
+# ccsbx-signer.service (U0b). The ONLY process that can read the machine key. It exposes
+# sign(token_claims) on a unix socket and nothing else, so hostd never holds the key.
+# Why: one tiny process holds the key and signs on request, so no bigger process (hostd) ever has it in memory or on disk.
+# The socket is made by systemd (ccsbx-signer.socket) as ccsbx-keys:ccsbx 0660, so hostd can connect
+# although this process can't chgrp to ccsbx (review M1). The signer takes the socket as fd 3
+# (LISTEN_FDS). The flags below are the design; the signer's Go code (U0b/U5) must accept exactly these.
+[Unit]
+Description=ccsbx signer (machine key; sign(token_claims) only)
+After=local-fs.target
+Requires=ccsbx-signer.socket
+
+[Service]
+Type=simple
+User=ccsbx-keys
+Group=ccsbx-keys
+ExecStart=/usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --systemd-socket --allow-user ccsbx
+Restart=on-failure
+RestartSec=2
+# hardening: it reads its own key directory, writes nothing else, talks to nobody
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+LimitCORE=0
+ProtectProc=invisible
+RestrictSUIDSGID=yes
+PrivateNetwork=yes
+SystemCallFilter=@system-service
+CapabilityBoundingSet=
+UMask=0077

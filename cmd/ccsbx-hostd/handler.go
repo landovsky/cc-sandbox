@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/journal"
@@ -139,6 +141,11 @@ func notifyQuestion(rt *msg.Router, r hostd.Request, data json.RawMessage) {
 // worker's manager as a message (the cockpit may be down). A worker that needs a human decision
 // (permission prompt, question dialog) or has ended is something its manager should hear.
 func hearFunc(rt *msg.Router) func(journal.Record) {
+	// One hear per (sid, gen) per interval, decided BEFORE anything is resolved: a fence that
+	// writes permission_prompt notifications in a loop must not cost a directory read and a
+	// tmux probe per line.
+	var mu sync.Mutex
+	last := map[string]time.Time{}
 	return func(e journal.Record) {
 		var what string
 		switch e.Type {
@@ -154,6 +161,17 @@ func hearFunc(rt *msg.Router) func(journal.Record) {
 		if what == "" {
 			return
 		}
+		k := fmt.Sprintf("%s/%d", e.Sid, e.Gen)
+		mu.Lock()
+		if t, ok := last[k]; ok && time.Since(t) < hearEvery {
+			mu.Unlock()
+			return
+		}
+		last[k] = time.Now()
+		mu.Unlock()
 		rt.ToManager(msg.Session{Sid: e.Sid}, "hear", "HEAR: "+e.Node+" "+what, msg.Origin{})
 	}
 }
+
+// hearEvery is the least time between two hears from one (sid, generation).
+const hearEvery = 30 * time.Second

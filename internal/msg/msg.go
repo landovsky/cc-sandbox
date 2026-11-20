@@ -193,7 +193,10 @@ func (r *Router) SendWith(from Session, body []byte, o Origin) Result {
 		}
 		// An in-scope node with no ccsbx session is an unfenced session on this machine (a
 		// manager is always local): the hub path (ccmsg) reaches it, if there is one.
-		if r.Hub != nil && b.To.Node != "" {
+		// Only when NO ccsbx record anywhere (any realm, live or between generations) holds
+		// that label: otherwise the label is a fenced node that is briefly not live (a replace)
+		// or lives in another realm, and the bus must not become a way around the realm rule.
+		if r.Hub != nil && b.To.Node != "" && !labelKnown(all, b.To.Node) {
 			if !r.pairOK(sender.Sid, "hub:"+b.To.Node) {
 				return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "refused", Code: "rate_capped"})
 			}
@@ -256,8 +259,34 @@ func (r *Router) ToManager(from Session, kind, text string, o Origin) Result {
 	return Result{Status: "refused", Code: "scope"}
 }
 
+// DeliverRelayed is the ONLY entry for a message that arrives from outside this machine's fences
+// (a hub relay, the downlink reader of B10/B11/M2b). It is deliberately not DeliverOwner:
+// DeliverOwner skips the scope rule and stamps "owner device", which is right for the owner's own
+// CLI and wrong for anything a remote project sent. Here the sender is a daemon-minted sid on this
+// machine (the relay's own session record), the scope rule is applied to it, and the stamp says
+// fenced, never owner.
+func (r *Router) DeliverRelayed(fromSid, target, text string, o Origin) Result {
+	all, err := r.Dir.Sessions()
+	if err != nil {
+		return Result{Status: "error", Code: "undeliverable"}
+	}
+	var sender *Session
+	for i := range all {
+		if all[i].Sid == fromSid {
+			sender = &all[i]
+		}
+	}
+	if sender == nil {
+		return Result{Status: "refused", Code: "scope"}
+	}
+	b, _ := json.Marshal(map[string]any{"type": "msg.send", "to": map[string]string{"node": target}, "kind": "message", "text": text})
+	return r.SendWith(*sender, b, o) // inScope, rate limit, idle gating, fenced stamp
+}
+
 // DeliverOwner is a delivery from the owner's device (the daemon's unix socket). The target is
-// a sid, node or bus id; the stamp says unfenced, never human. A target that is not at its
+// a sid, node or bus id; the stamp says unfenced, never human. It skips the scope rule on
+// purpose and so must only ever be reached from the 0600 owner socket: a relayed message
+// (hub downlink, another machine) goes through DeliverRelayed, never through here. A target that is not at its
 // prompt is refused (target_busy), or, with queue, held until it is.
 func (r *Router) DeliverOwner(who, to, text string, queue bool) Result {
 	r.mu.Lock()
@@ -306,8 +335,22 @@ func (r *Router) deliverOwner(who string, target Session, text string) Result {
 	return r.receipt("owner", 0, target.Sid, Result{Status: "ok", To: target.Sid})
 }
 
-// Idle reports whether the session is at its input prompt right now: the fence reported Stop,
-// and nothing has been typed into it since.
+// WithIdle runs act only if the session is at its prompt, and marks the pane busy first, under
+// the router's lock: the idle check and the action are one step, so a queued message can't be
+// pumped into the pane between them (C9b's replace would kill a turn that message started).
+// It reports whether act ran.
+func (r *Router) WithIdle(sid string, gen int, act func() error) (bool, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.cfg()
+	r.load()
+	if !r.ready(sid, gen) {
+		return false, nil
+	}
+	r.delivered[sid] = r.now()
+	return true, act()
+}
+
 // IdleNow reports whether the session is at its input prompt right now.
 func (r *Router) IdleNow(sid string, gen int) bool {
 	r.mu.Lock()
@@ -363,6 +406,16 @@ func resolve(all []Session, realm, node, bus string) *Session {
 		}
 	}
 	return best
+}
+
+// labelKnown: some ccsbx session record, in any realm and live or not, has this label.
+func labelKnown(all []Session, node string) bool {
+	for _, s := range all {
+		if s.Label == node {
+			return true
+		}
+	}
+	return false
 }
 
 // Resolve returns the live session for a label (the daemon's GET /v1/resolve).

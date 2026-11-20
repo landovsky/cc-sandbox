@@ -535,3 +535,93 @@ func TestOldReceiptsAreNotLoadedAndABigLogIsCompacted(t *testing.T) {
 		t.Fatalf("log not compacted: %d bytes", st.Size())
 	}
 }
+
+// ---- review of PR #4: hub realm, relayed messages, bounded exec, idle+act in one step --------
+
+type recHub struct{ sent []string }
+
+func (h *recHub) Send(node, line string) error { h.sent = append(h.sent, node); return nil }
+
+// context: the manager's label is held by a FENCED session of another realm (or one that is
+// between generations during a replace). The bus fallback is for unfenced managers only; taking it
+// here would reach whatever unfenced session holds that label, around the realm rule.
+func TestHubFallbackNeverCoversALabelACcsbxRecordHoldsBlock(t *testing.T) {
+	for name, mgr := range map[string]Session{
+		"other realm":        func() Session { s := sess("sM", "cc-sandbox:mgr", true, ""); s.Realm = "production"; return s }(),
+		"between generation": sess("sM", "cc-sandbox:mgr", false, ""),
+	} {
+		w := newWorld(t, sess("sW", "cc-sandbox:w1", true, "cc-sandbox:mgr"), mgr)
+		w.dir.s[0].Realm = "e2e"
+		if name == "between generation" {
+			w.dir.s[0].Realm = "production"
+		}
+		h := &recHub{}
+		w.r.Hub = h
+		res := w.r.Send(w.dir.s[0], body("cc-sandbox:mgr", "x"))
+		if len(h.sent) != 0 || res.Status == "ok" {
+			t.Errorf("%s: went through the bus: %+v %v", name, res, h.sent)
+		}
+	}
+}
+
+// context: the allow side: a manager that is an unfenced session (no ccsbx record) is reached
+// through the bus.
+func TestHubFallbackReachesAnUnfencedManagerAllow(t *testing.T) {
+	w := newWorld(t, sess("sW", "cc-sandbox:w1", true, "cc-sandbox:mgr"))
+	h := &recHub{}
+	w.r.Hub = h
+	if res := w.r.Send(w.dir.s[0], body("cc-sandbox:mgr", "x")); res.Status != "ok" || len(h.sent) != 1 {
+		t.Fatalf("%+v %v", res, h.sent)
+	}
+}
+
+// context: a future hub-downlink reader relays a message into a fenced pane. The relayed path
+// applies the sender's scope and stamps FENCED; reaching a session outside the sender's scope is
+// refused, and the stamp can never say "owner device".
+func TestRelayedMessageIsScopedAndNeverStampedOwnerBlock(t *testing.T) {
+	w := newWorld(t, sess("sR", "cc-sandbox:relay", true, "cc-sandbox:mgr"), sess("sM", "cc-sandbox:mgr", true, ""), sess("sX", "other:x", true, ""))
+	if res := w.r.DeliverRelayed("sR", "other:x", "hi", Origin{}); res.Status != "refused" || res.Code != "scope" || len(w.out.lines) != 0 {
+		t.Fatalf("out of scope relayed: %+v %v", res, w.out.lines)
+	}
+	if res := w.r.DeliverRelayed("sR", "cc-sandbox:mgr", "hi", Origin{}); res.Status != "ok" {
+		t.Fatalf("%+v", res)
+	}
+	if g := w.out.lines["sM"][0]; strings.Contains(g, "owner device") || !strings.Contains(g, "· fenced ·") {
+		t.Fatalf("stamp: %q", g)
+	}
+	if res := w.r.DeliverRelayed("sNOPE", "cc-sandbox:mgr", "hi", Origin{}); res.Code != "scope" {
+		t.Fatalf("unknown sender: %+v", res)
+	}
+}
+
+// context: tmux is wedged (or ccmsg hangs). Every call is killed after ExecTimeout, so hostd's scan
+// loop stalls for seconds at worst, not for good.
+func TestExecIsBoundedByATimeout(t *testing.T) {
+	old := ExecTimeout
+	ExecTimeout = 200 * time.Millisecond
+	defer func() { ExecTimeout = old }()
+	tm := &Tmux{Socket: "x", Command: func(string, ...string) *exec.Cmd { return exec.Command("sleep", "30") }}
+	start := time.Now()
+	if tm.Alive("s1") {
+		t.Fatal("a hung tmux was taken for alive")
+	}
+	if time.Since(start) > 3*time.Second {
+		t.Fatalf("took %s", time.Since(start))
+	}
+}
+
+// context: C9b's replace checks idle and then ends the pane. A queued message pumped in between
+// would start a turn that replace then kills; WithIdle marks the pane busy under the router's lock.
+func TestWithIdleActsOnceAndMarksThePaneBusy(t *testing.T) {
+	w := newWorld(t, sess("sM", "cc-sandbox:mgr", true, ""))
+	w.stop("sM")
+	w.now = w.now.Add(time.Second)
+	ran := 0
+	ok, err := w.r.WithIdle("sM", 1, func() error { ran++; return nil })
+	if !ok || err != nil || ran != 1 {
+		t.Fatalf("%v %v %d", ok, err, ran)
+	}
+	if ok, _ := w.r.WithIdle("sM", 1, func() error { ran++; return nil }); ok || ran != 1 {
+		t.Fatal("the pane was not marked busy: a second action (or a pumped message) could follow")
+	}
+}

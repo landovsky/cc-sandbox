@@ -597,11 +597,12 @@ func (s *Server) replace(w http.ResponseWriter, sid, brief string) {
 		writeJSON(w, 404, map[string]any{"error": "no_live_session"})
 		return
 	}
-	if !s.Msg.IdleNow(sid, cur.Gen) {
+	var gen int
+	ran, err := s.Msg.WithIdle(sid, cur.Gen, func() (e error) { gen, e = s.Replace(sid, brief); return e })
+	if !ran {
 		writeJSON(w, 409, map[string]any{"error": "target_busy"})
 		return
 	}
-	gen, err := s.Replace(sid, brief)
 	if err != nil {
 		writeJSON(w, 500, map[string]any{"error": err.Error()})
 		return

@@ -458,6 +458,11 @@ t "roots: a root reached THROUGH a symlinked directory (/srv/viadir/sub) is refu
 ins "$d" install --yes --allowed-roots /srv/real/sub >/dev/null 2>"$d/err"; rc=$?
 t "roots: a real directory is accepted (exit 0)" bash -c '[ '"$rc"' -eq 0 ] || { cat "$1" >&2; exit 1; }' _ "$d/err"
 
+echo "# ccsbx-root's verbs: status (read-only, A's n1-a-h1-r67) is listed explicitly"
+d="$(fx verbs)"; ins "$d" install --yes >/dev/null 2>&1
+t "verbs: the installed ccsbx-root.toml lists status explicitly, next to stop" bash -c 'grep -q "^verbs = \\[.*\"stop\", \"status\"" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+t "verbs: it lists exactly run stop status renew gc attach exec-token (no verb is added by accident)" bash -c 'v="$(sed -n "s/^verbs = \\[\\(.*\\)\\]\$/\\1/p" "$1" | tr -d "\" " | tr "," "\\n" | sort | tr "\\n" " ")"; [ "$v" = "attach exec-token gc renew run status stop " ]' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"
 

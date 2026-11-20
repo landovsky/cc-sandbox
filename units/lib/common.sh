@@ -34,7 +34,7 @@ CHECK_FAIL=0
 LIBEXEC=/usr/local/libexec/ccsbx
 MANAGED_PATHS=(
   /etc/systemd/system/ccsbx-signer.service /etc/systemd/system/ccsbx-signer.socket
-  /etc/systemd/system/ccsbx-hostd.service
+  /etc/systemd/system/ccsbx-hostd.service /etc/systemd/system/ccsbx-tmux.service
   /etc/sudoers.d/90-ccsbx-root /etc/sudoers.d/91-ccsbx-deploy /etc/ccsbx/ccsbx-root.toml
   /usr/local/sbin/ccsbx-root /usr/local/sbin/ccsbx-deploy /usr/local/bin/ccsbx
   "$LIBEXEC/ccsbx-hostd" "$LIBEXEC/ccsbx-signer"

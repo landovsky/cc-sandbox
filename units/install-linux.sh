@@ -201,7 +201,7 @@ post_install_check() {
   if [ "${EXEC%%:*}" = record ]; then rec post-install-check; ready="${CCSBX_TEST_POSTCHECK_RC:-0}"
   else
     for i in 1 2 3 4 5 6 7 8 9 10; do
-      if systemctl is-active --quiet ccsbx-hostd.service && systemctl is-active --quiet ccsbx-signer.socket \
+      if systemctl is-active --quiet ccsbx-tmux.service && systemctl is-active --quiet ccsbx-hostd.service && systemctl is-active --quiet ccsbx-signer.socket \
          && [ -S "$SIGNER_SOCK" ] && [ -S "$HOSTD_SOCK" ]; then ready=0; break; fi
       sleep 1
     done

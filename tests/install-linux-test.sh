@@ -315,8 +315,9 @@ echo "# (checked against: $src)"
 bad="$(grep '^ExecStart=' "$hd" | grep -o ' --[a-z-]*' | tr -d ' ' | sed 's/^--//' | while read -r f; do grep -qE "(^|[[:space:]])-{1,2}$f([[:space:]]|\$)" "$help" || echo "$f"; done)"
 t "R1: every flag in hostd's ExecStart is a flag 'ccsbx-hostd run' has ($src)${bad:+: unknown: $bad}" test -z "$bad"
 t "R1: the unit sets the tmux socket to an absolute path in /run/ccsbx and leaves --ccmsg-bin unset" bash -c 'grep -q -- "--tmux-socket /run/ccsbx/tmux.sock" "$1" && ! grep "^ExecStart=" "$1" | grep -q -- "--ccmsg-bin"' _ "$hd"
-t "R1b: /run/ccsbx is ccsbx-only 0700 with no group and no chgrp (a group-writable tmux socket lets any owner-uid process type into fenced panes)" bash -c 'grep -q "^RuntimeDirectoryMode=0700" "$1" && ! grep -q "chgrp" <(grep -v "^#" "$1") && ! grep -q "^SupplementaryGroups=.*ccsbx-clients.*tmux" "$1"' _ "$hd"
-t "R1b: the API socket lives in its own 0755 directory and keeps --socket-group ccsbx-clients (0660)" bash -c 'grep -q "^RuntimeDirectory=ccsbx ccsbx-api" "$1" && grep -q "ExecStartPre=+/usr/bin/chmod 0755 /run/ccsbx-api" "$1" && grep "^ExecStart=" "$1" | grep -q -- "--local-socket /run/ccsbx-api/hostd.sock --socket-group ccsbx-clients" && grep -q "^ReadWritePaths=.*/run/ccsbx-api" "$1"' _ "$hd"
+tmx="$here/units/systemd/ccsbx-tmux.service"
+t "R1b: /run/ccsbx is made by the tmux unit, ccsbx-only 0700, no group, no chgrp (a group-writable tmux socket lets any owner-uid process type into fenced panes)" bash -c 'grep -q "^RuntimeDirectory=ccsbx\$" "$2" && grep -q "^RuntimeDirectoryMode=0700" "$2" && ! grep -q "chgrp" <(grep -v "^#" "$2") && ! grep -q "^RuntimeDirectory=ccsbx " "$1"' _ "$hd" "$tmx"
+t "R1b: the API socket lives in its own 0755 directory and keeps --socket-group ccsbx-clients (0660)" bash -c 'grep -q "^RuntimeDirectory=ccsbx-api\$" "$1" && grep -q "ExecStartPre=+/usr/bin/chmod 0755 /run/ccsbx-api" "$1" && grep "^ExecStart=" "$1" | grep -q -- "--local-socket /run/ccsbx-api/hostd.sock --socket-group ccsbx-clients" && grep -q "^ReadWritePaths=.*/run/ccsbx-api" "$1"' _ "$hd"
 d="$(fx r1b)"; ins "$d" install --yes >/dev/null 2>&1
 t "R1b: no separate sudoers line for attach (the one ccsbx-root rule already covers the verb), and none for a group" bash -c 'f="$1/root/etc/sudoers.d/.90-ccsbx-root.new"; ! grep -q "attach" "$f" && ! grep -q "^%" "$f"' _ "$d"
 d="$(fx tok)"; ins "$d" install --yes >/dev/null 2>&1
@@ -375,6 +376,29 @@ t "N4: the sudoers file sets env_reset,!setenv for ccsbx-root, exactly" grep -qx
 t "N4: …and it is a Defaults line, not an extra grant (still exactly two NOPASSWD rules)" bash -c '[ "$(grep -v "^#" "$1" | grep -c "NOPASSWD")" -eq 2 ] && ! grep -v "^#" "$1" | grep -E "^Defaults" | grep -q NOPASSWD' _ "$sf"
 t "N4: the file is still validated by visudo before it is renamed into place" bash -c 'a="$(grep -n "visudo -cf /etc/sudoers.d/.90-ccsbx-root.new" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "mv -f /etc/sudoers.d/.90-ccsbx-root.new" "$1" | head -1 | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
 t "N4: plan says ccsbx-root gets a clean environment" bash -c 'grep -q "CLEAN environment" <<<"$1" && grep -q "env_reset,!setenv" <<<"$1"' _ "$("$inst" plan 2>&1)"
+
+echo "# ccsbx-tmux.service: the tmux server in the host mount namespace, hostd only connects"
+t "tmux: the unit has no mount-namespace sandboxing and leaves NoNewPrivileges off (its panes run sudo ccsbx-root)" bash -c 'u="$(grep -v "^#" "$1")"; for k in ProtectSystem ProtectHome PrivateTmp PrivateDevices ReadOnlyPaths ReadWritePaths InaccessiblePaths RestrictNamespaces ProtectKernel ProtectControlGroups MountFlags; do ! grep -q "^$k" <<<"$u" || { echo "has $k"; exit 1; }; done; grep -q "^NoNewPrivileges=no" <<<"$u"' _ "$tmx"
+t "tmux: runs as uid ccsbx, a foreground server on /run/ccsbx/tmux.sock with no config, socket 0600 (UMask 0077), LimitCORE=0" bash -c 'grep -q "^User=ccsbx" "$1" && grep -q "^ExecStart=/usr/bin/tmux -D -S /run/ccsbx/tmux.sock -f /dev/null" "$1" && grep -q "^UMask=0077" "$1" && grep -q "^LimitCORE=0" "$1"' _ "$tmx"
+t "tmux: hostd requires and follows it, and no longer makes /run/ccsbx or starts a server" bash -c 'grep -q "^Requires=.*ccsbx-tmux.service" "$1" && grep -q "^After=.*ccsbx-tmux.service" "$1"' _ "$hd"
+d="$(fx tmux)"; ins "$d" install --yes >/dev/null 2>&1; c="$d/rec/cmds"
+t "tmux: the installer writes the unit and starts it BEFORE hostd" bash -c 'test -f "$1/root/etc/systemd/system/ccsbx-tmux.service" && a="$(grep -n "enable --now ccsbx-tmux.service" "$2" | cut -d: -f1)" && b="$(grep -n "enable --now ccsbx-hostd.service" "$2" | cut -d: -f1)" && [ "$a" -lt "$b" ]' _ "$d" "$c"
+ins "$d" uninstall --yes >/dev/null 2>&1
+t "tmux: …the disable comes before the rm of its file, and its file is removed (it did not exist before)" bash -c 'a="$(grep -n "disable --now ccsbx-tmux.service" "$1" | head -1 | cut -d: -f1)"; r="$(grep -n "^rm -f /etc/systemd/system/ccsbx-tmux.service" "$1" | head -1 | cut -d: -f1)"; [ -n "$a" ] && [ -n "$r" ] && [ "$a" -lt "$r" ]' _ "$c"
+# check: the mount namespace and the socket
+d="$(fx tmuxchk)"; mkdir -p "$d/root/run/ccsbx"
+run_chk() { CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas CCSBX_TEST_TMUX_PID="$1" CCSBX_TEST_HOST_NS_PID="$2" "$inst" check 2>&1; }
+out="$(run_chk $$ $$)"
+t "tmux check: the same mount namespace as the host is an ok line" grep -q '^ok    ccsbx-tmux is in the host mount namespace' <<<"$out"
+t "tmux check: a missing socket is a FAIL (it must be ccsbx:600)" grep -q '^FAIL  the tmux socket is missing' <<<"$out"
+if unshare -Urm true 2>/dev/null; then
+  unshare -Urm sleep 20 & upid=$!; sleep 0.5
+  if [ -r "/proc/$upid/ns/mnt" ]; then
+    out="$(run_chk "$upid" $$)"
+    t "tmux check: a unit in a PRIVATE mount namespace is a FAIL" grep -q '^FAIL  ccsbx-tmux is NOT in the host mount namespace' <<<"$out"
+  else echo "ok   - (skipped: cannot read the private namespace)"; fi
+  kill "$upid" 2>/dev/null; wait "$upid" 2>/dev/null
+else echo "ok   - (skipped: unprivileged user namespaces are not available here)"; fi
 
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"

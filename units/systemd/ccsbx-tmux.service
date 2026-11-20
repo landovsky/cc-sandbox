@@ -1,0 +1,31 @@
+# ccsbx-tmux.service (U0). The ccsbx tmux server: the panes of fenced sessions live in it, and each pane runs
+# `sudo ccsbx-root run ...`. hostd only CONNECTS to it (--tmux-socket); it never starts the server.
+# Why its own unit: a pane started inside hostd's sandbox would inherit ProtectHome, a private mount namespace and
+# hostd's other restrictions, so sudo or ccsbx-root's bind mounts (which must reach dockerd) would fail. This unit
+# therefore has NO mount-namespace sandboxing: no ProtectSystem, ProtectHome, PrivateTmp, ReadOnlyPaths or
+# RestrictNamespaces, and NoNewPrivileges stays off (its panes call sudo). `check` proves it shares the host's mount
+# namespace; ccsbx-root itself refuses to run when it does not.
+# Kept hardening is only what does not touch children: LimitCORE=0, and UMask=0077 so the socket is 0600.
+# /run/ccsbx is owned by ccsbx, 0700 (made here, not in hostd's unit): a group-writable tmux socket would let any
+# process of the owner's uid type into fenced panes. The owner attaches through `sudo ccsbx-root attach <sid>`.
+# `tmux -D` runs the server in the foreground (no forking, no keepalive session); it turns exit-empty off, so it
+# stays up with no sessions. `-f /dev/null`: no config file, no status line, no prefix.
+[Unit]
+Description=ccsbx tmux server (fenced session panes)
+After=local-fs.target
+
+[Service]
+Type=simple
+User=ccsbx
+Group=ccsbx
+RuntimeDirectory=ccsbx
+RuntimeDirectoryMode=0700
+UMask=0077
+ExecStart=/usr/bin/tmux -D -S /run/ccsbx/tmux.sock -f /dev/null
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=no
+LimitCORE=0
+
+[Install]
+WantedBy=multi-user.target

@@ -98,12 +98,15 @@ u0_sops() {
 
 u0_hostd() {
   step "U0 hostd unit"
+  note "the tmux server is its own unit (no sandbox: its panes run sudo ccsbx-root and need the host mount namespace); hostd only connects"
+  put /etc/systemd/system/ccsbx-tmux.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-tmux.service"
   put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-hostd.service"
   note "the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced"
   if [ "$MODE" != install ] || [ ! -e "$(pth /var/lib/ccsbx/listen.token)" ]; then
     cmd runuser -u ccsbx -- sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /var/lib/ccsbx/listen.token'
   fi
   cmd systemctl daemon-reload
+  cmd systemctl enable --now ccsbx-tmux.service
   cmd systemctl enable --now ccsbx-hostd.service
   note "hostd listens on 127.0.0.1:7480 only (with a token file): no firewall rule is added (least privilege)"
 }
@@ -128,6 +131,21 @@ u0_groups() {
   note "NOW: sudo reboot  (a fresh tmux server has the new groups; the old one keeps docker)"
 }
 
+# the tmux unit must share the host mount namespace (its panes run sudo ccsbx-root and its binds must reach dockerd),
+# and its socket must be ccsbx-only 0600. Reading another user's /proc/PID/ns needs root; otherwise a note.
+tmux_check() {
+  local pid host sock own
+  expect "ccsbx-tmux is active" systemctl is-active --quiet ccsbx-tmux.service
+  if [ -n "$PREFIX" ]; then pid="${CCSBX_TEST_TMUX_PID:-}"; host="${CCSBX_TEST_HOST_NS_PID:-1}"
+  else pid="$(systemctl show -p MainPID --value ccsbx-tmux.service 2>/dev/null)"; host=1; fi
+  if [ -z "$pid" ] || [ "$pid" = 0 ]; then bad "ccsbx-tmux has no main process to inspect"
+  elif [ -r "/proc/$pid/ns/mnt" ] && [ -r "/proc/$host/ns/mnt" ]; then
+    if [ "$(readlink "/proc/$pid/ns/mnt")" = "$(readlink "/proc/$host/ns/mnt")" ]; then ok "ccsbx-tmux is in the host mount namespace"
+    else bad "ccsbx-tmux is NOT in the host mount namespace (a sandboxed pane breaks sudo ccsbx-root and its binds)"; fi
+  else note_check "ccsbx-tmux mount namespace: needs root to read /proc/$pid/ns/mnt; run check as root"; fi
+  sock="$(pth /run/ccsbx/tmux.sock)"; own="$(stat -c '%U:%a' "$sock" 2>/dev/null || echo missing)"
+  [ "$own" = "ccsbx:600" ] && ok "the tmux socket is ccsbx:600" || bad "the tmux socket is $own (want ccsbx:600)"
+}
 u0_check() {
   echo "-- U0 root paths"
   local u; u="$(real_user)"
@@ -150,6 +168,7 @@ u0_check() {
   if snap list lxd >/dev/null 2>&1; then bad "snap lxd is still installed"; else ok "snap lxd is gone"; fi
   if systemctl is-enabled lxd-installer.socket >/dev/null 2>&1; then bad "lxd-installer.socket is still enabled"; else ok "lxd-installer.socket not enabled"; fi
   expect "ccsbx-hostd is active" systemctl is-active --quiet ccsbx-hostd.service
+  tmux_check
   # sudo -n -l lists NOPASSWD only for ccsbx-root (and ccsbx-deploy if Q12 = yes)
   local out extra
   if out="$(sudo -n -l 2>/dev/null)"; then
@@ -182,6 +201,7 @@ u0_uninstall() {
   note "from the FIRST backup: $RESTORE_DIR (never overwritten, so a re-run or a failed install can't spoil it)"
   note "units are stopped and disabled BEFORE their files are removed (a disable needs the file)"
   try systemctl disable --now ccsbx-hostd.service
+  try systemctl disable --now ccsbx-tmux.service
   try systemctl disable --now ccsbx-signer.socket
   try systemctl disable --now ccsbx-signer.service
   note "this restores the state before the FIRST install; hand edits to sudoers.d since then are lost"

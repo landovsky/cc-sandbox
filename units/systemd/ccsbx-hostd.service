@@ -18,9 +18,9 @@
 # agreed with the U3a/hostd builder before the gate. Anything else ccsbx-root writes must be added here.
 [Unit]
 Description=ccsbx hostd (journal, stamping, start API)
-After=network-online.target ccsbx-signer.socket
+After=network-online.target ccsbx-signer.socket ccsbx-tmux.service
 Wants=network-online.target
-Requires=ccsbx-signer.socket
+Requires=ccsbx-signer.socket ccsbx-tmux.service
 
 [Service]
 Type=simple
@@ -30,10 +30,9 @@ SupplementaryGroups=ccsbx-clients
 ExecStart=/usr/local/libexec/ccsbx/ccsbx-hostd run --state /var/lib/ccsbx --local-socket /run/ccsbx-api/hostd.sock --socket-group ccsbx-clients --signer /run/ccsbx-signer/sign.sock --listen 127.0.0.1:7480 --listen-token-file /var/lib/ccsbx/listen.token --tmux-socket /run/ccsbx/tmux.sock
 StateDirectory=ccsbx
 StateDirectoryMode=0750
-RuntimeDirectory=ccsbx ccsbx-api
+RuntimeDirectory=ccsbx-api
 RuntimeDirectoryMode=0700
-# /run/ccsbx is ccsbx-only, 0700 (the tmux socket inside is 0600): a group-writable tmux socket would let any
-# process of the owner's uid type into fenced panes. The owner attaches through `sudo ccsbx-root attach`, not directly.
+# /run/ccsbx (the tmux socket, 0600) belongs to ccsbx-tmux.service; hostd only connects to it and never starts the server.
 # The API socket needs a directory the owner can traverse, so it lives in /run/ccsbx-api (made 0755 below); the
 # socket itself is ccsbx:ccsbx-clients 0660 (--socket-group), so the directory mode grants nothing by itself.
 ExecStartPre=+/usr/bin/chmod 0755 /run/ccsbx-api

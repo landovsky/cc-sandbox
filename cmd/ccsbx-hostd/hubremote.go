@@ -316,6 +316,23 @@ func (h *hubRemote) vetUnfenced(d hubc.Deliver, entries []map[string]any) (rs ms
 	if node == "" {
 		return rs, "", "the sender's hub entry has no node"
 	}
+	// The node is the scope identity the target trusts, so only ONE holder of it is heard: if any other hub
+	// entry holds it (a fenced manager's own, or another machine's owner token squatting on it: the hub
+	// refuses that now, but this is checked here, not believed), or a session record of this machine does,
+	// which of them is the sender is not for us to guess. Impersonation, and the real channel cut, is what a
+	// duplicate would otherwise be.
+	if hubc.CountNode(entries, node) != 1 {
+		return rs, "", "the sender's node is held by more than one hub entry (a fenced session's, or another principal's): not heard"
+	}
+	if h.rt != nil && h.rt.Dir != nil {
+		if ss, err := h.rt.Dir.Sessions(); err == nil {
+			for _, s := range ss {
+				if strings.Replace(s.Label, ":#", ":", 1) == strings.Replace(node, ":#", ":", 1) {
+					return rs, "", "the sender's node is the label of a session record of this machine: not heard"
+				}
+			}
+		}
+	}
 	body := d.Body
 	if body == "" {
 		body = d.Text

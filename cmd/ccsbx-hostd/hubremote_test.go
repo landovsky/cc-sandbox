@@ -269,6 +269,36 @@ func TestUnfencedSenderBoundToItsMachinesSpokeIsDeliveredAndLabelledAllow(t *tes
 	}
 }
 
+// context (round 4): the node is the scope identity a fenced worker trusts. An owner token of ANY machine can
+// publish an unfenced entry carrying a fenced manager's node; bound correctly, it would be heard as that
+// manager, and the duplicate would also cut the worker's own reports to the real one. So a sender whose node
+// anything else holds (a fenced entry, another principal's entry, a session record of this machine) is not heard.
+func TestUnfencedSenderWhoseNodeAnythingElseHoldsIsNotHeardBlock(t *testing.T) {
+	squat := func(node string) (map[string]any, map[string]string) {
+		e := map[string]any{"id": "sq1", "key": "x4/%1", "uid": "u-squat", "label": "squat", "node": node, "machine": "x4", "tracked_by": "spoke:x4"}
+		return e, map[string]string{"id": "sq1", "machine": "x4"}
+	}
+	for name, node := range map[string]string{
+		"a node a FENCED manager holds (the worker's manager)": "cc-sandbox:mgr",
+		"the same node in the #-form":                          "cc-sandbox:#mgr",
+		"a node a session record of this machine carries":      "cc-sandbox:worker",
+	} {
+		r := newRig(t, nil)
+		e, from := squat(node)
+		r.hub.sessions = append(r.hub.sessions, e)
+		if r.recv(unfenced("spoke:x4", true, e, from)) || len(r.out.lines) != 0 {
+			t.Errorf("%s: heard (%v)", name, r.out.lines)
+		}
+	}
+	// two unfenced entries on one node (the owner of mac and a squatter of x4): neither is heard
+	r := newRig(t, nil)
+	e, from := squat("cc-sandbox:peer")
+	r.hub.sessions = append(r.hub.sessions, e)
+	if r.recv(unfenced("spoke:mac", true, macUnfencedMgr, map[string]string{"id": "um1", "machine": "mac"})) || r.recv(unfenced("spoke:x4", true, e, from)) {
+		t.Error("a node held by two unfenced entries was heard")
+	}
+}
+
 // context: the shared owner secret is held by every owner session on every machine, so "bound by legacy"
 // proves nothing: refused outright. So is a binding the hub did not make, another machine's principal, a
 // from.machine that is missing or wrong, and a sender the presence list does not back.

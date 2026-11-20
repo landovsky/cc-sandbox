@@ -110,6 +110,12 @@ func IsUnauthorized(err error) bool {
 	return errors.As(err, &e) && e.Status == 401
 }
 
+// IsConflict reports a 409 (the hub refused a track: a node already held by a fenced entry or another principal).
+func IsConflict(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Status == 409
+}
+
 // IsForbidden reports a 403.
 func IsForbidden(err error) bool {
 	var e *Error

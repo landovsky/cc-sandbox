@@ -245,7 +245,8 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	mac := &hubc.Client{URL: url, Token: func() (string, error) { return macTok, nil }}
 	owner := &hubc.Client{URL: url, Token: func() (string, error) { return admin, nil }} // the SHARED secret
 	entry := func(label, node, uid, down string) map[string]any {
-		return map[string]any{"key": "mac3/" + label, "label": label, "node": node, "uid": uid, "machine": "mac3", "pane": "%1", "state": "waiting", "downlink": down}
+		_ = down
+		return map[string]any{"key": "mac3/" + label, "label": label, "node": node, "uid": uid, "machine": "mac3", "pane": "%1", "state": "waiting"}
 	}
 	if _, err := mac.Track(ctx, []map[string]any{
 		entry("umgr", "cc-sandbox:umgr", "eeeeeeee-0000-4000-8000-0000000000a1", "spoke:mac3/umgr"),
@@ -254,6 +255,7 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		t.Fatal(err)
 	}
 	var umgrID, uotherID, workerID string
+	// (the owner's unfenced entries route to the machine's own spoke:<m> downlink: the hub refuses a named one)
 	for i := 0; i < 100 && (umgrID == "" || uotherID == "" || workerID == ""); i++ {
 		es, _ := owner.Sessions(ctx)
 		if e := hubc.FindNode(es, "cc-sandbox:umgr"); e != nil {
@@ -334,12 +336,31 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		t.Errorf("hostd's principal tracking an unfenced entry: want 403, got %v", err)
 	}
 
+	// 5c. (round 4) the owner token of a THIRD machine cannot squat a node a fenced session holds, nor one
+	// another principal's live entry holds: the hub refuses (409), so nobody is heard as the fenced manager
+	// and the real channel is not cut.
+	x4Tok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "spoke", "machine": "x4", "trees": []string{"cc-sandbox"}})["token"].(string)
+	x4 := &hubc.Client{URL: url, Token: func() (string, error) { return x4Tok, nil }}
+	squat := func(node string) error {
+		_, err := x4.Track(ctx, []map[string]any{{"key": "x4/%1", "label": "squat", "node": node, "uid": "eeeeeeee-0000-4000-8000-0000000000c1", "machine": "x4", "pane": "%1", "state": "waiting"}}, 120)
+		return err
+	}
+	if err := squat("cc-sandbox:worker2"); !hubc.IsConflict(err) {
+		t.Errorf("an owner token squatting a FENCED session's node: want 409, got %v", err)
+	}
+	if err := squat("cc-sandbox:umgr"); !hubc.IsConflict(err) {
+		t.Errorf("an owner token squatting another principal's live node: want 409, got %v", err)
+	}
+	if es, _ := owner.Sessions(ctx); hubc.FindSid(es, "eeeeeeee-0000-4000-8000-0000000000c1") != nil {
+		t.Error("a refused squat was tracked")
+	}
+
 	// 6. the fenced worker reaches the unfenced manager (its node is in the relay's may_reach: the manager
 	// only), typed there with the fenced stamp; the test plays the manager's spoke by polling its downlink.
 	got := make(chan hubc.Frame, 4)
 	go func() {
 		for ctx.Err() == nil {
-			fs, _, err := mac.Poll(ctx, "spoke:mac3/umgr", 0, time.Second)
+			fs, _, err := mac.Poll(ctx, "spoke:mac3", 0, time.Second)
 			if err != nil {
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -347,7 +368,7 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 			for _, f := range fs {
 				var d hubc.Deliver
 				json.Unmarshal(f.Payload, &d)
-				mac.Ack(ctx, hubc.Ack{Topic: "spoke:mac3/umgr", Seq: f.Seq, AckTopic: d.AckTopic, AckRef: d.AckRef, OK: true, Confirmed: true})
+				mac.Ack(ctx, hubc.Ack{Topic: "spoke:mac3", Seq: f.Seq, AckTopic: d.AckTopic, AckRef: d.AckRef, OK: true, Confirmed: true})
 				got <- f
 			}
 		}
@@ -386,4 +407,7 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	if res2.Code != "dropped" {
 		t.Fatalf("a node held by two entries was sent to: %+v", res2)
 	}
+	// 8. and the manager's node being held twice, the correctly bound unfenced manager is not heard either:
+	// hostd does not guess which of the two is the sender.
+	refused("a sender whose node is held twice", "dup-node", mac, map[string]string{"id": umgrID, "machine": "mac3"})
 }

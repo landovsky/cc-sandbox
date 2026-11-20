@@ -451,8 +451,14 @@ hostd's rights (tracking a fenced identity, reading hostd's frames), and the rev
   be left out), and hostd confirms the binding against its own read of the presence list (the entry exists, is
   not fenced, is tracked by that principal). The line is typed visibly as `unfenced (hub)` and the normal
   scope check runs on the bound node. Residual: any owner-uid process on THAT one machine holds its spoke
-  credential and can name another session tracked under it (the local ccmsg trust, hence the label); it can
-  never claim a fenced identity (that needs a relay signature) or a session of another machine.
+  credential and can name another session tracked under it (the local ccmsg trust, hence the label). It can
+  never claim a fenced identity (that needs a relay signature), and a node is held by ONE principal: the hub
+  refuses (409) an owner entry carrying a node a fenced entry or another principal's live entry already holds,
+  and hostd independently hears no sender whose node anything else holds (another hub entry or a session
+  record of this machine), so an owner token of any machine cannot be heard as a fenced manager, nor make the
+  real manager's node ambiguous. Owner sessions route only to `spoke:<machine>` (no named downlink), and an
+  owner spoke's focus/rename/drop/read reach unfenced sessions of its own machine only; hostd's principal
+  gets none of those four.
 - **Fenced to unfenced.** A relay reaches an unfenced target only if (a) that target's node is in the relay's
   `may_reach`, fixed at mint by root from the session's record (the MANAGER only for now: Tomas's open
   question #3cy2 decides peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held

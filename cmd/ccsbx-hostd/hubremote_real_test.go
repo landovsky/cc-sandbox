@@ -62,7 +62,9 @@ func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s 
 	client := &hubc.Client{URL: url, Token: func() (string, error) { return tok, nil }}
 	// the stand-in for `ccsbx-root relay-mint`: the hub's admin API, which hostd itself never holds
 	mint := func(_ context.Context, sid string, gen int, pub string, _ bool) (string, error) {
-		reach := append([]string{}, s.Scope.Peers...)
+		// may_reach is the session's MANAGER only, as root derives it (Tomas's open question #3cy2: peers stay
+		// reachable only when they are fenced, over the signed path)
+		var reach []string
 		if s.Scope.Manager.Node != "" {
 			reach = append(reach, s.Scope.Manager.Node)
 		}
@@ -222,9 +224,9 @@ func sendVia(m *realMachine, s msg.Session, node, kind, text string) (bool, erro
 	return true, nil
 }
 
-// Accept §9 item 5, against the real hub: an UNFENCED manager (an ordinary session, tracked by the owner
-// credential) reaches a fenced worker, and a fenced worker reaches an unfenced manager only through the
-// relay's may_reach.
+// Accept §9 item 5, against the real hub, with what the hub can actually vouch for: an UNFENCED manager is
+// heard only through its machine's SPOKE principal (the shared secret binds nothing), and a fenced worker
+// reaches an unfenced manager only if it is the manager in the relay's may_reach AND a spoke tracked it.
 func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	url, admin := os.Getenv("CCSBX_REAL_HUB_URL"), os.Getenv("CCSBX_REAL_HUB_ADMIN")
 	if url == "" || admin == "" || os.Getenv("CCSBX_REAL_HUB_M2B") == "" {
@@ -234,18 +236,19 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	defer cancel()
 	worker := msg.Session{Sid: "s0worker02", Label: "cc-sandbox:worker2", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
 	worker.Scope.Manager.Node = "cc-sandbox:umgr"
-	worker.Scope.Peers = []string{"cc-sandbox:upeer"}
 	worker.Scope.ReplyWindowS = 3600
 	hp := startMachine(t, ctx, url, admin, "hp2", worker)
 
-	// two UNFENCED sessions, tracked by the owner (legacy) credential, each with its own downlink the test polls
-	owner := &hubc.Client{URL: url, Token: func() (string, error) { return admin, nil }}
+	// the Mac's owner sessions track through the Mac's SPOKE principal (a node within its trees)
+	macTok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "spoke", "machine": "mac3", "trees": []string{"cc-sandbox"}})["token"].(string)
+	mac := &hubc.Client{URL: url, Token: func() (string, error) { return macTok, nil }}
+	owner := &hubc.Client{URL: url, Token: func() (string, error) { return admin, nil }} // the SHARED secret
 	entry := func(label, node, uid, down string) map[string]any {
-		return map[string]any{"key": "mac/" + label, "label": label, "node": node, "uid": uid, "machine": "mac", "pane": "%1", "state": "waiting", "downlink": down}
+		return map[string]any{"key": "mac3/" + label, "label": label, "node": node, "uid": uid, "machine": "mac3", "pane": "%1", "state": "waiting", "downlink": down}
 	}
-	if _, err := owner.Track(ctx, []map[string]any{
-		entry("umgr", "cc-sandbox:umgr", "eeeeeeee-0000-4000-8000-0000000000a1", "spoke:mac/umgr"),
-		entry("uother", "cc-sandbox:uother", "eeeeeeee-0000-4000-8000-0000000000a2", "spoke:mac/uother"),
+	if _, err := mac.Track(ctx, []map[string]any{
+		entry("umgr", "cc-sandbox:umgr", "eeeeeeee-0000-4000-8000-0000000000a1", "spoke:mac3/umgr"),
+		entry("uother", "cc-sandbox:uother", "eeeeeeee-0000-4000-8000-0000000000a2", "spoke:mac3/uother"),
 	}, 120); err != nil {
 		t.Fatal(err)
 	}
@@ -264,12 +267,22 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	if umgrID == "" || uotherID == "" || workerID == "" {
-		t.Fatalf("not on the hub: umgr=%q uother=%q worker=%q", umgrID, uotherID, workerID)
+		t.Fatalf("not on the hub with their nodes: umgr=%q uother=%q worker=%q (the spoke's trees must keep an unfenced node)", umgrID, uotherID, workerID)
+	}
+	typed := func(sub string) bool {
+		hp.out.mu.Lock()
+		defer hp.out.mu.Unlock()
+		for _, l := range hp.out.lines {
+			if strings.Contains(l, sub) {
+				return true
+			}
+		}
+		return false
 	}
 
-	// 1. the unfenced manager (posting with the owner credential that tracked it) reaches the fenced worker:
-	// bound by the hub, typed as unfenced (hub), scope checked on its node (the worker's manager).
-	res, err := owner.Send(ctx, hubc.SendReq{To: workerID, Text: "please report", From: map[string]string{"id": umgrID, "machine": "mac"}})
+	// 1. the unfenced manager, posting with ITS MACHINE'S spoke credential, is bound by the hub, confirmed by
+	// hostd against the presence list, typed as unfenced (hub), scope checked on its node (the worker's manager).
+	res, err := mac.Send(ctx, hubc.SendReq{To: workerID, Text: "please report", From: map[string]string{"id": umgrID, "machine": "mac3"}})
 	if err != nil || res.Delivered != 1 {
 		t.Fatalf("unfenced manager -> fenced worker: %+v %v", res, err)
 	}
@@ -277,30 +290,43 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	if l := hp.out.lines[0]; !strings.Contains(l, "unfenced (hub)") || !strings.Contains(l, "cc-sandbox:umgr") || !strings.Contains(l, "please report") {
 		t.Fatalf("what the worker's pane got: %q", l)
 	}
-	// ... but the same credential claiming ANOTHER session's id that is not in the worker's scope is refused
-	// by the scope check (bound, but "uother" is neither the worker's manager nor a peer)
-	res, _ = owner.Send(ctx, hubc.SendReq{To: workerID, Text: "let me in", From: map[string]string{"id": uotherID, "machine": "mac"}})
-	time.Sleep(500 * time.Millisecond)
-	for _, l := range hp.out.lines {
-		if strings.Contains(l, "let me in") {
-			t.Fatalf("a bound sender outside the worker's scope was typed: %q", l)
-		}
-	}
-	// ... and a sender claiming a machine it is not on is unbound, so refused
-	owner.Send(ctx, hubc.SendReq{To: workerID, Text: "wrong machine", From: map[string]string{"id": umgrID, "machine": "elsewhere"}})
-	time.Sleep(500 * time.Millisecond)
-	for _, l := range hp.out.lines {
-		if strings.Contains(l, "wrong machine") {
-			t.Fatalf("an unbound sender was typed: %q", l)
-		}
-	}
 
-	// 2. the fenced worker reaches the unfenced manager (its node is in the relay's may_reach), typed there
-	// with the fenced stamp; the test plays the manager's spoke by polling its downlink and acking.
+	refused := func(why, text string, c *hubc.Client, from map[string]string) {
+		t.Helper()
+		c.Send(ctx, hubc.SendReq{To: workerID, Text: text, From: from})
+		time.Sleep(400 * time.Millisecond)
+		if typed(text) {
+			t.Fatalf("%s: was typed", why)
+		}
+	}
+	// 2. the shared secret is a forgery vector: any owner process can claim the manager's id
+	refused("a legacy poster claiming the spoke-tracked manager, no machine", "forged-legacy-1", owner, map[string]string{"id": umgrID})
+	refused("a legacy poster claiming it WITH the machine", "forged-legacy-2", owner, map[string]string{"id": umgrID, "machine": "mac3"})
+	// ... even for an entry the shared secret itself tracked, which the hub binds ("legacy") but hostd refuses
+	if _, err := owner.Track(ctx, []map[string]any{{"key": "ws/legacy", "label": "legacyunf", "node": "cc-sandbox:legacyonly", "uid": "eeeeeeee-0000-4000-8000-0000000000a3", "machine": "mac3", "pane": "%1", "state": "waiting", "downlink": "spoke:mac3/legacyunf"}}, 120); err != nil {
+		t.Fatal(err)
+	}
+	es, _ := owner.Sessions(ctx)
+	var legacyID string
+	for _, e := range es {
+		if e["label"] == "legacyunf" {
+			legacyID, _ = e["id"].(string)
+		}
+	}
+	refused("an entry tracked by the shared secret, posted with it", "forged-legacy-3", owner, map[string]string{"id": legacyID, "machine": "mac3"})
+	// 3. from.machine left out, with the right credential
+	refused("from.machine omitted", "no-machine", mac, map[string]string{"id": umgrID})
+	// 4. an unsigned claim of a FENCED identity, end to end
+	refused("an unsigned claim of the fenced worker's id", "claims-fenced", mac, map[string]string{"id": workerID, "machine": "mac3"})
+	// 5. a bound sender outside the worker's scope (uother is not its manager)
+	refused("a bound sender outside the scope", "out-of-scope", mac, map[string]string{"id": uotherID, "machine": "mac3"})
+
+	// 6. the fenced worker reaches the unfenced manager (its node is in the relay's may_reach: the manager
+	// only), typed there with the fenced stamp; the test plays the manager's spoke by polling its downlink.
 	got := make(chan hubc.Frame, 4)
 	go func() {
 		for ctx.Err() == nil {
-			fs, _, err := owner.Poll(ctx, "spoke:mac/umgr", 0, time.Second)
+			fs, _, err := mac.Poll(ctx, "spoke:mac3/umgr", 0, time.Second)
 			if err != nil {
 				time.Sleep(100 * time.Millisecond)
 				continue
@@ -308,7 +334,7 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 			for _, f := range fs {
 				var d hubc.Deliver
 				json.Unmarshal(f.Payload, &d)
-				owner.Ack(ctx, hubc.Ack{Topic: "spoke:mac/umgr", Seq: f.Seq, AckTopic: d.AckTopic, AckRef: d.AckRef, OK: true, Confirmed: true})
+				mac.Ack(ctx, hubc.Ack{Topic: "spoke:mac3/umgr", Seq: f.Seq, AckTopic: d.AckTopic, AckRef: d.AckRef, OK: true, Confirmed: true})
 				got <- f
 			}
 		}
@@ -326,8 +352,7 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("the unfenced manager got nothing")
 	}
-
-	// 3. OUTSIDE may_reach: the same relay credential sent straight to another unfenced node is a 403 at the hub
+	// ... but NOT an unfenced peer (not in may_reach), straight with the relay credential: 403 at the hub
 	kpriv, ktok, err := hp.hr.relayFor(ctx, worker, "")
 	if err != nil {
 		t.Fatal(err)
@@ -336,5 +361,16 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	sig := stamp.Sign(kpriv, stamp.Fields{From: worker.Sid, To: uotherID, Kind: "report", Body: "x"}, time.Now())
 	if _, err := rc.Send(ctx, hubc.SendReq{To: uotherID, Text: "x", Kind: "report", Sig: sig, From: map[string]string{"sid": worker.Sid, "fenced": "true"}}); !hubc.IsForbidden(err) {
 		t.Fatalf("a relay reached an unfenced node outside its may_reach: %v", err)
+	}
+
+	// 7. two entries hold the manager's node (the shared secret re-tracked it elsewhere): the worker's next
+	// report goes to NEITHER (ambiguous), and is journaled as dropped.
+	if _, err := owner.Track(ctx, []map[string]any{{"key": "ws/evil", "label": "evil", "node": "cc-sandbox:umgr", "uid": "eeeeeeee-0000-4000-8000-0000000000a4", "machine": "mac9", "pane": "%1", "state": "waiting", "downlink": "spoke:mac9/evil"}}, 120); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	res2 := hp.hr.rt.Send(worker, []byte(`{"type":"msg.send","to":{"node":"cc-sandbox:umgr"},"kind":"report","text":"secret report"}`))
+	if res2.Code != "dropped" {
+		t.Fatalf("a node held by two entries was sent to: %+v", res2)
 	}
 }

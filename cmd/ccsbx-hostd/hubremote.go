@@ -240,7 +240,7 @@ func (h *hubRemote) vet(ctx context.Context, d hubc.Deliver) (rs msg.RemoteSende
 		return rs, "", "the address in the stamp does not name this target"
 	}
 	if d.Trust != "fenced" {
-		return h.vetUnfenced(d)
+		return h.vetUnfenced(d, entries)
 	}
 	sid := d.From["sid"]
 	if d.Sig == "" || d.Pub == "" || sid == "" {
@@ -279,25 +279,42 @@ func (h *hubRemote) vet(ctx context.Context, d hubc.Deliver) (rs msg.RemoteSende
 	return msg.RemoteSender{Node: node, Sid: sid, Machine: machine, Fenced: true}, d.Body, ""
 }
 
-// vetUnfenced hears an unfenced sender only on what the HUB authenticated: the deliver must have come in on
-// a principal that itself tracked the entry named by from.id, on the machine from claims (`bound`), and the
-// entry must not be a fenced one (a fenced identity speaks only signed). The hub cannot say more without
-// a signature: ANY session holding the same credential on that machine (every owner-uid session, for the
-// shared secret) can still name another session tracked under it. That is the trust local ccmsg already
-// has, which is why the line is typed visibly as "unfenced (hub)"; it must never let anyone claim a fenced
-// identity, or a session of another machine. Absent or negative binding means refuse.
-func (h *hubRemote) vetUnfenced(d hubc.Deliver) (rs msg.RemoteSender, text, verdict string) {
+// vetUnfenced hears an unfenced sender only when a machine's SPOKE principal vouches for it: the deliver
+// must have come in on `spoke:<machine>`, and the hub must have bound from.id to an entry that SAME
+// principal tracked, on that same machine, which from.machine names (it may not be left out). The shared
+// owner secret ("legacy") is held by every owner session on every machine, so "bound by legacy" proves
+// nothing and is refused outright. hostd cross-checks the hub's from_entry against its own read of the
+// hub's presence list (the entry exists, is not fenced, is tracked by that principal): the binding is
+// verified here, not just believed. The line is typed as "unfenced (hub)" and the normal scope check runs
+// on the bound node. Residual (the documented local-ccmsg trust): any owner-uid process on that ONE machine
+// holds that machine's spoke credential and can name another session tracked under it; it can never claim
+// a fenced identity (that needs a relay signature) or a session of another machine. Absent or negative
+// binding means refuse.
+func (h *hubRemote) vetUnfenced(d hubc.Deliver, entries []map[string]any) (rs msg.RemoteSender, text, verdict string) {
 	if !d.Bound || d.FromEntry == nil {
 		return rs, "", "an unfenced sender the hub did not bind to the credential it posted with is not heard"
 	}
-	if d.From["fenced"] == "true" || d.FromEntry["fenced"] == true || d.Sig != "" {
-		return rs, "", "a fenced identity is claimed without a relay signature"
-	}
-	node, _ := d.FromEntry["node"].(string)
 	machine, _ := d.FromEntry["machine"].(string)
-	uid, _ := d.FromEntry["uid"].(string)
-	if node == "" || machine == "" || (d.From["machine"] != "" && d.From["machine"] != machine) {
-		return rs, "", "the hub's entry for the unfenced sender has no node, or is not from the machine it claims"
+	id, _ := d.FromEntry["id"].(string)
+	if machine == "" || d.Via != "spoke:"+machine {
+		return rs, "", "an unfenced sender is heard only through its own machine's spoke principal (not the shared secret, not another machine's)"
+	}
+	if d.From["machine"] == "" || d.From["machine"] != machine || d.From["fenced"] == "true" || d.Sig != "" {
+		return rs, "", "the unfenced sender does not name its machine, or claims a fenced identity without a relay signature"
+	}
+	var live map[string]any
+	for _, e := range entries {
+		if e["id"] == id && id != "" {
+			live = e
+		}
+	}
+	if live == nil || live["fenced"] == true || live["tracked_by"] != d.Via || live["machine"] != machine {
+		return rs, "", "the hub's own presence list does not bind that sender to the posting principal"
+	}
+	node, _ := live["node"].(string)
+	uid, _ := live["uid"].(string)
+	if node == "" {
+		return rs, "", "the sender's hub entry has no node"
 	}
 	body := d.Body
 	if body == "" {
@@ -345,6 +362,9 @@ func (h *hubRemote) SendRemote(sender msg.Session, node, kind, text string) (boo
 	entries, err := h.hub.Sessions(ctx)
 	if err != nil {
 		return false, "", err
+	}
+	if n := hubc.CountNode(entries, node); n > 1 {
+		return false, "", msg.ErrAmbiguousNode // two sessions hold the node: which one is the manager is not for us to guess
 	}
 	e := hubc.FindNode(entries, node)
 	if e == nil {
@@ -428,13 +448,14 @@ func (h *hubRemote) relayFor(ctx context.Context, s msg.Session, stale string) (
 	if err != nil {
 		return nil, "", err
 	}
+	mine := append(ed25519.PrivateKey(nil), priv...) // copied BEFORE the stored one is visible to pruneKeys
 	h.mu.Lock()
 	if old := h.keys[k]; old != nil {
 		wipe(old)
 	}
 	h.keys[k] = &relayKey{priv: priv, token: tok}
 	h.mu.Unlock()
-	return append(ed25519.PrivateKey(nil), priv...), tok, nil
+	return mine, tok, nil
 }
 
 func wipe(k *relayKey) {

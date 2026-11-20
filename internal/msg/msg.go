@@ -222,6 +222,9 @@ func (r *Router) SendWith(from Session, body []byte, o Origin) Result {
 				case err == nil:
 					r.dropped(sender, b.To.Node, "the hub delivered it to nobody")
 					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "dropped"})
+				case errors.Is(err, ErrAmbiguousNode):
+					r.dropped(sender, b.To.Node, "more than one session holds that node")
+					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "dropped"})
 				case errors.Is(err, ErrUnknownNode) && r.Hub == nil:
 					r.dropped(sender, b.To.Node, "no session on the hub holds that node")
 					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "dropped"})
@@ -287,6 +290,8 @@ type Uplink interface {
 var (
 	ErrLocalNode   = errors.New("the node is on this machine")
 	ErrUnknownNode = errors.New("the hub holds no session for that node")
+	// ErrAmbiguousNode: more than one live session holds the node, so a message must not guess.
+	ErrAmbiguousNode = errors.New("more than one session holds that node")
 )
 
 // dropped tells whoever journals (Dropped hook) that a message ended as dropped.

@@ -296,6 +296,18 @@ func FindNode(entries []map[string]any, node string) map[string]any {
 	return best
 }
 
+// CountNode is how many entries hold a node (the same matching as FindNode).
+func CountNode(entries []map[string]any, node string) int {
+	want := strings.Replace(node, ":#", ":", 1)
+	n := 0
+	for _, e := range entries {
+		if v, _ := e["node"].(string); v != "" && (v == node || v == want) {
+			n++
+		}
+	}
+	return n
+}
+
 // FindSid is the entry the hub holds for a session id (its `uid`), or nil.
 func FindSid(entries []map[string]any, sid string) map[string]any {
 	for _, e := range entries {

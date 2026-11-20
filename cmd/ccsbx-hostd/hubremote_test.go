@@ -132,7 +132,7 @@ func newRig(t *testing.T, mint minter) *rig {
 	hub.sessions = []map[string]any{
 		{"id": "t1", "key": "ccsbx:" + targetSid, "uid": targetSid, "label": "cc-sandbox:worker", "node": "cc-sandbox:worker", "machine": "hp", "fenced": true},
 		{"id": "m1", "key": "mac/%1", "uid": "s0mac12345", "label": "mgr", "node": "cc-sandbox:mgr", "machine": "mac", "fenced": true},
-		{"id": "u1", "key": "mac/%2", "uid": "u-peer", "label": "plain", "node": "cc-sandbox:peer", "machine": "mac"},
+		{"id": "um1", "key": "mac/%2", "uid": "u-peer", "label": "plain", "node": "cc-sandbox:peer", "machine": "mac", "tracked_by": "spoke:mac"},
 		{"id": "n1", "key": "mac/%3", "uid": "s0nonode99", "label": "nonode", "machine": "mac", "fenced": true},
 	}
 	worker := msg.Session{Sid: targetSid, Label: "cc-sandbox:worker", BusID: "ccsbx:" + targetSid, Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
@@ -243,63 +243,54 @@ func TestAGenuineStampFromOutOfScopeOrNodelessSenderIsRefused(t *testing.T) {
 
 // unfenced is a payload as the hub builds it for an unfenced sender: via the principal it posted with,
 // bound (or not) to an entry that principal itself tracked.
-func unfenced(bound bool, entry map[string]any, from map[string]string) hubc.Deliver {
-	return hubc.Deliver{UID: targetSid, To: "t1", Trust: "unfenced", Text: "hello", Body: "hello", From: from, Via: "legacy", Bound: bound, FromEntry: entry}
+func unfenced(via string, bound bool, entry map[string]any, from map[string]string) hubc.Deliver {
+	return hubc.Deliver{UID: targetSid, To: "t1", Trust: "unfenced", Text: "hello", Body: "hello", From: from, Via: via, Bound: bound, FromEntry: entry}
 }
 
-var macUnfencedMgr = map[string]any{"id": "u1", "node": "cc-sandbox:mgr", "machine": "mac", "uid": "u-mgr", "label": "mgr"}
+var macUnfencedMgr = map[string]any{"id": "um1", "node": "cc-sandbox:peer", "machine": "mac", "uid": "u-peer", "label": "plain", "tracked_by": "spoke:mac"}
 
 // context: a Mac manager that is an ordinary session (ccmsg) reaches a fenced worker through the hub. The
-// hub says it posted with a credential that itself tracked that session on that machine: heard, typed
-// visibly as unfenced, and held to the normal scope rule on the BOUND node.
-func TestUnfencedSenderBoundByTheHubIsDeliveredAndLabelledAllow(t *testing.T) {
+// hub says it posted with its machine's SPOKE principal, which itself tracked that session on that machine,
+// and hostd confirms it against its own read of the presence list: heard, typed visibly as unfenced, and
+// held to the normal scope rule on the BOUND node.
+func TestUnfencedSenderBoundToItsMachinesSpokeIsDeliveredAndLabelledAllow(t *testing.T) {
 	r := newRig(t, nil)
-	if !r.recv(unfenced(true, macUnfencedMgr, map[string]string{"id": "u1", "machine": "mac"})) || len(r.out.lines) != 1 {
+	if !r.recv(unfenced("spoke:mac", true, macUnfencedMgr, map[string]string{"id": "um1", "machine": "mac"})) || len(r.out.lines) != 1 {
 		t.Fatalf("%v %v", r.out.lines, r.logs)
 	}
-	if l := r.out.lines[0]; !strings.Contains(l, "unfenced (hub)") || !strings.Contains(l, "cc-sandbox:mgr") {
+	if l := r.out.lines[0]; !strings.Contains(l, "unfenced (hub)") || !strings.Contains(l, "cc-sandbox:peer") {
 		t.Fatalf("%q", l)
 	}
-	// the same binding for a node outside the target's scope is refused by the normal scope check
-	stranger := map[string]any{"id": "u2", "node": "other:stranger", "machine": "mac", "uid": "u-x"}
-	if r.recv(unfenced(true, stranger, map[string]string{"id": "u2"})) || len(r.out.lines) != 1 {
+	// a bound sender whose node is outside the target's scope is refused by the normal scope check
+	r.hub.sessions = append(r.hub.sessions, map[string]any{"id": "ux", "uid": "u-x", "node": "other:stranger", "machine": "mac", "tracked_by": "spoke:mac"})
+	stranger := map[string]any{"id": "ux", "node": "other:stranger", "machine": "mac", "uid": "u-x", "tracked_by": "spoke:mac"}
+	if r.recv(unfenced("spoke:mac", true, stranger, map[string]string{"id": "ux", "machine": "mac"})) || len(r.out.lines) != 1 {
 		t.Fatal("a bound sender outside the target's scope was heard")
 	}
 }
 
-// context: the hub could NOT bind from.id (it is not an entry tracked by the credential that posted it,
-// or sits on another machine's spoke, or the field is missing: an old hub): absent or negative means refuse.
-func TestUnfencedSenderTheHubDidNotBindIsRefusedBlock(t *testing.T) {
+// context: the shared owner secret is held by every owner session on every machine, so "bound by legacy"
+// proves nothing: refused outright. So is a binding the hub did not make, another machine's principal, a
+// from.machine that is missing or wrong, and a sender the presence list does not back.
+func TestUnfencedSenderTheHubDidNotBindToASpokeIsRefusedBlock(t *testing.T) {
 	r := newRig(t, nil)
+	r.hub.sessions = append(r.hub.sessions, map[string]any{"id": "nn1", "uid": "u-nn", "machine": "mac", "tracked_by": "spoke:mac"})
+	ok := map[string]string{"id": "um1", "machine": "mac"}
 	for name, d := range map[string]hubc.Deliver{
-		"not bound":                      unfenced(false, nil, map[string]string{"id": "u1", "machine": "mac"}),
-		"bound but no entry":             unfenced(true, nil, map[string]string{"id": "u1"}),
-		"an old hub (no binding at all)": {UID: targetSid, To: "t1", Trust: "unfenced", Text: "hi", From: map[string]string{"id": "u1"}},
-		"no from":                        unfenced(false, nil, nil),
-		"another machine than it claims": unfenced(true, macUnfencedMgr, map[string]string{"id": "u1", "machine": "elsewhere"}),
-		"an entry with no node":          unfenced(true, map[string]any{"id": "u1", "machine": "mac"}, map[string]string{"id": "u1"}),
-	} {
-		if r.recv(d) {
-			t.Errorf("%s: accepted", name)
-		}
-	}
-	if len(r.out.lines) != 0 {
-		t.Fatalf("typed: %v", r.out.lines)
-	}
-}
-
-// context: a fenced identity speaks only signed. An unfenced message that claims one (from.fenced, a fenced
-// entry, or a signature that does not make it fenced) is refused even when the hub bound it.
-func TestClaimingAFencedIdentityWithoutARelaySignatureIsRefusedBlock(t *testing.T) {
-	r := newRig(t, nil)
-	fencedEntry := map[string]any{"id": "m1", "node": "cc-sandbox:mgr", "machine": "mac", "uid": "s0mac12345", "fenced": true}
-	for name, d := range map[string]hubc.Deliver{
-		"a fenced entry":     unfenced(true, fencedEntry, map[string]string{"id": "m1"}),
-		"from.fenced = true": unfenced(true, macUnfencedMgr, map[string]string{"id": "u1", "fenced": "true"}),
-		"a stray signature": func() hubc.Deliver {
-			d := unfenced(true, macUnfencedMgr, map[string]string{"id": "u1"})
-			d.Sig = "v1.x"
-			return d
+		"via the shared secret (legacy)":    unfenced("legacy", true, macUnfencedMgr, ok),
+		"no via (an old hub)":               unfenced("", true, macUnfencedMgr, ok),
+		"another machine's spoke principal": unfenced("spoke:elsewhere", true, macUnfencedMgr, ok),
+		"not bound":                         unfenced("spoke:mac", false, nil, ok),
+		"bound but no entry":                unfenced("spoke:mac", true, nil, ok),
+		"from.machine left out":             unfenced("spoke:mac", true, macUnfencedMgr, map[string]string{"id": "um1"}),
+		"from.machine is another machine":   unfenced("spoke:mac", true, macUnfencedMgr, map[string]string{"id": "um1", "machine": "elsewhere"}),
+		"a presence entry with no node":     unfenced("spoke:mac", true, map[string]any{"id": "nn1", "machine": "mac", "uid": "u"}, map[string]string{"id": "nn1", "machine": "mac"}),
+		"an old hub (no binding at all)":    {UID: targetSid, To: "t1", Trust: "unfenced", Text: "hi", From: ok},
+		"no from":                           unfenced("spoke:mac", false, nil, nil),
+		"an entry the presence list lacks":  unfenced("spoke:mac", true, map[string]any{"id": "gone", "node": "cc-sandbox:mgr", "machine": "mac", "uid": "u"}, map[string]string{"id": "gone", "machine": "mac"}),
+		"an entry tracked by someone else": func() hubc.Deliver {
+			e := map[string]any{"id": "u1", "node": "cc-sandbox:peer", "machine": "mac", "uid": "u-peer"}
+			return unfenced("spoke:mac", true, e, map[string]string{"id": "u1", "machine": "mac"})
 		}(),
 	} {
 		if r.recv(d) {
@@ -308,6 +299,39 @@ func TestClaimingAFencedIdentityWithoutARelaySignatureIsRefusedBlock(t *testing.
 	}
 	if len(r.out.lines) != 0 {
 		t.Fatalf("typed: %v", r.out.lines)
+	}
+}
+
+// context: a fenced identity speaks only signed. An unfenced message that claims one is refused even when
+// the hub bound it.
+func TestClaimingAFencedIdentityWithoutARelaySignatureIsRefusedBlock(t *testing.T) {
+	r := newRig(t, nil)
+	for name, d := range map[string]hubc.Deliver{
+		"from.fenced = true": unfenced("spoke:mac", true, macUnfencedMgr, map[string]string{"id": "um1", "machine": "mac", "fenced": "true"}),
+		"a stray signature": func() hubc.Deliver {
+			d := unfenced("spoke:mac", true, macUnfencedMgr, map[string]string{"id": "um1", "machine": "mac"})
+			d.Sig = "v1.x"
+			return d
+		}(),
+		"the id of a fenced entry": unfenced("spoke:mac", true, map[string]any{"id": "m1", "node": "cc-sandbox:mgr", "machine": "mac", "uid": "s0mac12345", "tracked_by": "spoke:mac"}, map[string]string{"id": "m1", "machine": "mac"}),
+	} {
+		if r.recv(d) {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if len(r.out.lines) != 0 {
+		t.Fatalf("typed: %v", r.out.lines)
+	}
+}
+
+// context: two live entries hold one node (a re-tracked or ghost entry): which one is the manager is not for
+// hostd to guess, so a message to that node is dropped, never sent to the newest.
+func TestANodeHeldByTwoEntriesIsNotSentToEither(t *testing.T) {
+	calls := 0
+	r := newRig(t, fixedMint("sbp1.relay-token-0001", &calls))
+	r.hub.sessions = append(r.hub.sessions, map[string]any{"id": "m9", "uid": "s0mac99999", "label": "ghost", "node": "cc-sandbox:mgr", "machine": "mac5", "fenced": true})
+	if _, _, err := r.hr.SendRemote(worker(), "cc-sandbox:mgr", "report", "secret"); !errors.Is(err, msg.ErrAmbiguousNode) || calls != 0 || len(r.hub.got) != 0 {
+		t.Fatalf("%v minted %d sent %d", err, calls, len(r.hub.got))
 	}
 }
 

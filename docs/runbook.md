@@ -437,20 +437,53 @@ record, never from the fence) and polls `spoke:<machine>/ccsbx`.
   record (manager, peers, reply-to-sender). An unfenced sender is delivered as `unfenced (hub)` under the same
   scope. The typed text is rendered by hostd from the verified body, and the hub's own line must carry the
   same flattened body or the message is refused.
-- **Unfenced senders** (an ordinary Mac manager using ccmsg) are heard only on what the HUB authenticated: the
-  deliver must have come in on a credential that itself tracked the entry named by `from.id`, on the machine
-  `from` claims, and the entry must not be a fenced one (the hub marks this `bound`; hostd refuses any
-  unfenced message whose binding is absent or negative). The line is typed visibly as `unfenced (hub)` and
-  the normal scope check runs on the BOUND node. Residual: any owner-uid session on that machine (they
-  all hold the same credential) can still claim another session tracked under it. That is the trust local
-  ccmsg has today, which is why it is labelled unfenced. It never lets anyone claim a fenced identity (that
-  needs a relay signature) or a session of another machine.
-- **Fenced to unfenced.** A relay reaches an unfenced target only if that target's node is in the relay's
-  `may_reach`, fixed at mint by root from the session's record (manager and peers).
+- **Unfenced senders** (an ordinary Mac manager using ccmsg) are heard only through THEIR MACHINE'S SPOKE
+  PRINCIPAL. The shared owner secret is held by every owner session on every machine, so a message posted with
+  it binds nothing and is refused. The deliver must have come in on `spoke:<machine>`, the hub must have bound
+  `from.id` to an entry that same principal tracked on that machine, `from.machine` must name it (it may not
+  be left out), and hostd confirms the binding against its own read of the presence list (the entry exists, is
+  not fenced, is tracked by that principal). The line is typed visibly as `unfenced (hub)` and the normal
+  scope check runs on the bound node. Residual: any owner-uid process on THAT one machine holds its spoke
+  credential and can name another session tracked under it (the local ccmsg trust, hence the label); it can
+  never claim a fenced identity (that needs a relay signature) or a session of another machine.
+- **Fenced to unfenced.** A relay reaches an unfenced target only if (a) that target's node is in the relay's
+  `may_reach`, fixed at mint by root from the session's record (the MANAGER only for now: Tomas's open
+  question #3cy2 decides peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held
+  by more than one live entry (which of them is the manager is not for it to guess): `msg.dropped`.
+- **A spoke principal's deliver** may reach its own machine's sessions and any FENCED session (the receiving
+  hostd verifies and scopes it); focus, rename, drop and read stay on its own machine.
 - **Minting the machine's spoke credential** (once, as the hub admin, on the hub host; the file is root-owned,
   0640, group ccsbx): `curl -X POST -H "authorization: Bearer $ADMIN" -d '{"role":"spoke","machine":"<machine>","trees":["cc-sandbox"]}' http://127.0.0.1:4011/v1/principals`.
   Without `trees` the hub drops every node and nothing can be scoped or addressed; hostd logs a warning
-  when its own entries come back without one.
+  when its own entries come back without one. Re-minting a machine's spoke replaces the old token.
+
+### Moving a machine's owner sessions onto its spoke principal (deploy gate ❓ 2xq4: NOT deployed)
+What changes: today every spoke and every reader (ccmsg, ccq, cc-pick, cc-tree, sb-hook) on a machine uses the
+ONE shared secret. After the switch, that machine uses its own spoke principal token (`sbp1.…`, minted with
+`trees:["cc-sandbox", ...]` for the trees whose nodes its sessions publish). Nothing in the hub changes mode:
+it accepts both, so machines move one at a time. The shared secret stays for the admin API (minting) and as
+the default until a machine opts in.
+- **The opt-in is a file**, not a code path: `~/.config/session-bus/spoke-token` (mode 600; `$SB_SPOKE_TOKEN_FILE`
+  overrides). When it exists and is non-empty, `sb_secret` (shell), `sb_auth.secret()` (python) and cc-tree's
+  `hub_secret()` return it instead of the shared secret; an explicit `$SB_SECRET` still wins; an empty file
+  falls back to the shared secret. The websocket spoke (the Elixir client) reads `SB_SECRET` from its service
+  environment, so that env value is the second half of the switch.
+- **Order, per machine** (do hp, check, then the Mac): (1) on the hub host mint the spoke credential for the
+  machine (above); (2) put the token in `~/.config/session-bus/spoke-token` (600); (3) readers pick it up at once:
+  check `ccq` and `ccmsg --help`-less dry run (`CCMSG_DRY_RUN=1 ccmsg <node> x`) still resolve nodes; (4) change
+  the spoke service's `SB_SECRET` to the token and restart it: on hp `systemctl --user edit` the spoke unit's
+  Environment, then `systemctl --user restart`; on the Mac edit the LaunchAgent plist's `SB_SECRET` and
+  `launchctl kickstart -k`; (5) `ccq` shows the machine's sessions again under the new principal within one
+  lease; (6) hostd uses the SAME machine token (a spoke principal is one per machine: minting a second token for the
+  machine replaces the first for everyone), in its own file (`--hub-token-file`, root:ccsbx 0640): whenever the
+  machine's token is re-minted, update every file that holds it (the owner's `spoke-token`, the spoke
+  service's `SB_SECRET`, hostd's token file) and restart those that cache it.
+- **What keeps working**: nodes still resolve in `ccmsg` and cc-tree deliver (an entry from a spoke principal keeps
+  its node when the tree is in its `trees`; a tree not listed is dropped, so mint with every tree you use).
+  Standalone (no cc-sandbox) works either way: the flag is a file in the owner's config dir.
+- **Rollback**: delete `~/.config/session-bus/spoke-token`, put the shared secret back in the spoke service's
+  `SB_SECRET`, restart it; the readers go back to the shared secret at once. The principal can be revoked
+  (`DELETE /v1/principals/spoke:<machine>`) or simply left to expire (its default lifetime).
 - **Node bound.** The hub keeps a fenced entry's `node` only for the trees the machine's spoke principal was
   minted for (`trees`), so a fence cannot publish an owner's unrelated tree node.
 - **Known limit: the public key is supplied by the hub.** hostd verifies the stamp against the `pub` the hub

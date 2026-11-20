@@ -118,7 +118,7 @@ func TestAPodMessageToTheManagerIsStampedAndPostedWithTheRelayToken(t *testing.T
 		t.Fatalf("auth %q", r.hub.auth)
 	}
 	sig, _ := r.hub.posted["sig"].(string)
-	if _, err := stamp.Verify(r.pub, sig, stamp.Fields{From: "s0worker", To: "m1", Kind: "report", Body: "SECRET-TEXT done"}, time.Now(), stamp.NewCache()); err != nil {
+	if _, err := stamp.Verify(r.pub, sig, stamp.Fields{From: "s0worker", To: "u-m1", Kind: "report", Body: "SECRET-TEXT done"}, time.Now(), stamp.NewCache()); err != nil {
 		t.Fatalf("the receiver cannot verify the stamp: %v", err)
 	}
 }
@@ -254,11 +254,12 @@ func peerScope(machine string) func(*BusConfig) {
 }
 
 // context "a peer of the session is as reachable as the manager, on the machine the record places it on": and a
-// peer entry that only exists on another machine gets nothing.
+// peer entry that only exists on another machine gets nothing. (A real hub lists a relay only its manager today,
+// may_reach has no peers, so this is the sender's rule for when it lists more.)
 func TestAPeerIsReachableOnItsOwnMachineOnly(t *testing.T) {
 	r := newBusRig(t, peerScope("mac2"))
 	r.hub.entries = append(r.hub.entries, hubEntry("p1", "cc-sandbox:peer", "mac2", false))
-	if rep := send(r.bus, `{"to":{"node":"cc-sandbox:peer"},"text":"hi"}`); rep.Status != "ok" || r.hub.posted["to"] != "p1" {
+	if rep := send(r.bus, `{"to":{"node":"cc-sandbox:peer"},"text":"hi"}`); rep.Status != "ok" || r.hub.posted["to"] != "u-p1" {
 		t.Fatalf("%+v posted %v", rep, r.hub.posted)
 	}
 	r2 := newBusRig(t, peerScope("mac2"))

@@ -17,7 +17,7 @@ if have_stub; then
     && ok "the stub's fixed catalog has the 'outcome' script that e2e/03 drives with 'E2E:outcome'" \
     || bad "stub catalog has an outcome script" "$("$CCSBX" stub --print-catalog 2>&1 | head -5)"
 else skip "the stub's catalog has the 'outcome' script" "C18 (stream B, branch n1-b) is not on main yet"; fi
-skip "outcome, question, subtask, checkpoint, rename, mark, done land on the session's own node (say E2E:outcome in a fence)" "needs C5 (ccf MCP) + C6 (verb writer) + fence image"
+skip "outcome, question, subtask, checkpoint, rename, mark, done land on the session's own node (say E2E:outcome in a fence)" "needs C5 (ccf MCP) + C6 (verb writer) baked into the image: /opt/ccf is empty, so the stub's tool call has no server to reach (the stub itself is on main and a fenced Claude reaches it: 07-workday)"
 skip "no verb can name another node; Tomas-only verbs are refused from the fence" "needs C5, C7"
 skip "replays are exact across a journal reset and a crash mid-verb" "needs C6 + M4 (verb queue)"
 skip "stale verbs are dropped (older than a human commit, on a moved node, after rename-tree)" "needs C15"

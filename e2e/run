@@ -6,11 +6,14 @@
 #   e2e/run 01-launch 03-verbs   just those
 #   e2e/run --list               the scripts, run nothing
 #   CCSBX_BIN=/path/ccsbx e2e/run            another binary;  E2E_KEEP=1 E2E_ROOT=/tmp/x e2e/run  keep the realm
+#   E2E_IMAGE (fence image, default ccsbx-fence:dev), E2E_DOTFILES (hub test library), E2E_CCTREE (cc-tree with the
+#   remote start path): see e2e/lib.sh. Docker steps remove only the exact names they made (tests/fence-cleanup.sh).
+#   Run it under a cap:  systemd-run --user --scope -p MemoryMax=4G -p MemorySwapMax=0 timeout 900 make e2e
 # Each script runs in its own scratch realm (see e2e/lib.sh), never the live tree or daemon.
 # Exit: 0 every line ok (a SKIP is ok but counted and listed); 1 any "not ok"; 2 usage/setup.
 here="$(cd "$(dirname "$0")" && pwd)"
 case "${1:-}" in
-  -h|--help) sed -n '2,10p' "$0"; exit 0;;
+  -h|--help) sed -n '2,14p' "$0"; exit 0;;
   --list) ls "$here" | grep -E '^0[0-9]-'; exit 0;;
 esac
 scripts=("$@"); [ ${#scripts[@]} -gt 0 ] || mapfile -t scripts < <(ls "$here" | grep -E '^0[0-9]-')

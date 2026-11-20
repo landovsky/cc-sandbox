@@ -34,7 +34,7 @@ fx() {                                   # fx NAME → a fresh fake root with su
 ins() {                                  # ins FXDIR ARGS… — run the installer inside the fake root, recording commands
   local d="$1"; shift
   CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/rec/cmds" CCSBX_BIN_DIR="$d/dist" CCSBX_P15_FILE="$d/p15.tsv" \
-  CCSBX_OWNER=tomas CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" "$inst" "$@"
+  CCSBX_OWNER=tomas CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" CCSBX_IMAGE="${IMG:-ghcr.io/landovsky/ccsbx-fence@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "$inst" "$@"
 }
 snapshot() { (cd "$1" && find root dist -type f -o -type l | sort | xargs -r sha256sum 2>/dev/null; cat rec/cmds 2>/dev/null); }
 
@@ -408,26 +408,38 @@ out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$
 t "G: check has a seccomp profile line (a FAIL here, nothing installed in the fake root)" grep -q 'seccomp profile verifies' <<<"$out"
 t "G: the tmux unit comment no longer claims -f /dev/null gives no prefix or status line, and names the new-window cost" bash -c '! grep -q "no config file, no status line, no prefix" "$1" && grep -q "built-in defaults" "$1" && grep -q "new-window" "$1"' _ "$tmx"
 
-echo "# helper mode (PR #12): hostd's run dir, root-owned profiles and pins, one source for the worktree root"
-t "helper: hostd's ExecStart passes --run-dir, --pins, --profiles, --worktree-root and --image, all flags the binary has" bash -c 'l="$(grep "^ExecStart=" "$1")"; for f in run-dir pins profiles worktree-root image; do grep -q -- "--$f " <<<"$l" || { echo "no --$f"; exit 1; }; done' _ "$hd"
-t "helper: the unit points at the ROOT-OWNED copies under /etc/ccsbx, never at the owner-writable repo" bash -c 'l="$(grep "^ExecStart=" "$1")"; grep -q -- "--pins /etc/ccsbx/pins.toml" <<<"$l" && grep -q -- "--profiles /etc/ccsbx/profiles" <<<"$l" && ! grep -q "/home/" <<<"$l"' _ "$hd"
+echo "# helper mode (PR #12): hostd's run dir, root-owned pins, one source for the roots, image by digest, machine name"
+DIG="ghcr.io/landovsky/ccsbx-fence@sha256:$(printf 'b%.0s' $(seq 64))"
+t "helper: hostd's ExecStart passes --run-dir, --pins, --worktree-root, --image and --machine, all flags the binary has" bash -c 'l="$(grep "^ExecStart=" "$1")"; for f in run-dir pins worktree-root image machine; do grep -q -- "--$f " <<<"$l" || { echo "no --$f"; exit 1; }; done' _ "$hd"
+t "helper: --profiles is gone from the unit (profiles are embedded; an unknown flag would be fatal)" bash -c '! grep "^ExecStart=" "$1" | grep -q -- "--profiles"' _ "$hd"
+t "helper: the unit points at the ROOT-OWNED pins copy, never at the owner-writable repo" bash -c 'l="$(grep "^ExecStart=" "$1")"; grep -q -- "--pins /etc/ccsbx/pins.toml" <<<"$l" && ! grep -q "/home/" <<<"$l"' _ "$hd"
 t "helper: hostd can write replies under the run dir (ReadWritePaths) and reads it through group ccsbx" grep -q '^ReadWritePaths=.*/var/lib/ccsbx-run' "$hd"
-d="$(fx helper)"; ins "$d" install --yes --allowed-roots /srv/a,/srv/b --image ccsbx-fence:cand >"$d/out" 2>&1; u="$d/root/etc/systemd/system/ccsbx-hostd.service"
-t "helper: the installed unit has the SAME list as --worktree-root, and the image, no placeholder left" bash -c 'grep -q -- "--worktree-root /srv/a,/srv/b --image ccsbx-fence:cand" "$1" && ! grep -q "@[A-Z_]*@" "$1"' _ "$u"
-t "helper: …and ccsbx-root.toml lists the same roots (one source, written to both)" grep -q 'allowed_roots = \["/srv/a", "/srv/b"\]' "$d/root/etc/ccsbx/ccsbx-root.toml"
-t "helper: profiles are copied to /etc/ccsbx/profiles unchanged, pins to /etc/ccsbx/pins.toml" bash -c 'cmp -s "$2/profiles/dev-default.json" "$1/root/etc/ccsbx/profiles/dev-default.json" && cmp -s "$2/profiles/e2e-default.json" "$1/root/etc/ccsbx/profiles/e2e-default.json" && cmp -s "$2/pins.toml" "$1/root/etc/ccsbx/pins.toml"' _ "$d" "$here"
-t "helper: the signer scope is built from the root-owned copy" grep -q 'pairs read from the root-owned copy /etc/ccsbx/profiles: dev-default:api|stub,e2e-default:stub' "$d/out"
+d="$(fx helper)"; IMG="$DIG" ins "$d" install --yes --allowed-roots /srv/a,/srv/b --machine hp-ubuntu >"$d/out" 2>&1; u="$d/root/etc/systemd/system/ccsbx-hostd.service"
+t "helper: the installed unit has the SAME list as --worktree-root, the digest image and the machine, no placeholder left" bash -c 'grep -q -- "--worktree-root /srv/a,/srv/b --image $2 --machine hp-ubuntu" "$1" && ! grep -q "@[A-Z_]*@" "$1"' _ "$u" "$DIG"
+t "helper: …and ccsbx-root.toml lists the same roots and the same machine (one source, written to both)" bash -c 'grep -q "allowed_roots = \\[\"/srv/a\", \"/srv/b\"\\]" "$1" && grep -q "^machine = \"hp-ubuntu\"" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+t "helper: pins.toml is copied to /etc/ccsbx/pins.toml unchanged; no profiles directory is made" bash -c 'cmp -s "$2/pins.toml" "$1/root/etc/ccsbx/pins.toml" && [ ! -e "$1/root/etc/ccsbx/profiles" ]' _ "$d" "$here"
+t "helper: the signer pairs still come from the repo's profiles" bash -c 'grep -- "--write-scope" "$1" | grep -q -- "--pairs dev-default:api\\|stub,e2e-default:stub"' _ "$d/rec/cmds"
 t "helper: the run dir exists (root 0755, as ccsbx-root makes it) before hostd starts" bash -c 'a="$(grep -n "install -d -o root -g root -m 0755 /var/lib/ccsbx-run" "$1" | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-hostd" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
-t "helper: the copies are in the backup's ABSENT list, so uninstall removes them" bash -c 'grep -qx /etc/ccsbx/pins.toml "$1" && grep -qx /etc/ccsbx/profiles/dev-default.json "$1"' _ "$d/root/var/backups/ccsbx-install/original/ABSENT"
+t "helper: pins.toml is in the backup's ABSENT list, so uninstall removes it" grep -qx /etc/ccsbx/pins.toml "$d/root/var/backups/ccsbx-install/original/ABSENT"
 ins "$d" uninstall --yes >/dev/null 2>&1
-t "helper: uninstall removes the profile copies and pins" bash -c 'grep -qx "rm -f /etc/ccsbx/pins.toml" "$1" && grep -qx "rm -f /etc/ccsbx/profiles/dev-default.json" "$1"' _ "$d/rec/cmds"
+t "helper: uninstall removes the pins copy" grep -qx "rm -f /etc/ccsbx/pins.toml" "$d/rec/cmds"
 d="$(fx helper2)"; ins "$d" install --yes >/dev/null 2>&1
-t "helper: the default allowed roots are the owner's ~/git and ~/wt (as before), written to ccsbx-root.toml" bash -c 'grep -q "^allowed_roots = \[\"[^\"]*/git\", \"[^\"]*/wt\"\]\$" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
-t "helper: hostd's --worktree-root is exactly ccsbx-root.toml's allowed_roots list (~/git,~/wt)" bash -c 'u="$1/root/etc/systemd/system/ccsbx-hostd.service"; w="$(grep -o -- "--worktree-root [^ ]*" "$u" | cut -d" " -f2)"; r="$(sed -n "s/^allowed_roots = \[\(.*\)\]\$/\1/p" "$1/root/etc/ccsbx/ccsbx-root.toml" | tr -d "\" " )"; [ -n "$w" ] && [ "$w" = "$r" ] && grep -q "/git,.*/wt\$" <<<"$w"' _ "$d"
-d="$(fx helper3)"; ins "$d" install --yes --image 'bad image;x' >/dev/null 2>"$d/err"; rc=$?
-t "helper: a bad --image is refused (exit 3), nothing changed" bash -c '[ '"$rc"' -eq 3 ] && [ ! -s "$1" ]' _ "$d/rec/cmds"
+t "helper: the default allowed roots are the owner's ~/git and ~/wt, written to ccsbx-root.toml" bash -c 'grep -q "^allowed_roots = \\[\"[^\"]*/git\", \"[^\"]*/wt\"\\]\$" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+t "helper: hostd's --worktree-root is exactly ccsbx-root.toml's allowed_roots list" bash -c 'u="$1/root/etc/systemd/system/ccsbx-hostd.service"; w="$(grep -o -- "--worktree-root [^ ]*" "$u" | cut -d" " -f2)"; r="$(sed -n "s/^allowed_roots = \\[\\(.*\\)\\]\$/\\1/p" "$1/root/etc/ccsbx/ccsbx-root.toml" | tr -d "\" ")"; [ -n "$w" ] && [ "$w" = "$r" ] && grep -q "/git,.*/wt\$" <<<"$w"' _ "$d"
+echo "# the image is passed BY DIGEST: hostd and ccsbx-root refuse every start of a tag (image_not_pinned)"
+for bad_img in 'ccsbx-fence:dev' 'ghcr.io/landovsky/ccsbx-fence:latest' 'ghcr.io/other/ccsbx-fence@sha256:'"$(printf 'c%.0s' $(seq 64))" 'ghcr.io/landovsky/ccsbx-fence@sha256:abc' 'bad image;x'; do
+  d="$(fx img)"; ins "$d" install --yes --image "$bad_img" >/dev/null 2>"$d/err"; rc=$?
+  t "image: '$bad_img' is refused (exit 3), nothing changed" bash -c '[ '"$rc"' -eq 3 ] && grep -q "image" "$1" && [ ! -s "$2" ]' _ "$d/err" "$d/rec/cmds"
+done
+d="$(fx img0)"; CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/rec/cmds" CCSBX_BIN_DIR="$d/dist" CCSBX_P15_FILE="$d/p15.tsv" CCSBX_OWNER=tomas CCSBX_B9_CMD=true "$inst" install --yes >/dev/null 2>"$d/err"; rc=$?
+t "image: no image at all is refused (exit 3): there is no tag default any more" bash -c '[ '"$rc"' -eq 3 ] && grep -q "no fence image" "$1"' _ "$d/err"
+t "image: the repo the installer accepts is the one pins.DefaultRepos allows (a candidate from any other repo is refused by pins.Check)" bash -c 'grep -q "DefaultRepos = \[\]string{\"ghcr.io/landovsky/ccsbx-fence\"}" "$1/internal/pins/pins.go"' _ "$here"
+echo "# the machine name: lowercase, the same string for hostd and ccsbx-root"
+t "machine: a mixed-case host name is lowercased by default (root lowercases its own name, so hostd must agree)" bash -c 'grep -q "tr .A-Z. .a-z." "$1"' _ "$inst"
+d="$(fx mach)"; ins "$d" install --yes --machine HP-Ubuntu >/dev/null 2>"$d/err"; rc=$?
+t "machine: an explicit mixed-case --machine is refused (exit 3), not passed on" test "$rc" -eq 3
 out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
-t "helper: check looks at the pins file and the profiles dir (FAIL in an empty fake root)" bash -c 'grep -q "^FAIL  /etc/ccsbx/pins.toml is missing" <<<"$1" && grep -q "^FAIL  /etc/ccsbx/profiles is missing" <<<"$1"' _ "$out"
+t "helper: check looks at the pins file (FAIL in an empty fake root)" grep -q '^FAIL  /etc/ccsbx/pins.toml is missing' <<<"$out"
 for r in '/srv/a,' ',/srv/a' '/srv/a,,/srv/b' '/srv/a/' '/srv//a'; do
   d="$(fx wr)"; ins "$d" install --yes --allowed-roots "$r" >/dev/null 2>"$d/err"; rc=$?
   t "helper: --allowed-roots '$r' (an empty entry or a trailing slash: hostd would refuse every start) is refused (exit 3)" test "$rc" -eq 3

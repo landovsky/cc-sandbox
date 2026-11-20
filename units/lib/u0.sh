@@ -23,15 +23,10 @@ u0_binaries() {
   put /etc/ccsbx/ccsbx-root.toml 0644 root:root <<EOT
 # written by install-linux.sh (U0). Root-owned: tomas can't widen it. Edit with sudoedit.
 allowed_roots = [${ALLOWED_ROOTS_TOML}]
+machine = "${MACHINE}"
 verbs = ["run", "stop", "renew", "gc", "attach", "exec-token"]
 EOT
-  note "root-owned copies of the profiles and the pins: hostd, the signer scope and later readers use THESE, never the owner-writable repo"
-  cmd install -d -o root -g root -m 0755 "$PROFILES_ETC"
-  local pf
-  for pf in "$REPO_DIR"/profiles/*.json; do
-    [ -e "$pf" ] || continue
-    put "$PROFILES_ETC/$(basename "$pf")" 0644 root:root < "$pf"
-  done
+  note "a root-owned copy of the pins: ccsbx-root and hostd read THIS, never the owner-writable repo"
   put /etc/ccsbx/pins.toml 0644 root:root < "$REPO_DIR/pins.toml"
   note "pins.toml is empty today: only e2e candidate images run, as expected, until U1a is pinned"
 }
@@ -111,8 +106,8 @@ u0_hostd() {
   put /etc/systemd/system/ccsbx-tmux.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-tmux.service"
   note "ccsbx-root's run directory (it makes it itself, root-owned 0755; made here so hostd's unit can bind it read-write)"
   cmd install -d -o root -g root -m 0755 /var/lib/ccsbx-run
-  note "hostd's unit gets the same roots as ccsbx-root ($WORKTREE_ROOT, as --worktree-root) and the fence image ($IMAGE)"
-  put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < <(sed -e "s|@WORKTREE_ROOT@|$WORKTREE_ROOT|g" -e "s|@IMAGE@|$IMAGE|g" "$UNITS_DIR/systemd/ccsbx-hostd.service")
+  note "hostd's unit gets the same roots as ccsbx-root ($WORKTREE_ROOT, as --worktree-root) and the fence image ($IMAGE, by digest) and machine name ($MACHINE)"
+  put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < <(sed -e "s|@WORKTREE_ROOT@|$WORKTREE_ROOT|g" -e "s|@IMAGE@|$IMAGE|g" -e "s|@MACHINE@|$MACHINE|g" "$UNITS_DIR/systemd/ccsbx-hostd.service")
   note "the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced"
   if [ "$MODE" != install ] || [ ! -e "$(pth /var/lib/ccsbx/listen.token)" ]; then
     cmd runuser -u ccsbx -- sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /var/lib/ccsbx/listen.token'
@@ -182,10 +177,8 @@ u0_check() {
   expect "ccsbx-hostd is active" systemctl is-active --quiet ccsbx-hostd.service
   tmux_check
   local f own
-  for f in /etc/ccsbx/pins.toml "$PROFILES_ETC"; do
-    own="$(stat -c '%U:%a' "$(pth "$f")" 2>/dev/null || echo missing)"
-    case "$f:$own" in /etc/ccsbx/pins.toml:root:644|"$PROFILES_ETC":root:755) ok "$f is $own";; *) bad "$f is $own (want root:644 for pins, root:755 for the profiles dir)";; esac
-  done
+  f=/etc/ccsbx/pins.toml; own="$(stat -c '%U:%a' "$(pth "$f")" 2>/dev/null || echo missing)"
+  [ "$own" = "root:644" ] && ok "$f is $own" || bad "$f is $own (want root:644)"
   expect "the seccomp profile verifies (ccsbx seccomp-profile --verify)" "$(pth /usr/local/bin/ccsbx)" seccomp-profile --verify "$(pth /etc/ccsbx/seccomp.json)"
   # sudo -n -l lists NOPASSWD only for ccsbx-root (and ccsbx-deploy if Q12 = yes)
   local out extra

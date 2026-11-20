@@ -39,6 +39,7 @@ night-2 piece.
 
 | # | Step | Command |
 |---|---|---|
+| 0 | **The fence image digest** (the install needs it; Tomas has pushed `main`, so G's Actions workflow `fence-image` has built the image: U1a/R19) | in `~/git/cc-sandbox`, in the shell you will use for steps 8 and 8b: `RUN=$(gh run list --repo landovsky/cc-sandbox --workflow fence-image.yml --branch main --status success --limit 1 --json databaseId -q '.[0].databaseId')`; `gh run download "$RUN" --repo landovsky/cc-sandbox --name digest --dir /tmp/fence-digest`; `DIGEST=$(cat /tmp/fence-digest/digest.txt)`; `[[ "$DIGEST" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ ]] && echo "digest ok: $DIGEST"`. If the run is missing or red there is no digest and the install refuses. `_GAP:_` the workflow file name (`fence-image.yml`), the artifact name (`digest`) and the file (`digest.txt`) are assumed: confirm them with G (stream N1-G); the job summary of the same run also shows the digest |
 | 1 | Read the install PR and the plan | `gh pr view 2 --web`, then run `plan` **from the PR branch** (`git switch n1-d-root`, then back to `main`) or after step 3: on `main` the `units/` directory is empty until the PR is merged. This file's copy is from last night |
 | 2 | Push main (builders never push it; it is ahead of origin) | `git -C ~/git/cc-sandbox push origin main` |
 | 3 | Merge the install PR, then get its files | `gh pr merge 2 --squash` (or review in the browser), then `git pull --ff-only` in `~/git/cc-sandbox` |
@@ -47,10 +48,11 @@ night-2 piece.
 | 6 | B9: the hub is native | stream C's release is live and `systemctl --user is-active session-bus-hub.service` says `active` (unit name assumed; `CCSBX_B9_UNIT` overrides). The install refuses otherwise |
 | 7 | Build the binaries the installer wants | `make dist-linux GO=$HOME/.local/go/bin/go` builds `ccsbx-root`, `ccsbx-hostd`, `ccsbx-signer`, `ccsbx` for linux/amd64 into `dist/` with a `SHA256SUMS` that lists exactly them. Compare the checksums with a build you trust (CI or a second machine) before step 8: the file sits next to the binaries |
 | 7b | Root-only test of `ccsbx-root`'s bind mount (**PR #8 must be merged first**) | from `~/git/cc-sandbox`: `~/.local/go/bin/go version` first (go is not on sudo's PATH, so the full path is used and `GOTOOLCHAIN=local` stops it fetching a toolchain), then `sudo unshare -m env GOTOOLCHAIN=local /home/tomas/.local/go/bin/go test -tags rootmount -run TestRealMounter ./internal/rootcmd`. It must **PASS**; if it does not, stop here |
-| 8 | The root install (sudo, password) | `sudo units/install-linux.sh install --yes` (add `--with-deploy` only if Q12 = yes) |
-| 8b | Seccomp profile for `ccsbx-root run` (**before the reboot**: it needs `/etc/ccsbx` from step 8 and docker, which the old session still has) | from `~/git/cc-sandbox`, in this order: `V=$(docker version --format '{{.Server.Version}}')`; `curl -fsSL -o default.json https://raw.githubusercontent.com/moby/moby/v$V/profiles/seccomp/default.json`; `ccsbx seccomp-profile --base default.json --out /tmp/seccomp.json`; `sudo install -o root -g root -m 0644 /tmp/seccomp.json /etc/ccsbx/seccomp.json`; `ccsbx seccomp-profile --verify /etc/ccsbx/seccomp.json`; `tests/seccomp-setuid-test.sh --base default.json --image ccsbx-fence:dev` (docker; the candidate image, since there is no production pin yet). The verify and the docker test must both pass. `check` verifies the profile again |
+| 8 | The root install (sudo, password) | `sudo units/install-linux.sh install --yes --image "$DIGEST"` (the value from step 0; `sudo` keeps your shell's expansion of `$DIGEST`) (add `--with-deploy` only if Q12 = yes). **The image is passed by digest**: the CI-built candidate from U1a; a tag is refused, because hostd and `ccsbx-root` refuse every start of a tag (`image_not_pinned`). A digest not in `pins.toml` is a candidate: only e2e profiles may run it, which is what step 10b uses |
+| 8b | Seccomp profile for `ccsbx-root run` (**before the reboot**: it needs `/etc/ccsbx` from step 8 and docker, which the old session still has) | from `~/git/cc-sandbox`, in this order: `V=$(docker version --format '{{.Server.Version}}')`; `curl -fsSL -o default.json https://raw.githubusercontent.com/moby/moby/v$V/profiles/seccomp/default.json`; `ccsbx seccomp-profile --base default.json --out /tmp/seccomp.json`; `sudo install -o root -g root -m 0644 /tmp/seccomp.json /etc/ccsbx/seccomp.json`; `ccsbx seccomp-profile --verify /etc/ccsbx/seccomp.json`; `tests/seccomp-setuid-test.sh --base default.json --image ccsbx-fence:dev` (docker; the candidate image, since there is no production pin yet). The verify and the docker test must both pass. Last, still before the reboot (docker is gone after it): `docker pull "$DIGEST"`, so step 10b's pane can really run the fence. `check` verifies the profile again |
 | 9 | Reboot | `sudo reboot`, then open tmux again |
 | 10 | The install is complete | `units/install-linux.sh check` (exit 0) |
+| 10b | **One e2e start reaches `ccsbx-root run`** (the Gate M ACCEPT for the start path; U1c is merged) | from `~/git/cc-sandbox`: `ccsbx start --spec tests/specs/e2e-hello.json --json`. **Step 1 of the proof, hostd accepts:** exit 0 and a StartReply with a `sid`. Exit 2 prints `ccsbx start: refused: <code>` with one of `image_not_pinned` (the image is a tag, or hostd's `--image` is wrong), `profile_not_approved`, `wrong_machine` (the machine name differs between the spec, hostd and `ccsbx-root.toml`), `bad_spec` (for example a workdir outside `--worktree-root`), `rate_capped`, `machine_full`, `already_running`; or `ccsbx start: ccsbx-hostd is not running or not reachable (socket /run/ccsbx-api/hostd.sock)`. **Step 2, ccsbx-root accepts:** `sudo ccsbx-root attach <sid>` shows the pane. **PASS** = the pane has no line starting `ccsbx-root run: refused:`; it runs the fence, or ends with docker's own error (`ccsbx-root run: ...` without `refused:`, exit 1), which means every check passed. **FAIL** = `ccsbx-root run: refused: ` followed by `pins: ...` (the image is not an acceptable digest), `profile <p> is not approved for machine <m> with billing <b>`, `session <sid> is for machine "<a>", this is "<b>"`, `this process is not in the host's mount namespace` (a sandboxed unit: `ccsbx-tmux` must be the host's), `seccomp profile ...` (step 8b), `session <sid> has ended`, or `must run as root` |
 | 11 | k3s launcher check 5: hp only, as `ccsbx-keys`, launcher-scoped | the block below, verbatim from the k3s side |
 | 12 | The first SHARED go (M8/M1) | merge the k3s PR `_GAP:_ number from the k3s side`: `gh pr merge <n> --repo landovsky/k3s`; then `flux get kustomization cc-sandbox` on the Mac |
 | 13 | Everything green | `bin/ccsbx-preflight --morning --post-M1` (set `CCSBX_DOORS_MODEL_URL` and `CCSBX_DOORS_EGRESS_URL` first) |
@@ -162,12 +164,13 @@ After the group change only password sudo can start them (`sudo docker start <na
   The installer parses it as root and refuses if a NOPASSWD line isn't one of docker, apt-get,
   dokku, sops (it won't guess).
 
-## `units/install-linux.sh plan` as of 2026-11-20 (owner tomas, after the helper-mode flags)
+## `units/install-linux.sh plan` as of 2026-11-20 (owner tomas, after the gate fixes: image by digest, machine name, no --profiles)
 
 ```
 install-linux plan  (owner=tomas, bin-dir=<repo>/dist)
 Nothing below is run by 'plan'. The same steps run under 'install --yes' as root.
 GATES (install refuses while any is unmet)
+  UNMET: no fence image: pass --image ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the CI-built candidate, U1a); a tag is refused
   UNMET: B9 missing: user unit session-bus-hub.service is not active (the native hub release, stream C)
   UNMET: P15 open: 24 row(s) not done or dropped: A5 B-session-bus B-messaging-hub-db-1 B-redis-5ctq B-redis-4s6w … (run units/p15 status)
   UNMET: binaries missing in <repo>/dist: ccsbx-root ccsbx-hostd ccsbx-signer ccsbx (a linux build of each + SHA256SUMS in --bin-dir; see --help)
@@ -203,11 +206,8 @@ GATES (install refuses while any is unmet)
      $ install -o root -g root -m 0755 <repo>/dist/ccsbx-signer /usr/local/libexec/ccsbx/ccsbx-signer
      $ install -o root -g root -m 0755 <repo>/dist/ccsbx /usr/local/bin/ccsbx
      # ccsbx-root reads its allowed workdir roots from /etc/ccsbx/ccsbx-root.toml (root-owned)
-     write /etc/ccsbx/ccsbx-root.toml  (mode 0644, root:root, 3 lines)
-     # root-owned copies of the profiles and the pins: hostd, the signer scope and later readers use THESE, never the owner-writable repo
-     $ install -d -o root -g root -m 0755 /etc/ccsbx/profiles
-     write /etc/ccsbx/profiles/dev-default.json  (mode 0644, root:root, 10 lines)
-     write /etc/ccsbx/profiles/e2e-default.json  (mode 0644, root:root, 10 lines)
+     write /etc/ccsbx/ccsbx-root.toml  (mode 0644, root:root, 4 lines)
+     # a root-owned copy of the pins: ccsbx-root and hostd read THIS, never the owner-writable repo
      write /etc/ccsbx/pins.toml  (mode 0644, root:root, 8 lines)
      # pins.toml is empty today: only e2e candidate images run, as expected, until U1a is pinned
 
@@ -234,8 +234,8 @@ GATES (install refuses while any is unmet)
      write /etc/systemd/system/ccsbx-tmux.service  (mode 0644, root:root, 35 lines)
      # ccsbx-root's run directory (it makes it itself, root-owned 0755; made here so hostd's unit can bind it read-write)
      $ install -d -o root -g root -m 0755 /var/lib/ccsbx-run
-     # hostd's unit gets the same roots as ccsbx-root (/home/tomas/git,/home/tomas/wt, as --worktree-root) and the fence image (ccsbx-fence:dev)
-     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 58 lines)
+     # hostd's unit gets the same roots as ccsbx-root (/home/tomas/git,/home/tomas/wt, as --worktree-root) and the fence image (, by digest) and machine name (hp-ubuntu)
+     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 59 lines)
      # the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced
      $ runuser -u ccsbx -- sh -c umask\ 077\;\ head\ -c\ 32\ /dev/urandom\ \|\ base64\ \>\ /var/lib/ccsbx/listen.token
      $ systemctl daemon-reload

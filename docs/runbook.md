@@ -94,11 +94,15 @@
      It prints `DONE` only after hostd and the signer are up. hostd listens on loopback only
      (`127.0.0.1:7480`, with a token file), so the firewall question (S11) does not arise.
      Before step 2 do the manual checks listed in `docs/night-1-morning.md` (S5, S9, S14, S15).
-     **Profiles, pins, worktree root:** the install copies `profiles/*.json` and `pins.toml` to `/etc/ccsbx/`
-     (root-owned); hostd's `--profiles`/`--pins` and the signer's pairs read those copies, not the repo, so an
-     agent that can write the repo cannot change what a profile may bill. Change a profile: edit the repo, merge,
-     rerun `install --yes`. hostd's `--worktree-root` is the `--allowed-roots` value `ccsbx-root.toml` gets (default
-     `~/git,~/wt`; the same comma list for both, no spaces, no empty entry, no trailing slash); its `--run-dir` is `/var/lib/ccsbx-run`.
+     **Pins, image, machine, worktree root:** the install copies `pins.toml` to `/etc/ccsbx/pins.toml` (root-owned;
+     `ccsbx-root` and hostd read it, not the repo). There is no profiles copy: profiles are compiled into the
+     binaries, so hostd has no `--profiles`. The signer's pairs come from the repo's `profiles/*.json` at install.
+     hostd's `--image` is a **digest** (`--image ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex>` is required; a tag
+     is refused by the installer because every start of a tag fails with `image_not_pinned`). A digest not in
+     `pins.toml` is a candidate that only e2e profiles may run. `--machine` is the lowercased `hostname -s`, written to
+     both hostd's unit and `ccsbx-root.toml`, so root never refuses a start over a mixed-case name. hostd's
+     `--worktree-root` is the `--allowed-roots` value `ccsbx-root.toml` gets (default `~/git,~/wt`; the same comma list
+     for both, no spaces, no empty entry, no trailing slash); its `--run-dir` is `/var/lib/ccsbx-run`.
      **Signer scope:** before it enables the signer socket the install has `ccsbx-signer --write-scope` write
      `/var/lib/ccsbx-keys/signer.scope` (0600, `ccsbx-keys`); without it the signer exits 2. The scope lists the
      owner, the machine name and the exact profile:billing pairs from `profiles/*.json` (a profile is signed

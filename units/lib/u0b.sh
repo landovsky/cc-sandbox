@@ -48,11 +48,7 @@ u0b_keys() {
   fi
   note "the signer will not serve without its scope (owners, machines, profile:billing pairs). The signer writes it itself"
   note "  (--write-scope: atomic, 0600): only that binary ever opens machine.key. Rewritten on every run to match the options"
-  if [ "$MODE" = install ] && [ "${PAIRS_DEFAULTED:-0}" = 1 ]; then
-    PAIRS="$(pairs_from "$(pth "$PROFILES_ETC")")"
-    [ -n "$PAIRS" ] || die "no profile in $PROFILES_ETC lists machine $MACHINE: the signer would have an empty scope"
-    note "pairs read from the root-owned copy $PROFILES_ETC: $PAIRS"
-  fi
+  [ -n "$PAIRS" ] || { [ "$MODE" != install ] || die "no profile in the repo lists machine $MACHINE: the signer would have an empty scope"; }
   cmd runuser -u ccsbx-keys -- "$LIBEXEC/ccsbx-signer" --keys "$KEYS_DIR" --write-scope --owners "$(real_user)" --machines "$MACHINE" --pairs "$PAIRS"
   note "the printed PUBLIC key goes into config/machines/<machine>.json (M9); nothing secret is printed"
   note "the K8 kubeconfig arrives SOPS-encrypted to the age key; it is decrypted only by ccsbx-keys"

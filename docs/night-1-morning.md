@@ -83,6 +83,7 @@ Step 8 in detail (changed after the PR #2 review):
   Only the signer opens `machine.key`. `check` asks the signer, as uid `ccsbx`, for a token for one in-scope
   test claim (api + dev-default), so it needs root;
 - `ccsbx-root` runs with a clean environment: the sudoers file has `Defaults!/usr/local/sbin/ccsbx-root env_reset,!setenv`, so `sudo -E` and `VAR=x` do not reach it;
+- the ccsbx tmux server is its own unit, `ccsbx-tmux.service` (uid `ccsbx`, no sandbox, host mount namespace), started before hostd; hostd only connects to `/run/ccsbx/tmux.sock`. `check` (as root) confirms the namespace and that the socket is `ccsbx:600`;
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
@@ -208,10 +209,13 @@ GATES (install refuses while any is unmet)
      $ systemctl enable --now ccsbx-signer.socket
 
 [05] U0 hostd unit
-     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 54 lines)
+     # the tmux server is its own unit (no sandbox: its panes run sudo ccsbx-root and need the host mount namespace); hostd only connects
+     write /etc/systemd/system/ccsbx-tmux.service  (mode 0644, root:root, 31 lines)
+     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 53 lines)
      # the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced
      $ runuser -u ccsbx -- sh -c umask\ 077\;\ head\ -c\ 32\ /dev/urandom\ \|\ base64\ \>\ /var/lib/ccsbx/listen.token
      $ systemctl daemon-reload
+     $ systemctl enable --now ccsbx-tmux.service
      $ systemctl enable --now ccsbx-hostd.service
      # hostd listens on 127.0.0.1:7480 only (with a token file): no firewall rule is added (least privilege)
 

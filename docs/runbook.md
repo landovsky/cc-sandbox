@@ -99,11 +99,14 @@
      owner, the machine name and the exact profile:billing pairs from `profiles/*.json` (a profile is signed
      only with a billing in its own list). Rerun `install --yes` with `--machine/--pairs` to change it.
      `check` (as root) proves it by getting a token for one in-scope test claim (api + dev-default).
-     **Attach:** `/run/ccsbx` (hostd's tmux socket, 0600) is `ccsbx`-only, mode 0700, with no group: a
-     group-writable tmux socket would let any process of the owner's uid type into fenced panes. The owner
-     attaches with `sudo ccsbx-root attach <sid>`; the installer's one rule for `ccsbx-root` already covers
-     that verb, so no separate attach line is added (narrowing it to `attach *` is G's call). hostd's API
-     socket is `/run/ccsbx-api/hostd.sock`, `ccsbx:ccsbx-clients` 0660, in a 0755 directory.
+     **tmux and attach:** the ccsbx tmux server runs in its own unit, `ccsbx-tmux.service` (uid `ccsbx`, no
+     sandbox, so it shares the host mount namespace: its panes run `sudo ccsbx-root run`, whose binds must reach
+     dockerd). hostd `Requires=` it and only connects to `/run/ccsbx/tmux.sock`; it never starts the server.
+     `/run/ccsbx` is `ccsbx`-only, 0700, with the socket 0600: a group-writable tmux socket would let any process
+     of the owner's uid type into fenced panes. The owner attaches with `sudo ccsbx-root attach <sid>`; the
+     installer's one rule for `ccsbx-root` already covers that verb, so no separate attach line is added.
+     hostd's API socket is `/run/ccsbx-api/hostd.sock`, `ccsbx:ccsbx-clients` 0660, in a 0755 directory.
+     `check` (as root) confirms `ccsbx-tmux`'s mount namespace equals PID 1's and that the socket is `ccsbx:600`.
      **Known limit after Gate M:** hostd runs as uid `ccsbx` (no `--ccmsg-bin`), so it cannot use the
      owner's bus sockets. Messages from a fenced session to an unfenced manager wait for the hub
      spoke over :4011 (B10/B11/M2b). Until then only ccsbx sessions are reachable by hostd.

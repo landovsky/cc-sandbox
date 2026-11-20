@@ -30,7 +30,9 @@
 #   --owner USER          the human who keeps access            (CCSBX_OWNER, default the invoking user)
 #   --allowed-roots A,B   ccsbx-root's workdir roots AND hostd's --worktree-root: one source, the same comma list written to both
 #                                                              (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt, the owner from SUDO_USER via getent)
-#   --image REF           the fence image hostd passes to panes   (CCSBX_IMAGE, default ccsbx-fence:dev until a pin exists)
+#   --image REF           the fence image hostd passes to panes, BY DIGEST: ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (CCSBX_IMAGE,
+#                         required). A tag is refused: ccsbx-root and hostd refuse every start of a tag (image_not_pinned). A digest
+#                         that is not in pins.toml is a candidate: only e2e-* profiles may run it. The digest comes from CI (U1a)
 #   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
 #   --pairs P             what the signer may sign: exact profile:billing|billing,... (CCSBX_PAIRS; default: built from
 #                         <repo>/profiles/*.json that list this machine, e.g. dev-default:api|stub,e2e-default:stub)
@@ -54,7 +56,7 @@ case "${1:-}" in
   *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
-MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-ccsbx-fence:dev}"
+MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -81,7 +83,7 @@ export CCSBX_OWNER VERBOSE PURGE_KEYS MODE
 OWNER="$(real_user)"; OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"; OWNER_HOME="${OWNER_HOME:-/home/$OWNER}"
 [ -n "$ALLOWED_ROOTS" ] || ALLOWED_ROOTS="$OWNER_HOME/git,$OWNER_HOME/wt"
 # the signer's scope (what the machine key may sign): owner, machine, profiles, billings
-[ -n "$MACHINE" ] || MACHINE="$(hostname -s 2>/dev/null)"
+[ -n "$MACHINE" ] || MACHINE="$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z')"   # lowercase: root lowercases its own, so a mixed-case name would make it refuse every start
 # the pairs come from the profiles themselves: each profile that lists this machine, with ITS billings (a flat
 # profiles x billings product would let a profile be signed with a billing it does not allow)
 pairs_from() {   # pairs_from DIR — name:billing|billing,... of every profile in DIR that lists this machine
@@ -96,13 +98,8 @@ for f in sys.argv[2:]:
 print(",".join(out))
 PY
 }
-# the root-owned copy is the source once it exists (the repo is owner-writable); the first install reads the repo,
-# and u0b_keys recomputes from the copy the same run has just written
-PAIRS_DEFAULTED=0
-if [ -z "$PAIRS" ]; then
-  PAIRS_DEFAULTED=1
-  if compgen -G "$(pth /etc/ccsbx/profiles)/*.json" >/dev/null; then PAIRS="$(pairs_from "$(pth /etc/ccsbx/profiles)")"; else PAIRS="$(pairs_from "$REPO_DIR/profiles")"; fi
-fi
+# the signer's pairs come from the repo's profiles at install (the repo is reviewed and merged; profiles are embedded elsewhere)
+[ -n "$PAIRS" ] || PAIRS="$(pairs_from "$REPO_DIR/profiles")"
 SCOPE_ERRORS=()
 [[ "$MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || SCOPE_ERRORS+=("machine name '$MACHINE' is not a plain host name (--machine)")
 _b='(api|subscription|stub)'
@@ -120,14 +117,15 @@ ALLOWED_ROOTS_TOML="${ALLOWED_ROOTS_TOML%, }"
 # hostd --worktree-root takes the same comma list as allowed_roots (no spaces, no empty entry, no trailing slash, no ~)
 [[ "$ALLOWED_ROOTS" =~ (^,|,,|,$) ]] && ROOT_ERRORS+=("allowed roots '$ALLOWED_ROOTS' has an empty entry")
 WORKTREE_ROOT="$(IFS=,; echo "${_roots[*]}")"
-[[ "$IMAGE" =~ ^[A-Za-z0-9._/:@-]+$ ]] || ROOT_ERRORS+=("image '$IMAGE' is not a plain image reference (--image)")
-# the root-owned copies hostd, the signer scope and later readers use, never the owner-writable repo
-PROFILES_ETC=/etc/ccsbx/profiles
-for _p in "$REPO_DIR"/profiles/*.json; do [ -e "$_p" ] && MANAGED_PATHS+=("$PROFILES_ETC/$(basename "$_p")"); done
+# the repo list is pins.DefaultRepos (internal/pins/pins.go); a test keeps the two in step
+if [ -z "$IMAGE" ]; then ROOT_ERRORS+=("no fence image: pass --image ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the CI-built candidate, U1a); a tag is refused")
+elif [[ "$IMAGE" != *@sha256:* ]]; then ROOT_ERRORS+=("image '$IMAGE' is a tag: hostd and ccsbx-root refuse every start of a tag (image_not_pinned); use ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex>")
+elif ! [[ "$IMAGE" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("image '$IMAGE' is not ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the only repo a candidate may come from)"); fi
+# the root-owned pins copy: ccsbx-root and hostd read it, never the owner-writable repo (profiles are embedded in the binaries)
 MANAGED_PATHS+=(/etc/ccsbx/pins.toml)
 [ -f "$REPO_DIR/pins.toml" ] || ROOT_ERRORS+=("no $REPO_DIR/pins.toml to install as /etc/ccsbx/pins.toml")
 RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
-export OWNER MACHINE PAIRS IMAGE WORKTREE_ROOT PROFILES_ETC BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+export OWNER MACHINE PAIRS IMAGE WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()

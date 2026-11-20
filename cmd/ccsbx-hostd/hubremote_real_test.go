@@ -443,11 +443,25 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		t.Fatalf("a relay reached an unfenced node outside its may_reach: %v", err)
 	}
 
-	// 7. the shared secret (every owner session on every machine holds it) is conflict-checked too: it cannot
-	// re-track the manager's node elsewhere to make it ambiguous and cut the worker's channel (the hub refuses,
-	// 409; hostd's own handling of a node held twice is covered by the unit tests).
-	if _, err := owner.Track(ctx, []map[string]any{{"key": "ws/evil", "label": "evil", "node": "cc-sandbox:umgr", "uid": "eeeeeeee-0000-4000-8000-0000000000a4", "machine": "mac9", "pane": "%1", "state": "waiting"}}, 120); !hubc.IsConflict(err) {
-		t.Fatalf("the shared secret re-tracking a held node: want 409, got %v", err)
+	// 7. the shared secret behaves as it always did (the hub neither claims nor refuses for it): a legacy entry may copy the
+	// manager's node on another machine. That is safe because hostd binds the node to the record's machine: the worker's next
+	// report still reaches the real manager (mac3), and the copy on mac9 is neither sent to nor heard.
+	if _, err := owner.Track(ctx, []map[string]any{{"key": "ws/evil", "label": "evil", "node": "cc-sandbox:umgr", "uid": "eeeeeeee-0000-4000-8000-0000000000a4", "machine": "mac9", "pane": "%1", "state": "waiting"}}, 120); err != nil {
+		t.Fatalf("the shared secret was refused: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if ok, err := sendVia(hp, worker, "cc-sandbox:umgr", "report", "after the copy"); !ok || err != nil {
+		t.Fatalf("a legacy copy of the manager's node on another machine cut the worker's channel: %v %v", ok, err)
+	}
+	select {
+	case f := <-got:
+		var d hubc.Deliver
+		json.Unmarshal(f.Payload, &d)
+		if !strings.Contains(d.Text, "after the copy") {
+			t.Fatalf("what mac3 got: %+v", d)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the real manager got nothing")
 	}
 
 	// 9. (rounds 5 and 6) squatting an ABSENT manager's node. The worker's manager umgr5 is an unfenced session

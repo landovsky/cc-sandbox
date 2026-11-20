@@ -11,6 +11,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/backend"
+	"github.com/landovsky/cc-sandbox/internal/pins"
 	"github.com/landovsky/cc-sandbox/internal/profile"
 )
 
@@ -23,32 +25,41 @@ type Launcher interface {
 // Record is what the daemon keeps per session; `ccsbx run --sid` reads it back, so the values
 // the run uses are the ones the daemon minted and checked, not whatever the caller passes.
 type Record struct {
-	Sid       string     `json:"sid"`
-	Gen       int        `json:"gen"`
-	Label     string     `json:"label"`
-	RequestID string     `json:"request_id"`
-	Uid       int        `json:"uid"` // the caller, from the OS
-	Started   time.Time  `json:"started"`
-	Ended     *time.Time `json:"ended,omitempty"`
-	Spec      LaunchSpec `json:"spec"`
-	Reply     StartReply `json:"reply"`
+	Sid       string `json:"sid"`
+	Gen       int    `json:"gen"`
+	Label     string `json:"label"`
+	RequestID string `json:"request_id"`
+	// RequestIDs is every request that produced a generation of this session, so a retry of
+	// the gen-1 start after a resume can't start a second session.
+	RequestIDs []string   `json:"request_ids,omitempty"`
+	Uid        int        `json:"uid"` // the caller, from the OS
+	Started    time.Time  `json:"started"`
+	Ended      *time.Time `json:"ended,omitempty"`
+	Spec       LaunchSpec `json:"spec"`
+	Reply      StartReply `json:"reply"`
+	// GitDir is the gitdir the fence may see read-only, decided once at the session's first
+	// start. Later generations reuse it: the worktree's .git file is agent-written and is never
+	// read again.
+	GitDir string `json:"git_dir,omitempty"`
 }
 
 // Daemon holds the policy knobs and the state directory.
 type Daemon struct {
-	StateDir    string
-	ProfilesDir string
-	Machine     string // this machine's name; a spec for another machine is refused
-	Uid         int    // the caller's uid (from the OS, never from the spec)
-	Image       string // fence image reference recorded in the pin
-	CCVersion   string
-	MaxLive     int // machine_full above this many live sessions
-	MaxPerHour  int // rate_capped above this many starts by one caller in an hour
-	Backend     string
-	Socket      string // tmux -L name for the attach command; default ccsbx
-	Root        string // "direct" tonight
-	Launcher    Launcher
-	Now         func() time.Time
+	StateDir     string
+	ProfilesDir  string
+	Machine      string // this machine's name; a spec for another machine is refused
+	Uid          int    // the caller's uid (from the OS, never from the spec)
+	Image        string // fence image reference recorded in the pin
+	PinsFile     string // pins.toml; missing means no production pins
+	WorktreeRoot string // every worktree must be inside this directory (CCSBX_WORKTREE_ROOT)
+	CCVersion    string
+	MaxLive      int // machine_full above this many live sessions
+	MaxPerHour   int // rate_capped above this many starts by one caller in an hour
+	Backend      string
+	Socket       string // tmux -L name for the attach command; default ccsbx
+	Root         string // "direct" tonight
+	Launcher     Launcher
+	Now          func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
 	Exe string
 }
@@ -83,8 +94,11 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 
 	// Idempotent per (caller, request_id): a retry gets the same reply and starts nothing.
 	for _, r := range recs {
-		if r.Uid == d.Uid && r.RequestID == s.RequestID {
+		if r.Uid == d.Uid && (r.RequestID == s.RequestID || contains(r.RequestIDs, s.RequestID)) {
 			rep := r.Reply
+			if r.RequestID != s.RequestID { // an older generation's request: its own reply is not kept
+				return nil, refuse(BadSpec, "request_id %s was already used for an earlier generation of %s", s.RequestID, r.Sid)
+			}
 			return &rep, nil
 		}
 	}
@@ -92,18 +106,17 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	if s.Machine != d.Machine {
 		return nil, refuse(WrongMachine, "spec is for %s, this is %s (the pane lives on the session's machine)", s.Machine, d.Machine)
 	}
-	if s.Resume != nil {
-		return nil, refuse(NotBuilt, "resume is U7")
-	}
 	if s.Workdir.Path == "" || s.Workdir.Repo != "" {
 		return nil, refuse(NotBuilt, "only workdir.path is supported (repo/base/branch needs the git route, H1)")
 	}
-	if !filepath.IsAbs(s.Workdir.Path) {
-		return nil, refuse(BadSpec, "workdir.path must be absolute")
+	rw, err := backend.CheckWorkdir(s.Workdir.Path, d.WorktreeRoot, d.StateDir)
+	if err != nil {
+		return nil, refuse(BadSpec, "workdir: %v", err)
 	}
-	if st, err := os.Stat(s.Workdir.Path); err != nil || !st.IsDir() {
+	if st, err := os.Stat(rw); err != nil || !st.IsDir() {
 		return nil, refuse(BadSpec, "workdir.path %s is not a directory", s.Workdir.Path)
 	}
+	s.Workdir.Path = rw // the resolved path is what gets mounted and recorded
 
 	p, err := profile.Load(d.ProfilesDir, s.Profile)
 	if err != nil {
@@ -119,6 +132,15 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	}
 	if !billingOK {
 		return nil, refuse(BillingUnavailable, "profile %s does not allow billing %q", p.Name, s.Billing)
+	}
+
+	pl, err := pins.Load(d.PinsFile)
+	if err != nil {
+		return nil, fmt.Errorf("pins: %w", err)
+	}
+	channel, err := pins.Check(pl, nil, d.Image, p, d.Root != "helper")
+	if err != nil {
+		return nil, refuse(ImageNotPinned, "%v", err)
 	}
 
 	live, started := 0, 0
@@ -142,14 +164,43 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		return nil, refuse(MachineFull, "%d live sessions (cap %d)", live, d.MaxLive)
 	}
 
-	sid, err := mintSid()
-	if err != nil {
-		return nil, err
+	var rec *Record
+	var prev *Record // set on resume, to roll back to if the launch fails
+	if s.Resume != nil {
+		old, err := d.Load(s.Resume.Sid)
+		if err != nil {
+			return nil, refuse(BadSpec, "resume: no session %q", s.Resume.Sid)
+		}
+		switch {
+		case old.Uid != d.Uid:
+			return nil, refuse(BadSpec, "resume: session %s belongs to another caller", old.Sid)
+		case old.Label != s.Label:
+			return nil, refuse(BadSpec, "resume: session %s has label %q, not %q (a resume keeps its label)", old.Sid, old.Label, s.Label)
+		case old.Spec.Workdir.Path != rw:
+			return nil, refuse(BadSpec, "resume: workdir must be the same, the transcript is keyed by it")
+		}
+		cp := *old
+		prev = &cp
+		rec = old
+		rec.Gen++
+		rec.RequestIDs = append(rec.RequestIDs, old.RequestID)
+		rec.RequestID, rec.Started, rec.Ended, rec.Spec = s.RequestID, d.now().UTC(), nil, *s
+	} else {
+		sid, err := mintSid()
+		if err != nil {
+			return nil, err
+		}
+		// First start only: the worktree has not been written by an agent of this session yet.
+		gd, err := backend.ResolveGitDir(rw)
+		if err != nil {
+			return nil, refuse(BadSpec, "workdir git metadata: %v", err)
+		}
+		rec = &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s, GitDir: gd}
 	}
-	rec := &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s}
+	sid := rec.Sid
 	rec.Reply = StartReply{
-		V: 1, Sid: sid, Gen: 1, ID: fmt.Sprintf("%s/%s/%s/g%d", s.Owner, d.Machine, sid, 1), Backend: d.Backend,
-		Pin:     Pin{CC: orUnpinned(d.CCVersion), Image: orUnpinned(d.Image), Channel: "dev"},
+		V: 1, Sid: sid, Gen: rec.Gen, ID: fmt.Sprintf("%s/%s/%s/g%d", s.Owner, d.Machine, sid, rec.Gen), Backend: d.Backend,
+		Pin:     Pin{CC: orUnpinned(d.CCVersion), Image: orUnpinned(d.Image), Channel: channel},
 		Attach:  Attach{Local: []string{"tmux", "-L", orDefault(d.Socket, "ccsbx"), "attach", "-t", sid}, Remote: []string{"ssh", "-t", d.Machine, "ccsbx", "attach", sid}},
 		Journal: Journal{Epoch: d.epoch(), Seq: len(recs)},
 		NotEv:   d.Root != "helper",
@@ -161,7 +212,11 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	if err := d.Launcher.Launch(rec); err != nil {
 		// Remove, not mark ended: a retry with this request_id must not be answered with the
 		// reply of a session that never started.
-		_ = os.Remove(d.path("sessions", rec.Sid+".json"))
+		if prev != nil {
+			_ = d.save(prev) // a failed resume leaves the session as it was
+		} else {
+			_ = os.Remove(d.path("sessions", rec.Sid+".json"))
+		}
 		return nil, fmt.Errorf("launch %s: %w", sid, err)
 	}
 	rep := rec.Reply
@@ -179,6 +234,15 @@ func (d *Daemon) Load(sid string) (*Record, error) {
 	}
 	var r Record
 	return &r, json.Unmarshal(b, &r)
+}
+
+func contains(l []string, s string) bool {
+	for _, x := range l {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 func orUnpinned(s string) string {

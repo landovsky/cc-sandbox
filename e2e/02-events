@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# e2e/02-events — hook point 2: the event journal and tab/tree state (plan §9 item 3).
+. "$(dirname "$0")/lib.sh"; e2e_init
+st() { "$CCSBX" start --launcher none --json "$@"; }
+spec e2e:ev1 lid-e1 > "$E2E_ROOT/e1.json"; spec e2e:ev2 lid-e2 > "$E2E_ROOT/e2.json"
+a="$(st --spec "$E2E_ROOT/e1.json" 2>&1)"; b="$(st --spec "$E2E_ROOT/e2.json" 2>&1)"
+[ "$(jget journal.epoch <<<"$a" 2>/dev/null)" = "$(jget journal.epoch <<<"$b" 2>/dev/null)" ] \
+  && ok "both starts land in one journal epoch (an epoch changes only on a reset, which cockpits must notice)" || bad "one journal epoch" "$a $b"
+sa="$(jget journal.seq <<<"$a" 2>/dev/null)"; sb="$(jget journal.seq <<<"$b" 2>/dev/null)"
+[ "$sb" = "$((sa+1))" ] && ok "each start appends exactly one journal record (seq $sa -> $sb), so a follower's cursor can resume with no gap" \
+  || bad "journal seq advances by one per start" "seq $sa then $sb"
+skip "hook events (UserPromptSubmit, Stop+usage, status) reach 'ccsbx events --session s'" "needs C3 (ccf-hook in the image) + a fence image"
+skip "tab colour and tree state follow working/asks/background/waiting/cold/done within 5 s" "needs C4a (follow --write) + C18 stub drive"
+skip "a reader machine shows the same states as the writer" "needs C4b + M3 (second machine)"
+skip "a daemon cut off for 5 min shows 'away', then fills in with no duplicates" "needs C4b"

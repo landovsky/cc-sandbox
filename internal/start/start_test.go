@@ -2,6 +2,8 @@ package start
 
 import (
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -23,21 +25,41 @@ func (f *fakeLauncher) Launch(r *Record) error {
 }
 func (f *fakeLauncher) Alive(sid string) bool { f.mu.Lock(); defer f.mu.Unlock(); return f.alive[sid] }
 
+// vt is a temp dir under /var/tmp: /tmp is a fixed mount point of the fence, so a worktree there
+// is refused.
+func vt(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("/var/tmp", "ccsbx-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	d, _ = filepath.EvalSymlinks(d)
+	os.Mkdir(filepath.Join(d, "wt"), 0o755)
+	return d
+}
+
 func newDaemon(t *testing.T) (*Daemon, *fakeLauncher) {
 	t.Helper()
 	fl := &fakeLauncher{alive: map[string]bool{}}
-	return &Daemon{StateDir: t.TempDir(), ProfilesDir: "../../profiles", Machine: "hp-ubuntu", Uid: 1000,
-		MaxLive: 8, MaxPerHour: 20, Backend: "docker", Root: "direct", Launcher: fl, Exe: "ccsbx"}, fl
+	root := vt(t)
+	curRoot = root
+	return &Daemon{StateDir: t.TempDir(), WorktreeRoot: root, ProfilesDir: "../../profiles", Machine: "hp-ubuntu", Uid: 1000,
+		MaxLive: 8, MaxPerHour: 20, Backend: "docker", Root: "direct", Launcher: fl, Exe: "ccsbx", Image: "ccsbx-fence:dev", PinsFile: t.TempDir() + "/pins.toml"}, fl
 }
 
 func spec(mod func(*LaunchSpec)) *LaunchSpec {
 	s := &LaunchSpec{V: 1, RequestID: "rid-1", Owner: "tomas", Machine: "hp-ubuntu", Label: "cc-sandbox:a", Realm: "production",
-		Harness: "claude", Workdir: Workdir{Path: os.TempDir()}, Profile: "dev-default", Billing: "stub"}
+		Harness: "claude", Workdir: Workdir{Path: filepath.Join(curRoot, "wt")}, Profile: "dev-default", Billing: "stub"}
 	if mod != nil {
 		mod(s)
 	}
 	return s
 }
+
+// curRoot is the worktree root of the daemon newDaemon built last; spec() puts its workdir there.
+// (These tests run sequentially.)
+var curRoot string
 
 func code(err error) string {
 	if r, ok := err.(*Refusal); ok {
@@ -194,13 +216,101 @@ func TestStart(t *testing.T) {
 		}
 	})
 
-	t.Run("resume and repo workdirs are refused as not built, not half-done", func(t *testing.T) {
+	t.Run("a repo workdir is refused as not built, not half-done", func(t *testing.T) {
 		d, _ := newDaemon(t)
-		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Resume = &Resume{Sid: "s123456"} })); code(err) != NotBuilt {
-			t.Fatal(err)
-		}
 		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Workdir = Workdir{Repo: "github.com/x/y"} })); code(err) != NotBuilt {
 			t.Fatal(err)
+		}
+	})
+}
+
+// U7: a resume is the same session, one generation later.
+func TestResume(t *testing.T) {
+	first := func(t *testing.T) (*Daemon, *fakeLauncher, *StartReply) {
+		d, fl := newDaemon(t)
+		rep, err := d.Start(spec(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		fl.alive[rep.Sid] = false // the g1 pane has exited
+		return d, fl, rep
+	}
+	res := func(sid string, mod func(*LaunchSpec)) *LaunchSpec {
+		return spec(func(s *LaunchSpec) {
+			s.RequestID, s.Resume = "rid-resume", &Resume{Sid: sid}
+			if mod != nil {
+				mod(s)
+			}
+		})
+	}
+
+	t.Run("resume keeps the sid and bumps the generation, so the home and transcript carry over", func(t *testing.T) {
+		d, _, a := first(t)
+		b, err := d.Start(res(a.Sid, nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if b.Sid != a.Sid || b.Gen != 2 || b.ID != "tomas/hp-ubuntu/"+a.Sid+"/g2" {
+			t.Fatalf("%+v", b)
+		}
+		rec, _ := d.Load(a.Sid)
+		if rec.Gen != 2 {
+			t.Fatalf("record gen %d", rec.Gen)
+		}
+	})
+
+	t.Run("a session still running can't be resumed: two generations would share one home", func(t *testing.T) {
+		d, fl := newDaemon(t)
+		a, _ := d.Start(spec(nil))
+		fl.alive[a.Sid] = true
+		if _, err := d.Start(res(a.Sid, nil)); code(err) != AlreadyRunning {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("resume under a different label is refused: the label names the node", func(t *testing.T) {
+		d, _, a := first(t)
+		if _, err := d.Start(res(a.Sid, func(s *LaunchSpec) { s.Label = "other:node" })); code(err) != BadSpec {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("resume from another worktree is refused: the transcript is keyed by cwd", func(t *testing.T) {
+		d, _, a := first(t)
+		other := filepath.Join(d.WorktreeRoot, "other")
+		os.Mkdir(other, 0o755)
+		if _, err := d.Start(res(a.Sid, func(s *LaunchSpec) { s.Workdir.Path = other })); code(err) != BadSpec {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("an unknown or malformed sid is refused", func(t *testing.T) {
+		d, _, _ := first(t)
+		for _, sid := range []string{"s000000000", "../x", ""} {
+			if _, err := d.Start(res(sid, nil)); code(err) != BadSpec {
+				t.Errorf("%q: %v", sid, err)
+			}
+		}
+	})
+
+	t.Run("a retry of the gen-1 request after a resume must not start a new session", func(t *testing.T) {
+		d, fl, a := first(t)
+		d.Start(res(a.Sid, nil))
+		fl.alive[a.Sid] = false
+		before := fl.launch
+		if _, err := d.Start(spec(nil)); err == nil || fl.launch != before {
+			t.Fatalf("err=%v launches %d->%d", err, before, fl.launch)
+		}
+	})
+
+	t.Run("a resume whose launch fails leaves the session at its old generation", func(t *testing.T) {
+		d, _, a := first(t)
+		d.Launcher = &failLauncher{fakeLauncher{alive: map[string]bool{}}}
+		if _, err := d.Start(res(a.Sid, nil)); err == nil {
+			t.Fatal("expected failure")
+		}
+		if rec, _ := d.Load(a.Sid); rec.Gen != 1 {
+			t.Fatalf("gen %d", rec.Gen)
 		}
 	})
 }
@@ -238,6 +348,86 @@ func TestFailedLaunch(t *testing.T) {
 			t.Fatalf("retry: %v", err)
 		}
 	})
+}
+
+func TestImagePins(t *testing.T) {
+	t.Run("a mutable tag outside direct mode is refused: unpinned images never run on a real fence", func(t *testing.T) {
+		d, fl := newDaemon(t)
+		d.Root = "helper"
+		if _, err := d.Start(spec(nil)); code(err) != ImageNotPinned || fl.launch != 0 {
+			t.Fatal(err)
+		}
+	})
+	t.Run("in direct mode a local dev tag runs and the reply says channel dev", func(t *testing.T) {
+		d, _ := newDaemon(t)
+		rep, err := d.Start(spec(nil))
+		if err != nil || rep.Pin.Channel != "dev" {
+			t.Fatalf("%v %v", rep, err)
+		}
+	})
+	t.Run("a candidate digest is refused under dev-default even in direct mode", func(t *testing.T) {
+		d, _ := newDaemon(t)
+		d.Image = "ghcr.io/landovsky/ccsbx-fence@sha256:" + strings.Repeat("2", 64)
+		if _, err := d.Start(spec(nil)); code(err) != ImageNotPinned {
+			t.Fatal(err)
+		}
+	})
+}
+
+// T:gitdir-from-record (daemon half). The worktree's `.git` file is written by the agent between
+// generations; a resume must keep using the gitdir decided at the first start.
+func TestResumeIgnoresTamperedDotGit(t *testing.T) {
+	d, fl := newDaemon(t)
+	wt := filepath.Join(d.WorktreeRoot, "wt")
+	repo := filepath.Join(d.WorktreeRoot, "repo")
+	os.Mkdir(repo, 0o755)
+	for _, c := range [][]string{{"init", "-q", "-b", "main", "."}, {"commit", "-q", "--allow-empty", "-m", "i"}, {"worktree", "add", "-q", filepath.Join(d.WorktreeRoot, "lw"), "-b", "w"}} {
+		cmd := exec.Command("git", c...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if b, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, b)
+		}
+	}
+	wt = filepath.Join(d.WorktreeRoot, "lw")
+	first, err := d.Start(spec(func(s *LaunchSpec) { s.Workdir.Path = wt }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := d.Load(first.Sid)
+	want := filepath.Join(repo, ".git", "worktrees", "lw")
+	if rec.GitDir != want {
+		t.Fatalf("recorded gitdir %q, want %q", rec.GitDir, want)
+	}
+	// the agent rewrites .git to a host path
+	os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: /etc\n"), 0o644)
+	fl.alive[first.Sid] = false
+	if _, err := d.Start(spec(func(s *LaunchSpec) {
+		s.Workdir.Path, s.RequestID, s.Resume = wt, "rid-resume", &Resume{Sid: first.Sid}
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ = d.Load(first.Sid); rec.GitDir != want {
+		t.Fatalf("after resume the recorded gitdir is %q: the worktree's .git file was trusted", rec.GitDir)
+	}
+}
+
+func TestFirstStartRefusesAnUnrelatedGitDirFile(t *testing.T) {
+	d, fl := newDaemon(t)
+	wt := filepath.Join(d.WorktreeRoot, "wt")
+	os.WriteFile(filepath.Join(wt, ".git"), []byte("gitdir: /etc\n"), 0o644)
+	if _, err := d.Start(spec(nil)); code(err) != BadSpec || fl.launch != 0 {
+		t.Fatalf("%v launches=%d", err, fl.launch)
+	}
+}
+
+func TestWorkdirOutsideRootIsRefused(t *testing.T) {
+	d, _ := newDaemon(t)
+	for _, p := range []string{"/home", "/var/lib", d.WorktreeRoot, filepath.Dir(d.WorktreeRoot)} {
+		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Workdir.Path = p })); code(err) != BadSpec {
+			t.Errorf("%s: %v", p, err)
+		}
+	}
 }
 
 // context: cc-tree's LaunchSpec carries the node's Grants: line as "grants". The daemon refuses

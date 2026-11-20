@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# e2e/run — run the e2e scripts and print ONE numbered TAP stream (plan §3 C19).
+#
+# Recipes:
+#   e2e/run                      all scripts, 00-standalone first (standalone is part of every run)
+#   e2e/run 01-launch 03-verbs   just those
+#   e2e/run --list               the scripts, run nothing
+#   CCSBX_BIN=/path/ccsbx e2e/run            another binary;  E2E_KEEP=1 E2E_ROOT=/tmp/x e2e/run  keep the realm
+# Each script runs in its own scratch realm (see e2e/lib.sh), never the live tree or daemon.
+# Exit: 0 every line ok (a SKIP is ok but counted and listed); 1 any "not ok"; 2 usage/setup.
+here="$(cd "$(dirname "$0")" && pwd)"
+case "${1:-}" in
+  -h|--help) sed -n '2,10p' "$0"; exit 0;;
+  --list) ls "$here" | grep -E '^0[0-9]-'; exit 0;;
+esac
+scripts=("$@"); [ ${#scripts[@]} -gt 0 ] || mapfile -t scripts < <(ls "$here" | grep -E '^0[0-9]-')
+for s in "${scripts[@]}"; do [ -x "$here/$s" ] || { echo "e2e/run: no such script: $s (e2e/run --list)" >&2; exit 2; }; done
+echo "TAP version 13"
+n=0; bad=0; skips=0; tmp="$(mktemp)"; trap 'rm -f "$tmp"' EXIT
+for s in "${scripts[@]}"; do
+  echo "# $s"
+  E2E_ROOT= "$here/$s" > "$tmp" 2>"$tmp.err"; rc=$?
+  while IFS= read -r line; do
+    case "$line" in
+      "ok - "*|"not ok - "*)
+        n=$((n+1)); case "$line" in "not ok"*) bad=$((bad+1));; esac
+        case "$line" in *"# SKIP "*) skips=$((skips+1));; esac
+        echo "${line%% - *} $n - ${line#* - }" | sed -E "s/^(ok|not ok) ([0-9]+) - (ok|not ok) - /\1 \2 - /";;
+      *) echo "$line";;
+    esac
+  done < "$tmp"
+  if [ $rc -ne 0 ] || [ -s "$tmp.err" ]; then
+    n=$((n+1)); [ $rc -ne 0 ] && { bad=$((bad+1)); echo "not ok $n - $s exited $rc"; } || echo "ok $n - $s wrote to stderr (see #)"
+    sed 's/^/# stderr: /' "$tmp.err"
+  fi
+done
+echo "1..$n"
+echo "# $((n-bad-skips)) passed, $skips skipped (the piece they need is not built), $bad failed; direct mode: NOT EVIDENCE"
+[ $bad -eq 0 ]

@@ -12,6 +12,9 @@ package rules
 
 import (
 	"fmt"
+
+	"github.com/landovsky/cc-sandbox/internal/tomlmini"
+
 	"os"
 	"sort"
 	"strings"
@@ -49,7 +52,7 @@ func Load(path string) ([]Rule, error) {
 
 // Parse turns rules.toml text into rules.
 func Parse(src string) ([]Rule, error) {
-	doc, err := parseTOML(src)
+	doc, err := tomlmini.Parse(src)
 	if err != nil {
 		return nil, err
 	}

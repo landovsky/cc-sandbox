@@ -1,0 +1,8 @@
+# Production pins (H2, invariant 26): image digests that may run under any profile.
+# Append-only through `ccsbx pin-promote`, which needs a green full-suite result on every
+# required host. Empty until the first fence image exists (U1a is waiting on its base-image and
+# Claude Code digests). Hand edits are reviewed in git like any other change.
+#
+# [[pin]]
+# ref = "ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex>"
+# cc  = "<Claude Code version inside the image>"

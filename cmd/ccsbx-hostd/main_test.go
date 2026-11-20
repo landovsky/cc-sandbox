@@ -262,7 +262,7 @@ func TestHubTtlIsRangeChecked(t *testing.T) {
 // config under which every caller would be refused: "nothing live before the ACL".
 func TestTailnetListenerIsOffByDefaultAndRefusesBadConfig(t *testing.T) {
 	_, h := runHostd("run", "--help")
-	for _, w := range []string{"-tailnet-listen", "-owner-login", "-owner-devices", "-peer-devices", "-peer-tags", "-whois", "CCSBX_TAILNET_LISTEN"} {
+	for _, w := range []string{"-tailnet-listen", "-owner-login", "-owner-devices", "-peer-devices", "-peer-tags", "-whois", "-tailscale-bin", "-tailnet-host", "-tailnet-max-conns", "CCSBX_TAILNET_LISTEN"} {
 		if !strings.Contains(h, w) {
 			t.Errorf("--help does not list %s", w)
 		}
@@ -271,6 +271,11 @@ func TestTailnetListenerIsOffByDefaultAndRefusesBadConfig(t *testing.T) {
 		{"--tailnet-listen", "0.0.0.0:7480", "--owner-login", "a@b.c", "--owner-devices", "x"},
 		{"--tailnet-listen", "192.168.1.2:7480", "--owner-login", "a@b.c", "--owner-devices", "x"},
 		{"--tailnet-listen", "100.64.0.1:7480"}, // no one would be allowed
+		// the configuration itself must not widen the classes (M3, S4, N2)
+		{"--tailnet-listen", "100.64.0.1:7480", "--peer-tags", "tag:ccsbx"},                                               // the operator proxies' tag, which a fenced pod can reach
+		{"--tailnet-listen", "100.64.0.1:7480", "--owner-login", "a@b.c", "--owner-devices", "mac-tomas"},                 // a short name
+		{"--tailnet-listen", "100.64.0.1:7480", "--owner-login", "a@b.c"},                                                 // an owner with no device: silently nobody
+		{"--tailnet-listen", "100.64.0.1:7480", "--peer-tags", "tag:h", "--whois", "cli", "--tailscale-bin", "tailscale"}, // a bare name: PATH lookup
 	} {
 		base := []string{"run", "--state", t.TempDir(), "--local-socket", "-"}
 		done := make(chan int, 1)

@@ -84,24 +84,39 @@ func (s *Server) mkHandler(local, tokenGate bool) http.Handler {
 	})
 }
 
+// route is one pattern of the API. routes() is the single list the mux is built from, so that a test can
+// walk every route and require the tailnet policy (tailnetRoutes) to classify it.
+type route struct {
+	Pattern string
+	H       http.HandlerFunc
+}
+
+func (s *Server) routes() []route {
+	return []route{
+		{"/v1/resolve", s.resolve},
+		{"/v1/sessions", s.sessions},
+		{"/v1/sessions/", s.deliver},
+		{"/v1/start", s.startSession},
+		{"/v1/info", s.info},
+		{"/v1/events", s.events},
+		{"/v1/events/stream", s.stream},
+		{"/v1/cursors/", s.cursor},
+		{"/v1/cursors", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, 200, map[string]any{"epoch": s.J.Epoch(), "head": s.J.Head(), "cursors": s.J.Cursors()})
+		}},
+		{"/v1/cockpit/lease", s.lease},
+		{"/v1/cockpit/requests", s.requests},
+		{"/v1/cockpit/requests/", s.result},
+		{"/v1/cockpit/status", s.status},
+		{"/v1/cockpit/pending", s.pending},
+	}
+}
+
 func (s *Server) mux() *http.ServeMux {
 	m := http.NewServeMux()
-	m.HandleFunc("/v1/resolve", s.resolve)
-	m.HandleFunc("/v1/sessions", s.sessions)
-	m.HandleFunc("/v1/sessions/", s.deliver)
-	m.HandleFunc("/v1/start", s.startSession)
-	m.HandleFunc("/v1/info", s.info)
-	m.HandleFunc("/v1/events", s.events)
-	m.HandleFunc("/v1/events/stream", s.stream)
-	m.HandleFunc("/v1/cursors/", s.cursor)
-	m.HandleFunc("/v1/cursors", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, 200, map[string]any{"epoch": s.J.Epoch(), "head": s.J.Head(), "cursors": s.J.Cursors()})
-	})
-	m.HandleFunc("/v1/cockpit/lease", s.lease)
-	m.HandleFunc("/v1/cockpit/requests", s.requests)
-	m.HandleFunc("/v1/cockpit/requests/", s.result)
-	m.HandleFunc("/v1/cockpit/status", s.status)
-	m.HandleFunc("/v1/cockpit/pending", s.pending)
+	for _, r := range s.routes() {
+		m.HandleFunc(r.Pattern, r.H)
+	}
 	return m
 }
 
@@ -534,13 +549,14 @@ func (s *Server) startSession(w http.ResponseWriter, r *http.Request) {
 // ---- local message delivery (U3b, plan §4.4) ----
 
 // resolve: GET /v1/resolve?label= -> the live session for a node, and whether its pane is at the
-// input prompt. Owner class (socket only), like deliver.
+// input prompt. Owner class (socket only) or, on the tailnet listener, a peer daemon (another machine's
+// hostd asks it, M2c), like the session list.
 func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
 	if s.Msg == nil || s.Dir == nil {
 		writeJSON(w, 404, map[string]any{"error": "no_messaging"})
 		return
 	}
-	if !isLocal(r) {
+	if !isLocal(r) && classOf(r) < ClassPeer {
 		writeJSON(w, 403, map[string]any{"error": "owner operation: use the unix socket"})
 		return
 	}

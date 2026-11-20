@@ -1619,10 +1619,31 @@ where = "hp"
 
 [[rule]]
 id = "tailnet-peer-is-not-owner"
-title = "a peer daemon on the tailnet cannot deliver, take the cockpit lease, read the journal, prompt or replace; session start is not served on the tailnet even to the owner"
+title = "a peer daemon on the tailnet can list and resolve but cannot deliver, take the cockpit lease, read the journal, prompt or replace; session start is not served on the tailnet even to the owner"
 suite = "msg"
-allow = "tests/twin-go.sh ./internal/daemonapi TestStartIsNotServedOnTheTailnetEvenToTheOwner"
+allow = "tests/twin-go.sh ./internal/daemonapi TestAPeerCanListAndResolve"
 block = "tests/twin-go.sh ./internal/daemonapi TestAPeerCannotDoOwnerThingsBlock"
 invariants = [5]
 backends = ["unit"]
 where = "hp"
+
+[[rule]]
+id = "tailnet-not-a-local-process-or-a-browser"
+title = "on the tailnet listener a local process on the machine's own tailnet address, a rebound Host, an Origin or cross-site fetch and a non-JSON POST are refused before WhoIs is believed; a route nobody classified is closed on the tailnet"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/daemonapi TestOnlyTailnetAddressesAreEverLookedUp"
+block = "tests/twin-go.sh ./internal/daemonapi TestALocalProcessOnTheMachinesOwnTailnetAddressIsRefused"
+invariants = [5]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "tailnet-config-does-not-widen-classes"
+title = "hostd refuses a tailnet configuration that would widen the classes: tag:ccsbx (the operator proxies') as a peer tag, short device names, an owner without devices, a bare tailscale binary name, a listen address that is not this node's own"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/daemonapi TestListenAddressRule"
+block = "tests/twin-go.sh ./internal/daemonapi TestConfigurationThatWouldWidenTheClassesIsRefused"
+invariants = [5]
+backends = ["unit"]
+where = "hp"
+

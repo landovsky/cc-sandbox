@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/stamp"
 	"github.com/landovsky/cc-sandbox/internal/token"
@@ -234,6 +235,7 @@ func TestServeRequiresItsStateToBePrivate(t *testing.T) {
 	root := t.TempDir()
 	open := filepath.Join(root, "open")
 	os.Mkdir(open, 0o755)
+	os.Chmod(open, 0o755) // explicit: serve with git on narrows the process umask, and a test must not depend on it
 	target := filepath.Join(root, "t")
 	os.Mkdir(target, 0o700)
 	link := filepath.Join(root, "link")
@@ -451,5 +453,159 @@ func TestTrustedFileChecksTypeModeAndOwner(t *testing.T) {
 	// the owner check: this file is ours, so asked for as another uid's (and not root's) it is refused
 	if err := trustedFile(good, me+4242); err == nil {
 		t.Error("a file owned by neither the sidecar's uid nor root accepted")
+	}
+}
+
+// context "the pod as it runs: serve with git on, the fence's outbox, the real forwarder and a door that checks every
+// proof": after the load the sidecar clones into the empty worktree and says so in in/, a commit and a push asked
+// for through the outbox land on the door's session branch, main is untouched, and msg.* without a hub is refused.
+func TestServeClonesThenCommitsAndPushesThroughItsOwnForwarder(t *testing.T) {
+	old := syscall.Umask(0o077) // a restrictive process umask must not make anything the fence reads unreadable
+	defer syscall.Umask(old)
+	g := newGitRig(t, nil)
+	root, err := os.MkdirTemp("", "servegit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	os.Chmod(root, 0o700)
+	out, in, state, work := filepath.Join(root, "out"), filepath.Join(root, "in"), filepath.Join(root, "state"), filepath.Join(root, "work")
+	for _, d := range []string{filepath.Join(out, "requests"), in, work} {
+		os.MkdirAll(d, 0o755)
+	}
+	os.Chmod(filepath.Join(out, "requests"), 0o700)
+	l, _ := net.Listen("tcp", "127.0.0.1:0")
+	listen := l.Addr().String()
+	l.Close()
+	ctl := filepath.Join(root, "ctl", "ctl.sock")
+	seed := bytes.Repeat([]byte{9}, ed25519.SeedSize)
+	priv := ed25519.NewKeyFromSeed(seed)
+	now := time.Now()
+	tok, err := token.Mint(g.key, token.Claims{Sub: "tomas/hp-ubuntu/s0worker/g1", Billing: "stub", Profile: "dev-default", Aud: []string{"ccsbx-egress"},
+		Cnf: token.CnfOf(priv.Public().(ed25519.PublicKey)), Exp: now.Add(time.Hour).Unix()}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload, _ := json.Marshal(map[string]string{"token": tok, "key": base64.StdEncoding.EncodeToString(seed)})
+	du, _ := url.Parse(g.doorURL)
+	o := ServeOptions{
+		Config: Config{Listen: listen, Control: ctl, Doors: map[string]*url.URL{"egress": du}, Logf: func(string, ...any) {}},
+		Sid:    "s0worker", Gen: 1, Label: "w", Machine: "hp",
+		Out: out, In: in, State: state, FenceUID: os.Getuid(), RelayEvery: 20 * time.Millisecond, FenceWritable: DefaultFenceWritable,
+		GitRepo: "o/r", GitBase: "main", GitBranch: "ccsbx/s1", GitURL: "http://" + listen + "/egress/git",
+		GitDir: filepath.Join(root, "side", "git"), SnapshotDir: filepath.Join(root, "side", "snapshot", "s"), Work: work,
+	}
+	os.MkdirAll(filepath.Join(root, "side", "snapshot"), 0o700)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan int, 1)
+	go func() { done <- runServe(ctx, o, io.Discard) }()
+	for i := 0; i < 200; i++ {
+		if c, err := net.Dial("unix", ctl); err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err := Load(ctl, bytes.NewReader(payload)); err != nil {
+		t.Fatal(err)
+	}
+	wait := func(name string) []byte {
+		for i := 0; i < 400; i++ {
+			if b, err := os.ReadFile(name); err == nil {
+				return b
+			}
+			time.Sleep(25 * time.Millisecond)
+		}
+		t.Fatalf("no %s", name)
+		return nil
+	}
+	if b := wait(filepath.Join(in, "worktree-ready")); !strings.HasPrefix(string(b), "ok") {
+		t.Fatalf("worktree marker %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(work, "a.txt")); string(b) != "base\n" {
+		t.Fatalf("the worktree: %q", b)
+	}
+	os.WriteFile(filepath.Join(work, "made.txt"), []byte("by the fence\n"), 0o644)
+	ask := func(rid, body string) hostd.Reply {
+		os.WriteFile(filepath.Join(out, "requests", rid+".json"), []byte(body), 0o600)
+		var rep hostd.Reply
+		json.Unmarshal(wait(filepath.Join(in, "replies", rid+".json")), &rep)
+		return rep
+	}
+	if rep := ask("c1", `{"type":"git.commit","message":"from the pod"}`); rep.Status != "ok" {
+		t.Fatalf("commit: %+v", rep)
+	}
+	if rep := ask("p1", `{"type":"git.push"}`); rep.Status != "ok" {
+		t.Fatalf("push: %+v", rep)
+	}
+	// what the FENCE reads and writes must have explicit modes, whatever the umask: the test runs as the fence's uid, so
+	// the modes themselves are what is asserted (a reply at 0600 or in/replies at 0700 would lock the fence out)
+	mode := func(p string) os.FileMode {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Mode().Perm()
+	}
+	for p, want := range map[string]os.FileMode{
+		filepath.Join(in, "replies"): 0o755, filepath.Join(in, "replies", "c1.json"): 0o644, filepath.Join(in, "worktree-ready"): 0o644,
+		filepath.Join(work, "a.txt"): 0o664, filepath.Join(work, "run.sh"): 0o775, filepath.Join(work, "sub"): 0o775, filepath.Join(work, "sub", "x.txt"): 0o664,
+	} {
+		if got := mode(p); got != want {
+			t.Errorf("%s is %o, want %o", p, got, want)
+		}
+	}
+	if rep := ask("m1", `{"type":"msg.send","to":{"node":"x"},"text":"hi"}`); rep.Status != "refused" {
+		t.Fatalf("msg.send without a hub: %+v", rep)
+	}
+	if tree := g.door("ls-tree", "-r", "--name-only", "refs/heads/ccsbx/s1"); !strings.Contains(tree, "made.txt") {
+		t.Fatalf("the door's branch: %s", tree)
+	}
+	if g.door("log", "-1", "--format=%s", "refs/heads/main") != "base" {
+		t.Fatal("main at the door moved")
+	}
+	cancel()
+	if code := <-done; code != 0 {
+		t.Fatalf("exit %d", code)
+	}
+	if now := syscall.Umask(0o077); now != 0o077 {
+		t.Errorf("serve changed the process umask to %o", now)
+	}
+}
+
+// context "git is half-configured": a repo without a session branch, or a branch that is main, must stop serve before it
+// listens, not fail at the first push.
+func TestServeRefusesAHalfConfiguredGit(t *testing.T) {
+	for name, mut := range map[string]func(*ServeOptions){
+		"no branch":                   func(o *ServeOptions) { o.GitBranch = "" },
+		"main branch":                 func(o *ServeOptions) { o.GitBranch = "main" },
+		"no url":                      func(o *ServeOptions) { o.GitURL = "" },
+		"no relay":                    func(o *ServeOptions) { o.Out = "" },
+		"git dir in work":             func(o *ServeOptions) { o.GitDir = o.Work + "/g" },
+		"git dir under a fence mount": func(o *ServeOptions) { o.GitDir = "/work/g" },
+	} {
+		o := serveBase(t)
+		root := t.TempDir()
+		o.Out, o.In, o.State, o.Sid, o.Gen, o.FenceUID = filepath.Join(root, "out"), filepath.Join(root, "in"), filepath.Join(root, "st"), "s", 1, os.Getuid()
+		os.MkdirAll(filepath.Join(o.Out, "requests"), 0o700)
+		os.MkdirAll(o.In, 0o700)
+		o.GitRepo, o.GitBase, o.GitBranch, o.GitURL = "o/r", "main", "ccsbx/s", "http://127.0.0.1:1/egress/git"
+		o.Work, o.GitDir, o.SnapshotDir = filepath.Join(root, "w"), filepath.Join(root, "g"), filepath.Join(root, "snap")
+		mut(&o)
+		if code, msg := serveCode(o); code != 2 {
+			t.Errorf("%s: exit %d (%s)", name, code, msg)
+		}
+	}
+}
+
+// context "a launcher passes a value that begins with '--' (a label, say, that looks like a flag)": the parser takes
+// it as the flag's value, the way A's PodFor needs. The door spec echoes its value in the refusal, which shows it.
+func TestAFlagValueThatLooksLikeAFlagIsTheValue(t *testing.T) {
+	for _, args := range [][]string{{"--door", "--hub-url=x"}, {"--door=--hub-url=x"}} {
+		var errb bytes.Buffer
+		code := Main(append([]string{"serve", "--control", filepath.Join(t.TempDir(), "c", "c.sock")}, args...), nil, io.Discard, &errb)
+		if code != 2 || !strings.Contains(errb.String(), `bad --door "--hub-url=x"`) {
+			t.Errorf("%v: exit %d (%s)", args, code, errb.String())
+		}
 	}
 }

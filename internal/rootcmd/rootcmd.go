@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/user"
@@ -86,15 +87,19 @@ type Deps struct {
 	NewPod func(cfg *Config, kc *k8sCtx) (PodAPI, error)
 	// Mint makes the sidecar's one payload: the session token and its generation key (made here), and the
 	// relay token, which register(pub) obtains from the hub for that key's public half.
-	Mint  func(ctx context.Context, cfg *Config, c token.Claims, register func(pub string) (string, error)) ([]byte, error)
-	Sleep func(time.Duration)
-	Now   func() time.Time
+	Mint func(ctx context.Context, cfg *Config, c token.Claims, register func(pub string) (string, error)) ([]byte, error)
+	// RevokeToken has the signer sign a revoke for the doors and posts it to revoke_doors.
+	RevokeToken func(ctx context.Context, cfg *Config, b token.RevokeBody) error
+	Sleep       func(time.Duration)
+	Now         func() time.Time
 	// Hub is the HTTP client for the hub (no redirects, 10 s); Audit takes one line per relay mint and
 	// revoke (never a token or secret). nil: production defaults.
 	Hub   *http.Client
 	Audit io.Writer
 	// HubListeners reads who is LISTENing on a TCP port of this machine (/proc/net/tcp and tcp6).
 	HubListeners func(port int) ([]TCPListener, error)
+	// LocalAddrs are this host's interface addresses: the hub's address must be one of them.
+	LocalAddrs func() ([]net.IP, error)
 	// SelfPath is this binary's own path (re-executed as the launch user for a pod attach); AttachSession
 	// runs a pod attach: the launch user's kubectl on a pty, the owner's terminal served by a credential-
 	// less process through the terminal filter. It returns the session's exit status.
@@ -234,7 +239,7 @@ func Real(getenv func(string) string) *Deps {
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
 		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
-		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, Sleep: time.Sleep, Now: time.Now, HubListeners: procListeners, SelfPath: selfPath, AttachSession: realAttachSession,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, RevokeToken: realRevokeToken, Sleep: time.Sleep, Now: time.Now, HubListeners: procListeners, LocalAddrs: localAddrs, SelfPath: selfPath, AttachSession: realAttachSession,
 	}
 }
 
@@ -280,4 +285,33 @@ func selfPath() (string, error) {
 		return "", err
 	}
 	return filepath.EvalSymlinks(p)
+}
+
+// localAddrs are the addresses of the interfaces that are UP: net.InterfaceAddrs also lists an address on an
+// interface that is down, where nothing can be listening and the address is not this host's to be reached on.
+func localAddrs() ([]net.IP, error) {
+	return upAddrs(net.Interfaces, func(i *net.Interface) ([]net.Addr, error) { return i.Addrs() })
+}
+
+func upAddrs(list func() ([]net.Interface, error), addrsOf func(*net.Interface) ([]net.Addr, error)) ([]net.IP, error) {
+	ifs, err := list()
+	if err != nil {
+		return nil, err
+	}
+	var out []net.IP
+	for i := range ifs {
+		if ifs[i].Flags&net.FlagUp == 0 {
+			continue
+		}
+		as, err := addrsOf(&ifs[i])
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range as {
+			if n, ok := a.(*net.IPNet); ok {
+				out = append(out, n.IP)
+			}
+		}
+	}
+	return out, nil
 }

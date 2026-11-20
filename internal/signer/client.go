@@ -24,6 +24,29 @@ type Client struct {
 
 // Sign sends the claims and returns the token. A refusal comes back as an error with the signer's text.
 func (c Client) Sign(ctx context.Context, cl token.Claims) (string, error) {
+	r, err := c.ask(ctx, cl)
+	if err != nil {
+		return "", err
+	}
+	if r.Token == "" {
+		return "", errors.New("signer: empty token")
+	}
+	return r.Token, nil
+}
+
+// SignRevoke asks for the header and the exact body of a revoke of generation gen of a session.
+func (c Client) SignRevoke(ctx context.Context, b token.RevokeBody) (header string, body []byte, err error) {
+	r, err := c.ask(ctx, map[string]any{"revoke": b})
+	if err != nil {
+		return "", nil, err
+	}
+	if r.Revoke == "" || r.Body == "" {
+		return "", nil, errors.New("signer: empty revoke")
+	}
+	return r.Revoke, []byte(r.Body), nil
+}
+
+func (c Client) ask(ctx context.Context, req any) (*reply, error) {
 	to := c.Timeout
 	if to <= 0 {
 		to = 5 * time.Second
@@ -33,24 +56,21 @@ func (c Client) Sign(ctx context.Context, cl token.Claims) (string, error) {
 	defer cancel()
 	conn, err := d.DialContext(ctx, "unix", c.Socket)
 	if err != nil {
-		return "", fmt.Errorf("signer: %v", err)
+		return nil, fmt.Errorf("signer: %v", err)
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(to))
-	if err := json.NewEncoder(conn).Encode(cl); err != nil {
-		return "", err
+	if err := json.NewEncoder(conn).Encode(req); err != nil {
+		return nil, err
 	}
 	var r reply
 	if err := json.NewDecoder(conn).Decode(&r); err != nil {
-		return "", fmt.Errorf("signer: no reply: %v", err)
+		return nil, fmt.Errorf("signer: no reply: %v", err)
 	}
 	if r.Error != "" {
-		return "", fmt.Errorf("signer refused: %s", r.Error)
+		return nil, fmt.Errorf("signer refused: %s", r.Error)
 	}
-	if r.Token == "" {
-		return "", errors.New("signer: empty token")
-	}
-	return r.Token, nil
+	return &r, nil
 }
 
 // MintFwdSecrets makes a fresh generation key, has claims (with cnf set to its public half) signed,

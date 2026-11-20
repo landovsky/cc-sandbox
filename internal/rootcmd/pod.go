@@ -150,7 +150,8 @@ func (e *env) podCreate(sid string, stdout io.Writer) error {
 	// the sidecar's identity and scope come from the record (hostd's, shape-checked here again) and root's
 	// config, never from anything the fence can write
 	sideCmd, err := k8s.SideArgv(k8s.SideInfo{Sid: rec.Sid, Gen: rec.Gen, Label: rec.Label, FullID: rec.Reply.ID, Machine: rec.Spec.Machine,
-		Scope: rec.Spec.MsgScope, HubURL: e.cfg.K8sHubURL, Doors: e.cfg.K8sDoors})
+		Scope: rec.Spec.MsgScope, HubURL: e.cfg.K8sHubURL, Doors: e.cfg.K8sDoors,
+		GitRepo: rec.Spec.Workdir.Repo, GitBase: rec.Spec.Workdir.Base, GitBranch: rec.Spec.Workdir.Branch})
 	if err != nil {
 		return refuse("%v", err)
 	}
@@ -226,6 +227,10 @@ func (e *env) podLoad(sid string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	scope, err := k8s.ParseScope(rec.Spec.MsgScope)
+	if err != nil {
+		return refuse("msg_scope of %s is not well formed: %v", sid, err)
+	}
 	// The hub's admin secret is root's (0600): it is read here, before the drop, into memory, and used
 	// below, in this process as the launch user, to register the relay for the generation key made there.
 	// Neither the secret nor the relay token is ever printed, and hostd sees neither.
@@ -275,11 +280,15 @@ func (e *env) podLoad(sid string, stdout io.Writer) error {
 		Label: rec.Label, Billing: rec.Spec.Billing, Profile: rec.Spec.Profile, Aud: e.cfg.K8sAudiences, PlacedBy: e.cfg.Machine,
 		Exp: e.d.Now().Add(time.Duration(e.cfg.K8sTokenHours) * time.Hour).Unix(),
 	}, func(pub string) (string, error) {
-		tok, err := e.registerRelay(ctx, hubSecret, rec.Spec.MsgScope, rec.Sid, rec.Gen, pub)
+		tok, err := e.registerRelay(ctx, hubSecret, scope, rec.Sid, rec.Gen, pub)
 		registered = err == nil
 		return tok, err
 	})
 	if err != nil {
+		if registered {
+			e.revokeWith(hubSecret, rec.Sid, rec.Gen)
+		}
+		e.revokeToken(ctx, rec) // the token may have been signed before the relay failed: kill it at the doors
 		return podErr(fmt.Errorf("mint: %w", err))
 	}
 	ref := k8s.Ref{Namespace: e.cfg.K8sNamespace, Name: k8s.PodName(rec.Sid, rec.Gen), Sid: rec.Sid, Gen: rec.Gen, UID: rec.PodUID}
@@ -287,6 +296,7 @@ func (e *env) podLoad(sid string, stdout io.Writer) error {
 		if registered {
 			e.revokeWith(hubSecret, rec.Sid, rec.Gen) // the relay was never delivered: do not leave it live
 		}
+		e.revokeToken(ctx, rec) // nor the token: it was signed and never delivered
 		return podErr(err)
 	}
 	return json.NewEncoder(stdout).Encode(map[string]any{"loaded": true, "pod": ref.Name})
@@ -396,6 +406,8 @@ func (e *env) podStop(sid string, stdout io.Writer) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
+	// the token first: whatever happens to the delete, this generation's token must not outlive the stop
+	e.revokeToken(ctx, rec)
 	if err := api.Delete(ctx, rec.Sid, rec.Gen, rec.PodUID); err != nil {
 		return podErr(err)
 	}
@@ -467,4 +479,20 @@ func (e *env) podStatus(sid string, stdout io.Writer) error {
 	}
 	fmt.Fprintln(stdout, "present")
 	return nil
+}
+
+// revokeToken tells the doors that this generation (and the earlier ones) of the session is over: the signer
+// signs the revoke (as the launch user, which this process is by now), and it is posted to every door in
+// revoke_doors. Best effort, never fails the verb: a failure is in the audit line with the sid and generation,
+// so the owner can revoke by hand, and the token expires within k8s_token_hours in any case.
+func (e *env) revokeToken(_ context.Context, rec *start.Record) {
+	// a context of its own: the caller's may be the very deadline that failed the load
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	err := e.d.RevokeToken(ctx, e.cfg, token.RevokeBody{Owner: rec.Spec.Owner, Machine: rec.Spec.Machine, Sid: rec.Sid, Gen: rec.Gen})
+	if err != nil {
+		e.audit("token-revoke", rec.Sid, rec.Gen, "", "FAILED, revoke by hand: "+err.Error())
+		return
+	}
+	e.audit("token-revoke", rec.Sid, rec.Gen, "", "ok")
 }

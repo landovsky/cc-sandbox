@@ -52,6 +52,11 @@ type Record struct {
 	// with secrets, attach, delete) checks against the live pod.
 	Backend string `json:"backend,omitempty"`
 	PodUID  string `json:"pod_uid,omitempty"`
+	// Starting is set from a pod session's first save until its pod is loaded (or the start failed): the
+	// generation is being made, and nothing else may act on this session (a resume is refused). Starts are the
+	// times this session's generations were started, so a resume counts against the hourly cap.
+	Starting bool        `json:"starting,omitempty"`
+	Starts   []time.Time `json:"starts,omitempty"`
 }
 
 // Daemon holds the policy knobs and the state directory.
@@ -88,9 +93,13 @@ type Daemon struct {
 	// generation ends (the doors then refuse it; plan U5). Optional.
 	Revoke func(sid string, gen int)
 	// Logf receives the daemon's notices; with no Revoke it carries "token may exist for sid X gen N".
-	Logf        func(format string, a ...any)
-	ReplaceWait time.Duration // how long Replace waits for the old fence to shut down (default 15s)
-	Now         func() time.Time
+	Logf func(format string, a ...any)
+	// PodVerbsRevoke says ccsbx-root's pod verbs revoke a pod generation's token and relay themselves (pod-stop, and
+	// pod-load when it fails), so hostd has nothing to revoke by hand for pods and says nothing about it; their
+	// own audit lines report a revoke that failed.
+	PodVerbsRevoke bool
+	ReplaceWait    time.Duration // how long Replace waits for the old fence to shut down (default 15s)
+	Now            func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
 	Exe string
 }

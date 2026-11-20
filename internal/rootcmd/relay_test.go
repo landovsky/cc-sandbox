@@ -7,8 +7,10 @@ package rootcmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -92,6 +94,9 @@ func (r *relayFx) reconfig(extra string) {
 			return hubUID, hubUID, nil
 		}
 		return l(n)
+	}
+	r.d.LocalAddrs = func() ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("100.101.219.96")}, nil
 	}
 	r.d.HubListeners = func(port int) ([]TCPListener, error) {
 		if r.lis != nil {
@@ -362,8 +367,10 @@ func TestTheHubMustBeOnLoopback(t *testing.T) {
 	p := filepath.Join(r.dir, "etc", "c.toml")
 	base := "allowed_roots = [\"" + r.roots + "\"]\nmachine = \"m\"\n"
 	for why, u := range map[string]string{
-		"a remote host": "http://10.0.0.5:4011", "a name": "http://hub.example:4011", "https": "https://127.0.0.1:4011",
-		"localhost by name": "http://localhost:4011", "a non-tailnet 100.x": "http://100.1.2.3:4011", "a public address": "http://8.8.8.8:4011",
+		"a name": "http://hub.example:4011", "https": "https://127.0.0.1:4011",
+		"localhost by name": "http://localhost:4011", "IPv6 loopback": "http://[::1]:4011", "a leading-zero octet": "http://127.0.0.01:4011",
+		"a hex address": "http://0x7f.0.0.1:4011", "a short form": "http://127.1:4011", "no port": "http://127.0.0.1", "port 0": "http://127.0.0.1:0",
+		"a port with a leading zero": "http://127.0.0.1:04011", "a mapped IPv6 literal": "http://[::ffff:127.0.0.1]:4011",
 		"userinfo": "http://u:p@127.0.0.1:4011", "a path": "http://127.0.0.1:4011/x", "none": "",
 	} {
 		put(t, p, base+"hub_url = \""+u+"\"\n", 0o644)
@@ -371,7 +378,7 @@ func TestTheHubMustBeOnLoopback(t *testing.T) {
 			t.Errorf("%s was accepted as the hub", why)
 		}
 	}
-	for _, u := range []string{"http://127.0.0.1:4011", "http://[::1]:4011", "http://100.101.219.96:4011", "http://100.64.0.1:4011", "http://100.127.255.254:4011"} {
+	for _, u := range []string{"http://127.0.0.1:4011", "http://100.101.219.96:4011", "http://192.168.1.20:4011"} { // whether it is THIS host's is checked at use
 		put(t, p, base+"hub_url = \""+u+"\"\n", 0o644)
 		if _, err := LoadConfig(p, os.Getuid()); err != nil {
 			t.Errorf("%s: %v", u, err)
@@ -576,6 +583,9 @@ func TestTheSecretGoesOnlyToAnAddressTheHubListensOn(t *testing.T) {
 	hub := hubUID
 	squat := os.Getuid() + 7
 	r := newRelayFx(t)
+	r.d.LocalAddrs = func() ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("100.101.219.96")}, nil
+	}
 	check := func(url string, ls []TCPListener) error {
 		cfg := *r.cfg
 		cfg.HubURL = url
@@ -603,6 +613,8 @@ func TestTheSecretGoesOnlyToAnAddressTheHubListensOn(t *testing.T) {
 		"a wildcard listener of another uid":                                          {"http://127.0.0.1:4011", []TCPListener{{IP: wild, UID: squat}}, false},
 		"the hub's uid on an address that is not the url's, plus a wildcard squatter": {"http://100.101.219.96:4011", []TCPListener{{IP: loop, UID: hub}, {IP: wild, UID: squat}}, false},
 		"an address that is not an address":                                           {"http://127.0.0.1:4011", []TCPListener{{IP: "zz", UID: hub}}, false},
+		"a foreign address, with a wildcard listener of the hub's uid":                {"http://203.0.113.9:4011", []TCPListener{{IP: wild, UID: hub}}, false},
+		"a foreign address that a listener of the hub's uid names":                    {"http://203.0.113.9:4011", []TCPListener{{IP: "09710CB0", UID: hub}}, false},
 	} {
 		if err := check(c.url, c.ls); (err == nil) != c.ok {
 			t.Errorf("%s: ok=%v want %v (%v)", why, err == nil, c.ok, err)
@@ -623,5 +635,14 @@ func TestProcAddressesDecode(t *testing.T) {
 		if decodeProcIP(bad) != nil {
 			t.Errorf("%q decoded", bad)
 		}
+	}
+}
+
+// the host's own addresses can not be read: nothing is sent
+func TestTheSecretIsNotSentWhenThisHostsAddressesCannotBeRead(t *testing.T) {
+	r := newRelayFx(t)
+	r.d.LocalAddrs = func() ([]net.IP, error) { return nil, errors.New("no interfaces") }
+	if code, _ := r.mint("--", sid, "2", relayPub); code != 3 || len(r.hubCalls()) != 0 {
+		t.Errorf("exit %d hub calls %d", code, len(r.hubCalls()))
 	}
 }

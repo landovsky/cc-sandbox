@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/user"
@@ -97,6 +98,8 @@ type Deps struct {
 	Audit io.Writer
 	// HubListeners reads who is LISTENing on a TCP port of this machine (/proc/net/tcp and tcp6).
 	HubListeners func(port int) ([]TCPListener, error)
+	// LocalAddrs are this host's interface addresses: the hub's address must be one of them.
+	LocalAddrs func() ([]net.IP, error)
 	// SelfPath is this binary's own path (re-executed as the launch user for a pod attach); AttachSession
 	// runs a pod attach: the launch user's kubectl on a pty, the owner's terminal served by a credential-
 	// less process through the terminal filter. It returns the session's exit status.
@@ -236,7 +239,7 @@ func Real(getenv func(string) string) *Deps {
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
 		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
-		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, RevokeToken: realRevokeToken, Sleep: time.Sleep, Now: time.Now, HubListeners: procListeners, SelfPath: selfPath, AttachSession: realAttachSession,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, RevokeToken: realRevokeToken, Sleep: time.Sleep, Now: time.Now, HubListeners: procListeners, LocalAddrs: localAddrs, SelfPath: selfPath, AttachSession: realAttachSession,
 	}
 }
 
@@ -282,4 +285,18 @@ func selfPath() (string, error) {
 		return "", err
 	}
 	return filepath.EvalSymlinks(p)
+}
+
+func localAddrs() ([]net.IP, error) {
+	as, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil, err
+	}
+	var out []net.IP
+	for _, a := range as {
+		if n, ok := a.(*net.IPNet); ok {
+			out = append(out, n.IP)
+		}
+	}
+	return out, nil
 }

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -161,6 +162,7 @@ func (f *fx) writeConfigPod(t *testing.T, side bool, extra string) {
 		}
 		return lookup(n)
 	}
+	f.d.LocalAddrs = func() ([]net.IP, error) { return []net.IP{net.ParseIP("127.0.0.1")}, nil }
 	f.d.HubListeners = func(port int) ([]TCPListener, error) {
 		return []TCPListener{{IP: "0100007F", Port: port, UID: hubUID}}, nil
 	}

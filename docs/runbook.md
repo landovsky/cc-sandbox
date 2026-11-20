@@ -723,8 +723,8 @@ them has a group-writable umask (the sidecar's checkout must use 002). A sidecar
 as large as the worktree) is mounted at `/run/ccsbx/side/snapshot`, nested in the side-state volume's path. Whether the
 cluster's admission accepts `fsGroup` and the nested mount is a Gate M question.
 
-**The hub's address (D's review).** The hub on hp listens on hp's tailnet address, not on loopback, so `hub_url` may be
-`http://<loopback or a 100.64.0.0/10 address>:PORT` (an IP literal; a name is refused). Before the admin secret is
+**The hub's address (D's review).** The hub on hp listens on hp's tailnet address, not on loopback, so `hub_url` is
+`http://A.B.C.D:PORT` (an IPv4 literal in canonical form, with a port; names, IPv6, short and leading-zero forms are refused) and, when the secret is about to be sent, A.B.C.D must be one of THIS host's interface addresses. Before the admin secret is
 sent, every LISTEN socket on the port must be `hub_user`'s AND the url's own address must be one the hub listens on
 or one a wildcard listener covers: a squatter on `127.0.0.1` while the hub is on the tailnet address, or a hub that
 listens somewhere else, gets nothing.

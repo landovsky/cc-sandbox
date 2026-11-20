@@ -368,6 +368,18 @@ func (e *env) checkHubListener() error {
 		return fmt.Errorf("%w: nothing listens on port %d", errHubUntrusted, port)
 	}
 	hubIP := net.ParseIP(u.Hostname())
+	// the address must be one of this host's: the admin secret goes nowhere else
+	mine, err := e.d.LocalAddrs()
+	if err != nil {
+		return fmt.Errorf("%w: cannot read this host's addresses: %v", errHubUntrusted, err)
+	}
+	isMine := false
+	for _, a := range mine {
+		isMine = isMine || (hubIP != nil && a.Equal(hubIP))
+	}
+	if !isMine {
+		return fmt.Errorf("%w: %s is not an address of this host", errHubUntrusted, u.Hostname())
+	}
 	covered := false
 	for _, l := range ls {
 		if l.UID != uid {

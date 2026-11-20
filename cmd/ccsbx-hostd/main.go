@@ -62,6 +62,12 @@ func app() *cli.App {
 				f.Int("event-rate", 50, "fence hook events journaled per second per outbox; beyond the burst they are dropped and counted (events_shed)")
 				f.Int("event-burst", 500, "event bucket size per outbox")
 				f.Int("max-total", 20000, "requests per generation in its lifetime; beyond that they are shed")
+				f.String("run-dir", "", "where generations' outboxes are read: <run-dir>/s/<sid>/g<n>/{out,in,CLOSED} (default: the state dir). Helper mode: ccsbx-root's run dir, /var/lib/ccsbx-run, where out/ is 10001:ccsbx 2770 and hostd reads it through the group; every openat2/fstat check (owner uid = --fence-uid) still applies")
+				f.String("pins", "pins.toml", "production pins file for session starts (digests that may run under any profile)")
+				f.String("worktree-root", home, "session starts: every worktree must be strictly inside this directory (symlinks resolved)")
+				f.String("cc-version", "", "Claude Code version recorded in a started session's pin")
+				f.Int("max-live", 8, "session starts: machine_full above this many live sessions")
+				f.Int("max-per-hour", 20, "session starts: rate_capped above this many starts per caller per hour")
 				f.String("tmux-socket", "ccsbx", "tmux server the session panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (a socket shared between uids; hostd makes it 0660)")
 				f.String("machine", hostname(), "this machine's name, stamped on journal records")
 				f.String("journal", "", "journal directory (default <state>/journal)")
@@ -114,7 +120,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	defer q.Close()
 	q.TTL = time.Duration(num("lease-ttl")) * time.Second
 	q.MaxPending = num("queue-max")
-	q.Reply = replyWriter(get("state"), d)
+	q.Reply = replyWriter(runDirOr(get("run-dir"), get("state")), d)
 	lg := log.New(stderr, "ccsbx-hostd: ", log.LstdFlags)
 	jdir := get("journal")
 	if jdir == "" {
@@ -138,8 +144,12 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	if get("hear") == "true" {
 		onEvent = hearFunc(rt)
 	} // a message is typed only into a pane whose last hook event is Stop
-	h := hostd.New(hostd.Config{Journal: j, OnEvent: onEvent, OnTick: func() { rt.Pump(pumpReply(get("state"))) },
-		StateDir: get("state"), FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
+	runDir := get("run-dir")
+	if runDir == "" {
+		runDir = get("state")
+	}
+	h := hostd.New(hostd.Config{Journal: j, OnEvent: onEvent, OnTick: func() { rt.Pump(pumpReply(runDir)) },
+		StateDir: get("state"), RunDir: runDir, FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
 		Handler: m.handle, Rate: float64(num("rate")), Burst: num("burst"), EventRate: float64(num("event-rate")), EventBurst: num("event-burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
 	})
 	if get("once") == "true" {
@@ -160,7 +170,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		}
 		return a
 	}
-	sd := &start.Daemon{StateDir: abs(get("state")), Machine: get("machine"), Root: "direct", Exe: exe, Backend: "docker",
+	sd := &start.Daemon{StateDir: abs(get("state")), RunDir: runDir, Machine: get("machine"), Root: "direct", Exe: exe, Backend: "docker",
 		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Env: []string{"--state", abs(get("state")),
 			"--profiles", abs(get("profiles")), "--machine", get("machine"), "--image", get("image"), "--root", "direct"}}}
 	var servers []*http.Server
@@ -171,6 +181,20 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 			return 0, err
 		}
 		return rec.Gen, nil
+	}
+	// Session start for helper mode: the owner's `ccsbx start` asks here; hostd writes the record in
+	// its state dir and launches the pane. The caller's uid is the socket peer's, not the spec's.
+	srv.Start = func(uid int, specJSON []byte) (*start.StartReply, error) {
+		spec, err := start.ParseSpec(specJSON)
+		if err != nil {
+			return nil, err
+		}
+		d := *sd // a copy per call: Uid differs, everything else is hostd's configuration
+		d.Uid, d.RunDir = uid, runDir
+		d.ProfilesDir, d.PinsFile, d.WorktreeRoot = abs(get("profiles")), abs(get("pins")), abs(get("worktree-root"))
+		d.Image, d.CCVersion, d.Socket = get("image"), get("cc-version"), get("tmux-socket")
+		d.MaxLive, d.MaxPerHour = num("max-live"), num("max-per-hour")
+		return d.Start(spec)
 	}
 	sock := get("local-socket")
 	if sock == "" {
@@ -184,7 +208,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "ccsbx-hostd: %s: %v\n", what, err)
 			return false
 		}
-		hs := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
+		hs := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, ConnContext: daemonapi.PeerContext}
 		servers = append(servers, hs)
 		go hs.Serve(l)
 		lg.Printf("api on %s", what)
@@ -268,6 +292,14 @@ func readToken(path string) (string, error) {
 		return "", fmt.Errorf("%s: the token must be at least 16 characters", path)
 	}
 	return t, nil
+}
+
+// runDirOr is the run dir, or the state dir when none is given.
+func runDirOr(run, state string) string {
+	if run != "" {
+		return run
+	}
+	return state
 }
 
 func hostname() string { h, _ := os.Hostname(); return h }

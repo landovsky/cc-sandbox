@@ -73,7 +73,12 @@ var Types = map[string]bool{
 
 // Config holds every tunable (all reachable as ccsbx-hostd flags / CCSBX_* env vars).
 type Config struct {
-	StateDir         string
+	StateDir string
+	// RunDir is where the generations' outboxes (s/<sid>/g<n>/out, in, CLOSED) are READ. Empty: the
+	// state dir (direct mode). In helper mode they belong to ccsbx-root's run dir
+	// (/var/lib/ccsbx-run), the out/ leaf is 10001:ccsbx 2770 and hostd reads it through the group;
+	// hostd's own ledger, state and journal stay under StateDir.
+	RunDir           string
 	FenceUID         int                  // owner uid required of every outbox file
 	MaxBytes         int64                // per request file
 	Rate             float64              // requests per second per outbox
@@ -91,6 +96,14 @@ type Config struct {
 	EventBurst       int                  // event bucket size per outbox
 	Now              func() time.Time
 	Logf             func(format string, args ...any)
+}
+
+// RunRoot is the directory holding s/<sid>/g<n>: RunDir, or the state dir when none is set.
+func (c Config) RunRoot() string {
+	if c.RunDir != "" {
+		return c.RunDir
+	}
+	return c.StateDir
 }
 
 // Defaults fills the zero values.
@@ -188,7 +201,7 @@ func (h *Hostd) Scan() Stats {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	st := Stats{Reasons: map[string]int{}}
-	sess, _ := filepath.Glob(filepath.Join(h.Cfg.StateDir, "s", "s*", "g*"))
+	sess, _ := filepath.Glob(filepath.Join(h.Cfg.RunRoot(), "s", "s*", "g*"))
 	h.checkEpoch(sess)
 	for _, gdir := range sess {
 		sid, gen := filepath.Base(filepath.Dir(gdir)), filepath.Base(gdir)

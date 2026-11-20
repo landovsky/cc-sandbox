@@ -7,11 +7,15 @@ package daemonapi
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/start"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -452,5 +456,143 @@ func TestPromptOnlyAtThePromptAndNeverOverTheTokenPort(t *testing.T) {
 	local2, _, out2 := newSteerRig(t, true, nil)
 	if code, _ := call(t, "POST", local2.URL+"/v1/sessions/sM/prompt", "", `{"kind":"nudge","text":"checkpoint now"}`); code != 200 || len(out2.lines) != 1 {
 		t.Fatalf("idle pane: %d %v", code, out2.lines)
+	}
+}
+
+// ---- session start over the socket (helper mode) -----------------------------------------------
+
+// startRig serves the API on a real unix socket (the only place peer credentials exist) and, for the
+// twin, on the token-protected loopback handler.
+type startRig struct {
+	sock   string
+	client *http.Client
+	tcp    *httptest.Server
+	got    []int // uids Start was called with
+	specs  []string
+}
+
+func newStartRig(t *testing.T, fn func(uid int, spec []byte) (*start.StartReply, error)) *startRig {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", "st")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	j, _ := journal.Open(t.TempDir(), "hp-ubuntu", 0)
+	q, _ := verbq.Open(t.TempDir())
+	r := &startRig{sock: filepath.Join(dir, "h.sock")}
+	s := &Server{J: j, Q: q, Token: "0123456789abcdef-token"}
+	s.Start = func(uid int, spec []byte) (*start.StartReply, error) {
+		r.got = append(r.got, uid)
+		r.specs = append(r.specs, string(spec))
+		return fn(uid, spec)
+	}
+	l, err := ListenUnix(r.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := &http.Server{Handler: s.Handler(), ConnContext: PeerContext}
+	go hs.Serve(l)
+	r.tcp = httptest.NewServer(s.TCPHandler())
+	t.Cleanup(func() { hs.Close(); r.tcp.Close(); j.Close(); q.Close() })
+	r.client = &http.Client{Transport: &http.Transport{DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "unix", r.sock)
+	}}}
+	return r
+}
+
+func (r *startRig) post(t *testing.T, body string) (int, map[string]any) {
+	resp, err := r.client.Post("http://d/v1/start", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	var m map[string]any
+	json.NewDecoder(resp.Body).Decode(&m)
+	return resp.StatusCode, m
+}
+
+// context: in helper mode the owner's `ccsbx start` can't write a record (the state dir is the
+// service uid's), so it asks hostd. hostd must take WHO is asking from the socket, never from the
+// spec: a body that claims uid 0 or another owner changes nothing.
+func TestStartOverTheSocketUsesThePeerUidNotTheBodyAllow(t *testing.T) {
+	r := newStartRig(t, func(uid int, spec []byte) (*start.StartReply, error) {
+		return &start.StartReply{Sid: "s0abc12345", ID: "tomas/hp/s0abc12345/g1", Gen: 1}, nil
+	})
+	code, m := r.post(t, `{"v":1,"label":"x","uid":0,"owner":"root"}`)
+	if code != 200 || m["sid"] != "s0abc12345" {
+		t.Fatalf("%d %v", code, m)
+	}
+	if len(r.got) != 1 || r.got[0] != os.Getuid() {
+		t.Fatalf("start saw uid %v, want the socket peer's %d", r.got, os.Getuid())
+	}
+	if !strings.Contains(r.specs[0], `"uid":0`) {
+		t.Fatal("the spec was altered on its way")
+	}
+}
+
+// context: a policy refusal is the caller's answer, not a server error.
+func TestStartRefusalIs409WithTheRefusalJSON(t *testing.T) {
+	r := newStartRig(t, func(int, []byte) (*start.StartReply, error) {
+		return nil, &start.Refusal{Code: "already_running", Msg: "x already_running on hp"}
+	})
+	code, m := r.post(t, `{}`)
+	if code != 409 || m["refused"] != "already_running" {
+		t.Fatalf("%d %v", code, m)
+	}
+	r2 := newStartRig(t, func(int, []byte) (*start.StartReply, error) { return nil, os.ErrPermission })
+	if code, _ := r2.post(t, `{}`); code != 500 {
+		t.Fatalf("a non-policy failure must be 500, got %d", code)
+	}
+}
+
+// context: starting a fenced session is the owner's act. A token holder on the loopback port (or a
+// stranger without the token) must not be able to start one, and Start must not even be called.
+func TestStartIsRefusedOnTheLoopbackPortBlock(t *testing.T) {
+	r := newStartRig(t, func(int, []byte) (*start.StartReply, error) { return &start.StartReply{Sid: "s0abc12345"}, nil })
+	for _, tok := range []string{"0123456789abcdef-token", ""} {
+		req, _ := http.NewRequest("POST", r.tcp.URL+"/v1/start", strings.NewReader(`{}`))
+		if tok != "" {
+			req.Header.Set("Authorization", "Bearer "+tok)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		want := 403
+		if tok == "" {
+			want = 401
+		}
+		if resp.StatusCode != want {
+			t.Fatalf("token %q: %d, want %d", tok, resp.StatusCode, want)
+		}
+	}
+	if len(r.got) != 0 {
+		t.Fatal("Start was called from the loopback port")
+	}
+}
+
+// context: a connection with no peer credentials (not a unix socket) has no identity, so nothing is
+// started for it: fail closed.
+func TestStartWithoutPeerCredentialsFailsClosed(t *testing.T) {
+	called := false
+	s := &Server{Start: func(int, []byte) (*start.StartReply, error) { called = true; return &start.StartReply{}, nil }}
+	ts := httptest.NewServer(s.Handler()) // a TCP test server: no SO_PEERCRED
+	defer ts.Close()
+	resp, err := http.Post(ts.URL+"/v1/start", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 500 || called {
+		t.Fatalf("%d called=%v", resp.StatusCode, called)
+	}
+}
+
+func TestStartRejectsAnOversizeSpec(t *testing.T) {
+	r := newStartRig(t, func(int, []byte) (*start.StartReply, error) { return &start.StartReply{}, nil })
+	if code, _ := r.post(t, strings.Repeat("a", 300<<10)); code != 400 || len(r.got) != 0 {
+		t.Fatalf("%d %v", code, r.got)
 	}
 }

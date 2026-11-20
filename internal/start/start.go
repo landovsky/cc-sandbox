@@ -50,6 +50,7 @@ type Record struct {
 // Daemon holds the policy knobs and the state directory.
 type Daemon struct {
 	StateDir     string
+	RunDir       string // where generations' s/<sid>/g<n>/CLOSED live; empty: StateDir (helper mode: ccsbx-root's run dir)
 	ProfilesDir  string
 	Machine      string // this machine's name; a spec for another machine is refused
 	Uid          int    // the caller's uid (from the OS, never from the spec)
@@ -74,6 +75,13 @@ func (d *Daemon) now() time.Time {
 		return d.Now()
 	}
 	return time.Now()
+}
+
+func (d *Daemon) runRoot() string {
+	if d.RunDir != "" {
+		return d.RunDir
+	}
+	return d.StateDir
 }
 
 func (d *Daemon) path(parts ...string) string {
@@ -378,7 +386,7 @@ func (d *Daemon) Replace(sid, brief string) (*Record, error) {
 	if err := st.Stop(sid); err != nil {
 		return nil, fmt.Errorf("end the old pane: %w", err)
 	}
-	closed := d.path("s", sid, fmt.Sprintf("g%d", prev.Gen), "CLOSED")
+	closed := filepath.Join(d.runRoot(), "s", sid, fmt.Sprintf("g%d", prev.Gen), "CLOSED")
 	wait := d.ReplaceWait
 	if wait == 0 {
 		wait = 15 * time.Second

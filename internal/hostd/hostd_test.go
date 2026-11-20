@@ -583,3 +583,75 @@ func directModeWorktree(t *testing.T) (root, wt string) {
 	os.Mkdir(wt, 0o755)
 	return root, wt
 }
+
+// ---- --run-dir: helper mode reads outboxes under ccsbx-root's run dir ---------------------------
+
+// runDirFixture is the fixture with its generation moved to a separate run dir, as in helper mode:
+// the session record is in the state dir, s/<sid>/g1/{out,in} is under the run dir.
+func runDirFixture(t *testing.T, mut func(*Config)) (*fixture, string) {
+	t.Helper()
+	run := t.TempDir()
+	f := newFixture(t, func(c *Config) {
+		c.RunDir = run
+		if mut != nil {
+			mut(c)
+		}
+	})
+	if err := os.Rename(filepath.Join(f.state, "s"), filepath.Join(run, "s")); err != nil {
+		t.Fatal(err)
+	}
+	f.g = filepath.Join(run, "s", sid, "g1")
+	return f, run
+}
+
+// context: after Gate M the outboxes are not in hostd's state dir any more but in ccsbx-root's run
+// dir. A request there is handled, stamped from the path and the record, and answered in that
+// generation's in/replies; the state dir has no s/ at all.
+func TestRequestsInTheRunDirAreHandledAndAnsweredThereAllow(t *testing.T) {
+	f, run := runDirFixture(t, nil)
+	f.req("r1.json", `{"type":"ccf.mark"}`)
+	st := f.h.Scan()
+	if st.Accepted != 1 || len(f.got) != 1 || f.got[0].Sid != sid {
+		t.Fatalf("%+v %v", st, f.got)
+	}
+	if _, err := os.Stat(filepath.Join(run, "s", sid, "g1", "in", "replies", "r1.json")); err != nil {
+		t.Fatalf("the reply is not in the run dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(f.state, "s")); err == nil {
+		t.Fatal("hostd made an s/ in the state dir")
+	}
+}
+
+// context: the run dir is read through a group, so every file check still has to hold there: a file
+// whose owner is not the fence uid is refused, and a symlink is not followed.
+func TestRunDirKeepsEveryOutboxCheckBlock(t *testing.T) {
+	f, _ := runDirFixture(t, func(c *Config) { c.FenceUID = os.Getuid() + 1 }) // the file's owner is not the fence uid
+	f.req("r1.json", `{"type":"ccf.mark"}`)
+	f.h.Scan()
+	if len(f.got) != 0 || f.code("r1") != "refused:wrong_owner" {
+		t.Fatalf("%v %s", f.got, f.code("r1"))
+	}
+	g, _ := runDirFixture(t, nil)
+	os.Symlink("/etc/passwd", filepath.Join(g.g, "out", "requests", "evil.json"))
+	g.h.Scan()
+	if len(g.got) != 0 || g.code("evil") != "refused:unsafe_path" {
+		t.Fatalf("%v %s", g.got, g.code("evil"))
+	}
+}
+
+// context: the CLOSED marker of a generation is root's, in the run dir; hostd needs only to see it
+// there to drain the generation one last time and journal its end.
+func TestClosedMarkerIsLookedForInTheRunDir(t *testing.T) {
+	f, _ := runDirFixture(t, nil)
+	j := f.withJournal(t.TempDir())
+	f.appendEvents(`{"type":"hook.Stop","data":{}}` + "\n")
+	f.h.Scan()
+	if err := os.WriteFile(filepath.Join(f.g, "CLOSED"), []byte("closed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.h.Scan()
+	recs, _ := j.After(0, "", "", 0)
+	if !contains(types(recs), "host:session.ended") {
+		t.Fatalf("the end was not journaled: %v", types(recs))
+	}
+}

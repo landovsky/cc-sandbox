@@ -1,12 +1,13 @@
-# ccsbx-hostd.service (U3a/U0). The per-machine daemon: journal, stamping, start API on :7480.
+# ccsbx-hostd.service (U3a/U0). The per-machine daemon: journal, stamping, start API on loopback 127.0.0.1:7480 (token file).
 # Why: the daemon runs unprivileged so a bug in it is not root; it asks ccsbx-root for the few things that need it.
 # It runs as uid ccsbx, can reach the signer's socket (group ccsbx) but never the key directory,
 # and reaches docker only through `sudo -n /usr/local/sbin/ccsbx-root <verb>`.
+# --ccmsg-bin is deliberately UNSET: hostd as uid ccsbx cannot use the owner's bus sockets, so messages to an
+# unfenced manager wait for the hub spoke (B10/B11/M2b). Every flag also reads CCSBX_<FLAG>; unknown flags are fatal.
 # The command line is `ccsbx-hostd run ...` with exactly the flags the U3a/G builder adds on n1-g (review R1):
 # --local-socket, --socket-group, --signer, --listen (loopback only), --listen-token-file. An unknown flag is
-# fatal in hostd, so confirm them with `ccsbx-hostd run --help` before the gate. The token file is assumed to be
-# made by hostd itself under its state dir. OPEN: hostd sends messages with `tmux -L ccsbx send-keys` into the
-# OWNER's tmux server; as uid ccsbx with PrivateTmp that socket is not reachable (agree with the hostd builder).
+# fatal in hostd, so confirm them with `ccsbx-hostd run --help` before the gate. The token file (0600, ccsbx) is made by the installer. hostd sends messages with `send-keys` into the
+# tmux server it owns on --tmux-socket (an absolute path, `tmux -S`, in /run/ccsbx), reachable by the owner's attach.
 # SupplementaryGroups=ccsbx-clients: hostd may chgrp its local socket to that group (a process can only
 # chgrp to a group it is in), so the owner's `ccsbx` CLI can connect (review M1).
 # The sandbox below is inherited by `sudo ccsbx-root` (it stays in this mount namespace), review M2.
@@ -26,11 +27,14 @@ Type=simple
 User=ccsbx
 Group=ccsbx
 SupplementaryGroups=ccsbx-clients
-ExecStart=/usr/local/libexec/ccsbx/ccsbx-hostd run --state /var/lib/ccsbx --local-socket /run/ccsbx/hostd.sock --socket-group ccsbx-clients --signer /run/ccsbx-signer/sign.sock --listen 127.0.0.1:7480 --listen-token-file /var/lib/ccsbx/listen.token
+ExecStart=/usr/local/libexec/ccsbx/ccsbx-hostd run --state /var/lib/ccsbx --local-socket /run/ccsbx/hostd.sock --socket-group ccsbx-clients --signer /run/ccsbx-signer/sign.sock --listen 127.0.0.1:7480 --listen-token-file /var/lib/ccsbx/listen.token --tmux-socket /run/ccsbx/tmux.sock
 StateDirectory=ccsbx
 StateDirectoryMode=0750
 RuntimeDirectory=ccsbx
-RuntimeDirectoryMode=0755
+RuntimeDirectoryMode=0750
+# /run/ccsbx is ccsbx:ccsbx-clients 0750 so the owner's `ccsbx attach` reaches tmux.sock and hostd.sock. systemd makes
+# a RuntimeDirectory with the service's own group, so a root (+) pre-step changes the group; the state dir stays ccsbx-only.
+ExecStartPre=+/usr/bin/chgrp ccsbx-clients /run/ccsbx
 Restart=on-failure
 RestartSec=2
 # NoNewPrivileges must stay OFF: hostd calls sudo for ccsbx-root. Everything else is closed.

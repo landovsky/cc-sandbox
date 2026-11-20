@@ -1,0 +1,27 @@
+# ccsbx-hostd run: flags, derived from cmd/ccsbx-hostd/main.go at n1-g 13b6c69 (f.String/f.Int/f.Bool lines).
+# Why: a fixture to check the unit's ExecStart against when dist/ has no hostd. Replace with 'ccsbx-hostd run --help' output when G's binary is built.
+   -state
+   -fence-uid
+   -max-bytes
+   -rate
+   -burst
+   -max-total
+   -tmux-socket
+   -machine
+   -journal
+   -retention-days
+   -local-socket
+   -socket
+   -socket-group
+   -signer
+   -listen
+   -listen-token-file
+   -lease-ttl
+   -queue-max
+   -ccmsg-bin
+   -hear
+   -ccsbx-bin
+   -profiles
+   -image
+   -interval
+   -once

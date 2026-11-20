@@ -95,6 +95,10 @@ u0_sops() {
 u0_hostd() {
   step "U0 hostd unit and firewall"
   put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-hostd.service"
+  note "the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced"
+  if [ "$MODE" != install ] || [ ! -e "$(pth /var/lib/ccsbx/listen.token)" ]; then
+    cmd runuser -u ccsbx -- sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /var/lib/ccsbx/listen.token'
+  fi
   cmd systemctl daemon-reload
   cmd systemctl enable --now ccsbx-hostd.service
   note "hostd listens on 127.0.0.1:7480 only (with a token file); the firewall rule below is for the tailnet and is harmless while nothing listens there"

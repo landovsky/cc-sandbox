@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/daemonapi"
+	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
 // Every subcommand's --help runs nothing (the next agent learns the tool without side effects).
@@ -152,5 +153,32 @@ func TestRunDirAndStartPolicyFlags(t *testing.T) {
 		if !strings.Contains(h, w) {
 			t.Errorf("--help does not list %s", w)
 		}
+	}
+}
+
+// context: helper mode without --run-dir would look for outboxes in the state dir and find none, so
+// every request would go unanswered. It is refused at start, and --once (a dry run) must not skip it.
+func TestHelperModeWithoutARunDirIsRefusedEvenWithOnce(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "ccsbx-root")
+	os.WriteFile(root, []byte("#!/bin/sh\n"), 0o755)
+	oldBin := start.RootBin
+	start.RootBin = root
+	defer func() { start.RootBin = oldBin }()
+	defer start.SetTestRootUID(os.Getuid())()
+	state := t.TempDir()
+	code, out := runHostd("run", "--once", "--root", "helper", "--state", state)
+	if code == 0 || !strings.Contains(out, "--run-dir") {
+		t.Fatalf("%d %s", code, out)
+	}
+	if code, out := runHostd("run", "--once", "--root", "helper", "--state", state, "--run-dir", t.TempDir()); code != 0 {
+		t.Fatalf("with a run dir: %d %s", code, out)
+	}
+}
+
+// context: hostd uses the profiles compiled into the binary (the same copy ccsbx-root has); there is
+// no --profiles flag to point it at a different set.
+func TestHostdHasNoProfilesFlag(t *testing.T) {
+	if code, _ := runHostd("run", "--once", "--state", t.TempDir(), "--profiles", "x"); code == 0 {
+		t.Fatal("--profiles was accepted")
 	}
 }

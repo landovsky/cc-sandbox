@@ -16,22 +16,27 @@ import (
 
 // LaunchSpec is the request body (§4.1). Unknown fields are refused so a typo can't weaken it.
 type LaunchSpec struct {
-	V           int             `json:"v"`
-	RequestID   string          `json:"request_id"`
-	Owner       string          `json:"owner"`
-	Machine     string          `json:"machine"`
-	Label       string          `json:"label"`
-	Realm       string          `json:"realm"`
-	Resume      *Resume         `json:"resume"`
-	Harness     string          `json:"harness"`
-	HarnessArgs []string        `json:"harness_args"`
-	Workdir     Workdir         `json:"workdir"`
-	Profile     string          `json:"profile"`
-	Billing     string          `json:"billing"`
-	Grants      []string        `json:"grants"` // the grant names the node's Grants: line asks for (decided at the doors, M1)
-	MsgScope    json.RawMessage `json:"msg_scope"`
-	Client      json.RawMessage `json:"client"`
-	Brief       *Brief          `json:"brief"`
+	V           int      `json:"v"`
+	RequestID   string   `json:"request_id"`
+	Owner       string   `json:"owner"`
+	Machine     string   `json:"machine"`
+	Label       string   `json:"label"`
+	Realm       string   `json:"realm"`
+	Resume      *Resume  `json:"resume"`
+	Harness     string   `json:"harness"`
+	HarnessArgs []string `json:"harness_args"`
+	Workdir     Workdir  `json:"workdir"`
+	// GitDir is the resolved git directory of the workdir ("" if it has none). Only helper mode takes
+	// it: the CLIENT resolves it as the owner (hostd, as the service uid, cannot enter the home) and
+	// hostd checks its shape; in direct mode the daemon resolves it itself and a spec carrying one is
+	// refused (see Daemon.Start).
+	GitDir   string          `json:"gitdir,omitempty"`
+	Profile  string          `json:"profile"`
+	Billing  string          `json:"billing"`
+	Grants   []string        `json:"grants"` // the grant names the node's Grants: line asks for (decided at the doors, M1)
+	MsgScope json.RawMessage `json:"msg_scope"`
+	Client   json.RawMessage `json:"client"`
+	Brief    *Brief          `json:"brief"`
 }
 
 // Resume asks for generation+1 of an existing session (U7).

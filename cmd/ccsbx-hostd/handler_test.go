@@ -18,6 +18,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
+	"github.com/landovsky/cc-sandbox/profiles"
 )
 
 // context: the whole M4 path in one go — a worker's `done` while no cockpit is up is answered
@@ -221,8 +222,8 @@ func wdir(t *testing.T) string {
 
 func policyFor(t *testing.T, lookup string) (*start.Daemon, startPolicy) {
 	t.Helper()
-	sd := &start.Daemon{StateDir: t.TempDir(), Machine: "hp-ubuntu", Root: "direct", Exe: "ccsbx", Backend: "docker", Launcher: start.NoLauncher{}}
-	return sd, startPolicy{Profiles: "../../profiles", Pins: "/nonexistent/pins.toml", WorktreeRoots: "/var/tmp", Image: "ccsbx-fence:dev",
+	sd := &start.Daemon{StateDir: t.TempDir(), Machine: "hp-ubuntu", Root: "direct", Exe: "ccsbx", Backend: "docker", Launcher: start.NoLauncher{}, ProfileLoader: profiles.Load}
+	return sd, startPolicy{Pins: "/nonexistent/pins.toml", WorktreeRoots: "/var/tmp", Image: "ccsbx-fence:dev",
 		MaxLive: 8, MaxPerHour: 20, MinUID: 1000,
 		LookupID: func(id string) (*user.User, error) { return &user.User{Uid: id, Username: lookup}, nil }}
 }

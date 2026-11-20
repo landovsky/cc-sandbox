@@ -4,11 +4,15 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -41,9 +45,13 @@ func helloSpec(t *testing.T) (path string, body string) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	wd, _ := os.MkdirTemp("/var/tmp", "ccsbx-hello-")
+	t.Cleanup(func() { os.RemoveAll(wd) })
+	wd, _ = filepath.EvalSymlinks(wd)
+	spec := strings.Replace(string(b), "/var/tmp/ccsbx-hello", wd, 1)
 	p := filepath.Join(t.TempDir(), "spec.json")
-	os.WriteFile(p, b, 0o644)
-	return p, string(b)
+	os.WriteFile(p, []byte(spec), 0o644)
+	return p, spec
 }
 
 const okReply = `{"v":1,"sid":"s0abcdefgh","gen":1,"id":"tomas/hp/s0abcdefgh/g1","backend":"docker","attach":{"local":["sudo","ccsbx-root","attach","s0abcdefgh"]}}`
@@ -57,8 +65,20 @@ func TestHelperStartSendsTheSpecToHostdAndWritesNothing(t *testing.T) {
 	if code != 0 || !strings.Contains(out, `"sid": "s0abcdefgh"`) {
 		t.Fatalf("%d %s", code, out)
 	}
-	if got.method != "POST /v1/start" || got.ctype != "application/json" || got.body != body {
-		t.Errorf("hostd got %q %q, body equal=%v", got.method, got.ctype, got.body == body)
+	if got.method != "POST /v1/start" || got.ctype != "application/json" {
+		t.Errorf("hostd got %q %q", got.method, got.ctype)
+	}
+	var sent, orig map[string]any
+	json.Unmarshal([]byte(got.body), &sent)
+	json.Unmarshal([]byte(body), &orig)
+	// The client adds gitdir and writes the workdir back in full; everything else must be untouched.
+	for _, m := range []map[string]any{sent, orig} {
+		delete(m, "gitdir")
+		delete(m, "workdir")
+		delete(m, "grants")
+	}
+	if fmt.Sprint(sent) != fmt.Sprint(orig) {
+		t.Errorf("the client changed the spec beyond the resolved paths:\n sent %v\n orig %v", sent, orig)
 	}
 	if ents, _ := os.ReadDir(state); len(ents) != 0 {
 		t.Errorf("the client wrote under --state in helper mode: %v", ents)
@@ -126,5 +146,60 @@ func TestHelperStartRefusesDevFlagsAndBadSpecs(t *testing.T) {
 	}
 	if got.method != "" {
 		t.Errorf("hostd was called for a request that is refused here: %s", got.method)
+	}
+}
+
+// context: hostd, as another uid, cannot enter the owner's home, so the CLIENT must send the paths
+// already resolved: a symlinked workdir arrives as its real path, and a git worktree arrives with its
+// gitdir. (hostd then only checks their shape; ccsbx-root validates them for real at run time.)
+func TestHelperStartSendsTheResolvedWorkdirAndGitdir(t *testing.T) {
+	newStubs(t)
+	sock, got := fakeHostd(t, 200, okReply)
+	real, _ := os.MkdirTemp("/var/tmp", "ccsbx-real-")
+	t.Cleanup(func() { os.RemoveAll(real) })
+	real, _ = filepath.EvalSymlinks(real)
+	link := real + "-link"
+	os.Symlink(real, link)
+	t.Cleanup(func() { os.Remove(link) })
+	if out, err := exec.Command("git", "-C", real, "init", "-q").CombinedOutput(); err != nil {
+		t.Skipf("no git: %v %s", err, out)
+	}
+	b, _ := os.ReadFile("../../tests/specs/hello.json")
+	spec := filepath.Join(t.TempDir(), "spec.json")
+	os.WriteFile(spec, []byte(strings.Replace(string(b), "/var/tmp/ccsbx-hello", link, 1)), 0o644)
+	if code, out := run("start", "--root", "helper", "--socket", sock, "--spec", spec); code != 0 {
+		t.Fatalf("%d %s", code, out)
+	}
+	var sent struct {
+		Workdir struct{ Path string }
+		Gitdir  string
+	}
+	json.Unmarshal([]byte(got.body), &sent)
+	if sent.Workdir.Path != real || sent.Gitdir != filepath.Join(real, ".git") {
+		t.Fatalf("hostd got workdir %q gitdir %q; want %q and its .git", sent.Workdir.Path, sent.Gitdir, real)
+	}
+}
+
+// context: a spec that already carries a gitdir would let the caller choose what is mounted; the
+// client computes it, never takes it from the file.
+func TestHelperStartRefusesASpecThatBringsItsOwnGitdir(t *testing.T) {
+	newStubs(t)
+	sock, got := fakeHostd(t, 200, okReply)
+	p, body := helloSpec(t)
+	os.WriteFile(p, []byte(strings.Replace(body, `"profile"`, `"gitdir":"/etc","profile"`, 1)), 0o644)
+	if code, _ := run("start", "--root", "helper", "--socket", sock, "--spec", p); code != 2 || got.method != "" {
+		t.Fatalf("code %d, hostd was called: %q", code, got.method)
+	}
+}
+
+// context: a workdir that does not exist is refused here, with the path, not left to hostd.
+func TestHelperStartRefusesAMissingWorkdirBeforeCallingHostd(t *testing.T) {
+	newStubs(t)
+	sock, got := fakeHostd(t, 200, okReply)
+	p, body := helloSpec(t)
+	wd := regexp.MustCompile(`"path":"([^"]+)"`).FindStringSubmatch(body)[1]
+	os.WriteFile(p, []byte(strings.Replace(body, wd, wd+"/nope", 1)), 0o644)
+	if code, out := run("start", "--root", "helper", "--socket", sock, "--spec", p); code != 2 || got.method != "" || !strings.Contains(out, "nope") {
+		t.Fatalf("code %d %s, hostd called: %q", code, out, got.method)
 	}
 }

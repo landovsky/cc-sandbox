@@ -26,6 +26,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
+	"github.com/landovsky/cc-sandbox/profiles"
 )
 
 var version = "dev"
@@ -88,7 +89,6 @@ func app() *cli.App {
 				f.String("ccmsg-bin", "", "ccmsg (session-bus) to reach an unfenced manager on this machine, e.g. ~/.dotfiles/session-bus/bin/ccmsg; empty: only ccsbx sessions are reachable")
 				f.Bool("hear", false, "C23 hear: tell a worker's manager by message when the worker needs a human decision (permission prompt, question dialog)")
 				f.String("ccsbx-bin", "", "the ccsbx binary a replaced session's pane runs (default: ccsbx next to this binary)")
-				f.String("profiles", "profiles", "directory of <name>.json profiles, passed to the pane of a replaced session")
 				f.String("image", "ccsbx-fence:dev", "fence image, passed to the pane of a replaced session")
 				f.String("interval", "250ms", "time between scans")
 				f.Bool("once", false, "scan once and print the stats as a line, then exit")
@@ -111,6 +111,16 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "ccsbx-hostd: --signer: %v\n", err)
 			return cli.ExitFail
 		}
+	}
+	// The mode and its run-dir requirement are checked before anything else runs, --once included.
+	mode, err := start.ResolveRoot(get("root"))
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx-hostd:", err)
+		return cli.ExitRefused
+	}
+	if mode == "helper" && get("run-dir") == "" {
+		fmt.Fprintln(stderr, "ccsbx-hostd: helper mode needs --run-dir (ccsbx-root's run dir, /var/lib/ccsbx-run): without it hostd would look for outboxes in the state dir and see none")
+		return cli.ExitRefused
 	}
 	d := &start.Daemon{StateDir: get("state")}
 	tm := &msg.Tmux{Socket: get("tmux-socket")}
@@ -175,18 +185,9 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		}
 		return a
 	}
-	mode, err := start.ResolveRoot(get("root"))
-	if err != nil {
-		fmt.Fprintln(stderr, "ccsbx-hostd:", err)
-		return cli.ExitRefused
-	}
-	if mode == "helper" && get("run-dir") == "" {
-		fmt.Fprintln(stderr, "ccsbx-hostd: helper mode needs --run-dir (ccsbx-root's run dir, /var/lib/ccsbx-run): without it hostd would look for outboxes in the state dir and see none")
-		return cli.ExitRefused
-	}
-	sd := &start.Daemon{StateDir: abs(get("state")), RunDir: runDir, Machine: get("machine"), Root: mode, Exe: exe, Backend: "docker",
+	sd := &start.Daemon{StateDir: abs(get("state")), RunDir: runDir, ProfileLoader: profiles.Load, Machine: get("machine"), Root: mode, Exe: exe, Backend: "docker",
 		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Helper: mode == "helper", Env: []string{"--state", abs(get("state")),
-			"--profiles", abs(get("profiles")), "--machine", get("machine"), "--image", get("image"), "--root", mode}}}
+			"--profiles", abs("profiles"), "--machine", get("machine"), "--image", get("image"), "--root", mode}}}
 	var servers []*http.Server
 	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
 	srv.Replace = func(sid, brief string) (int, error) {
@@ -199,7 +200,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	// Session start for helper mode: the owner's `ccsbx start` asks here; hostd writes the record in
 	// its state dir and launches the pane. The caller's uid is the socket peer's, not the spec's.
 	srv.Start = startHandler(sd, startPolicy{
-		Profiles: abs(get("profiles")), Pins: get("pins"), WorktreeRoots: get("worktree-root"), Image: get("image"),
+		Pins: get("pins"), WorktreeRoots: get("worktree-root"), Image: get("image"),
 		CCVersion: get("cc-version"), TmuxSocket: get("tmux-socket"), RunDir: runDir,
 		MaxLive: num("max-live"), MaxPerHour: num("max-per-hour"), MinUID: num("min-uid"), LookupID: user.LookupId,
 	})

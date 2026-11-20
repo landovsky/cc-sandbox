@@ -532,3 +532,55 @@ func TestSpecClaimingAnotherOwnerIsRefusedBlock(t *testing.T) {
 		t.Fatal("a caller with no passwd entry was accepted: fail closed")
 	}
 }
+
+// ---- helper mode: the daemon checks the client-resolved paths by shape ---------------------------
+
+// context: in helper mode hostd can't enter the owner's home, so a workdir that does not exist on ITS
+// filesystem must still get past the workdir/gitdir step (the client resolved it, ccsbx-root checks it
+// for real). The start then fails LATER (here, at the profile), never at the workdir.
+func TestHelperModeNeverStatsTheWorkdir(t *testing.T) {
+	d, _ := newDaemon(t)
+	d.Root, d.WorktreeRoot, d.ProfilesDir = "helper", "/nonexistent-home/u/git", "/nonexistent-profiles"
+	s := spec(func(s *LaunchSpec) {
+		s.Workdir.Path = "/nonexistent-home/u/git/proj"
+		s.GitDir = "/nonexistent-home/u/git/proj/.git"
+	})
+	_, err := d.Start(s)
+	if err == nil || strings.Contains(err.Error(), "workdir") || strings.Contains(err.Error(), "gitdir") {
+		t.Fatalf("the start did not get past the workdir step: %v", err)
+	}
+}
+
+func TestHelperModeRefusesAnOutOfShapeGitdir(t *testing.T) {
+	d, _ := newDaemon(t)
+	d.Root, d.WorktreeRoot = "helper", "/nonexistent-home/u/git"
+	s := spec(func(s *LaunchSpec) { s.Workdir.Path = "/nonexistent-home/u/git/proj"; s.GitDir = "/etc" })
+	if _, err := d.Start(s); err == nil || !strings.Contains(err.Error(), "gitdir") {
+		t.Fatalf("%v", err)
+	}
+}
+
+// context: in direct mode the daemon resolves the gitdir itself; a spec that brings one is refused so
+// the caller can never choose what gets mounted.
+func TestDirectModeRefusesASpecWithAGitdir(t *testing.T) {
+	d, fl := newDaemon(t)
+	s := spec(func(s *LaunchSpec) { s.GitDir = "/etc" })
+	before := fl.launch
+	if _, err := d.Start(s); err == nil || !strings.Contains(err.Error(), "gitdir") || fl.launch != before {
+		t.Fatalf("%v", err)
+	}
+}
+
+func TestResolveClientPathsResolvesSymlinksAndComputesTheGitdir(t *testing.T) {
+	root := vt(t)
+	real := filepath.Join(root, "real")
+	os.Mkdir(real, 0o755)
+	os.Symlink(real, filepath.Join(root, "link"))
+	s := &LaunchSpec{Workdir: Workdir{Path: filepath.Join(root, "link")}}
+	if err := ResolveClientPaths(s, os.Getuid()); err != nil || s.Workdir.Path != real || s.GitDir != "" {
+		t.Fatalf("%v %+v", err, s)
+	}
+	if err := ResolveClientPaths(&LaunchSpec{Workdir: Workdir{Path: filepath.Join(root, "nope")}}, os.Getuid()); err == nil {
+		t.Fatal("a missing workdir was accepted")
+	}
+}

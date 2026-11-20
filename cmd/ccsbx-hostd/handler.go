@@ -299,7 +299,11 @@ func startHandler(sd *start.Daemon, p startPolicy) func(uid int, spec []byte) (*
 // path (which runs it already): a local `ccsbx start` and a remote start of one label must not both launch.
 func startHandlerBy(sd *start.Daemon, p startPolicy, guard *remotestart.Service) func(uid int, spec []byte, startedBy string) (*start.StartReply, error) {
 	return func(uid int, specJSON []byte, startedBy string) (*start.StartReply, error) {
-		if uid == 0 || uid == os.Getuid() || uid < p.MinUID {
+		// A REMOTE start (startedBy != "") runs as the operator-configured --owner-user, not as a socket peer: in
+		// direct mode that is the user hostd itself runs as (nothing to protect: the panes are that user's too); in
+		// helper mode hostd's uid is the service user and the owner must be someone else.
+		serviceUser := uid == os.Getuid() && (startedBy == "" || sd.Root == "helper")
+		if uid == 0 || serviceUser || uid < p.MinUID {
 			return nil, &start.Refusal{Code: start.BadSpec, Msg: fmt.Sprintf("uid %d may not start sessions (root, the service user, or below the minimum uid %d)", uid, p.MinUID)}
 		}
 		spec, err := start.ParseSpec(specJSON)

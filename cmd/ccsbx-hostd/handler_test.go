@@ -8,16 +8,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http/httptest"
 	"os"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/daemonapi"
 	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
+	"github.com/landovsky/cc-sandbox/internal/profile"
 	"github.com/landovsky/cc-sandbox/internal/remotestart"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
@@ -493,4 +498,143 @@ func TestARemoteWorkdirIsHeldToTheWorktreeRootBlock(t *testing.T) {
 	if ref := try(inside); ref != nil {
 		t.Fatalf("a directory inside the root was refused: %v", ref)
 	}
+}
+
+// context (M2c, direct mode): in direct mode hostd runs AS the owner, so the owner's own uid is exactly what a remote
+// start must run as; in helper mode hostd's uid is the service user, and an owner-user equal to it is a
+// misconfiguration that must not start sessions.
+func TestARemoteStartMayRunAsHostdsOwnUserOnlyInDirectMode(t *testing.T) {
+	w := wdir(t)
+	for _, c := range []struct {
+		root string
+		ok   bool
+	}{{"direct", true}, {"helper", false}} {
+		sd, p := policyFor(t, "tomas")
+		sd.Root = c.root
+		_, err := startHandlerBy(sd, p, nil)(os.Getuid(), []byte(fmt.Sprintf(specOf, "tomas", w)), "owner:tomas@example.com@mac")
+		refused := err != nil && strings.Contains(err.Error(), "may not start sessions")
+		if refused == c.ok {
+			t.Errorf("%s mode: refused as the service user = %v (%v)", c.root, refused, err)
+		}
+	}
+}
+
+// context (M2c over real HTTP): two daemons that ask each other through GET /v1/resolve?v=2 (the real routes, JSON and
+// all), each with its own state and a launcher that records a live session. One label is live on one machine only,
+// whichever asks first, and a start on the other is refused with where it lives.
+func TestTwoDaemonsAskingEachOtherOverHTTPNeverStartTheSameLabelTwice(t *testing.T) {
+	type machine struct {
+		sd  *start.Daemon
+		svc *remotestart.Service
+		ts  *httptest.Server
+	}
+	names := []string{"hp-ubuntu", "mac-tomas"}
+	set := remotestart.PeerSetHash(names)
+	ms := map[string]*machine{}
+	srvOf := map[string]*daemonapi.Server{}
+	for _, n := range names {
+		sd, p := policyFor(t, "tomas")
+		sd.Machine = n
+		m := &machine{sd: sd}
+		ms[n] = m
+		srv := &daemonapi.Server{}
+		srvOf[n] = srv
+		m.ts = httptest.NewServer(srv.Handler())
+		t.Cleanup(m.ts.Close)
+		_ = p
+	}
+	for _, n := range names {
+		other := names[0]
+		if n == names[0] {
+			other = names[1]
+		}
+		m := ms[n]
+		sd, p := policyFor(t, "tomas")
+		sd.Machine = n
+		sd.Launcher = aliveLauncher{}   // a launched session counts as live
+		sd.ProfileLoader = bothMachines // the profile is approved on both machines of this test
+		m.sd = sd
+		nn := n
+		svc, err := remotestart.New(remotestart.Config{
+			Machine: n, OwnerUser: "tomas", PeerSet: set, StateDir: t.TempDir(),
+			Peers:     []remotestart.Peer{{Name: other, URL: ms[other].ts.URL}},
+			Profiles:  bothMachines,
+			LookupUID: func(string) (int, error) { return 4000, nil },
+			Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
+				return startHandlerBy(sd, p, nil)(uid, spec, by)
+			},
+			Live: func(label string) []remotestart.View {
+				recs, _ := sd.LiveByLabel(label)
+				var out []remotestart.View
+				for _, r := range recs {
+					out = append(out, remotestart.View{Machine: nn, Sid: r.Sid, Gen: r.Gen, State: "running"})
+				}
+				return out
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.svc = svc
+		srvOf[n].Remote = svc
+	}
+	w := wdir(t)
+	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
+	body := func(machine, rid string) []byte {
+		return []byte(strings.NewReplacer(`"r1"`, `"`+rid+`"`, "hp-ubuntu", machine).Replace(fmt.Sprintf(specOf, "tomas", w)))
+	}
+	// the same label, started on BOTH machines at the same moment
+	var wg sync.WaitGroup
+	results := make([]*start.Refusal, 2)
+	ok := make([]bool, 2)
+	for i, n := range names {
+		wg.Add(1)
+		go func(i int, n string) {
+			defer wg.Done()
+			rep, ref := ms[n].svc.Start(context.Background(), me, body(n, "q"+strconv.Itoa(i)))
+			results[i], ok[i] = ref, rep != nil
+		}(i, n)
+	}
+	wg.Wait()
+	if ok[0] && ok[1] {
+		t.Fatal("the same label was started on both machines")
+	}
+	// afterwards: it lives on exactly one; a start on the other is refused with where
+	var live string
+	for _, n := range names {
+		if recs, _ := ms[n].sd.LiveByLabel("cc-sandbox:x"); len(recs) > 0 {
+			live = n
+		}
+	}
+	if live == "" {
+		for _, r := range results {
+			if r == nil || (r.Code != start.StartInProgress && r.Code != start.AlreadyRunning) {
+				t.Fatalf("neither machine started it, and a refusal is not the safe kind: %v", r)
+			}
+		}
+		return // both refused and would retry: the safe worst case
+	}
+	other := names[0]
+	if live == names[0] {
+		other = names[1]
+	}
+	_, ref := ms[other].svc.Start(context.Background(), me, body(other, "later"))
+	if ref == nil || ref.Code != start.AlreadyRunning || ref.Machine != live {
+		t.Fatalf("a start on %s after it lives on %s: %v", other, live, ref)
+	}
+}
+
+// aliveLauncher launches nothing and reports every session alive (start.NoLauncher reports none, so its records never
+// block a label: right for most tests, wrong for one about a label that IS live).
+type aliveLauncher struct{}
+
+func (aliveLauncher) Launch(*start.Record) error { return nil }
+func (aliveLauncher) Alive(string) bool          { return true }
+
+func bothMachines(name string) (*profile.Profile, error) {
+	p, err := profiles.Load(name)
+	if err == nil {
+		p.Machines = append(p.Machines, "mac-tomas")
+	}
+	return p, err
 }

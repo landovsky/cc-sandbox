@@ -50,6 +50,8 @@ type Toleration struct {
 	Operator string `json:"operator,omitempty"`
 	Value    string `json:"value,omitempty"`
 	Effect   string `json:"effect,omitempty"`
+	// TolerationSeconds is only ever set by the server, on its default NoExecute tolerations.
+	TolerationSeconds *int64 `json:"tolerationSeconds,omitempty"`
 }
 
 type DNSConfig struct {

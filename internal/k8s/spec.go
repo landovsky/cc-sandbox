@@ -207,10 +207,17 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 	return p, nil
 }
 
-// specHash is the sha256 of the pod's canonical JSON without its annotations.
+// specHash is the sha256 of the pod's canonical JSON without what the server or a person adds after
+// creation: annotations, UID, deletionTimestamp, status and the server's two default tolerations.
+// The same function hashes the pod as built and the pod as fetched, so a fetched pod hashes equal
+// only if every field we model is what we wrote.
 func specHash(p *Pod) (string, error) {
 	q := *p
 	q.Metadata.Annotations = nil
+	q.Metadata.UID = ""
+	q.Metadata.DeletionTimestamp = nil
+	q.Status = nil
+	q.Spec.Tolerations = withoutServerDefaults(p.Spec.Tolerations)
 	b, err := json.Marshal(&q)
 	if err != nil {
 		return "", err
@@ -219,17 +226,29 @@ func specHash(p *Pod) (string, error) {
 	return hex.EncodeToString(sum[:]), nil
 }
 
-// CheckFetched is CheckContract for a pod the server returned: the server adds its default
-// NoExecute tolerations (not-ready, unreachable), which are not ours to refuse, and nothing else.
+// isServerDefaultToleration is exactly what the API server's DefaultTolerationSeconds admission adds:
+// not-ready or unreachable, operator Exists, effect NoExecute, 300 s. Nothing wider is let through.
+func isServerDefaultToleration(t Toleration) bool {
+	return (t.Key == "node.kubernetes.io/not-ready" || t.Key == "node.kubernetes.io/unreachable") &&
+		t.Operator == "Exists" && t.Value == "" && t.Effect == "NoExecute" &&
+		t.TolerationSeconds != nil && *t.TolerationSeconds == 300
+}
+
+func withoutServerDefaults(in []Toleration) []Toleration {
+	var out []Toleration
+	for _, t := range in {
+		if !isServerDefaultToleration(t) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// CheckFetched is CheckContract for a pod the server returned: the server's two default tolerations
+// are not ours to refuse, and nothing else is let through.
 func (c Config) CheckFetched(p *Pod) error {
 	q := *p
-	q.Spec.Tolerations = nil
-	for _, t := range p.Spec.Tolerations {
-		if t.Effect == "NoExecute" && strings.HasPrefix(t.Key, "node.kubernetes.io/") {
-			continue
-		}
-		q.Spec.Tolerations = append(q.Spec.Tolerations, t)
-	}
+	q.Spec.Tolerations = withoutServerDefaults(p.Spec.Tolerations)
 	return c.CheckContract(&q)
 }
 

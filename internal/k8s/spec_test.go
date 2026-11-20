@@ -278,10 +278,11 @@ func TestPodCarriesItsSpecHash(t *testing.T) {
 // What the server adds (its NoExecute tolerations) is tolerated in a fetched pod, and only that.
 func TestCheckFetchedToleratesServerDefaultsOnly(t *testing.T) {
 	c := DefaultConfig()
+	s300 := int64(300)
 	p := goodPod(t)
 	p.Spec.Tolerations = append(p.Spec.Tolerations,
-		Toleration{Key: "node.kubernetes.io/not-ready", Operator: "Exists", Effect: "NoExecute"},
-		Toleration{Key: "node.kubernetes.io/unreachable", Operator: "Exists", Effect: "NoExecute"})
+		Toleration{Key: "node.kubernetes.io/not-ready", Operator: "Exists", Effect: "NoExecute", TolerationSeconds: &s300},
+		Toleration{Key: "node.kubernetes.io/unreachable", Operator: "Exists", Effect: "NoExecute", TolerationSeconds: &s300})
 	if err := c.CheckContract(p); err == nil {
 		t.Error("the strict check accepted extra tolerations")
 	}
@@ -291,6 +292,27 @@ func TestCheckFetchedToleratesServerDefaultsOnly(t *testing.T) {
 	p.Spec.Tolerations = append(p.Spec.Tolerations, Toleration{Key: "dedicated", Operator: "Exists"})
 	if err := c.CheckFetched(p); err == nil {
 		t.Error("an extra toleration of ours was accepted")
+	}
+}
+
+// Each way of widening a "default" toleration is refused: another key, a wider operator, the effect,
+// no seconds, other seconds, or a value.
+func TestServerDefaultTolerationsAreExactlyTwo(t *testing.T) {
+	c := DefaultConfig()
+	s300, s9000 := int64(300), int64(9000)
+	for why, tol := range map[string]Toleration{
+		"another node.kubernetes.io key": {Key: "node.kubernetes.io/disk-pressure", Operator: "Exists", Effect: "NoExecute", TolerationSeconds: &s300},
+		"effect NoSchedule":              {Key: "node.kubernetes.io/not-ready", Operator: "Exists", Effect: "NoSchedule", TolerationSeconds: &s300},
+		"no seconds (forever)":           {Key: "node.kubernetes.io/not-ready", Operator: "Exists", Effect: "NoExecute"},
+		"9000 seconds":                   {Key: "node.kubernetes.io/not-ready", Operator: "Exists", Effect: "NoExecute", TolerationSeconds: &s9000},
+		"operator Equal":                 {Key: "node.kubernetes.io/not-ready", Operator: "Equal", Effect: "NoExecute", TolerationSeconds: &s300},
+		"a value":                        {Key: "node.kubernetes.io/not-ready", Operator: "Exists", Value: "x", Effect: "NoExecute", TolerationSeconds: &s300},
+	} {
+		p := goodPod(t)
+		p.Spec.Tolerations = append(p.Spec.Tolerations, tol)
+		if err := c.CheckFetched(p); err == nil {
+			t.Errorf("%s was let through as a server default", why)
+		}
 	}
 }
 

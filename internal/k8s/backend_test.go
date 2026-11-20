@@ -76,8 +76,8 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// what the server's own admission adds: its default tolerations
 		spec := p["spec"].(map[string]any)
 		spec["tolerations"] = append(spec["tolerations"].([]any),
-			map[string]any{"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute"},
-			map[string]any{"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute"})
+			map[string]any{"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300},
+			map[string]any{"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute", "tolerationSeconds": 300})
 		f.pods[n] = p
 		reply(201, p)
 	case r.Method == "GET" && name == "":
@@ -365,6 +365,13 @@ func TestCreateOnAConflictAcceptsOnlyTheSamePod(t *testing.T) {
 		},
 		"a pod from another spec (another hash)": func(m map[string]any) {
 			dig(m, "metadata", "annotations").(map[string]any)[HashAnnotation] = strings.Repeat("0", 64)
+		},
+		"a pod with the right hash copied onto another image": func(m map[string]any) {
+			list(dig(m, "spec", "containers"))[0].(map[string]any)["image"] = "ghcr.io/landovsky/ccsbx-fence@sha256:" + strings.Repeat("e", 64)
+		},
+		"a pod with the right hash and another env value": func(m map[string]any) {
+			c := list(dig(m, "spec", "containers"))[0].(map[string]any)
+			c["env"] = append(list(c["env"]), map[string]any{"name": "X", "value": "1"})
 		},
 		"a pod with no hash": func(m map[string]any) { delete(dig(m, "metadata").(map[string]any), "annotations") },
 		"a pod that has since broken the contract": func(m map[string]any) {

@@ -28,7 +28,9 @@ func TestKubectlExecArgvEnvAndExitCode(t *testing.T) {
 	var out bytes.Buffer
 	kc := filepath.Join(t.TempDir(), "launcher.kubeconfig")
 	os.WriteFile(kc, []byte("apiVersion: v1\n"), 0o600)
-	x, err := NewKubectl(bin, kc)
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	os.WriteFile(ca, []byte("x"), 0o600)
+	x, err := NewKubectl(bin, kc, "https://10.0.0.1:6443", ca)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,7 +41,7 @@ func TestKubectlExecArgvEnvAndExitCode(t *testing.T) {
 	}
 	b, _ := os.ReadFile(log)
 	first := strings.SplitN(string(b), "\n", 2)[0]
-	if first != "--kubeconfig "+kc+" -n cc-sandbox exec -i -c side ccsbx-s-s0abcdefgh-g1 -- sh -c cat >/run/x" {
+	if first != "--kubeconfig "+kc+" --server https://10.0.0.1:6443 --certificate-authority "+ca+" --insecure-skip-tls-verify=false -n cc-sandbox exec -i -c side ccsbx-s-s0abcdefgh-g1 -- sh -c cat >/run/x" {
 		t.Errorf("kubectl was called as %q", first)
 	}
 	for _, leaked := range []string{"KUBECONFIG=", "HTTPS_PROXY", "evil", "HOME=/home"} {
@@ -48,7 +50,7 @@ func TestKubectlExecArgvEnvAndExitCode(t *testing.T) {
 		}
 	}
 	// a tty exec asks for -t, a failure to start kubectl is an error and not an exit code
-	if a := (Kubectl{Kubeconfig: "k"}).argv("n", "p", "fence", []string{"true"}, IO{TTY: true}); strings.Join(a, " ") != "--kubeconfig k -n n exec -t -c fence p -- true" {
+	if a := (Kubectl{Kubeconfig: "k", Server: "https://s", CAFile: "c"}).argv("n", "p", "fence", []string{"true"}, IO{TTY: true}); strings.Join(a, " ") != "--kubeconfig k --server https://s --certificate-authority c --insecure-skip-tls-verify=false -n n exec -t -c fence p -- true" {
 		t.Errorf("%v", a)
 	}
 	if code, err := (Kubectl{Bin: "/nonexistent/kubectl"}).Exec(context.Background(), "n", "p", "fence", []string{"x"}, IO{}); err == nil || code != -1 {
@@ -108,21 +110,32 @@ func TestKubectlRefusesUnusablePathsBeforeRunningAnything(t *testing.T) {
 	kc := filepath.Join(t.TempDir(), "kc")
 	os.WriteFile(kc, []byte("x"), 0o600)
 	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.pem")
+	os.WriteFile(ca, []byte("x"), 0o600)
+	const srv = "https://10.0.0.1:6443"
 	for name, k := range map[string]Kubectl{
-		"an empty kubeconfig":        {Bin: bin},
-		"a relative kubeconfig":      {Bin: bin, Kubeconfig: "kubeconfig"},
-		"a missing kubeconfig":       {Bin: bin, Kubeconfig: filepath.Join(dir, "nope")},
-		"a kubeconfig that is a dir": {Bin: bin, Kubeconfig: dir},
-		"a relative binary":          {Bin: "kubectl", Kubeconfig: kc},
-		"an empty binary":            {Kubeconfig: kc},
-		"an unclean binary path":     {Bin: filepath.Dir(bin) + "/../" + filepath.Base(filepath.Dir(bin)) + "/kubectl", Kubeconfig: kc},
+		"an empty kubeconfig":        {Bin: bin, Server: srv, CAFile: ca},
+		"a relative kubeconfig":      {Bin: bin, Kubeconfig: "kubeconfig", Server: srv, CAFile: ca},
+		"a missing kubeconfig":       {Bin: bin, Kubeconfig: filepath.Join(dir, "nope"), Server: srv, CAFile: ca},
+		"a kubeconfig that is a dir": {Bin: bin, Kubeconfig: dir, Server: srv, CAFile: ca},
+		"a relative binary":          {Bin: "kubectl", Kubeconfig: kc, Server: srv, CAFile: ca},
+		"an empty binary":            {Kubeconfig: kc, Server: srv, CAFile: ca},
+		"an unclean binary path":     {Bin: filepath.Dir(bin) + "/../" + filepath.Base(filepath.Dir(bin)) + "/kubectl", Kubeconfig: kc, Server: srv, CAFile: ca},
+		"no server":                  {Bin: bin, Kubeconfig: kc, CAFile: ca},
+		"a plain http server":        {Bin: bin, Kubeconfig: kc, Server: "http://localhost:8080", CAFile: ca},
+		"a server with userinfo":     {Bin: bin, Kubeconfig: kc, Server: "https://u:p@10.0.0.1", CAFile: ca},
+		"a server with a path":       {Bin: bin, Kubeconfig: kc, Server: "https://10.0.0.1/x", CAFile: ca},
+		"no CA":                      {Bin: bin, Kubeconfig: kc, Server: srv},
+		"a relative CA":              {Bin: bin, Kubeconfig: kc, Server: srv, CAFile: "ca.pem"},
+		"a missing CA":               {Bin: bin, Kubeconfig: kc, Server: srv, CAFile: filepath.Join(dir, "none.pem")},
+		"a CA that is a dir":         {Bin: bin, Kubeconfig: kc, Server: srv, CAFile: dir},
 	} {
 		in := &readCounter{r: strings.NewReader("TOKEN")}
 		code, err := k.Exec(context.Background(), "cc-sandbox", "ccsbx-s-s0abcdefgh-g1", "side", []string{"cat"}, IO{Stdin: in})
 		if err == nil || code != -1 || in.n != 0 {
 			t.Errorf("%s: %d %v (stdin read %d bytes)", name, code, err, in.n)
 		}
-		if _, err := NewKubectl(k.Bin, k.Kubeconfig); err == nil {
+		if _, err := NewKubectl(k.Bin, k.Kubeconfig, k.Server, k.CAFile); err == nil {
 			t.Errorf("%s: NewKubectl accepted it", name)
 		}
 	}
@@ -132,7 +145,7 @@ func TestKubectlRefusesUnusablePathsBeforeRunningAnything(t *testing.T) {
 	old, _ := os.Getwd()
 	os.Chdir(wd)
 	defer os.Chdir(old)
-	if _, err := NewKubectl(bin, "kubeconfig"); err == nil || !strings.Contains(err.Error(), "absolute") {
+	if _, err := NewKubectl(bin, "kubeconfig", srv, ca); err == nil || !strings.Contains(err.Error(), "absolute") {
 		t.Errorf("a relative kubeconfig that exists was accepted: %v", err)
 	}
 	if _, err := os.Stat(log); err == nil {
@@ -151,9 +164,11 @@ func (c *readCounter) Read(p []byte) (int, error) { n, err := c.r.Read(p); c.n +
 // name, and is refused while kubectl or the kubeconfig is not an absolute path.
 func TestAttachArgv(t *testing.T) {
 	b := NewBackend(nil, nil, DefaultConfig())
-	b.Kubectl, b.Kubeconfig = "/usr/local/bin/kubectl", "/var/lib/ccsbx-keys/launcher.kubeconfig"
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	os.WriteFile(ca, []byte("x"), 0o600)
+	b.Kubectl, b.Kubeconfig, b.Server, b.CAFile = "/usr/local/bin/kubectl", "/var/lib/ccsbx-keys/launcher.kubeconfig", "https://10.0.0.1:6443", ca
 	got, err := b.AttachArgv("s0abcdefgh", 3)
-	want := "/usr/local/bin/kubectl --kubeconfig /var/lib/ccsbx-keys/launcher.kubeconfig -n cc-sandbox exec -it -c fence ccsbx-s-s0abcdefgh-g3 -- tmux attach-session -t =s0abcdefgh:"
+	want := "/usr/local/bin/kubectl --kubeconfig /var/lib/ccsbx-keys/launcher.kubeconfig --server https://10.0.0.1:6443 --certificate-authority " + ca + " --insecure-skip-tls-verify=false -n cc-sandbox exec -it -c fence ccsbx-s-s0abcdefgh-g3 -- tmux attach-session -t =s0abcdefgh:"
 	if err != nil || strings.Join(got, " ") != want {
 		t.Errorf("%v %v", got, err)
 	}
@@ -170,6 +185,9 @@ func TestAttachArgv(t *testing.T) {
 		"a relative kubectl": func(b *Backend) { b.Kubectl = "kubectl" },
 		"no kubeconfig":      func(b *Backend) { b.Kubeconfig = "" },
 		"a relative one":     func(b *Backend) { b.Kubeconfig = "kc" },
+		"no server":          func(b *Backend) { b.Server = "" },
+		"an http server":     func(b *Backend) { b.Server = "http://localhost:8080" },
+		"no CA":              func(b *Backend) { b.CAFile = "" },
 	} {
 		b2 := *b
 		mod(&b2)

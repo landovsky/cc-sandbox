@@ -21,6 +21,8 @@ type Backend struct {
 	Cfg        Config
 	Kubectl    string // absolute path, for AttachArgv
 	Kubeconfig string // the launcher kubeconfig under ccsbx-keys, for AttachArgv
+	Server     string // https://host[:port], from ConnConfig, for AttachArgv
+	CAFile     string // CA file, from ConnConfig, for AttachArgv
 }
 
 // NewBackend wires a backend; kubectl and kubeconfig are only used to build attach argv.
@@ -96,6 +98,11 @@ func (b *Backend) Create(ctx context.Context, s Spec) (*Ref, error) {
 		}
 		if err := b.Cfg.CheckFetched(got); err != nil {
 			return nil, fmt.Errorf("pod %s exists but breaks the contract: %v", pod.Metadata.Name, err)
+		}
+		// The annotation is only a claim: anyone who can read it can copy it onto another pod. So the
+		// fetched pod is hashed again, and must come out as the hash it claims.
+		if h, herr := specHash(got); herr != nil || h != pod.Metadata.Annotations[HashAnnotation] {
+			return nil, fmt.Errorf("pod %s exists and carries this spec's hash, but is not this spec", pod.Metadata.Name)
 		}
 		return &ref, nil
 	}
@@ -190,6 +197,10 @@ func (b *Backend) AttachArgv(sid string, gen int) ([]string, error) {
 			return nil, fmt.Errorf("%s %q must be a clean absolute path", name, p)
 		}
 	}
-	return []string{b.Kubectl, "--kubeconfig", b.Kubeconfig, "-n", ref.Namespace, "exec", "-it", "-c", "fence", ref.Name, "--",
-		"tmux", "attach-session", "-t", "=" + sid + ":"}, nil
+	if err := checkConn(b.Server, b.CAFile); err != nil {
+		return nil, err
+	}
+	a := append([]string{b.Kubectl}, connArgs(b.Kubeconfig, b.Server, b.CAFile)...)
+	return append(a, "-n", ref.Namespace, "exec", "-it", "-c", "fence", ref.Name, "--",
+		"tmux", "attach-session", "-t", "="+sid+":"), nil
 }

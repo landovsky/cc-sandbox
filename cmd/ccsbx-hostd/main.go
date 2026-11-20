@@ -77,6 +77,8 @@ func app() *cli.App {
 				f.Int("min-uid", 1000, "session starts: a caller with a uid below this, root, or hostd's own uid is refused (ccsbx-root refuses them anyway; a start must not hold a label and a slot first)")
 				f.String("worktree-root", home, "session starts: comma-separated absolute directories (the syntax and meaning of ccsbx-root.toml allowed_roots, e.g. /home/u/git,/home/u/wt): a workdir must be strictly inside one of them after symlinks are resolved; a bad entry stops every start; hidden dirs of the home are refused when a root is the home")
 				f.String("pod-machines", "", "session starts: comma-separated machine names whose sessions run as pods (e.g. future-two): a spec for one is started through `sudo -n ccsbx-root pod-create` then `pod-load` (helper mode only); hostd holds no kubeconfig and never sees the pod's token or key. Empty: no pod placement")
+				f.String("signer-socket", "", "docker sessions: the signer's socket (hostd's own); with --revoke-door, the token of every generation that ends is revoked at the doors (the signer signs, hostd posts). Empty: no revoke (log only)")
+				f.String("revoke-door", "", "docker sessions: comma-separated base URLs of the doors' owner listeners that take the signed revoke at the end of a generation")
 				f.Duration("pod-ttl", 8*time.Hour, "pod sessions: a pod session older than this is stopped by the sweep (the pod deleted by UID); keep it at the root config's k8s_token_hours")
 				f.Duration("pod-sweep", time.Minute, "pod sessions: how often the sweep looks for expired pods and pods the owner already stopped (0 turns it off)")
 				f.Duration("pod-load-wait", 0, "pod sessions: how long hostd waits for `ccsbx-root pod-load` (0: its worst case, 600 s ready deadline plus load and API time, plus 30 s)")
@@ -193,7 +195,8 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	}
 	h := hostd.New(hostd.Config{Journal: j, OnEvent: onEvent, OnTick: func() { rt.Pump(pumpReply(runDir)) },
 		StateDir: get("state"), RunDir: runDir, FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
-		Handler: m.handle, Rate: float64(num("rate")), Burst: num("burst"), EventRate: float64(num("event-rate")), EventBurst: num("event-burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
+		OnGenerationEnd: generationEndRevoker(get("signer-socket"), get("revoke-door"), lg.Printf),
+		Handler:         m.handle, Rate: float64(num("rate")), Burst: num("burst"), EventRate: float64(num("event-rate")), EventBurst: num("event-burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
 	})
 	if get("once") == "true" {
 		st := h.Scan()
@@ -234,6 +237,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 			}
 		}
 		sd.PodRoot = start.SudoPodRoot{LoadWait: dur("pod-load-wait")}
+		sd.PodVerbsRevoke = true
 		sd.Logf = lg.Printf
 		if every := dur("pod-sweep"); every > 0 {
 			ttl := dur("pod-ttl")

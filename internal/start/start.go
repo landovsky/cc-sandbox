@@ -88,9 +88,13 @@ type Daemon struct {
 	// generation ends (the doors then refuse it; plan U5). Optional.
 	Revoke func(sid string, gen int)
 	// Logf receives the daemon's notices; with no Revoke it carries "token may exist for sid X gen N".
-	Logf        func(format string, a ...any)
-	ReplaceWait time.Duration // how long Replace waits for the old fence to shut down (default 15s)
-	Now         func() time.Time
+	Logf func(format string, a ...any)
+	// PodVerbsRevoke says ccsbx-root's pod verbs revoke a pod generation's token and relay themselves (pod-stop, and
+	// pod-load when it fails), so hostd has nothing to revoke by hand for pods and says nothing about it; their
+	// own audit lines report a revoke that failed.
+	PodVerbsRevoke bool
+	ReplaceWait    time.Duration // how long Replace waits for the old fence to shut down (default 15s)
+	Now            func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
 	Exe string
 }

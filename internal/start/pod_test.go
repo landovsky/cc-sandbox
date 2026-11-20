@@ -533,3 +533,20 @@ func TestAResumeDoesNotCountTwiceAgainstMaxLive(t *testing.T) {
 		t.Errorf("the only live session could not be resumed: %v", err)
 	}
 }
+
+// with the pod verbs revoking the token themselves, hostd does not log "revoke by hand" for a pod
+func TestHostdSaysNothingAboutRevokingWhenThePodVerbsDoIt(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	d.Revoke = nil
+	d.PodVerbsRevoke = true
+	l := logs(d)
+	fr.loadEr = errors.New("side load refused: bad key")
+	if _, err := d.Start(podSpec(nil)); err == nil || len(*l) != 0 {
+		t.Errorf("%v logged %v", err, *l)
+	}
+	d.PodVerbsRevoke = false
+	d.Start(podSpec(func(s *LaunchSpec) { s.RequestID, s.Label = "rid-3", "cc-sandbox:c" }))
+	if len(*l) != 1 {
+		t.Errorf("without the verbs revoking, the by-hand line must come back: %v", *l)
+	}
+}

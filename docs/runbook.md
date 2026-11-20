@@ -741,8 +741,10 @@ for the others), and `internal/revoke` posts it exactly as signed to every door 
 doors' owner listeners, `/_ccsbx/revoke`; no redirects). `pod-stop` revokes the token before it deletes the pod (whatever
 the delete does), and `pod-load` revokes it when the load or the mint fails after the signer may have signed. Never
 fatal: a failure is an audit line `token-revoke ... FAILED, revoke by hand` with the sid and generation (the token
-expires within `k8s_token_hours` anyway). With no `revoke_doors` the line says so. The docker generation's revoke from
-hostd (`OnGenerationEnd`) is not wired yet.
+expires within `k8s_token_hours` anyway). With no `revoke_doors` the line says so. For docker generations hostd does it: `--signer-socket` (hostd's own signer socket) and `--revoke-door` (comma list
+of the doors' owner listeners) turn on `OnGenerationEnd`: when a generation's outbox is drained for the last time hostd
+asks the signer to sign the revoke and posts it, retrying in the background (5 s, 30 s, 2 min); a revoke that never
+works is logged with `revoke sid <s> gen <n> by hand`. With neither flag nothing is revoked.
 
 **F3c in the pod spec.** `pod-create` also gives the sidecar `--git-repo owner/name` (the record's `workdir.repo`),
 `--git-base` and `--git-branch` (the record's `workdir.base` / `.branch`, left out when empty; plain branch names only)

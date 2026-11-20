@@ -335,6 +335,9 @@ func (d *Daemon) revokeOrSay(sid string, gen int) {
 		d.Revoke(sid, gen)
 		return
 	}
+	if d.PodVerbsRevoke {
+		return
+	}
 	if d.Logf != nil {
 		d.Logf("pod session %s generation %d: a token may exist and is not revoked (no revoke client): revoke sid %s gen %d by hand", sid, gen, sid, gen)
 	}

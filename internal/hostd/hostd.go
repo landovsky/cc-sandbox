@@ -78,22 +78,26 @@ type Config struct {
 	// state dir (direct mode). In helper mode they belong to ccsbx-root's run dir
 	// (/var/lib/ccsbx-run), the out/ leaf is 10001:ccsbx 02750 (hostd reads it through the group, never writes it) and s/ and s/<sid> are not listable by hostd: it derives every path from its records;
 	// hostd's own ledger, state and journal stay under StateDir.
-	RunDir           string
-	FenceUID         int                  // owner uid required of every outbox file
-	MaxBytes         int64                // per request file
-	Rate             float64              // requests per second per outbox
-	Burst            int                  // bucket size per outbox
-	MaxList          int                  // names read per outbox per scan
-	MaxTotal         int                  // requests per generation in its lifetime; beyond: shed silently
-	ShedRefs         int                  // refusal replies written per scan once the bucket is empty
-	Handler          Handler              // nil: every known type is answered error/not_built
-	OnEvent          func(journal.Record) // called after each fence event was journaled (hear)
-	OnTick           func()               // called after every scan (the message pump)
-	Journal          Journal              // nil: events.jsonl is not ingested (U3a alone)
-	MaxEventsPerScan int                  // events taken from one outbox per scan
-	MaxEventLine     int                  // bytes per events.jsonl line; longer lines are dropped
-	EventRate        float64              // fence events journaled per second per outbox; beyond: dropped and counted
-	EventBurst       int                  // event bucket size per outbox
+	RunDir   string
+	FenceUID int                  // owner uid required of every outbox file
+	MaxBytes int64                // per request file
+	Rate     float64              // requests per second per outbox
+	Burst    int                  // bucket size per outbox
+	MaxList  int                  // names read per outbox per scan
+	MaxTotal int                  // requests per generation in its lifetime; beyond: shed silently
+	ShedRefs int                  // refusal replies written per scan once the bucket is empty
+	Handler  Handler              // nil: every known type is answered error/not_built
+	OnEvent  func(journal.Record) // called after each fence event was journaled (hear)
+	OnTick   func()               // called after every scan (the message pump)
+	// OnGenerationEnd is called once for each generation whose outbox has been drained for the last time
+	// (CLOSED, superseded or ended), with the session's owner and machine from its record: the moment its
+	// token must die at the doors. It runs inside the scan and must not block.
+	OnGenerationEnd  func(sid string, gen int, owner, machine string)
+	Journal          Journal // nil: events.jsonl is not ingested (U3a alone)
+	MaxEventsPerScan int     // events taken from one outbox per scan
+	MaxEventLine     int     // bytes per events.jsonl line; longer lines are dropped
+	EventRate        float64 // fence events journaled per second per outbox; beyond: dropped and counted
+	EventBurst       int     // event bucket size per outbox
 	Now              func() time.Time
 	Logf             func(format string, args ...any)
 }
@@ -292,6 +296,9 @@ func (h *Hostd) Scan() Stats {
 			}
 			h.lifecycle(gdir, rec, box, "session.ended")
 			h.done[gdir] = true
+			if h.Cfg.OnGenerationEnd != nil {
+				h.Cfg.OnGenerationEnd(sid, genN, rec.Spec.Owner, rec.Spec.Machine)
+			}
 			delete(h.boxes, gdir)
 		}
 	}

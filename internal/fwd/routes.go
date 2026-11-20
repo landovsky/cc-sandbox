@@ -78,6 +78,14 @@ func CleanPath(u *url.URL) (string, bool) {
 			return "", false
 		}
 	}
+	// Decode once and require the escaped form to be the canonical encoding of the decoded path.
+	// An escape that only hides a plain character (%61 for "a") is then refused, so the checks below
+	// see the same segments the door will after it decodes, and a double encoding (the decoded path
+	// still holds a "%") is refused too.
+	dec, err := url.PathUnescape(raw)
+	if err != nil || strings.Contains(dec, "%") || (&url.URL{Path: dec}).EscapedPath() != raw {
+		return "", false
+	}
 	if path.Clean(raw) != raw && !(strings.HasSuffix(raw, "/") && path.Clean(raw)+"/" == raw) {
 		return "", false
 	}
@@ -91,14 +99,27 @@ func CleanPath(u *url.URL) (string, bool) {
 // word as a whole token in a key or value (?action=approve). Decisions live on the owner
 // listener, so this is defence in depth behind a broad --routes file.
 func QueryHasDecisionWord(rawQuery string) bool {
-	for _, tok := range strings.FieldsFunc(strings.ToLower(rawQuery), func(r rune) bool {
-		return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
-	}) {
-		if denySegments[tok] {
+	// Doors decode the query, so test every layer of decoding (up to a few), not the raw bytes only.
+	// A query that does not decode at all is treated as carrying one.
+	q := rawQuery
+	for i := 0; i < 4; i++ {
+		for _, tok := range strings.FieldsFunc(strings.ToLower(q), func(r rune) bool {
+			return !(r >= 'a' && r <= 'z' || r >= '0' && r <= '9')
+		}) {
+			if denySegments[tok] {
+				return true
+			}
+		}
+		d, err := url.QueryUnescape(q)
+		if err != nil {
 			return true
 		}
+		if d == q {
+			return false
+		}
+		q = d
 	}
-	return false
+	return true
 }
 
 // Check decides whether method+p (a clean path, without query) may go to door.
@@ -110,6 +131,9 @@ func Check(rules []Rule, door, method, p string) Verdict {
 		}
 		if denySegments[strings.ToLower(s)] {
 			return DenyDecision
+		}
+		if d, err := url.PathUnescape(s); err != nil || denySegments[strings.ToLower(d)] {
+			return DenyDecision // defence in depth: CleanPath already refuses encoded plain letters
 		}
 	}
 	for _, r := range rules {

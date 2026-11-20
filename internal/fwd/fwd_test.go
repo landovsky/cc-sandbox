@@ -158,6 +158,23 @@ func TestApproveViaFwd(t *testing.T) {
 			t.Fatalf("broad rule routed a /%s endpoint: %d", seg, resp.StatusCode)
 		}
 	}
+	// Review M1: the door decodes what it receives, so an encoded letter must not hide a deny word,
+	// in the path or in the query, nor survive a double encoding.
+	for _, p := range []string{"/egress/v1/x/%61pprove", "/egress/v1/x/%41PPROVE", "/egress/v1/x/ap%70rove",
+		"/egress/v1/x/%2561pprove", "/egress/v1/%64ecide", "/egress/v1/x?a=%61pprove", "/egress/v1/x?a=%2561pprove",
+		"/egress/v1/x?%61ction=ap%70rove"} {
+		resp, err := http.Post(s.URL+p, "application/json", strings.NewReader("{}"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 403 {
+			t.Fatalf("encoded decision word %s got through: %d", p, resp.StatusCode)
+		}
+	}
+	if n := r.hits.Load(); n != 0 {
+		t.Fatalf("door reached %d times through an encoded decision word", n)
+	}
 }
 
 // default deny, and shapes of path that could be read two ways.

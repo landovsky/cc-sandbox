@@ -196,7 +196,9 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	}
 	stage := func(s backend.Spec) (func(), error) { return e.stage(s, wpin, gpin) }
 	files := rec.FenceFiles(e.cfg.Machine, res.Settings, res.MCP)
-	return e.d.NewBackend(docker, e.d.Mounter).Run(spec, files, stage, e.d.Stdin, stdout, stderr)
+	code, err := e.d.NewBackend(docker, e.d.Mounter).Run(spec, files, stage, e.d.Stdin, stdout, stderr)
+	e.revokeRelay(rec.Sid, rec.Gen) // the generation is over: its relay credential goes with it
+	return code, err
 }
 
 // stage makes the two mountpoints under the generation directory and binds the pinned
@@ -285,6 +287,7 @@ func (e *env) stopCmd() *cli.Command {
 				return fail(stderr, "stop", err)
 			}
 			fmt.Fprintf(stdout, "stopped %s g%d\n", rec.Sid, rec.Gen)
+			e.revokeRelay(rec.Sid, rec.Gen)
 			if err := e.stripSession(rec); err != nil {
 				fmt.Fprintf(stderr, "ccsbx-root stop: the container is gone, but the workdir was not cleaned of setid bits: %v\n", err)
 				return cli.ExitFail
@@ -397,6 +400,13 @@ func (e *env) gcCmd() *cli.Command {
 				return fail(stderr, "gc", err)
 			}
 			fmt.Fprintf(stdout, "removed %d orphan(s)\n", len(orphans))
+			revoked := map[string]bool{}
+			for _, o := range orphans {
+				if k := fmt.Sprintf("%s/%d", o.Sid, o.Gen); !revoked[k] && o.Gen >= 1 {
+					revoked[k] = true
+					e.revokeRelay(o.Sid, o.Gen)
+				}
+			}
 			failed := false
 			seen := map[string]bool{}
 			for _, o := range orphans {

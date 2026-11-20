@@ -629,3 +629,17 @@ git clone inside the pod (F3c), a hostd revoke client (`Daemon.Revoke` is nil in
 
 The sidecar has a `journal` volume of its own (emptyDir, 16Mi, disk-backed, sidecar only, mounted at
 `/run/ccsbx/journal`), apart from the 8Mi `side-state` that holds the ledger.
+
+## relay-mint (M2b, D2)
+
+`sudo -n ccsbx-root relay-mint [--after-401] -- <sid> <gen> <pub>` (service user only; spec in
+`docs/relay-mint-spec.md`). Root config keys: `hub_url` (default `http://127.0.0.1:4011`, loopback only, refused
+otherwise) and `hub_secret` (default `/etc/ccsbx/hub-admin.secret`, root-owned, mode 0600, directory not
+group/other-writable; the installer creates it from the hub's admin secret, it is never copied off hp). The
+relay's `may_reach` is the record's `msg_scope.manager` as `<machine>/<node>`, empty when the record names no
+manager machine; there is no argument for it (peers are Tomas's open question #3cy2). Exit 2: refused (not
+the service user, stale or ended or not running or another machine's generation, rate, bad arguments), exit
+3: the hub or the secret (status code only on stderr). One audit line per mint and revoke on stderr (the first
+8 hex of sha256(pub), never a token or the secret). The relay is revoked (`DELETE /v1/principals/relay:<sid>%2F<gen>`)
+at the end of `run`, in `stop` and in `gc` for each reaped generation, best effort; the hub's 6 h relay
+lifetime is the backstop. Not run against a real hub (Gate M).

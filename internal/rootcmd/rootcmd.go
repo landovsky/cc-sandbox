@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/user"
 	"strconv"
@@ -85,6 +86,10 @@ type Deps struct {
 	Mint   func(ctx context.Context, cfg *Config, c token.Claims) ([]byte, error)
 	Sleep  func(time.Duration)
 	Now    func() time.Time
+	// Hub is the HTTP client for the hub (no redirects, 10 s); Audit takes one line per relay mint and
+	// revoke (never a token or secret). nil: production defaults.
+	Hub   *http.Client
+	Audit io.Writer
 }
 
 // App builds the command table for a loaded config.
@@ -94,7 +99,7 @@ func App(cfg *Config, d *Deps, getenv func(string) string) *cli.App {
 		Name: "ccsbx-root", Summary: "the fixed-verb root door for the fence (U0): run stop renew gc attach exec-token pod-create pod-load pod-stop",
 		Version: "dev", Getenv: getenv, EnvPrefix: "CCSBX_ROOT_",
 		Cmds: []*cli.Command{
-			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(), e.podCreateCmd(), e.podLoadCmd(), e.podStopCmd(),
+			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(), e.relayMintCmd(), e.podCreateCmd(), e.podLoadCmd(), e.podStopCmd(),
 			e.notWired("renew", "renew the machine's credentials (needs the signer, U0b)"),
 			e.notWired("exec-token", "mint an exec token for one session (needs the signer, U0b)"),
 		},

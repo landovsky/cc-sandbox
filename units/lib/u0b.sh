@@ -10,6 +10,7 @@
 KEYS_DIR=/var/lib/ccsbx-keys
 LAUNCH_DIR=/var/lib/ccsbx-launch               # ccsbx-launch: the launcher kubeconfig and token, 0700
 STATE_DIR=/var/lib/ccsbx
+LAUNCH_SOCK=/run/ccsbx-signer/launch.sock     # the second socket (ccsbx-signer-launch.socket): ccsbx-keys:ccsbx-launch 0660, the pod launcher's
 SIGNER_SOCK=/run/ccsbx-signer/sign.sock       # systemd creates it (ccsbx-signer.socket): ccsbx-keys:ccsbx 0660
 HOSTD_SOCK=/run/ccsbx-api/hostd.sock          # hostd makes it: ccsbx:ccsbx-clients 0660 (dir 0755)
 KEY_FILES="age.key machine.key"
@@ -70,7 +71,10 @@ u0b_signer() {
   step "U0b signer socket + service (sign(token_claims) only; the socket is activated by systemd)"
   put /etc/systemd/system/ccsbx-signer.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-signer.service"
   put /etc/systemd/system/ccsbx-signer.socket 0644 root:root < "$UNITS_DIR/systemd/ccsbx-signer.socket"
+  put /etc/systemd/system/ccsbx-signer-launch.socket 0644 root:root < "$UNITS_DIR/systemd/ccsbx-signer-launch.socket"
   cmd systemctl daemon-reload
+  note "two sockets, one service: the main socket (hostd) is fd 3 and the launch socket (ccsbx-launch) fd 4; the service Requires both"
+  cmd systemctl enable --now ccsbx-signer-launch.socket
   cmd systemctl enable --now ccsbx-signer.socket
 }
 
@@ -150,8 +154,10 @@ u0b_check() {
     else ok "test -r $k fails for $(id -un)"; fi
   done
   expect "ccsbx-signer.socket is active" systemctl is-active --quiet ccsbx-signer.socket
+  expect "ccsbx-signer-launch.socket is active" systemctl is-active --quiet ccsbx-signer-launch.socket
   expect "ccsbx-signer unit installed" test -f "$(pth /etc/systemd/system/ccsbx-signer.service)"
   sock_check "signer socket" "$SIGNER_SOCK" ccsbx
+  sock_check "launch socket (the pod launcher's)" "$LAUNCH_SOCK" ccsbx-launch
   sock_check "hostd socket" "$HOSTD_SOCK" "$(real_user)"
   sign_check
 }

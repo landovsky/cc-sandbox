@@ -11,6 +11,7 @@ SocketUser=ccsbx-keys
 SocketGroup=ccsbx
 SocketMode=0660
 DirectoryMode=0755
+FileDescriptorName=main
 
 [Install]
 WantedBy=sockets.target

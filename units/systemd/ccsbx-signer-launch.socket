@@ -1,0 +1,19 @@
+# ccsbx-signer-launch.socket (U0b, round 3). The signer's SECOND unix socket, for the pod launcher only.
+# Why: the main socket is ccsbx-keys:ccsbx 0660 (hostd's group). The launcher (ccsbx-launch, the signer's keys peer for
+# future-two) must reach the signer without joining hostd's group, so it gets a socket of its own: group ccsbx-launch.
+# Both sockets belong to ccsbx-signer.service; it takes them as fds 3 and 4, the main socket FIRST (--systemd-socket
+# takes exactly two fds when --keys-peer-user is set). FileDescriptorName= makes the order checkable (LISTEN_FDNAMES).
+[Unit]
+Description=ccsbx signer socket for the pod launcher
+
+[Socket]
+ListenStream=/run/ccsbx-signer/launch.sock
+SocketUser=ccsbx-keys
+SocketGroup=ccsbx-launch
+SocketMode=0660
+DirectoryMode=0755
+FileDescriptorName=launch
+Service=ccsbx-signer.service
+
+[Install]
+WantedBy=sockets.target

@@ -9,13 +9,14 @@
 [Unit]
 Description=ccsbx signer (machine key; sign(token_claims) only)
 After=local-fs.target
-Requires=ccsbx-signer.socket
+Requires=ccsbx-signer.socket ccsbx-signer-launch.socket
+After=ccsbx-signer.socket ccsbx-signer-launch.socket
 
 [Service]
 Type=simple
 User=ccsbx-keys
 Group=ccsbx-keys
-ExecStart=/usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --systemd-socket --allow-user ccsbx --keys-peer-user ccsbx-launch --keys-peer-machines future-two
+ExecStart=/usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --systemd-socket --allow-user ccsbx --keys-peer-user ccsbx-launch --keys-peer-machines future-two --keys-peer-socket /run/ccsbx-signer/launch.sock
 Restart=on-failure
 RestartSec=2
 # hardening: it reads its own key directory, writes nothing else, talks to nobody

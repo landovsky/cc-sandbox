@@ -751,3 +751,15 @@ func helperImage(d *Daemon) {
 	d.Image = "ghcr.io/landovsky/ccsbx-fence@sha256:" + strings.Repeat("a", 64)
 	d.ProfileLoader = profiles.Load
 }
+
+// context (R-H round 2): root's exit 3 ("could not tell") is this machine's trouble, not a bad spec: internal, not bad_spec.
+func TestACheckThatCouldNotTellIsInternalNotBadSpec(t *testing.T) {
+	d, _ := newDaemon(t)
+	d.Root, d.StartedBy = "helper", "owner:tomas@example.com@mac"
+	helperImage(d)
+	d.WorktreeRoot = filepath.Dir(spec(nil).Workdir.Path)
+	d.WorktreeCheck = func(string) (string, string, error) { return "", "", ErrCannotTell }
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Profile, s.Billing = "e2e-default", "stub" })); code(err) != "internal" {
+		t.Fatalf("%v", err)
+	}
+}

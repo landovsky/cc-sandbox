@@ -238,6 +238,9 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		if errors.Is(err, ErrNoHelper) {
 			return nil, refuse(NotBuilt, "a remote start needs ccsbx-root, which is not installed here")
 		}
+		if errors.Is(err, ErrCannotTell) { // root could not tell (exit 3): our side's trouble, not the caller's spec
+			return nil, refuse("internal", "the worktree check could not be made on this machine (see the daemon's log)")
+		}
 		if err != nil || got != filepath.Clean(s.Workdir.Path) {
 			return nil, refuse(BadSpec, "workdir is not a git worktree root")
 		}
@@ -478,6 +481,9 @@ func (d *Daemon) Load(sid string) (*Record, error) {
 
 // ErrNoHelper: ccsbx-root is not installed, so no worktree check can be made (the start is not_built, not bad_spec).
 var ErrNoHelper = errors.New("ccsbx-root is not installed")
+
+// ErrCannotTell: ccsbx-root worktree-check exited 3 (an unreadable config or record, a read error): no verdict, and not the caller's fault.
+var ErrCannotTell = errors.New("the worktree check could not tell")
 
 // overlaps: a and b are the same directory, or one is inside the other.
 func overlaps(a, b string) bool {

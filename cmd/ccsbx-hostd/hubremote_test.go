@@ -801,3 +801,24 @@ func TestAStalledSignalIgnoringHelperCannotHoldTheCallerPastItsBound(t *testing.
 		t.Fatalf("err=%v after %v", err, time.Since(t0))
 	}
 }
+
+// context (R-H round 2): an older ccsbx-root answers one line, or an empty gitdir; recording that would start a session
+// that `ccsbx-root run` refuses later. Only two non-empty, clean, absolute lines are an answer.
+func TestOnlyAPathAndANonEmptyGitdirAreAWorktreeCheckAnswer(t *testing.T) {
+	if p, g, err := parseWorktreeAnswer([]byte("/home/u/git/x\n/home/u/git/x/.git\n")); err != nil || p != "/home/u/git/x" || g != "/home/u/git/x/.git" {
+		t.Fatalf("%q %q %v", p, g, err)
+	}
+	for name, out := range map[string]string{
+		"one line (an older root)": "/home/u/git/x\n",
+		"an empty gitdir line":     "/home/u/git/x\n\n",
+		"three lines":              "/a\n/b\n/c\n",
+		"nothing":                  "",
+		"a relative gitdir":        "/home/u/git/x\n.git\n",
+		"an unclean path":          "/home/u/git/../x\n/home/u/git/x/.git\n",
+		"a trailing slash":         "/home/u/git/x/\n/home/u/git/x/.git\n",
+	} {
+		if _, _, err := parseWorktreeAnswer([]byte(out)); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}

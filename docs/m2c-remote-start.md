@@ -116,14 +116,14 @@ hostd calls it (wired: `rootWorktreeCheck`); with no helper installed a remote s
   path (a directory that is a git directory, or a `.git` file whose `gitdir:` target is host-owned and inside an allowed root), not a symlink; it does
   not equal, contain or sit inside another live session's workdir (root reads the run dir). The same rules `ccsbx-root run` applies at launch,
   so a path that passes here is one the run will accept.
-- **stdout on success: TWO lines, `<path>\n<gitdir>\n`:** the resolved absolute path (what hostd records and mounts), then the gitdir root
-  root derived (an absolute path, or an empty line when none). hostd records the second line as the session's `GitDir` (a caller never supplies one:
-  "a remote start carries no gitdir from the caller; root derives it and it is mounted read-only"); `ccsbx-root run` compares its own derivation
-  with the record, so a path that passes here is one the run accepts. Nothing else on stdout. stderr: one short fixed line per
-  refusal, with no path and no OS text.
+- **stdout on success: EXACTLY two lines, `<path>\n<gitdir>\n`, both non-empty, clean, absolute:** the resolved path (what hostd records and
+  mounts), then the gitdir root derived. hostd refuses anything else (a one-line answer or an empty second line, as an older ccsbx-root would give,
+  would record a start with no gitdir that `ccsbx-root run` then refuses). The first line must equal the path asked about; the gitdir must pass
+  `CheckGitDirLexical` (inside a configured root). hostd records the second line as the session's `GitDir` (a caller never supplies one); `ccsbx-root run`
+  compares its own derivation with the record. stderr: one fixed line per refusal, no path or OS text. Nothing else on stdout.
 - **Exit codes:** `0` the path is a git worktree root under `allowed_roots`; `2` refused: bad arguments, not under a root, not a directory, no own
   `.git`, a `.git` that is a symlink or not host-owned, overlaps a live session's workdir; `3` could not tell (a read error, the config unreadable): hostd
-  treats it as a refusal (`internal`), never as "ok".
+  answers `internal` (this machine's trouble, not the caller's spec), never "ok".
 - **hostd's side:** called once per remote start, after the shape and policy checks and BEFORE any record is written or any peer is asked, with a 5 s
   bound (SIGTERM at the deadline, 1 s WaitDelay, fixed environment: a stalled helper cannot hold the daemon lock); any exit but 0, a timeout, or a stdout that is not `<path>` or `<path>\n<gitdir>` with the first line the path asked about is `bad_spec` ("workdir is not a git
   worktree root"), with a fixed message. The returned path replaces `workdir.path` in the record. Dead-pane records are ended before root is asked (root counts `Ended == nil` records as live). A missing helper is `not_built`, any other failure `bad_spec`. It runs only for remote starts (`started_by` set); local

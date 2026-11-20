@@ -81,7 +81,7 @@ func rootMinter() minter {
 
 // rootWorktreeCheck is the helper-mode remote start's worktree check (docs/m2c-remote-start.md §4b):
 // `sudo -n ccsbx-root worktree-check -- <path>`: exit 0 and stdout `<path>\n<gitdir>\n` (the resolved path, then the gitdir root
-// derived, possibly empty), or anything else (2 refused, 3 could not tell, a timeout, a stalled helper) which is a refusal. Bounded
+// derived: both required), or anything else (2 refused, 3 could not tell, a timeout, a stalled helper) which is a refusal. Bounded
 // like SudoPodRoot.run: SIGTERM on the deadline (sudo relays it; SIGKILL to sudo would orphan the verb and leave it holding the pipe
 // while hostd holds the daemon lock), a 1 s WaitDelay, a fixed environment.
 func rootWorktreeCheck(path string) (string, string, error) {
@@ -90,20 +90,29 @@ func rootWorktreeCheck(path string) (string, string, error) {
 	}
 	out, err := runBounded(5*time.Second, start.SudoBin, "-n", start.RootBin, "worktree-check", "--", path)
 	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 3 {
+			return "", "", start.ErrCannotTell
+		}
 		return "", "", fmt.Errorf("worktree-check refused")
 	}
+	return parseWorktreeAnswer(out)
+}
+
+// parseWorktreeAnswer takes the verb's stdout. EXACTLY two non-empty, clean, absolute lines: the path, then its derived
+// gitdir. A one-line answer or an empty second line (an older ccsbx-root) would record the start with no gitdir and
+// `ccsbx-root run` would refuse it later: refuse now. Start checks the first line is the asked path and the gitdir lies in a root.
+func parseWorktreeAnswer(out []byte) (string, string, error) {
 	lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
-	if len(lines) < 1 || len(lines) > 2 || len(out) > 8192 || lines[0] == "" || !filepath.IsAbs(lines[0]) {
-		return "", "", fmt.Errorf("worktree-check answered something that is not <path>[\\n<gitdir>]")
+	if len(out) > 8192 || len(lines) != 2 {
+		return "", "", fmt.Errorf("worktree-check did not answer <path>\\n<gitdir>")
 	}
-	gd := ""
-	if len(lines) == 2 {
-		gd = lines[1]
-		if gd != "" && !filepath.IsAbs(gd) {
-			return "", "", fmt.Errorf("worktree-check answered a gitdir that is not absolute")
+	for _, l := range lines {
+		if l == "" || !filepath.IsAbs(l) || filepath.Clean(l) != l {
+			return "", "", fmt.Errorf("worktree-check answered a line that is not a clean absolute path")
 		}
 	}
-	return lines[0], gd, nil
+	return lines[0], lines[1], nil
 }
 
 type relayKey struct {

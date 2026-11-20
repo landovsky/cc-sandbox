@@ -85,7 +85,9 @@ type Daemon struct {
 	PodRoot    PodRoot
 	// Revoke is called when a pod session's token may exist and the start is abandoned or the
 	// generation ends (the doors then refuse it; plan U5). Optional.
-	Revoke      func(sid string, gen int)
+	Revoke func(sid string, gen int)
+	// Logf receives the daemon's notices; with no Revoke it carries "token may exist for sid X gen N".
+	Logf        func(format string, a ...any)
 	ReplaceWait time.Duration // how long Replace waits for the old fence to shut down (default 15s)
 	Now         func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").

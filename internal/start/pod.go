@@ -198,8 +198,8 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record) (*StartReply, error) {
 	}
 	// 3. wait and load: root mints the token in its own process and loads the sidecar
 	if err := d.PodRoot.Load(sid); err != nil {
-		if !errors.Is(err, ErrPodNotReady) && d.Revoke != nil {
-			d.Revoke(sid, rec.Gen) // a token may exist
+		if !errors.Is(err, ErrPodNotReady) {
+			d.revokeOrSay(sid, rec.Gen) // a token may exist
 		}
 		if errors.Is(err, ErrPodNotReady) {
 			return abandon(err, PodNotReady)
@@ -228,11 +228,21 @@ func (d *Daemon) StopPod(sid string) error {
 			return err
 		}
 	}
-	if d.Revoke != nil {
-		d.Revoke(sid, rec.Gen)
-	}
+	d.revokeOrSay(sid, rec.Gen)
 	if rec.Ended == nil {
 		d.markEnded(rec)
 	}
 	return nil
+}
+
+// revokeOrSay revokes the generation's token, or, with no revoke client, logs which token may still
+// be valid so the owner can revoke it by hand (it expires within k8s_token_hours in any case).
+func (d *Daemon) revokeOrSay(sid string, gen int) {
+	if d.Revoke != nil {
+		d.Revoke(sid, gen)
+		return
+	}
+	if d.Logf != nil {
+		d.Logf("pod session %s generation %d: a token may exist and is not revoked (no revoke client): revoke sid %s gen %d by hand", sid, gen, sid, gen)
+	}
 }

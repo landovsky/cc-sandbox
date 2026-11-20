@@ -6,6 +6,7 @@ package start
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,6 +79,24 @@ func TestPodStart(t *testing.T) {
 		rec, _ := d.Load(rep.Sid)
 		if rec.Backend != "k8s" || rec.PodUID != "pod-uid-1" || rep.Backend != "k8s" || rep.ID != "tomas/future-two/"+rep.Sid+"/g1" || rec.Spec.Machine != "future-two" {
 			t.Fatalf("%+v %+v", rec, rep)
+		}
+	})
+
+	t.Run("with no revoke client the log names the sid and generation of a token that may exist", func(t *testing.T) {
+		d, fr, _ := podDaemon(t)
+		d.Revoke = nil
+		var logged []string
+		d.Logf = func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) }
+		fr.loadEr = errors.New("side load refused: bad key")
+		_, err := d.Start(podSpec(nil))
+		if err == nil || len(logged) != 1 || !strings.Contains(logged[0], "revoke sid s") || !strings.Contains(logged[0], "gen 1 by hand") {
+			t.Fatalf("%v %v", err, logged)
+		}
+		fr.loadEr = ErrPodNotReady
+		logged = nil
+		d.Start(podSpec(func(s *LaunchSpec) { s.RequestID, s.Label = "rid-5", "cc-sandbox:b" }))
+		if len(logged) != 0 {
+			t.Errorf("a pod that never came up has no token, yet: %v", logged)
 		}
 	})
 

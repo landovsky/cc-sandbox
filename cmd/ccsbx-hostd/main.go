@@ -229,6 +229,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 			}
 		}
 		sd.PodRoot = start.SudoPodRoot{}
+		sd.Logf = lg.Printf
 	}
 	var servers []*http.Server
 	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}

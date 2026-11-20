@@ -363,6 +363,10 @@ func (r *Router) DeliverRemote(rs RemoteSender, targetSid, text string) Result {
 	if target == nil || strings.TrimSpace(text) == "" {
 		return r.receipt(from, 0, "", Result{Status: "error", Code: "no_live_session"})
 	}
+	if rs.Node != "" && nodeInScope(*target, rs.Node) && target.Scope.MachineOf(rs.Node) == "" {
+		// the record lists this node but places it on no machine: nobody on the hub can be told apart from a decoy
+		return r.receipt(from, 0, target.Sid, Result{Status: "refused", Code: "unplaced"})
+	}
 	if rs.Node == "" || !r.remoteInScope(rs, *target) {
 		return r.receipt(from, 0, target.Sid, Result{Status: "refused", Code: "scope"})
 	}
@@ -383,10 +387,15 @@ func (r *Router) DeliverRemote(rs RemoteSender, targetSid, text string) Result {
 // remoteInScope: the sender's node is in the target's own scope, or the target messaged it lately.
 func (r *Router) remoteInScope(rs RemoteSender, target Session) bool {
 	if nodeInScope(target, rs.Node) {
-		// An UNFENCED sender is only a node name the hub's presence list vouches for, and any machine's owner
-		// token can publish any unclaimed node: so it counts only on the machine the target's record binds the
-		// node to. A fenced sender's signature identifies it, wherever it is.
-		return rs.Fenced || (rs.Machine != "" && target.Scope.MachineOf(rs.Node) == rs.Machine)
+		// A node belongs to the machine the target's record places it on: a sender of that node counts only when
+		// it is ON that machine, fenced or not. A fenced sender's signature proves who it is, but its NODE is only
+		// the label its starter gave it (an owner process on another machine can start a fenced session labelled
+		// with someone's manager node), so the signature alone must not make it that manager. Only when the
+		// record places the node nowhere does a sender reach nobody (a start refuses a scope that names a manager
+		// or peer without its machine, so this is an old or hand-made record): a decoy from another machine would
+		// otherwise count by its signature alone.
+		want := target.Scope.MachineOf(rs.Node)
+		return want != "" && rs.Machine == want
 	}
 	win := time.Duration(target.Scope.ReplyWindowS) * time.Second
 	if win <= 0 {

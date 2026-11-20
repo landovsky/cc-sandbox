@@ -474,6 +474,26 @@ hostd's rights (tracking a fenced identity, reading hostd's frames), and the rev
   window: a squat BEFORE any worker bound to that node has started is accepted (nobody has said whose it is) and
   is overridden when the worker's hostd tracks; two tracks of one node at the very same moment can both pass the
   presence check (hostd's checks catch the result: a refused message, not an impersonation).
+  **A 409 on your OWN node** (a manager's tracking refused, `ccmsg`/cc-tree not resolving it) means look at
+  `GET /v1/nodes` (admin): another machine holds the claim. If it is a squatter that keeps renewing, it holds it
+  indefinitely (the 30 days count from the last refresh): `DELETE /v1/nodes/<url-encoded node>`, then the real
+  manager tracks. hostd's `binds` (its sessions' manager/peer machines, from their start specs) only cover nodes of
+  the hostd principal's `trees` and may only DEFEND a claim their own machine already holds: they never create, move or
+  win one (a claim comes only from a live session's own track on its machine), so a start spec naming a machine for a
+  manager that is offline (a sleeping Mac) pins nothing, and the manager's track succeeds when it returns. Where a claim
+  held by another machine disagrees with a daemon's bind, the hub says so in the track reply and hostd logs `hub warning:
+  <node> is claimed by <machine>` once per ten minutes: the session's start spec put its manager on the wrong machine, or
+  someone is squatting; fix the spec's `manager.machine` (and re-start) or clear the claim. **Residual window:** a squat
+  BEFORE the manager's first track (nobody has claimed the node yet) is accepted, and a squatter that keeps renewing keeps
+  the claim: an owner-uid process on any machine can lock a manager out that way (a DoS, no impersonation or leak: hostd
+  hears and sends by the record's machine, and now also for FENCED senders: a fenced session labelled with a manager's node
+  on another machine is refused). The remedy: `GET /v1/nodes` and `GET /v1/principals` to see who holds it, REVOKE the squatting machine's principal first (`DELETE /v1/principals/spoke:<machine>`, then re-mint that machine's own token: otherwise it re-claims at its next track), THEN `DELETE /v1/nodes/<node>`. A node whose record places it on no machine (an old record) reaches nobody: hostd refuses it as `unplaced`, and a new start refuses a `msg_scope` that lists a manager or peer without its machine (`bad_spec`). The hub's unit should set `SB_NODE_CLAIMS_FILE=$HOME/.local/state/session-bus/node-claims/claims.json` (a directory of its own, created 0700; the unit file is D's/the dev manager's to change) so a hub restart keeps the claims. `--known-machines`
+  makes a start whose `msg_scope` names any other machine refuse (bad_spec) before anything is published. The claim
+  table lives in memory unless `SB_NODE_CLAIMS_FILE` is set (a hub restart then reopens the first-publisher window
+  until each hostd re-tracks, seconds); the file is written through an exclusive random temp, in a directory created 0700 if new (an existing directory is never chmod-ed: give the file one of its own)
+  file, only when a claim appears or changes machine and every few minutes for the refresh times, and is ignored if it
+  is not a regular file of the hub's user that others cannot write. A fenced manager that MOVES to another machine
+  needs its workers' specs updated (their record names the old machine, so `SendRemote` ends `dropped`).
 - **Fenced to unfenced.** A relay reaches an unfenced target only if (a) that target's node is in the relay's
   `may_reach`, fixed at mint by root from the session's record (the MANAGER only for now: Tomas's open
   question #3cy2 decides peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held

@@ -275,3 +275,45 @@ func TestStartHandlerDoesNotRepairTheWorktreeRoots(t *testing.T) {
 		t.Fatalf("a list that ccsbx-root refuses was repaired and accepted: %v", err)
 	}
 }
+
+// context (round 6): a start spec's msg_scope says where its manager and peers live, and hostd publishes that to
+// the hub as a binding of a node to a machine. A typo, or a spec trying to bind someone's node to a machine that is
+// not one of the deployment's, is refused at start, before anything is published.
+func TestAScopeNamingAnUnknownMachineIsRefusedAtStart(t *testing.T) {
+	known := []string{"hp-ubuntu", "mac-tomas", "future-two"}
+	ok := `{"manager":{"node":"cc-sandbox:m","machine":"mac-tomas"},"peers":["cc-sandbox:p"],"peer_machines":{"cc-sandbox:p":"future-two"}}`
+	if err := checkScopeMachines([]byte(ok), known); err != nil {
+		t.Fatalf("a scope of known machines: %v", err)
+	}
+	for name, sc := range map[string]string{
+		"an unknown manager machine": `{"manager":{"node":"cc-sandbox:m","machine":"x6"}}`,
+		"an unknown peer machine":    `{"peer_machines":{"cc-sandbox:p":"x6"}}`,
+		"a malformed machine":        `{"manager":{"node":"cc-sandbox:m","machine":"a b/c"}}`,
+		"a manager with no machine":  `{"manager":{"node":"cc-sandbox:m"}}`,
+		"a peer with no machine":     `{"manager":{"node":"cc-sandbox:m","machine":"mac-tomas"},"peers":["cc-sandbox:p"]}`,
+	} {
+		if checkScopeMachines([]byte(sc), known) == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+	if checkScopeMachines([]byte(`{"manager":{"node":"cc-sandbox:m","machine":"anywhere"}}`), nil) != nil {
+		t.Error("with no list configured only the shape is checked")
+	}
+	if checkScopeMachines(nil, known) != nil || checkScopeMachines([]byte("null"), known) != nil {
+		t.Error("no scope is fine")
+	}
+}
+
+// context: the hub's warning about a binding that did not hold arrives with every renewal (about every 20 s); the
+// operator must see it once, not a line every 20 seconds.
+func TestAHubWarningIsLoggedOncePerMessage(t *testing.T) {
+	var n int
+	w := warnOnce(func(string, ...any) { n++ })
+	for i := 0; i < 5; i++ {
+		w("cc-sandbox:m is claimed by mac")
+	}
+	w("another")
+	if n != 2 {
+		t.Fatalf("logged %d times, want 2", n)
+	}
+}

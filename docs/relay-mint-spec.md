@@ -59,15 +59,21 @@ sudo -n /usr/local/sbin/ccsbx-root relay-mint -- <sid> <gen> <pub>
   (`msg_scope.manager.node`) together with the MACHINE the record binds it to (`msg_scope.manager.machine`, written
   from the owner's start spec, never from the fence), as the one entry `<machine>/<node>`, read by root from the
   SAME record it just validated: machine `[A-Za-z0-9._-]{1,64}`, node `[A-Za-z0-9._#:/-]{1,128}`. A record that
-  names no manager machine yields an EMPTY list (reaches fenced sessions only): a node belongs to the machine its
+  names no manager machine yields an EMPTY list (a new start refuses such a scope, `bad_spec`; an old record that has
+  one reaches nobody: the sender, hostd or a pod's sidecar, refuses to address a node the record places on no machine,
+  fenced or not, and the receiver refuses it as `unplaced`): a node belongs to the machine its
   record names, so an owner token of any other machine that publishes the same node is never reachable by the
   relay, and the hub matches machine AND node (a bare node is refused at mint, 422). Peers are not in it: whether a relay may type into an UNFENCED peer is Tomas's
   open question (#3cy2); peers that are fenced stay reachable over the signed fenced path. The hub's list
   format already holds up to 32 nodes, so adding peers later is a change to this one derivation. The verb has no argument for it: a `--may-reach` option, or
   any argument other than `--after-401` and `-- <sid> <gen> <pub>`, is refused with exit 2 before anything is
   read or sent. The hub lets a relay deliver to an UNFENCED target only when that target's node is in the
-  relay's `may_reach` (typed there with the fenced stamp); everything else is 403. A relay minted with an
-  empty list reaches fenced sessions only. (Hub side: dotfiles `n1-g-hub2`, `Principals` and `scope!`.) The reply's `token` is printed. A hub that
+  relay's `may_reach` (typed there with the fenced stamp); everything else is 403. The hub itself still lets a
+  relay deliver to ANY fenced session (the receiving hostd verifies the stamp and re-checks scope against ITS record),
+  so who a daemon or sidecar addresses is decided by `internal/hubsend.Resolve` from the sender's own record: the
+  manager's `<machine>/<node>`, never a fenced entry that merely carries the label. A relay addresses its target by
+  the full uid (an address that names more than one session is a 409, never a fan-out), and may read the session
+  list (`GET /sessions`) filtered to its `may_reach` entries and its own session. (Hub side: dotfiles `n1-g-hub2`, `Principals` and `scope!`.) The reply's `token` is printed. A hub that
   answers anything but 201 with a token: exit 3, the status code (not the body) on stderr.
 
 ## Revoke

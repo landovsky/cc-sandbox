@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -207,6 +208,72 @@ type startPolicy struct {
 	Pins, WorktreeRoots, Image, CCVersion, TmuxSocket, RunDir string
 	MaxLive, MaxPerHour, MinUID                               int
 	LookupID                                                  func(string) (*user.User, error)
+	// KnownMachines are the machines of this deployment (--known-machines): a msg_scope that places its manager
+	// or a peer on any other is refused at start, before anything is published (a typo, or a spec trying to
+	// bind someone's node to a machine that is not one of ours). Empty = only the shape is checked.
+	KnownMachines []string
+}
+
+var machineIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// checkScopeMachines refuses a msg_scope whose manager.machine or peer_machines name a machine that is
+// malformed or (when the deployment's machines are listed) unknown.
+func checkScopeMachines(raw []byte, known []string) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var sc msg.Scope
+	if err := json.Unmarshal(raw, &sc); err != nil {
+		return &start.Refusal{Code: start.BadSpec, Msg: "msg_scope is not readable"}
+	}
+	// every node the scope lists must say where it lives: a node placed on no machine reaches nobody (it cannot
+	// be told from a decoy), so a spec that lists one is refused here rather than started and silent
+	if sc.Manager.Node != "" && sc.Manager.Machine == "" {
+		return &start.Refusal{Code: start.BadSpec, Msg: "msg_scope.manager needs its machine"}
+	}
+	for _, p := range sc.Peers {
+		if sc.MachineOf(p) == "" {
+			return &start.Refusal{Code: start.BadSpec, Msg: "msg_scope.peers: every peer needs its machine in peer_machines"}
+		}
+	}
+	names := []string{sc.Manager.Machine}
+	for _, m := range sc.PeerMachines {
+		names = append(names, m)
+	}
+	for _, m := range names {
+		if m == "" {
+			continue
+		}
+		ok := machineIDRe.MatchString(m)
+		if ok && len(known) > 0 {
+			ok = false
+			for _, k := range known {
+				if k == m {
+					ok = true
+				}
+			}
+		}
+		if !ok {
+			return &start.Refusal{Code: start.BadSpec, Msg: "msg_scope names a machine this deployment does not know"}
+		}
+	}
+	return nil
+}
+
+// warnOnce passes a hub warning to logf at most once per message per ten minutes (a warning repeats with every
+// renewal of the session's entry, about every 20 s): "your session's manager node is claimed by <machine>".
+func warnOnce(logf func(string, ...any)) func(string) {
+	var mu sync.Mutex
+	last := map[string]time.Time{}
+	return func(w string) {
+		mu.Lock()
+		defer mu.Unlock()
+		if t, ok := last[w]; ok && time.Since(t) < 10*time.Minute {
+			return
+		}
+		last[w] = time.Now()
+		logf("hub warning: %s (a session's manager.machine in its start spec, or another daemon's, disagrees with who holds that node; see the runbook: GET/DELETE /v1/nodes)", w)
+	}
 }
 
 // startHandler is the daemon API's session start: the caller is the socket peer (uid), the spec is
@@ -224,6 +291,9 @@ func startHandler(sd *start.Daemon, p startPolicy) func(uid int, spec []byte) (*
 			return nil, err
 		}
 		if err := start.CheckOwner(uid, spec.Owner, p.LookupID); err != nil {
+			return nil, err
+		}
+		if err := checkScopeMachines(spec.MsgScope, p.KnownMachines); err != nil {
 			return nil, err
 		}
 		d := *sd // a copy per call: Uid differs, everything else is hostd's configuration
@@ -249,7 +319,7 @@ func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router
 		return readHubToken(tokFile)
 	}
 	machine := get("machine")
-	client := &hubc.Client{URL: url, Token: token}
+	client := &hubc.Client{URL: url, Token: token, Warn: warnOnce(lg.Printf)}
 	hr := newHubRemote(client, url, machine, rt, j, lg.Printf, rootMinter(), get("state"))
 	rt.Uplink = hr // a message to a node of another machine goes through the hub, signed
 	sp := hubspoke.New(hubspoke.Config{

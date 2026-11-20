@@ -10,12 +10,16 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +36,28 @@ type realMachine struct {
 	j    *xJ
 	sp   *hubspoke.Spoke
 	tok  string
+	mu   sync.Mutex
+	warn []string // what the hub said about a track that did not fully hold
+}
+
+func (m *realMachine) warnings() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.warn...)
+}
+
+func adminDelete(t *testing.T, url, admin, path string) {
+	t.Helper()
+	req, _ := http.NewRequest("DELETE", url+path, nil)
+	req.Header.Set("Authorization", "Bearer "+admin)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("DELETE %s: %d", path, resp.StatusCode)
+	}
 }
 
 func adminPost(t *testing.T, url, admin, path string, body any) map[string]any {
@@ -54,12 +80,15 @@ func adminPost(t *testing.T, url, admin, path string, body any) map[string]any {
 	return m
 }
 
-func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s msg.Session) *realMachine {
+// startMachine starts a logical machine's hostd. ttl (optional, seconds) is the lease of its hub entries: a short one
+// makes it renew (and so re-bind) every ttl/3 seconds.
+func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s msg.Session, ttl ...int) *realMachine {
 	t.Helper()
 	tok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "spoke", "machine": name, "name": "ccsbx", "trees": []string{"cc-sandbox"}})["token"].(string)
 	out, j := &xOut{}, &xJ{}
 	rt := &msg.Router{Dir: &xDir{[]msg.Session{s}}, Out: out, Idle: xIdle{}, StateDir: t.TempDir()}
-	client := &hubc.Client{URL: url, Token: func() (string, error) { return tok, nil }}
+	rm := &realMachine{name: name}
+	client := &hubc.Client{URL: url, Token: func() (string, error) { return tok, nil }, Warn: func(w string) { rm.mu.Lock(); rm.warn = append(rm.warn, w); rm.mu.Unlock() }}
 	// (hostd's own principal: spoke:<machine>/ccsbx, fenced entries and its own downlink only)
 	// the stand-in for `ccsbx-root relay-mint`: the hub's admin API, which hostd itself never holds
 	mint := func(_ context.Context, sid string, gen int, pub string, _ bool) (string, error) {
@@ -75,7 +104,7 @@ func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s 
 	hr := newHubRemote(client, url, name, rt, j, t.Logf, mint, t.TempDir())
 	rt.Uplink = hr
 	sp := hubspoke.New(hubspoke.Config{
-		Client: client, Machine: name, Name: "ccsbx", TTL: 60, PollWait: time.Second,
+		Client: client, Machine: name, Name: "ccsbx", TTL: leaseTTL(ttl), PollWait: time.Second,
 		// the production entry builder, so what the real hub sees is what hostd really publishes
 		Entries: func() []map[string]any {
 			return fencedEntries(name, []msg.Session{s}, func(string, int) (time.Time, bool) { return time.Now(), true })
@@ -84,7 +113,15 @@ func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s 
 		Logf:      t.Logf,
 	})
 	go sp.Run(ctx)
-	return &realMachine{name: name, hr: hr, out: out, j: j, sp: sp, tok: tok}
+	rm.hr, rm.out, rm.j, rm.sp, rm.tok = hr, out, j, sp, tok
+	return rm
+}
+
+func leaseTTL(l []int) int {
+	if len(l) > 0 {
+		return l[0]
+	}
+	return 60
 }
 
 func waitLines(t *testing.T, m *realMachine, n int) {
@@ -109,10 +146,11 @@ func TestRealHubTwoMachinesExchangeSignedMessagesAndRefuseForgeries(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	worker := msg.Session{Sid: "s0worker01", Label: "cc-sandbox:worker", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
-	worker.Scope.Manager.Node = "cc-sandbox:mgr"
+	worker.Scope.Manager.Node, worker.Scope.Manager.Machine = "cc-sandbox:mgr", "mac"
 	worker.Scope.ReplyWindowS = 3600
 	mgr := msg.Session{Sid: "s0mgr00001", Label: "cc-sandbox:mgr", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
 	mgr.Scope.Peers = []string{"cc-sandbox:worker"}
+	mgr.Scope.PeerMachines = map[string]string{"cc-sandbox:worker": "hp"}
 	mgr.Scope.ReplyWindowS = 3600
 	hp := startMachine(t, ctx, url, admin, "hp", worker)
 	mac := startMachine(t, ctx, url, admin, "mac", mgr)
@@ -405,17 +443,20 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		t.Fatalf("the shared secret re-tracking a held node: want 409, got %v", err)
 	}
 
-	// 9. (round 5) squatting an ABSENT manager's node. The worker's manager umgr5 is an unfenced session on mac3
-	// that is not tracked right now (a restart, a closed laptop). An owner token of a third machine, x4, publishes
-	// its node; then the worker starts (its record binds umgr5 to mac3, written from the owner's start spec).
+	// 9. (rounds 5 and 6) squatting an ABSENT manager's node. The worker's manager umgr5 is an unfenced session
+	// on mac3 that is not tracked right now (a restart, a closed laptop). An owner token of a third machine, x4,
+	// publishes its node (nobody has said whose it is yet, so the hub accepts it). Then the worker starts: its
+	// record binds umgr5 to mac3 (the owner's start spec), but a bind NEVER moves a claim whose machine has a live
+	// entry for the node, so while the squatter renews, the claim stays and hostd says so. Nothing leaks meanwhile:
+	// hostd hears and sends by the record's machine. When the squatter stops renewing, the next bind takes the claim.
 	w3 := msg.Session{Sid: "s0worker03", Label: "cc-sandbox:worker3", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
 	w3.Scope.Manager.Node, w3.Scope.Manager.Machine, w3.Scope.ReplyWindowS = "cc-sandbox:umgr5", "mac3", 3600
 	squatEntry := map[string]any{"key": "x4/%1", "label": "squat", "node": "cc-sandbox:umgr5", "uid": "eeeeeeee-0000-4000-8000-0000000000b1", "machine": "x4", "pane": "%1", "state": "waiting"}
 	x4Client := &hubc.Client{URL: url, Token: func() (string, error) { return x4Tok, nil }}
-	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 120); err != nil {
+	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 4); err != nil {
 		t.Fatalf("a squat with no worker bound to the node yet is accepted (nobody has said whose it is): %v", err)
 	}
-	hp3 := startMachine(t, ctx, url, admin, "hp3", w3)
+	hp3 := startMachine(t, ctx, url, admin, "hp3", w3, 3) // renews (and so re-binds) every second
 	var w3ID, squatID string
 	for i := 0; i < 100 && (w3ID == "" || squatID == ""); i++ {
 		es, _ := owner.Sessions(ctx)
@@ -427,8 +468,12 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if w3ID == "" {
-		t.Fatal("worker3 is not on the hub")
+	if w3ID == "" || squatID == "" {
+		t.Fatalf("worker3 %q or the squatter %q is not on the hub", w3ID, squatID)
+	}
+	// B1: while the squatter is live the bind did not take the claim, and hostd was told
+	if ws := hp3.warnings(); len(ws) == 0 || !strings.Contains(ws[0], "claimed by x4") {
+		t.Errorf("hostd was not told that the manager's node is claimed by another machine: %v", ws)
 	}
 	// the squatter, bound correctly by its own spoke and the only holder, speaks as the manager: not heard
 	x4Client.Send(ctx, hubc.SendReq{To: w3ID, Text: "squatter speaking as your manager", From: map[string]string{"id": squatID, "machine": "x4"}})
@@ -440,16 +485,35 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		}
 	}
 	hp3.out.mu.Unlock()
-	// the squatter cannot renew (the hub holds the node for mac3 now), and the REAL manager is not locked out
-	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 120); !hubc.IsConflict(err) {
-		t.Errorf("the squatter's re-track after the worker bound the node: want 409, got %v", err)
+	macEntries := func() []map[string]any {
+		return []map[string]any{
+			entry("umgr", "cc-sandbox:umgr", "eeeeeeee-0000-4000-8000-0000000000a1", ""),
+			entry("uother", "cc-sandbox:uother", "eeeeeeee-0000-4000-8000-0000000000a2", ""),
+			entry("umgr5", "cc-sandbox:umgr5", "eeeeeeee-0000-4000-8000-0000000000b2", ""),
+		}
 	}
-	if _, err := mac.Track(ctx, []map[string]any{
-		entry("umgr", "cc-sandbox:umgr", "eeeeeeee-0000-4000-8000-0000000000a1", ""),
-		entry("uother", "cc-sandbox:uother", "eeeeeeee-0000-4000-8000-0000000000a2", ""),
-		entry("umgr5", "cc-sandbox:umgr5", "eeeeeeee-0000-4000-8000-0000000000b2", ""),
-	}, 120); err != nil {
-		t.Fatalf("the real manager coming back is locked out by the squatter: %v", err)
+	// the owner's remedy (runbook): the squatter's claim is cleared (GET/DELETE /v1/nodes). Until then the real
+	// manager is locked out of its own node, which is the residual DoS of a squat BEFORE the first track: a bind
+	// never creates or wins a claim (only a live session's own track does), so the spec cannot fix it.
+	if _, err := mac.Track(ctx, macEntries(), 120); !hubc.IsConflict(err) {
+		t.Errorf("the real manager while the squatter's claim stands: want 409, got %v", err)
+	}
+	adminDelete(t, url, admin, "/v1/nodes/"+neturl.PathEscape("cc-sandbox:umgr5"))
+	var trackErr error
+	for i := 0; i < 80; i++ {
+		if _, trackErr = mac.Track(ctx, macEntries(), 120); trackErr == nil {
+			break
+		}
+		if !hubc.IsConflict(trackErr) {
+			t.Fatal(trackErr)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if trackErr != nil {
+		t.Fatalf("the real manager never got its node back after the claim was cleared and the squatter lapsed: %v", trackErr)
+	}
+	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 120); !hubc.IsConflict(err) {
+		t.Errorf("the squatter's re-track once the node is bound to mac3: want 409, got %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
 	// the worker's report goes to the REAL manager (mac3), never to the squatter
@@ -468,5 +532,129 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	}
 	if fs, _, err := x4Client.Poll(ctx, "spoke:x4", 0, time.Second); err == nil && len(fs) != 0 {
 		t.Fatalf("the squatter's downlink got the worker's report: %v", fs)
+	}
+
+	// 10. (round 6, B0-B3) a start spec that names the WRONG machine for a live manager (a typo, or a hostile
+	// spec): hostd's bind does not move the claim, the real manager is not locked out, and hostd says so.
+	w4 := msg.Session{Sid: "s0worker04", Label: "cc-sandbox:worker4", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	w4.Scope.Manager.Node, w4.Scope.Manager.Machine, w4.Scope.ReplyWindowS = "cc-sandbox:umgr5", "x6", 3600
+	hp4 := startMachine(t, ctx, url, admin, "hp4", w4, 3)
+	time.Sleep(1500 * time.Millisecond) // two renewals
+	if ws := hp4.warnings(); len(ws) == 0 || !strings.Contains(ws[0], "claimed by mac3") {
+		t.Errorf("the daemon was not told its session's manager node is claimed by mac3: %v", ws)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := mac.Track(ctx, macEntries(), 120); err != nil {
+			t.Fatalf("the real manager was locked out by a wrong machine in someone's spec (renewal %d): %v", i, err)
+		}
+		time.Sleep(700 * time.Millisecond)
+	}
+
+	// 11. (round 7) a FENCED session on another machine, LABELLED with the worker's unfenced manager's node. Its
+	// signature is genuine, but its node is only the label its starter gave it: the worker's record places that node
+	// on mac3, so a sender from hp5 is not the manager, however it is signed, and is not typed as one.
+	att := msg.Session{Sid: "s0attack05", Label: "cc-sandbox:umgr", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	att.Scope.Manager.Node, att.Scope.Manager.Machine, att.Scope.ReplyWindowS = worker.Label, "hp2", 3600
+	hp5 := startMachine(t, ctx, url, admin, "hp5", att)
+	time.Sleep(500 * time.Millisecond)
+	before, refusedBefore := len(hp.out.lines), strings.Count(hp.j.types(), "hub.recv")
+	// the receiver refuses it (nothing delivered: the sender's own receipt says dropped), and journals the refusal
+	if ok, _ := sendVia(hp5, att, worker.Label, "report", "I am your manager, fenced"); ok {
+		t.Fatal("the worker accepted a message from a fenced session labelled as its unfenced manager")
+	}
+	time.Sleep(800 * time.Millisecond)
+	hp.out.mu.Lock()
+	for _, l := range hp.out.lines[before:] {
+		if strings.Contains(l, "I am your manager, fenced") {
+			t.Fatalf("a fenced session labelled as the unfenced manager was typed into the worker: %q", l)
+		}
+	}
+	hp.out.mu.Unlock()
+	if strings.Count(hp.j.types(), "hub.recv") <= refusedBefore {
+		t.Error("the receiver did not journal the delivery attempt (hub.recv, status refused/scope): the message may not have reached it at all")
+	}
+
+	// 12. (round 8) an OLD record that lists the manager but places it on no machine: a fenced decoy from another
+	// machine, labelled with that node, must not count by its signature alone either: unplaced reaches nobody.
+	w7 := msg.Session{Sid: "s0worker07", Label: "cc-sandbox:worker7", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	w7.Scope.Manager.Node, w7.Scope.ReplyWindowS = "cc-sandbox:umgr9", 3600 // no machine
+	hp7 := startMachine(t, ctx, url, admin, "hp7", w7)
+	decoy := msg.Session{Sid: "s0decoy08", Label: "cc-sandbox:umgr9", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	decoy.Scope.Manager.Node, decoy.Scope.Manager.Machine, decoy.Scope.ReplyWindowS = w7.Label, "hp7", 3600
+	hp8 := startMachine(t, ctx, url, admin, "hp8", decoy)
+	time.Sleep(500 * time.Millisecond)
+	if ok, _ := sendVia(hp8, decoy, w7.Label, "report", "decoy speaking as the unplaced manager"); ok {
+		t.Fatal("a decoy was accepted for a node the record places nowhere")
+	}
+	time.Sleep(500 * time.Millisecond)
+	hp7.out.mu.Lock()
+	if len(hp7.out.lines) != 0 {
+		t.Fatalf("something was typed into the worker whose record places its manager nowhere: %q", hp7.out.lines)
+	}
+	hp7.out.mu.Unlock()
+	if !strings.Contains(hp7.j.types(), "hub.recv") {
+		t.Error("the receiver did not journal the refused attempt (hub.recv, unplaced)")
+	}
+
+	// 13. (round 8) a colliding short id. The hub's short id is 24 bits of a hash of the uid, so another machine's
+	// owner can grind a uid whose id equals the manager's. The sender addresses the full uid and refuses when any
+	// other entry shares the chosen one's address; and the hub never fans an address out to two entries (409).
+	uidA, uidB, shortID := collidingUIDs()
+	w13 := msg.Session{Sid: "s0worker13", Label: "cc-sandbox:worker13", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	w13.Scope.Manager.Node, w13.Scope.Manager.Machine, w13.Scope.ReplyWindowS = "cc-sandbox:umgr13", "mac3", 3600
+	hp13 := startMachine(t, ctx, url, admin, "hp13", w13)
+	e13 := func(label, node, uid string) map[string]any {
+		return map[string]any{"key": "mac3/" + label, "label": label, "node": node, "uid": uid, "machine": "mac3", "pane": "%1", "state": "waiting"}
+	}
+	if _, err := mac.Track(ctx, append(macEntries(), e13("umgr13", "cc-sandbox:umgr13", uidA)), 120); err != nil {
+		t.Fatal(err)
+	}
+	decoy13 := map[string]any{"key": "x4/%13", "label": "decoy13", "node": "cc-sandbox:other13", "uid": uidB, "machine": "x4", "pane": "%13", "state": "waiting"}
+	if _, err := x4Client.Track(ctx, []map[string]any{decoy13}, 120); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	es, _ = owner.Sessions(ctx)
+	n := 0
+	for _, e := range es {
+		if e["id"] == shortID {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("the setup: %d entries share the short id %s, want 2", n, shortID)
+	}
+	if ok, _ := sendVia(hp13, w13, "cc-sandbox:umgr13", "report", "to the manager, not to its twin"); ok {
+		t.Fatal("a message was sent to an address another entry shares")
+	}
+	if fs, _, err := x4Client.Poll(ctx, "spoke:x4", 0, time.Second); err == nil && len(fs) != 0 {
+		t.Fatalf("the decoy's downlink got the message: %d frames", len(fs))
+	}
+	// the same address, straight at the hub with the relay credential: 409, never a fan-out to both
+	kp13, kt13, err := hp13.hr.relayFor(ctx, w13, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc13 := &hubc.Client{URL: url, Token: func() (string, error) { return kt13, nil }}
+	sig13 := stamp.Sign(kp13, stamp.Fields{From: w13.Sid, To: shortID, Kind: "report", Body: "x"}, time.Now())
+	_, err = rc13.Send(ctx, hubc.SendReq{To: shortID, Text: "x", Kind: "report", Sig: sig13, From: map[string]string{"sid": w13.Sid, "fenced": "true"}})
+	if !hubc.IsConflict(err) {
+		t.Fatalf("the hub answered an ambiguous address with %v, want 409", err)
+	}
+}
+
+// collidingUIDs finds two uids whose hub short id (the first 6 hex of sha256) is the same: a birthday search, about
+// 4000 tries, which is how cheap it is for an attacker to match a victim whose uid he can choose... and about 2^24 to
+// match a fixed one.
+func collidingUIDs() (a, b, id string) {
+	seen := map[string]string{}
+	for i := 0; ; i++ {
+		u := fmt.Sprintf("dd%06d-0000-4000-8000-000000000000", i)
+		h := sha256.Sum256([]byte(u))
+		k := hex.EncodeToString(h[:3])
+		if prev, ok := seen[k]; ok {
+			return prev, u, k
+		}
+		seen[k] = u
 	}
 }

@@ -38,6 +38,7 @@ import (
 	"unicode"
 
 	"github.com/landovsky/cc-sandbox/internal/hubc"
+	"github.com/landovsky/cc-sandbox/internal/hubsend"
 	"github.com/landovsky/cc-sandbox/internal/hubspoke"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
@@ -143,8 +144,6 @@ func (h *hubRemote) event(typ, sid string, gen int, realm, node string, data map
 }
 
 // ---- receiving ----
-
-var kindRe = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 
 func (h *hubRemote) markHandled(key string) {
 	h.mu.Lock()
@@ -368,7 +367,7 @@ func addressNames(e map[string]any, to string) bool {
 	if to == "" {
 		return false
 	}
-	for _, k := range []string{"id", "key", "label", "node"} {
+	for _, k := range []string{"uid", "id", "key", "label", "node"} {
 		if v, _ := e[k].(string); v != "" && (v == to || (k == "node" && strings.Replace(to, ":#", ":", 1) == v)) {
 			return true
 		}
@@ -387,81 +386,38 @@ func (h *hubRemote) SendRemote(sender msg.Session, node, kind, text string) (boo
 	if err != nil {
 		return false, "", err
 	}
-	// A node belongs to the machine the sender's record binds it to (scope.manager.machine, from the owner's
-	// start spec): an entry for it on another machine is a squatter's (any machine's owner token can publish an
-	// unclaimed node) and gets nothing, however it is tracked; and it cannot make the real one ambiguous.
-	want := sender.Scope.MachineOf(node)
-	var held []map[string]any
-	for _, x := range entries {
-		if hubc.CountNode([]map[string]any{x}, node) > 0 {
-			held = append(held, x)
-		}
+	// who the message goes to is decided by internal/hubsend (the sender's record places the node on a machine;
+	// a squatter elsewhere gets nothing and cannot make the real one ambiguous), the same rules a pod's sidecar uses
+	to, err := hubsend.Resolve(entries, node, sender.Scope.MachineOf(node), h.machine)
+	if err != nil {
+		return false, "", err
 	}
-	if want != "" {
-		var on []map[string]any
-		for _, x := range held {
-			if m, _ := x["machine"].(string); m == want {
-				on = append(on, x)
-			}
-		}
-		if len(on) == 0 && len(held) > 0 {
-			return false, "", msg.ErrWrongMachine
-		}
-		held = on
-	}
-	if len(held) > 1 {
-		return false, "", msg.ErrAmbiguousNode // two sessions hold the node: which one is the manager is not for us to guess
-	}
-	if len(held) == 0 {
-		return false, "", msg.ErrUnknownNode
-	}
-	e := held[0]
-	m, _ := e["machine"].(string)
-	if m == h.machine {
-		return false, "", msg.ErrLocalNode
-	}
-	if want == "" && e["fenced"] != true {
-		return false, "", msg.ErrWrongMachine // an unfenced node the scope does not place: not guessed
-	}
-	to, _ := e["id"].(string)
-	toSid, _ := e["uid"].(string)
-	if to == "" {
-		return false, "", fmt.Errorf("the hub's entry for that node has no id")
-	}
-	if !kindRe.MatchString(kind) {
-		kind = "message"
-	}
+	from := hubsend.From{Sid: sender.Sid, Label: sender.Label, Machine: h.machine}
 	stale := ""
 	for attempt := 0; attempt < 2; attempt++ {
 		priv, token, err := h.relayFor(ctx, sender, stale)
 		if err != nil {
-			return false, toSid, err
+			return false, to.Sid, err
 		}
-		sig := stamp.Sign(priv, stamp.Fields{From: sender.Sid, To: to, Kind: kind, Body: text}, h.now())
+		delivered, err := hubsend.Send(ctx, h.url, token, priv, from, to, kind, text, h.now())
 		for i := range priv { // this send's own copy: nothing shared is left behind
 			priv[i] = 0
 		}
-		c := &hubc.Client{URL: h.url, Token: func() (string, error) { return token, nil }}
-		res, err := c.Send(ctx, hubc.SendReq{To: to, Text: text, Kind: kind, Sig: sig,
-			From: map[string]string{"sid": sender.Sid, "fenced": "true", "label": sender.Label, "machine": h.machine, "id": "ccsbx:" + sender.Sid}})
 		switch {
 		case err == nil:
-			if res.Delivered < 1 {
-				return false, toSid, nil
-			}
-			return true, toSid, nil
+			return delivered, to.Sid, nil
 		case hubc.IsUnauthorized(err) && attempt == 0:
 			stale = token // the relay credential expired or was revoked: ONE send mints a new one
 			continue
 		case hubc.IsForbidden(err):
 			// a refusal of THIS message (scope, stamp, sender): a new credential would not change it
 			h.logf("hub: message from %s to %s refused by the hub: %v", sender.Sid, node, err)
-			return false, toSid, nil
+			return false, to.Sid, nil
 		default:
-			return false, toSid, err
+			return false, to.Sid, err
 		}
 	}
-	return false, toSid, fmt.Errorf("the hub refused the relay credential twice")
+	return false, to.Sid, fmt.Errorf("the hub refused the relay credential twice")
 }
 
 // relayFor returns a COPY of the generation's private key and its relay token, minting them once. stale is

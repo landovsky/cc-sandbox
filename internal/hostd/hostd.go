@@ -76,7 +76,7 @@ type Config struct {
 	StateDir string
 	// RunDir is where the generations' outboxes (s/<sid>/g<n>/out, in, CLOSED) are READ. Empty: the
 	// state dir (direct mode). In helper mode they belong to ccsbx-root's run dir
-	// (/var/lib/ccsbx-run), the out/ leaf is 10001:ccsbx 2770 and hostd reads it through the group;
+	// (/var/lib/ccsbx-run), the out/ leaf is 10001:ccsbx 02750 (hostd reads it through the group, never writes it) and s/ and s/<sid> are not listable by hostd: it derives every path from its records;
 	// hostd's own ledger, state and journal stay under StateDir.
 	RunDir           string
 	FenceUID         int                  // owner uid required of every outbox file
@@ -181,8 +181,11 @@ type Hostd struct {
 	boxes     map[string]*outbox
 	start     *start.Daemon
 	epochDone bool
-	done      map[string]bool   // generations drained for good (their box is freed)
-	reuse     map[string]string // gdir/name -> the ULID a re-ingested request had the first time
+	done      map[string]bool
+	recErr    map[string]bool // session records already logged as unreadable
+	// ReplyErrors counts replies that could not be written (in/replies missing or not writable).
+	ReplyErrors int               // generations drained for good (their box is freed)
+	reuse       map[string]string // gdir/name -> the ULID a re-ingested request had the first time
 }
 
 func New(cfg Config) *Hostd {
@@ -196,13 +199,53 @@ var (
 	nameRe = regexp.MustCompile(`^([A-Za-z0-9][A-Za-z0-9_-]{0,63})\.json$`)
 )
 
+// generations lists the generation directories to look at WITHOUT listing the run dir: in helper
+// mode s/ and s/<sid> belong to root (0711: searchable, not readable), so hostd could not list them.
+// It derives every path from its own session records (sid + gen, written by hostd's start):
+// <run>/s/<sid>/g<n> for n in 1..record.Gen, keeping those that exist. A record that cannot be read
+// is logged once and skipped; one corrupt record must not stop the others.
+func (h *Hostd) generations() []string {
+	ents, err := os.ReadDir(filepath.Join(h.Cfg.StateDir, "sessions"))
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range ents {
+		sid, ok := strings.CutSuffix(e.Name(), ".json")
+		if !ok || !sidRe.MatchString(sid) {
+			continue
+		}
+		rec, err := h.start.Load(sid)
+		if err != nil {
+			if !h.recErr[sid] {
+				if h.recErr == nil {
+					h.recErr = map[string]bool{}
+				}
+				h.recErr[sid] = true
+				h.Cfg.Logf("hostd: session record %s is unreadable (%v): its outbox is skipped", sid, err)
+			}
+			continue
+		}
+		for g := 1; g <= rec.Gen; g++ {
+			gdir := filepath.Join(h.Cfg.RunRoot(), "s", sid, fmt.Sprintf("g%d", g))
+			if h.done[gdir] {
+				continue
+			}
+			if st, err := os.Stat(gdir); err == nil && st.IsDir() {
+				out = append(out, gdir)
+			}
+		}
+	}
+	return out
+}
+
 // Scan walks every live outbox once. A generation with a CLOSED marker is drained one last
 // time and then forgotten.
 func (h *Hostd) Scan() Stats {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	st := Stats{Reasons: map[string]int{}}
-	sess, _ := filepath.Glob(filepath.Join(h.Cfg.RunRoot(), "s", "s*", "g*"))
+	sess := h.generations()
 	h.checkEpoch(sess)
 	for _, gdir := range sess {
 		sid, gen := filepath.Base(filepath.Dir(gdir)), filepath.Base(gdir)
@@ -251,6 +294,9 @@ func (h *Hostd) Scan() Stats {
 			h.done[gdir] = true
 			delete(h.boxes, gdir)
 		}
+	}
+	if h.ReplyErrors > 0 {
+		st.Reasons["reply_failed"] = h.ReplyErrors
 	}
 	return st
 }
@@ -429,8 +475,16 @@ func classify(err error) string {
 	return "io_error"
 }
 
-// reply writes in/replies/<rid>.json (tmp + rename). rid is already validated by nameRe.
-func (h *Hostd) reply(gdir string, r Reply) { _ = WriteReply(gdir, r) }
+// reply writes in/replies/<rid>.json (tmp + rename). rid is already validated by nameRe. A failed
+// write is never dropped silently: it is logged with the session and counted (Hostd.ReplyErrors,
+// shown by Scan as the reason reply_failed), because a session that never gets its answer
+// otherwise just waits.
+func (h *Hostd) reply(gdir string, r Reply) {
+	if err := WriteReply(gdir, r); err != nil {
+		h.ReplyErrors++
+		h.Cfg.Logf("hostd: %s/%s: reply to %s could not be written: %v", filepath.Base(filepath.Dir(gdir)), filepath.Base(gdir), r.Rid, err)
+	}
+}
 
 // WriteReply writes a reply into a generation's inbox; the fence mounts in/ read-only. A later
 // reply for the same rid replaces the earlier one (queued -> the final result). It refuses a

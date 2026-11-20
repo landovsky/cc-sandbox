@@ -1452,7 +1452,17 @@ id = "start-owner-from-peer"
 title = "a session's owner (in its id: the journal and token identity) is the socket peer's passwd name; a spec naming another owner is refused"
 suite = "outbox"
 allow = "tests/twin-go.sh ./internal/start TestOwnerComesFromThePeerNotTheSpecAllow"
-block = "tests/twin-go.sh ./internal/start TestSpecClaimingAnotherOwnerIsRefusedBlock"
+block = "tests/twin-go.sh ./cmd/ccsbx-hostd TestStartHandlerRefusesASpecWithAnotherOwner"
 invariants = [5, 13]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "hostd-no-run-dir-listing"
+title = "hostd finds generations from its own session records, never by listing the run dir (root's s/ is searchable but not listable); a failed reply write is logged and counted"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestWatcherFindsGenerationsWithoutListingTheRunDirAllow"
+block = "tests/twin-go.sh ./internal/hostd TestFailedReplyWriteIsLoggedAndCounted"
+invariants = [10, 28]
 backends = ["unit"]
 where = "hp"

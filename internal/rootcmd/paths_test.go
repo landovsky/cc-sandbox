@@ -16,14 +16,23 @@ import (
 // They must agree on which lists are valid, so a start that hostd accepts is never one the helper
 // refuses at run time because the roots differ.
 func TestHostdWorktreeRootsAndAllowedRootsAgreeOnWhatIsAValidList(t *testing.T) {
-	a, b := t.TempDir(), t.TempDir()
+	mk := func() string { // under /var/tmp: /tmp is a fixed fence mount, so a root there is refused by hostd
+		d, err := os.MkdirTemp("/var/tmp", "ccsbx-roots-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.RemoveAll(d) })
+		return d
+	}
+	a, b := mk(), mk()
 	a, _ = filepath.EvalSymlinks(a)
 	b, _ = filepath.EvalSymlinks(b)
 	wd := filepath.Join(a, "w")
 	os.MkdirAll(wd, 0o755)
 	state := t.TempDir()
 	for _, roots := range [][]string{{a, b}, {a}, {a, ""}, {a, "rel"}, {a, "/"}, {a, b + "/"}, {a, b + "/nope"}, {}} {
-		c := &Config{}
+		c := Defaults() // valid in every other respect, so only the roots decide
+		c.Machine = "test-machine"
 		rootErr := c.validate(roots)
 		_, hostdErr := backend.CheckWorkdir(wd, strings.Join(roots, ","), state)
 		if (rootErr == nil) != (hostdErr == nil) {

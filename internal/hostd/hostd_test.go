@@ -715,3 +715,68 @@ func TestUnreadableFenceFilesAreLoggedAndSkippedNotFatal(t *testing.T) {
 		}
 	}
 }
+
+// ---- review of PR #12: no listing of the run dir; a failed reply is surfaced ---------------------
+
+// context: in helper mode s/ and s/<sid> are root's 0711: searchable but NOT listable by the service
+// uid, so a Glob finds nothing and the daemon goes deaf. hostd must find a generation from its own
+// session records. Here the directories are made unreadable for their owner (mode 0311), which is
+// what "not listable" means in a one-uid test: a Glob of them finds nothing, a Stat by name works.
+func TestWatcherFindsGenerationsWithoutListingTheRunDirAllow(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root lists everything")
+	}
+	f, run := runDirFixture(t, nil)
+	s, sd := filepath.Join(run, "s"), filepath.Join(run, "s", sid)
+	os.Chmod(sd, 0o311)
+	os.Chmod(s, 0o311)
+	t.Cleanup(func() { os.Chmod(s, 0o755); os.Chmod(sd, 0o755) })
+	if m, _ := filepath.Glob(filepath.Join(s, "s*", "g*")); len(m) != 0 {
+		t.Fatalf("the test directories are still listable: %v", m)
+	}
+	f.req("r1.json", `{"type":"ccf.mark"}`)
+	st := f.h.Scan()
+	if st.Accepted != 1 || len(f.got) != 1 {
+		t.Fatalf("the request was not found without listing: %+v", st)
+	}
+	if _, ok := f.reply("r1"); !ok {
+		t.Fatal("no reply")
+	}
+}
+
+// context: the old generations of a session are found too (1..record.Gen), and a corrupt record
+// does not stop the others.
+func TestWatcherCoversEveryGenerationOfARecordAndSurvivesABadRecord(t *testing.T) {
+	f := newFixture(t, nil)
+	f.setRecord(func(r *start.Record) { r.Gen = 2; r.Reply.ID = "tomas/hp/" + sid + "/g2" })
+	os.MkdirAll(filepath.Join(f.state, "s", sid, "g2", "out", "requests"), 0o755)
+	os.MkdirAll(filepath.Join(f.state, "s", sid, "g2", "in", "replies"), 0o755)
+	os.WriteFile(filepath.Join(f.state, "sessions", "s0broken1.json"), []byte("{not json"), 0o600)
+	f.req("old.json", `{"type":"ccf.mark"}`) // in g1, now a superseded generation
+	os.WriteFile(filepath.Join(f.state, "s", sid, "g2", "out", "requests", "new.json"), []byte(`{"type":"ccf.mark"}`), 0o644)
+	f.h.Scan()
+	if f.code("old") != "stale:stale_generation" {
+		t.Fatalf("g1: %s", f.code("old"))
+	}
+	if len(f.got) != 1 || f.got[0].Rid != "new" {
+		t.Fatalf("g2's request was not handled: %+v", f.got)
+	}
+}
+
+// context: a reply that cannot be written (no in/replies, or it is not writable) used to be dropped
+// silently, so the session just waited. It is logged with the session and counted.
+func TestFailedReplyWriteIsLoggedAndCounted(t *testing.T) {
+	var logs []string
+	f := newFixture(t, func(c *Config) {
+		c.Logf = func(format string, a ...any) { logs = append(logs, fmt.Sprintf(format, a...)) }
+	})
+	os.RemoveAll(filepath.Join(f.g, "in", "replies"))
+	f.req("r1.json", `{"type":"ccf.mark"}`)
+	st := f.h.Scan()
+	if st.Reasons["reply_failed"] == 0 {
+		t.Fatalf("not counted: %+v", st.Reasons)
+	}
+	if all := strings.Join(logs, "\n"); !strings.Contains(all, sid) || !strings.Contains(all, "r1") || !strings.Contains(all, "could not be written") {
+		t.Fatalf("not logged with the session and rid:\n%s", all)
+	}
+}

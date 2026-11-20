@@ -489,29 +489,6 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 
 type peerKey struct{}
 
-// PeerContext is an http.Server.ConnContext for the unix socket: it records the connecting
-// process's uid (SO_PEERCRED), which is the only identity a start call has.
-func PeerContext(ctx context.Context, c net.Conn) context.Context {
-	uc, ok := c.(*net.UnixConn)
-	if !ok {
-		return ctx
-	}
-	raw, err := uc.SyscallConn()
-	if err != nil {
-		return ctx
-	}
-	var uid = -1
-	_ = raw.Control(func(fd uintptr) {
-		if cr, err := syscall.GetsockoptUcred(int(fd), syscall.SOL_SOCKET, syscall.SO_PEERCRED); err == nil {
-			uid = int(cr.Uid)
-		}
-	})
-	if uid < 0 {
-		return ctx
-	}
-	return context.WithValue(ctx, peerKey{}, uid)
-}
-
 // startSession: POST /v1/start, body = the LaunchSpec JSON. Owner class: the unix socket only,
 // never the loopback port (a token holder must not be able to start fenced sessions). 200 with the
 // StartReply; 409 with the Refusal; 500 {"error"}.

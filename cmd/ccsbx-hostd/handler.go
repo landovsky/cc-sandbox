@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -120,7 +122,11 @@ func replyWriter(stateDir string, d *start.Daemon) verbq.ReplyFunc {
 		} else if res.Code != "" {
 			result = map[string]string{"code": res.Code}
 		}
-		return hostd.WriteReply(gdir, hostd.Reply{Rid: it.Rid, ID: it.ID, Status: res.Status, Result: result, Seq: int(it.Seq)}) == nil
+		if err := hostd.WriteReply(gdir, hostd.Reply{Rid: it.Rid, ID: it.ID, Status: res.Status, Result: result, Seq: int(it.Seq)}); err != nil {
+			log.Printf("ccsbx-hostd: %s: the cockpit's result for %s could not be written to the session: %v", it.Sid, it.Rid, err)
+			return false
+		}
+		return true
 	}
 }
 
@@ -128,7 +134,9 @@ func replyWriter(stateDir string, d *start.Daemon) verbq.ReplyFunc {
 func pumpReply(stateDir string) func(msg.Origin, msg.Result) {
 	return func(o msg.Origin, res msg.Result) {
 		gdir := filepath.Join(stateDir, "s", o.Sid, fmt.Sprintf("g%d", o.Gen))
-		_ = hostd.WriteReply(gdir, hostd.Reply{Rid: o.Rid, ID: o.ID, Status: res.Status, Result: res})
+		if err := hostd.WriteReply(gdir, hostd.Reply{Rid: o.Rid, ID: o.ID, Status: res.Status, Result: res}); err != nil {
+			log.Printf("ccsbx-hostd: %s: the result of message %s could not be written to its sender: %v", o.Sid, o.Rid, err)
+		}
 	}
 }
 
@@ -190,3 +198,38 @@ func hearFunc(rt *msg.Router) func(journal.Record) {
 
 // hearEvery is the least time between two hears from one (sid, generation).
 const hearEvery = 30 * time.Second
+
+// startPolicy is hostd's start configuration (its flags), apart from who is asking.
+type startPolicy struct {
+	Profiles, Pins, WorktreeRoots, Image, CCVersion, TmuxSocket, RunDir string
+	MaxLive, MaxPerHour, MinUID                                         int
+	LookupID                                                            func(string) (*user.User, error)
+}
+
+// startHandler is the daemon API's session start: the caller is the socket peer (uid), the spec is
+// the owner's request. Refused before anything is written: a caller that is root, hostd's own uid
+// (the service user: panes and the tmux server run as it) or below --min-uid, a spec whose owner is
+// not the caller's own name (the owner is part of the session's id, the journal and token identity),
+// and a worktree-root list ccsbx-root would not accept. Then Daemon.Start with a per-call copy of sd.
+func startHandler(sd *start.Daemon, p startPolicy) func(uid int, spec []byte) (*start.StartReply, error) {
+	return func(uid int, specJSON []byte) (*start.StartReply, error) {
+		if uid == 0 || uid == os.Getuid() || uid < p.MinUID {
+			return nil, &start.Refusal{Code: start.BadSpec, Msg: fmt.Sprintf("uid %d may not start sessions (root, the service user, or below the minimum uid %d)", uid, p.MinUID)}
+		}
+		spec, err := start.ParseSpec(specJSON)
+		if err != nil {
+			return nil, err
+		}
+		if err := start.CheckOwner(uid, spec.Owner, p.LookupID); err != nil {
+			return nil, err
+		}
+		d := *sd // a copy per call: Uid differs, everything else is hostd's configuration
+		d.Uid, d.RunDir = uid, p.RunDir
+		// The roots are passed through unchanged: hostd is a service, a relative entry means nothing to
+		// it, and CheckWorkdir refuses exactly what ccsbx-root's allowed_roots refuses.
+		d.ProfilesDir, d.PinsFile, d.WorktreeRoot = p.Profiles, p.Pins, p.WorktreeRoots
+		d.Image, d.CCVersion, d.Socket = p.Image, p.CCVersion, p.TmuxSocket
+		d.MaxLive, d.MaxPerHour = p.MaxLive, p.MaxPerHour
+		return d.Start(spec)
+	}
+}

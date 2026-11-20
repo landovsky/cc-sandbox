@@ -1,6 +1,8 @@
-// Command ccsbx-hostd is the session daemon's outbox watcher (U3a). It reads fence requests
-// from every live outbox under the state directory, stamps them from the path and the session
-// record, and answers them into in/replies/. Zero third-party modules.
+// Command ccsbx-hostd is the session daemon (U3a and what grew on it): it reads fence requests from
+// every live outbox under the run directory (found through its own session records, never by
+// listing), stamps them from the path and the record, answers them into in/replies/, journals
+// events, delivers messages, serves the daemon API on a local socket, and starts sessions for the
+// owner who asks over that socket. Zero third-party modules.
 package main
 
 import (
@@ -63,8 +65,9 @@ func app() *cli.App {
 				f.Int("event-rate", 50, "fence hook events journaled per second per outbox; beyond the burst they are dropped and counted (events_shed)")
 				f.Int("event-burst", 500, "event bucket size per outbox")
 				f.Int("max-total", 20000, "requests per generation in its lifetime; beyond that they are shed")
-				f.String("run-dir", "", "where generations' outboxes are read: <run-dir>/s/<sid>/g<n>/{out,in,CLOSED} (default: the state dir). Helper mode: ccsbx-root's run dir, /var/lib/ccsbx-run, where out/ is 10001:ccsbx 2770 and hostd reads it through the group; every openat2/fstat check (owner uid = --fence-uid) still applies")
-				f.String("pins", "pins.toml", "production pins file for session starts (digests that may run under any profile)")
+				f.String("run-dir", "", "where generations' outboxes are read: <run-dir>/s/<sid>/g<n>/{out,in,CLOSED} (default: the state dir). Helper mode: ccsbx-root's run dir, /var/lib/ccsbx-run, where out/ is 10001:ccsbx 02750 (hostd reads it through the group and never writes it) and s/ and s/<sid> are not listable by hostd, so every path is derived from its session records; every openat2/fstat check (owner uid = --fence-uid) still applies")
+				f.String("pins", "/etc/ccsbx/pins.toml", "production pins file for session starts (digests that may run under any profile); the same file ccsbx-root reads")
+				f.Int("min-uid", 1000, "session starts: a caller with a uid below this, root, or hostd's own uid is refused (ccsbx-root refuses them anyway; a start must not hold a label and a slot first)")
 				f.String("worktree-root", home, "session starts: comma-separated absolute directories (the syntax and meaning of ccsbx-root.toml allowed_roots, e.g. /home/u/git,/home/u/wt): a workdir must be strictly inside one of them after symlinks are resolved; a bad entry stops every start; hidden dirs of the home are refused when a root is the home")
 				f.String("cc-version", "", "Claude Code version recorded in a started session's pin")
 				f.Int("max-live", 8, "session starts: machine_full above this many live sessions")
@@ -185,22 +188,11 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	}
 	// Session start for helper mode: the owner's `ccsbx start` asks here; hostd writes the record in
 	// its state dir and launches the pane. The caller's uid is the socket peer's, not the spec's.
-	srv.Start = func(uid int, specJSON []byte) (*start.StartReply, error) {
-		spec, err := start.ParseSpec(specJSON)
-		if err != nil {
-			return nil, err
-		}
-		// The owner names the session in its id: it is the caller (socket peer), not what the spec says.
-		if err := start.CheckOwner(uid, spec.Owner, user.LookupId); err != nil {
-			return nil, err
-		}
-		d := *sd // a copy per call: Uid differs, everything else is hostd's configuration
-		d.Uid, d.RunDir = uid, runDir
-		d.ProfilesDir, d.PinsFile, d.WorktreeRoot = abs(get("profiles")), abs(get("pins")), start.AbsRoots(get("worktree-root"))
-		d.Image, d.CCVersion, d.Socket = get("image"), get("cc-version"), get("tmux-socket")
-		d.MaxLive, d.MaxPerHour = num("max-live"), num("max-per-hour")
-		return d.Start(spec)
-	}
+	srv.Start = startHandler(sd, startPolicy{
+		Profiles: abs(get("profiles")), Pins: get("pins"), WorktreeRoots: get("worktree-root"), Image: get("image"),
+		CCVersion: get("cc-version"), TmuxSocket: get("tmux-socket"), RunDir: runDir,
+		MaxLive: num("max-live"), MaxPerHour: num("max-per-hour"), MinUID: num("min-uid"), LookupID: user.LookupId,
+	})
 	sock := get("local-socket")
 	if sock == "" {
 		sock = get("socket")
@@ -250,7 +242,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sig; close(stop) }()
-	lg.Printf("watching %s every %s (direct mode: results are not evidence)", get("state"), iv)
+	lg.Printf("watching outboxes under %s (state %s) every %s (direct mode: results are not evidence)", runDir, get("state"), iv)
 	h.Run(iv, stop)
 	for _, hs := range servers {
 		hs.Close()

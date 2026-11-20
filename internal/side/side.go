@@ -210,6 +210,7 @@ func (s *Server) Serve(ctx context.Context) error {
 			srv.Close()
 			return nil
 		case err := <-s.failed:
+			s.denySummary(true)
 			return fmt.Errorf("side: forwarder: %w", err)
 		case <-loadCh:
 			loadCh = nil // a nil channel blocks: this case fires once

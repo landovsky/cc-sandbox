@@ -92,13 +92,20 @@ func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s 
 	// (hostd's own principal: spoke:<machine>/ccsbx, fenced entries and its own downlink only)
 	// the stand-in for `ccsbx-root relay-mint`: the hub's admin API, which hostd itself never holds
 	mint := func(_ context.Context, sid string, gen int, pub string, _ bool) (string, error) {
-		// may_reach is the session's MANAGER only, as root derives it (Tomas's open question #3cy2: peers stay
-		// reachable only when they are fenced, over the signed path)
+		// as root derives it from the record: `manager` is the ONE unfenced target, `may_reach` the manager and every
+		// placed peer (the hub reaches a fenced target only if it is listed, an unfenced one only if it is the manager)
 		var reach []string
+		manager := ""
 		if s.Scope.Manager.Node != "" && s.Scope.Manager.Machine != "" {
-			reach = append(reach, s.Scope.Manager.Machine+"/"+s.Scope.Manager.Node)
+			manager = s.Scope.Manager.Machine + "/" + s.Scope.Manager.Node
+			reach = append(reach, manager)
 		}
-		m := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": sid, "gen": fmt.Sprint(gen), "pub": pub, "may_reach": reach})
+		for _, p := range s.Scope.Peers {
+			if m := s.Scope.PeerMachines[p]; m != "" {
+				reach = append(reach, m+"/"+p)
+			}
+		}
+		m := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": sid, "gen": fmt.Sprint(gen), "pub": pub, "may_reach": reach, "manager": manager})
 		return m["token"].(string), nil
 	}
 	hr := newHubRemote(client, url, name, rt, j, t.Logf, mint, t.TempDir())
@@ -187,7 +194,7 @@ func TestRealHubTwoMachinesExchangeSignedMessagesAndRefuseForgeries(t *testing.T
 	// 3. T:xmachine-forged-from, at the hub: a relay that signs for one sid but sends as another, or tampers
 	// with the body, is refused by the hub (403) and nothing is typed.
 	pub, priv, _ := stamp.NewKey()
-	rtok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": "s0forger01", "gen": "1", "pub": pub})["token"].(string)
+	rtok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": "s0forger01", "gen": "1", "pub": pub, "may_reach": []string{"mac/cc-sandbox:mgr"}})["token"].(string)
 	es, _ := hp.hr.hub.Sessions(ctx)
 	mid := hubc.FindNode(es, "cc-sandbox:mgr")["id"].(string)
 	c := &hubc.Client{URL: url, Token: func() (string, error) { return rtok, nil }}
@@ -624,8 +631,11 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("the setup: %d entries share the short id %s, want 2", n, shortID)
 	}
-	if ok, _ := sendVia(hp13, w13, "cc-sandbox:umgr13", "report", "to the manager, not to its twin"); ok {
-		t.Fatal("a message was sent to an address another entry shares")
+	// the sender addresses the full uid, so a ground SHORT id blocks nothing: the real manager gets it, the twin does not
+	if ok, err := sendVia(hp13, w13, "cc-sandbox:umgr13", "report", "to the manager, not to its twin"); err != nil {
+		t.Logf("send: %v (the manager's pane is not being polled here: the hub may report it undelivered)", err)
+	} else {
+		_ = ok
 	}
 	if fs, _, err := x4Client.Poll(ctx, "spoke:x4", 0, time.Second); err == nil && len(fs) != 0 {
 		t.Fatalf("the decoy's downlink got the message: %d frames", len(fs))

@@ -2,6 +2,8 @@ package start
 
 import (
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
+	"os"
 	"os/exec"
 	"strconv"
 )
@@ -17,9 +19,9 @@ type TmuxLauncher struct {
 
 func (t *TmuxLauncher) cmd(args ...string) *exec.Cmd {
 	if t.Command != nil {
-		return t.Command("tmux", append([]string{"-L", t.Socket}, args...)...)
+		return t.Command("tmux", append(tmuxsock.Args(t.Socket), args...)...)
 	}
-	return exec.Command("tmux", append([]string{"-L", t.Socket}, args...)...)
+	return exec.Command("tmux", append(tmuxsock.Args(t.Socket), args...)...)
 }
 
 // Launch creates a detached session named after the sid and hardens the server in the same tmux
@@ -32,6 +34,16 @@ func (t *TmuxLauncher) Launch(r *Record) error {
 	args = append(args, ";", "set-option", "-g", "set-clipboard", "off", ";", "set-option", "-g", "allow-passthrough", "off")
 	if out, err := t.cmd(args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("tmux new-session: %v: %s", err, out)
+	}
+	// A shared socket path (the service uid's tmux, reached by the owner's uid through a group):
+	// tmux creates it 0600, so make it 0660 ourselves. Fail closed: if that can't be done the
+	// session is ended again rather than left on a socket nobody in the group can reach, or one
+	// with the wrong mode.
+	if tmuxsock.IsPath(t.Socket) {
+		if err := os.Chmod(t.Socket, 0o660); err != nil {
+			_ = t.Stop(r.Sid)
+			return fmt.Errorf("tmux socket %s: cannot set mode 0660 (session ended): %v", t.Socket, err)
+		}
 	}
 	return nil
 }

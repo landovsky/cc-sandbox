@@ -6,6 +6,7 @@ package main
 
 import (
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
 	"io"
 	"os"
 	"os/exec"
@@ -39,7 +40,7 @@ func attachCmd() *cli.Command {
 				fmt.Fprintln(stderr, "ccsbx attach: tmux isn't installed here")
 				return cli.ExitFail
 			}
-			argv := []string{"tmux", "-L", f.Lookup("tmux-socket").Value.String(), "attach", "-t", "=" + args[0] + ":"}
+			argv := append(append([]string{"tmux"}, tmuxsock.Args(f.Lookup("tmux-socket").Value.String())...), "attach", "-t", "="+args[0]+":")
 			if f.Lookup("read-only").Value.String() == "true" {
 				argv = append(argv, "-r")
 			}

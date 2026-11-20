@@ -60,7 +60,7 @@ func app() *cli.App {
 				f.Int("rate", 10, "requests per second per outbox")
 				f.Int("burst", 20, "token bucket size per outbox")
 				f.Int("max-total", 20000, "requests per generation in its lifetime; beyond that they are shed")
-				f.String("tmux-socket", "ccsbx", "tmux -L socket the session panes live on (message delivery by send-keys)")
+				f.String("tmux-socket", "ccsbx", "tmux server the session panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (a socket shared between uids; hostd makes it 0660)")
 				f.String("machine", hostname(), "this machine's name, stamped on journal records")
 				f.String("journal", "", "journal directory (default <state>/journal)")
 				f.Int("retention-days", 14, "journal retention; values below 14 are refused")
@@ -128,6 +128,9 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	rt.Idle = j
 	if b := get("ccmsg-bin"); b != "" {
 		rt.Hub = msg.CcmsgHub{Bin: b} // an unfenced manager on this machine, through the session bus
+	} else {
+		// Not an error: this is the state at Gate M (hostd's uid has no access to the owner's bus).
+		lg.Printf("--ccmsg-bin is not set: a fenced worker's message to an unfenced manager is answered no_live_session (the hub is reached only through the spoke, not built yet); messages between ccsbx sessions are unaffected")
 	}
 	var onEvent func(journal.Record)
 	if get("hear") == "true" {

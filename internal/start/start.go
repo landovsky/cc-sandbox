@@ -5,6 +5,7 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
 	"os"
 	"path/filepath"
 	"strings"
@@ -202,7 +203,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	rec.Reply = StartReply{
 		V: 1, Sid: sid, Gen: rec.Gen, ID: fmt.Sprintf("%s/%s/%s/g%d", s.Owner, d.Machine, sid, rec.Gen), Backend: d.Backend,
 		Pin:     Pin{CC: orUnpinned(d.CCVersion), Image: orUnpinned(d.Image), Channel: channel},
-		Attach:  Attach{Local: []string{"tmux", "-L", orDefault(d.Socket, "ccsbx"), "attach", "-t", sid}, Remote: []string{"ssh", "-t", d.Machine, "ccsbx", "attach", sid}},
+		Attach:  Attach{Local: append(append([]string{"tmux"}, tmuxsock.Args(orDefault(d.Socket, "ccsbx"))...), "attach", "-t", sid), Remote: []string{"ssh", "-t", d.Machine, "ccsbx", "attach", sid}},
 		Journal: Journal{Epoch: d.epoch(), Seq: len(recs)},
 		NotEv:   d.Root != "helper",
 	}

@@ -7,6 +7,7 @@ package msg
 import (
 	"bytes"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
 	"os/exec"
 	"strings"
 	"time"
@@ -47,7 +48,7 @@ type Tmux struct {
 func (t *Tmux) run(args ...string) ([]byte, error) { return t.runIn("", args...) }
 
 func (t *Tmux) runIn(stdin string, args ...string) ([]byte, error) {
-	a := append([]string{"-L", t.Socket}, args...)
+	a := append(tmuxsock.Args(t.Socket), args...)
 	var c *exec.Cmd
 	if t.Command != nil {
 		c = t.Command("tmux", a...)

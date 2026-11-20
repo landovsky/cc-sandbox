@@ -20,9 +20,10 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/termfilter"
 )
 
-// terminalReset puts the owner's terminal back to what a full-screen program may have changed: leave the
-// alternate screen, show the cursor, stop bracketed paste, reset attributes.
-var terminalReset = []byte("\x1b[?1049l\x1b[?25h\x1b[?2004l\x1b[0m")
+// terminalReset puts the owner's terminal back to what a full-screen program may have changed.
+// Every private mode the filter lets through (termfilter.Modes) is put back to its default here, and focus
+// reporting (never passed) is switched off in case an earlier program left it on.
+var terminalReset = []byte("\x1b[?1l\x1b[?5l\x1b[?6l\x1b[?7h\x1b[?12l\x1b[?25h\x1b[?47l\x1b[?1047l\x1b[?1048l\x1b[?1049l\x1b[?2004l\x1b[?2026l\x1b[?1004l\x1b>\x1b[0m")
 
 // ptyRun is one session on a pty.
 type ptyRun struct {

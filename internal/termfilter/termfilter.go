@@ -15,6 +15,10 @@
 // hold the filter's memory nor blank the screen for good.
 package termfilter
 
+// UTF-8 only: a terminal in an 8-bit mode reads a valid two-byte character such as C3 9D as two bytes, the
+// second of them a C1 control. The filter is sound for UTF-8 terminals, which is every terminal the owner
+// attaches from (ccsbx-root sets LANG=C.UTF-8 for the session); it does not claim more.
+
 // maxString is how many bytes of an OSC/DCS/APC/PM/SOS payload are swallowed before the filter gives up
 // waiting for its terminator and goes back to ordinary text.
 const maxString = 4096
@@ -28,17 +32,21 @@ const (
 	csi          // inside a CSI, collecting parameters
 	str          // inside OSC/DCS/APC/PM/SOS: dropping to ST or BEL
 	strEsc       // inside a string, after ESC (maybe the start of ST)
-	utf8c2       // saw 0xC2: the next byte decides whether this is a C1 control
 )
 
 // Filter is a streaming filter: Write can be given the stream in any pieces.
 type Filter struct {
-	st   state
-	buf  []byte // the CSI being read, so it can be passed or dropped whole
-	n    int    // bytes swallowed in the current string
-	osc  bool   // the current string is an OSC (BEL ends it as well as ST)
-	out  []byte
-	cont int // continuation bytes still expected of a UTF-8 character that was passed
+	st  state
+	buf []byte // the CSI being read, so it can be passed or dropped whole
+	n   int    // bytes swallowed in the current string
+	osc bool   // the current string is an OSC (BEL ends it as well as ST)
+	out []byte
+	// a multi-byte UTF-8 character being read: it is emitted only once complete and valid, so a lead byte
+	// can never adopt a following raw C1 byte as its "continuation"
+	pend [4]byte
+	pn   int // bytes held in pend
+	need int // continuation bytes still wanted (0: not inside a character)
+	lead byte
 }
 
 // csiFinal are the final bytes of the CSI sequences that only draw. Anything else is dropped.
@@ -51,10 +59,33 @@ const csiFinal = "mABCDEFGHfdJKLMP@XSTrsul`ea"
 // paste, application cursor keys and keypad, origin mode, reverse video.
 func allowedMode(params string) bool {
 	switch params {
-	case "?1", "?5", "?6", "?7", "?12", "?25", "?47", "?1047", "?1048", "?1049", "?2004", "?2026", "?1004":
-		return true
+	case "?1", "?5", "?6", "?7", "?12", "?25", "?47", "?1047", "?1048", "?1049", "?2004", "?2026":
+		return true // (not ?1004, focus reporting: the pod has no need to know the owner's focus)
 	}
 	return false
+}
+
+// Modes are the private modes the filter lets through; a terminal reset must undo every one.
+var Modes = []string{"?1", "?5", "?6", "?7", "?12", "?25", "?47", "?1047", "?1048", "?1049", "?2004", "?2026"}
+
+// validNext reports whether c may be the byte at position pn (1..3) of a character that began with lead:
+// a continuation byte, in the second-byte ranges that rule out overlong forms, surrogates and anything
+// above U+10FFFF.
+func validNext(lead byte, pn int, c byte) bool {
+	lo, hi := byte(0x80), byte(0xbf)
+	if pn == 1 {
+		switch lead {
+		case 0xe0:
+			lo = 0xa0
+		case 0xed:
+			hi = 0x9f
+		case 0xf0:
+			lo = 0x90
+		case 0xf4:
+			hi = 0x8f
+		}
+	}
+	return c >= lo && c <= hi
 }
 
 // Write filters p and returns the bytes to pass on. It never fails and never returns more than 2 bytes
@@ -70,6 +101,20 @@ func (f *Filter) Write(p []byte) []byte {
 func (f *Filter) step(c byte) {
 	switch f.st {
 	case text:
+		if f.need > 0 { // inside a multi-byte character
+			if validNext(f.lead, f.pn, c) {
+				f.pend[f.pn] = c
+				f.pn++
+				if f.pn-1 == f.need { // complete: UTF-8 is valid by construction; C1 controls (U+0080-U+009F) are dropped
+					if !(f.pend[0] == 0xc2 && f.pend[1] >= 0x80 && f.pend[1] <= 0x9f) {
+						f.out = append(f.out, f.pend[:f.pn]...)
+					}
+					f.need, f.pn = 0, 0
+				}
+				return
+			}
+			f.need, f.pn = 0, 0 // cut short or invalid: the partial character is dropped, and this byte is looked at afresh
+		}
 		switch {
 		case c == 0x1b:
 			f.st = esc
@@ -77,41 +122,18 @@ func (f *Filter) step(c byte) {
 			f.out = append(f.out, c)
 		case c < 0x20 || c == 0x7f:
 			// the other C0 controls (ENQ makes a terminal answer, SO/SI switch character sets) and DEL: dropped
-		case f.cont > 0:
-			if c >= 0x80 && c <= 0xbf { // a continuation byte of a character already passed
-				f.cont--
-				f.out = append(f.out, c)
-			} else { // the character was cut short: the byte is something new
-				f.cont = 0
-				f.step(c)
-			}
-		case c == 0xc2:
-			f.st = utf8c2
-		case c >= 0x80 && c <= 0xbf:
-			// with no character open this is a raw C1 control (CSI, OSC, DCS as single bytes in an 8-bit
-			// terminal) or a stray continuation byte: dropped
-		case c >= 0xc3 && c <= 0xdf:
-			f.cont = 1
+		case c < 0x80:
 			f.out = append(f.out, c)
+		case c >= 0xc2 && c <= 0xdf:
+			f.lead, f.need, f.pn, f.pend[0] = c, 1, 1, c
 		case c >= 0xe0 && c <= 0xef:
-			f.cont = 2
-			f.out = append(f.out, c)
+			f.lead, f.need, f.pn, f.pend[0] = c, 2, 1, c
 		case c >= 0xf0 && c <= 0xf4:
-			f.cont = 3
-			f.out = append(f.out, c)
-		case c >= 0xf5:
-			// never a valid lead byte
+			f.lead, f.need, f.pn, f.pend[0] = c, 3, 1, c
 		default:
-			f.out = append(f.out, c)
+			// 0x80-0xBF with no character open (raw C1 controls: CSI, OSC, DCS as single bytes in an 8-bit
+			// terminal; or a stray continuation byte), 0xC0 and 0xC1 (overlong), 0xF5-0xFF: never valid
 		}
-	case utf8c2:
-		f.st = text
-		if c >= 0x80 && c <= 0x9f {
-			return // U+0080..U+009F, UTF-8 encoded: a C1 control. Both bytes dropped.
-		}
-		f.out = append(f.out, 0xc2) // U+0080-9F excluded: the rest of U+0080-U+00BF (¡ ©) is ordinary text
-		f.cont = 1
-		f.step(c)
 	case esc:
 		switch {
 		case c == '[':

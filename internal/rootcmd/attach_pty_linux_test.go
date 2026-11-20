@@ -9,6 +9,7 @@ package rootcmd
 import (
 	"bytes"
 	"errors"
+	"github.com/landovsky/cc-sandbox/internal/termfilter"
 	"os/exec"
 	"strings"
 	"testing"
@@ -56,5 +57,18 @@ func TestTheChildGetsATerminal(t *testing.T) {
 	var out outBuf
 	if code, err := runOnPty(ptyRun{Cmd: cmd, In: strings.NewReader(""), Out: &out}); err != nil || code != 0 || !strings.Contains(out.String(), "tty-ok") {
 		t.Errorf("%d %v %q", code, err, out.String())
+	}
+}
+
+// context "the agent may have left the owner's terminal in a mode": every private mode the filter passes is
+// undone when the session ends (focus reporting, which is not passed, as well).
+func TestTheTerminalResetUndoesEveryModeTheFilterPasses(t *testing.T) {
+	for _, m := range termfilter.Modes {
+		if !strings.Contains(string(terminalReset), "\x1b["+m+"l") && !strings.Contains(string(terminalReset), "\x1b["+m+"h") {
+			t.Errorf("mode %s is passed by the filter but not reset", m)
+		}
+	}
+	if !strings.Contains(string(terminalReset), "\x1b[?1004l") || !strings.HasSuffix(string(terminalReset), "\x1b[0m") {
+		t.Errorf("%q", terminalReset)
 	}
 }

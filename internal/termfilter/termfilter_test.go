@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func run(in string) string {
@@ -118,5 +119,85 @@ func TestOutputIsBounded(t *testing.T) {
 	in := bytes.Repeat([]byte("\xc2\x41\x1b[1m"), 1000)
 	if got := f.Write(in); len(got) > 2*len(in) {
 		t.Errorf("%d from %d", len(got), len(in))
+	}
+}
+
+// context "a lead byte must not adopt a raw C1 byte as its continuation": the review's probes. A character
+// is emitted only complete and valid, a cut-short one is dropped, and what interrupted it is looked at fresh.
+func TestARawC1AfterAnInterruptedCharacterIsStillDropped(t *testing.T) {
+	for name, c := range map[string]struct{ in, want string }{
+		"a lead byte, a newline, then a raw OSC":         {"\xe2\n\x9d52;c;QUJD\x07", "\n52;c;QUJD\a"},
+		"a lead byte, then ESC [ m, then a raw CSI":      {"\xc2\x1b[m\x9b6n", "\x1b[m6n"},
+		"an overlong ESC":                                {"\xe0\x80\x9b", ""},
+		"an overlong U+009D (OSC)":                       {"\xe0\x82\x9d", ""},
+		"a surrogate":                                    {"\xed\xa0\x80", ""},
+		"above U+10FFFF":                                 {"\xf4\x90\x80\x80", ""},
+		"an overlong four-byte form":                     {"\xf0\x80\x80\x9b", ""},
+		"C0 and C1 lead bytes":                           {"\xc0\x9b\xc1\x9d", ""},
+		"a lead byte then a lead byte":                   {"\xe2\xe2\x82\xac", "\xe2\x82\xac"},
+		"a lead byte, ASCII, then its continuations":     {"\xe2a\x82\xac", "a"},
+		"a lead byte at the end of a line":               {"\xf0\x9f\r\n", "\r\n"},
+		"U+0080 and U+009F encoded":                      {"\xc2\x80\xc2\x9f", ""},
+		"U+00A0 encoded (not a control)":                 {"\xc2\xa0", "\xc2\xa0"},
+		"a valid two, three and four byte character":     {"é€😀", "é€😀"},
+		"the boundaries E0 A0 80, ED 9F BF, F4 8F BF BF": {"\xe0\xa0\x80\xed\x9f\xbf\xf4\x8f\xbf\xbf", "\xe0\xa0\x80\xed\x9f\xbf\xf4\x8f\xbf\xbf"},
+	} {
+		if got := run("A" + c.in + "B"); got != "A"+c.want+"B" {
+			t.Errorf("%s: %q gave %q, want %q", name, c.in, got, "A"+c.want+"B")
+		}
+		// the same, one byte per Write
+		var f Filter
+		var piece []byte
+		for _, b := range []byte("A" + c.in + "B") {
+			piece = append(piece, f.Write([]byte{b})...)
+		}
+		if string(piece) != "A"+c.want+"B" {
+			t.Errorf("%s, byte by byte: %q", name, piece)
+		}
+	}
+}
+
+// context "whatever the agent sends": the output is valid UTF-8 with no C1 control and no escape except
+// the ones the filter itself writes (ESC followed by [ or one of 78DEM=>c).
+func TestWhateverIsSentTheOutputIsCleanUTF8(t *testing.T) {
+	rnd := uint64(88172645463325252)
+	next := func() byte { rnd ^= rnd << 13; rnd ^= rnd >> 7; rnd ^= rnd << 17; return byte(rnd) }
+	alphabet := []byte{0x1b, '[', ']', 'P', '_', '^', 'X', 0x07, 0x9b, 0x9d, 0x90, 0xc2, 0xc3, 0xe0, 0xe2, 0xed, 0xf0, 0xf4, 0x80, 0xbf, 0xa0, '5', '2', ';', 'c', 'n', 'm', '?', '\\', 0x9c, 'a'}
+	for i := 0; i < 3000; i++ {
+		in := make([]byte, 64)
+		for j := range in {
+			if next()%4 == 0 {
+				in[j] = next()
+			} else {
+				in[j] = alphabet[int(next())%len(alphabet)]
+			}
+		}
+		var f Filter
+		out := f.Write(in[:20])
+		out = append(out, f.Write(in[20:])...)
+		if !utf8.Valid(out) {
+			t.Fatalf("input %q gave invalid UTF-8 %q", in, out)
+		}
+		for _, r := range string(out) {
+			if r >= 0x80 && r <= 0x9f {
+				t.Fatalf("input %q gave a C1 control %q", in, out)
+			}
+		}
+		for k := 0; k < len(out); k++ {
+			if out[k] == 0x1b && (k+1 >= len(out) || !strings.ContainsRune("[78DEM=>c", rune(out[k+1]))) {
+				t.Fatalf("input %q gave a stray escape %q", in, out)
+			}
+		}
+	}
+}
+
+func TestFocusReportingIsNotPassedAndEveryPassedModeIsListedForTheReset(t *testing.T) {
+	if got := run("\x1b[?1004h"); got != "" {
+		t.Errorf("focus reporting passed: %q", got)
+	}
+	for _, m := range Modes {
+		if got := run("\x1b[" + m + "h"); got == "" {
+			t.Errorf("mode %s is listed in Modes but dropped", m)
+		}
 	}
 }

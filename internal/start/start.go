@@ -37,12 +37,15 @@ type Record struct {
 	RequestID string `json:"request_id"`
 	// RequestIDs is every request that produced a generation of this session, so a retry of
 	// the gen-1 start after a resume can't start a second session.
-	RequestIDs []string   `json:"request_ids,omitempty"`
-	Uid        int        `json:"uid"` // the caller, from the OS
-	Started    time.Time  `json:"started"`
-	Ended      *time.Time `json:"ended,omitempty"`
-	Spec       LaunchSpec `json:"spec"`
-	Reply      StartReply `json:"reply"`
+	RequestIDs []string `json:"request_ids,omitempty"`
+	Uid        int      `json:"uid"` // the caller, from the OS
+	// StartedBy is who asked, when it was not a process on this machine: "owner:<login>@<device>", stamped by
+	// the daemon from the tailnet's word about the caller (M2c), never from the request.
+	StartedBy string     `json:"started_by,omitempty"`
+	Started   time.Time  `json:"started"`
+	Ended     *time.Time `json:"ended,omitempty"`
+	Spec      LaunchSpec `json:"spec"`
+	Reply     StartReply `json:"reply"`
 	// GitDir is the gitdir the fence may see read-only, decided once at the session's first
 	// start. Later generations reuse it: the worktree's .git file is agent-written and is never
 	// read again.
@@ -65,15 +68,18 @@ type Daemon struct {
 	ProfileLoader func(name string) (*profile.Profile, error)
 	Machine       string // this machine's name; a spec for another machine is refused
 	Uid           int    // the caller's uid (from the OS, never from the spec)
+	StartedBy     string // a remote caller's stamped identity, recorded with the session (M2c); "" for a local start
 	Image         string // fence image reference recorded in the pin
 	PinsFile      string // pins.toml; missing means no production pins
 	WorktreeRoot  string // every worktree must be inside this directory (CCSBX_WORKTREE_ROOT)
 	CCVersion     string
 	MaxLive       int // machine_full above this many live sessions
 	MaxPerHour    int // rate_capped above this many starts by one caller in an hour
-	Backend       string
-	Socket        string // tmux -L name for the attach command; default ccsbx
-	Root          string // "direct" or "helper"
+	// RemoteMaxPerHour is the same cap for starts asked for over the tailnet (StartedBy != ""), counted apart.
+	RemoteMaxPerHour int
+	Backend          string
+	Socket           string // tmux -L name for the attach command; default ccsbx
+	Root             string // "direct" or "helper"
 	// HelperProven: the helper has actually run on this machine and the docker group is gone. Only
 	// then does a reply claim evidence; the mere presence of ccsbx-root proves nothing (invariants 12, 14).
 	HelperProven bool
@@ -262,17 +268,24 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		if r.Ended == nil && d.Launcher.Alive(r.Sid) {
 			live++
 			if r.Spec.Label == s.Label {
-				return nil, refuse(AlreadyRunning, "%s already_running on %s (sid %s)", s.Label, d.Machine, r.Sid)
+				ref := refuse(AlreadyRunning, "%s already_running on %s (sid %s)", s.Label, d.Machine, r.Sid)
+				ref.Machine, ref.Sid, ref.State = d.Machine, r.Sid, "running"
+				return nil, ref
 			}
 		} else if r.Ended == nil {
 			d.markEnded(r) // the pane is gone: a stale record must not block the label
 		}
-		if r.Uid == d.Uid && d.now().Sub(r.Started) < time.Hour {
+		// remote starts have their own hourly budget (M2c): they cannot use up the owner's local starts
+		if r.Uid == d.Uid && d.now().Sub(r.Started) < time.Hour && (r.StartedBy != "") == (d.StartedBy != "") {
 			started++
 		}
 	}
-	if d.MaxPerHour > 0 && started >= d.MaxPerHour {
-		return nil, refuse(RateCapped, "%d starts in the last hour (cap %d)", started, d.MaxPerHour)
+	hourCap := d.MaxPerHour
+	if d.StartedBy != "" {
+		hourCap = d.RemoteMaxPerHour
+	}
+	if hourCap > 0 && started >= hourCap {
+		return nil, refuse(RateCapped, "%d starts in the last hour (cap %d)", started, hourCap)
 	}
 	if d.MaxLive > 0 && live >= d.MaxLive {
 		return nil, refuse(MachineFull, "%d live sessions (cap %d)", live, d.MaxLive)
@@ -286,6 +299,8 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 			return nil, refuse(BadSpec, "resume: no session %q", s.Resume.Sid)
 		}
 		switch {
+		case d.StartedBy != "" && old.StartedBy != d.StartedBy:
+			return nil, refuse(ResumeNotYours, "resume: session %s was not started by this caller", old.Sid)
 		case old.Uid != d.Uid:
 			return nil, refuse(BadSpec, "resume: session %s belongs to another caller", old.Sid)
 		case old.Label != s.Label:
@@ -323,7 +338,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 				return nil, refuse(BadSpec, "workdir git metadata: %v", err)
 			}
 		}
-		rec = &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s, GitDir: gd}
+		rec = &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s, GitDir: gd, StartedBy: d.StartedBy}
 	}
 	sid := rec.Sid
 	rec.Reply = StartReply{

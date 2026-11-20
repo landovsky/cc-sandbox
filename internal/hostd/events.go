@@ -83,8 +83,12 @@ func (h *Hostd) lifecycle(gdir string, rec *start.Record, box *outbox, typ strin
 	if cl.Role == "" {
 		cl.Role = "worker"
 	}
-	data, _ := json.Marshal(map[string]any{"full_id": rec.Reply.ID, "node": rec.Spec.Label, "role": cl.Role, "gen": gen,
-		"workdir": rec.Spec.Workdir.Path, "backend": rec.Reply.Backend, "machine": rec.Spec.Machine})
+	ev := map[string]any{"full_id": rec.Reply.ID, "node": rec.Spec.Label, "role": cl.Role, "gen": gen,
+		"workdir": rec.Spec.Workdir.Path, "backend": rec.Reply.Backend, "machine": rec.Spec.Machine}
+	if rec.StartedBy != "" { // a remote start: who asked, and for which grants (the daemon's record, not the fence's)
+		ev["started_by"], ev["grants"] = rec.StartedBy, rec.Spec.Grants
+	}
+	data, _ := json.Marshal(ev)
 	if _, err := h.Cfg.Journal.Append(journal.Event{Sid: rec.Sid, Gen: gen, Node: rec.Spec.Label, Realm: rec.Spec.Realm, Src: "host", Type: typ, Data: data}); err != nil {
 		h.Cfg.Logf("hostd: journal append failed: %v", err)
 		return

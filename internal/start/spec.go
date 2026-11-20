@@ -105,12 +105,27 @@ const (
 	PodConflict        = "pod_conflict"    // a pod is under the name that is not ours
 	PodNotReady        = "pod_not_ready"   // the pod did not come up in time; it was deleted
 	PodLoadFailed      = "pod_load_failed" // the sidecar could not be loaded; the pod was deleted
+	// the remote start (M2c)
+	GrantNotAllowed  = "grant_not_allowed"
+	ResumeNotYours   = "resume_not_yours"
+	StartInProgress  = "start_in_progress"
+	PeerUnreachable  = "peer_unreachable"
+	PeerSetMismatch  = "peer_set_mismatch"
+	RequestIDReused  = "request_id_reused"
+	Forbidden        = "forbidden"
+	UnsupportedMedia = "unsupported_media_type"
 )
 
 // Refusal is a policy refusal, not a failure.
 type Refusal struct {
 	Code string `json:"refused"`
 	Msg  string `json:"message"`
+	// already_running carries where, so a client can reattach without a second call; start_in_progress carries
+	// when to come back (seconds, also sent as Retry-After)
+	Machine    string `json:"machine,omitempty"`
+	Sid        string `json:"sid,omitempty"`
+	State      string `json:"state,omitempty"`
+	RetryAfter int    `json:"retry_after,omitempty"`
 }
 
 func (r *Refusal) Error() string { return r.Code + ": " + r.Msg }

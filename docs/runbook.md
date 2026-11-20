@@ -94,6 +94,11 @@
      It prints `DONE` only after hostd and the signer are up. hostd listens on loopback only
      (`127.0.0.1:7480`, with a token file), so the firewall question (S11) does not arise.
      Before step 2 do the manual checks listed in `docs/night-1-morning.md` (S5, S9, S14, S15).
+     **Attach:** `/run/ccsbx` (hostd's tmux socket, 0600) is `ccsbx`-only, mode 0700, with no group: a
+     group-writable tmux socket would let any process of the owner's uid type into fenced panes. The owner
+     attaches with `sudo ccsbx-root attach <sid>`; the installer's one rule for `ccsbx-root` already covers
+     that verb, so no separate attach line is added (narrowing it to `attach *` is G's call). hostd's API
+     socket is `/run/ccsbx-api/hostd.sock`, `ccsbx:ccsbx-clients` 0660, in a 0755 directory.
      **Known limit after Gate M:** hostd runs as uid `ccsbx` (no `--ccmsg-bin`), so it cannot use the
      owner's bus sockets. Messages from a fenced session to an unfenced manager wait for the hub
      spoke over :4011 (B10/B11/M2b). Until then only ccsbx sessions are reachable by hostd.

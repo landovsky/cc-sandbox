@@ -1498,3 +1498,25 @@ block = "tests/twin-go.sh ./internal/backend TestReadSmallRefusesWhatAnAgentCoul
 invariants = [10]
 backends = ["unit"]
 where = "hp"
+
+# ---- helper start follow-ups (n1-g-helper3). Direct mode: not evidence. ----
+
+[[rule]]
+id = "gitdir-under-roots"
+title = "a client-resolved linked-worktree gitdir must sit under a worktree root (or be <workdir>/.git): /etc/.git/worktrees/x is refused by hostd itself; paths with control characters are refused"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/backend TestCheckGitDirLexicalShapes"
+block = "tests/twin-go.sh ./internal/start TestHelperModeRefusesAGitdirOutsideTheWorktreeRoots"
+invariants = [3, 10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-file-every-read-site"
+title = "each of the three reads of a worktree's small git files (.git, the gitdir back-reference, commondir) is bounded: a FIFO or an oversize file at any one site is refused without a hang"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/backend TestReadSmallReadsAnOrdinaryGitFileAllow"
+block = "tests/twin-go.sh ./internal/backend TestEveryGitFileReadSiteIsBounded"
+invariants = [10]
+backends = ["unit"]
+where = "hp"

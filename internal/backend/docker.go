@@ -529,8 +529,13 @@ func isGitDir(d string) bool {
 
 // CheckPath refuses characters that would change how a path is read in a mount spec.
 func CheckPath(p string) error {
-	if strings.ContainsAny(p, ",:\n\r\x00") {
-		return fmt.Errorf("path %q contains a character that is not allowed in a mount (comma, colon, newline, NUL)", p)
+	if strings.ContainsAny(p, ",:") {
+		return fmt.Errorf("path %q contains a character that is not allowed in a mount (comma, colon)", p)
+	}
+	for _, r := range p {
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("path %q contains a control character (newline, NUL, escape, ...)", p)
+		}
 	}
 	return nil
 }
@@ -591,7 +596,7 @@ func CheckWorkdirLexical(w, roots, stateDir, runDir string) (string, error) {
 // empty (no .git), exactly <workdir>/.git, or a clean absolute path whose last two segments are
 // worktrees/<name> inside a .git directory (a linked worktree's gitdir). ccsbx-root verifies the real
 // thing (the back-reference, the owners) at run time.
-func CheckGitDirLexical(gd, workdir string) error {
+func CheckGitDirLexical(gd, workdir, roots string) error {
 	if gd == "" {
 		return nil
 	}
@@ -609,7 +614,15 @@ func CheckGitDirLexical(gd, workdir string) error {
 	if name == "" || filepath.Base(parent) != "worktrees" || filepath.Base(filepath.Dir(parent)) != ".git" {
 		return fmt.Errorf("gitdir %s is neither <workdir>/.git nor <repo>/.git/worktrees/<name>", gd)
 	}
-	return nil
+	// A linked worktree's gitdir lives in the main repository, which must sit under one of the worktree
+	// roots too: /etc/.git/worktrees/x has the right shape and is nowhere near anything a session may
+	// use. (ccsbx-root verifies the back-reference and the owners at run time.)
+	for _, r := range strings.Split(roots, ",") {
+		if r != "" && strings.HasPrefix(gd, r+string(filepath.Separator)) {
+			return nil
+		}
+	}
+	return fmt.Errorf("gitdir %s is not under a worktree root (%s)", gd, roots)
 }
 
 // CheckWorkdir decides whether a worktree path may be mounted rw into a fence. The path is

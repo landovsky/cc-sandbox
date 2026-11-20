@@ -12,7 +12,9 @@ import (
 	"strings"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
+	"github.com/landovsky/cc-sandbox/internal/profile"
 	"github.com/landovsky/cc-sandbox/internal/start"
+	"github.com/landovsky/cc-sandbox/profiles"
 )
 
 // stateFlags are shared by `start` and `run`: both must see the same state directory.
@@ -25,7 +27,7 @@ func defaultState() string {
 func stateFlags(f *cli.Flags) {
 	home, _ := os.UserHomeDir()
 	f.String("state", defaultState(), "daemon state directory (session records, lock)")
-	f.String("profiles", "profiles", "directory of <name>.json profiles")
+	f.String("profiles", "profiles", "directory of <name>.json profiles; '-' means the profiles compiled into this binary (what hostd uses and passes to the panes it starts)")
 	f.String("machine", hostname(), "this machine's name; a spec for another machine is refused")
 	f.String("worktree-root", home, "comma-separated directories (like ccsbx-root.toml allowed_roots): every worktree must be strictly inside one (symlinks resolved); hidden dirs of the home are refused when a root is the home")
 	f.String("pins", "pins.toml", "production pins file (digests that may run under any profile)")
@@ -51,8 +53,13 @@ func daemonFrom(f *cli.Flags) (*start.Daemon, error) {
 	if err != nil {
 		return nil, err
 	}
+	profilesDir, loader := abs(get("profiles")), (func(string) (*profile.Profile, error))(nil)
+	if get("profiles") == "-" {
+		profilesDir, loader = "-", profiles.Load // the embedded copy, not a directory anyone can edit
+	}
 	d := &start.Daemon{
-		StateDir: abs(get("state")), ProfilesDir: abs(get("profiles")), Machine: get("machine"), Uid: os.Getuid(),
+		ProfileLoader: loader,
+		StateDir:      abs(get("state")), ProfilesDir: profilesDir, Machine: get("machine"), Uid: os.Getuid(),
 		Backend: "docker", Root: mode, Exe: exe, PinsFile: abs(get("pins")), WorktreeRoot: start.AbsRoots(get("worktree-root")),
 	}
 	return d, nil

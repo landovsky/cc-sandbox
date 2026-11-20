@@ -108,6 +108,15 @@ func ResolveClientPaths(s *LaunchSpec, uid int) error {
 	return nil
 }
 
+// LoadProfile loads an approved profile: from ProfileLoader (the profiles compiled into the binary)
+// when set, else from ProfilesDir.
+func (d *Daemon) LoadProfile(name string) (*profile.Profile, error) {
+	if d.ProfileLoader != nil {
+		return d.ProfileLoader(name)
+	}
+	return profile.Load(d.ProfilesDir, name)
+}
+
 // AbsRoots makes every entry of a comma-separated worktree-root list absolute (a relative entry is
 // taken from the current directory, as a single --worktree-root always was). Entries are not
 // otherwise touched: CheckWorkdir validates them exactly as ccsbx-root validates allowed_roots.
@@ -176,7 +185,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		if err != nil {
 			return nil, refuse(BadSpec, "workdir: %v", err)
 		}
-		if err := backend.CheckGitDirLexical(s.GitDir, rw); err != nil {
+		if err := backend.CheckGitDirLexical(s.GitDir, rw, d.WorktreeRoot); err != nil {
 			return nil, refuse(BadSpec, "gitdir: %v", err)
 		}
 	} else {
@@ -194,11 +203,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	}
 	s.Workdir.Path = rw // the resolved path is what gets mounted and recorded
 
-	loadProfile := func(name string) (*profile.Profile, error) { return profile.Load(d.ProfilesDir, name) }
-	if d.ProfileLoader != nil {
-		loadProfile = d.ProfileLoader
-	}
-	p, err := loadProfile(s.Profile)
+	p, err := d.LoadProfile(s.Profile)
 	if err != nil {
 		return nil, refuse(ProfileNotApproved, "profile %q: %v", s.Profile, err)
 	}

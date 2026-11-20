@@ -9,6 +9,7 @@
 package backend
 
 import (
+	"bytes"
 	"fmt"
 	"os"
 	"os/exec"
@@ -1148,16 +1149,36 @@ func TestCheckWorkdirLexicalRefusesWhatCcsbxRootWouldBlock(t *testing.T) {
 }
 
 func TestCheckGitDirLexicalShapes(t *testing.T) {
-	wd := "/home/u/git/proj"
-	for _, ok := range []string{"", wd + "/.git", "/home/u/git/main/.git/worktrees/proj"} {
-		if err := CheckGitDirLexical(ok, wd); err != nil {
+	wd, roots := "/home/u/git/proj", "/home/u/git,/home/u/wt"
+	for _, ok := range []string{"", wd + "/.git", "/home/u/git/main/.git/worktrees/proj", "/home/u/wt/repo/.git/worktrees/x"} {
+		if err := CheckGitDirLexical(ok, wd, roots); err != nil {
 			t.Errorf("%q refused: %v", ok, err)
 		}
 	}
-	for _, bad := range []string{"/etc", "/var/run/x", "/home/u/git/main/.git", "/home/u/git/main/.git/worktrees/", "/home/u/git/main/.git/worktrees/a/b", ".git", "/home/u/git/proj/../.git", wd + "/.git/"} {
-		if err := CheckGitDirLexical(bad, wd); err == nil {
+	for _, bad := range []string{"/etc", "/var/run/x", "/home/u/git/main/.git", "/home/u/git/main/.git/worktrees/", "/home/u/git/main/.git/worktrees/a/b", ".git", "/home/u/git/proj/../.git", wd + "/.git/",
+		"/etc/.git/worktrees/x",                   // the right shape, but not under any worktree root
+		"/home/u/elsewhere/.git/worktrees/x",      // under the home, not under a root
+		"/home/u/gitx/.git/worktrees/x",           // a root's name as a prefix of a sibling
+		"/home/u/git/m\x1b[0m/.git/worktrees/x"} { // a control character
+		if err := CheckGitDirLexical(bad, wd, roots); err == nil {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+// context: a path with a control character (an escape sequence, a tab, a newline) would be shown to
+// the owner in a terminal or written into a record and a log; it is refused wherever paths are checked.
+func TestPathsWithControlCharactersAreRefused(t *testing.T) {
+	for _, p := range []string{"/home/u/git/a\x1bb", "/home/u/git/a\tb", "/home/u/git/a\nb", "/home/u/git/a\x00b", "/home/u/git/a\x7fb"} {
+		if CheckPath(p) == nil {
+			t.Errorf("CheckPath accepted %q", p)
+		}
+		if _, err := CheckWorkdirLexical(p, "/home/u/git", "", ""); err == nil {
+			t.Errorf("CheckWorkdirLexical accepted %q", p)
+		}
+	}
+	if CheckPath("/home/u/git/ünïcode dir/ok") != nil {
+		t.Error("an ordinary path with spaces and non-ASCII letters was refused")
 	}
 }
 
@@ -1196,5 +1217,64 @@ func TestReadSmallReadsAnOrdinaryGitFileAllow(t *testing.T) {
 	os.WriteFile(p, []byte("gitdir: /repo/.git/worktrees/w\n"), 0o644)
 	if b, err := readSmall(p, 4096); err != nil || !strings.HasPrefix(string(b), "gitdir:") {
 		t.Fatalf("%q %v", b, err)
+	}
+}
+
+// context: the three small files a worktree is judged by (the .git file, the gitdir back-reference, the
+// commondir) are each read in a different place. Reverting any ONE of those reads to os.ReadFile must
+// turn this red: a FIFO there hangs the daemon, an oversize file is read whole. So each site gets both
+// attacks, on a real linked worktree.
+func TestEveryGitFileReadSiteIsBounded(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
+	git := func(dir string, args ...string) {
+		c := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		c.Env = append(os.Environ(), "GIT_AUTHOR_NAME=a", "GIT_AUTHOR_EMAIL=a@a", "GIT_COMMITTER_NAME=a", "GIT_COMMITTER_EMAIL=a@a")
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Skipf("git %v: %v %s", args, err, out)
+		}
+	}
+	setup := func() (wt, target string) {
+		root := vt(t)
+		repo := filepath.Join(root, "repo")
+		os.Mkdir(repo, 0o755)
+		git(repo, "init", "-q")
+		git(repo, "commit", "-q", "--allow-empty", "-m", "x")
+		wt = filepath.Join(root, "wt")
+		git(repo, "worktree", "add", "-q", wt)
+		target = filepath.Join(repo, ".git", "worktrees", "wt")
+		return wt, target
+	}
+	wt0, _ := setup()
+	if gd, err := ResolveGitDir(wt0, os.Getuid()); err != nil || gd == "" {
+		t.Fatalf("the fixture itself is not a valid linked worktree: %q %v", gd, err)
+	}
+	sites := map[string]func(wt, target string) string{
+		"the .git file":       func(wt, _ string) string { return filepath.Join(wt, ".git") },
+		"the gitdir back-ref": func(_, target string) string { return filepath.Join(target, "gitdir") },
+		"the commondir file":  func(_, target string) string { return filepath.Join(target, "commondir") },
+	}
+	for name, path := range sites {
+		for _, attack := range []string{"fifo", "oversize"} {
+			wt, target := setup()
+			p := path(wt, target)
+			os.Remove(p)
+			if attack == "fifo" {
+				syscall.Mkfifo(p, 0o644)
+			} else {
+				os.WriteFile(p, bytes.Repeat([]byte("a"), 1<<20), 0o644)
+			}
+			done := make(chan error, 1)
+			go func() { _, err := ResolveGitDir(wt, os.Getuid()); done <- err }()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Errorf("%s as a %s was accepted", name, attack)
+				}
+			case <-time.After(3 * time.Second):
+				t.Errorf("%s as a %s: the read blocked (it must be O_NONBLOCK and bounded)", name, attack)
+			}
+		}
 	}
 }

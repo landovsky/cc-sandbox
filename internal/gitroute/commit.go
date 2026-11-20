@@ -13,6 +13,7 @@
 package gitroute
 
 import (
+	"errors"
 	"fmt"
 	"io/fs"
 	"os"
@@ -69,11 +70,30 @@ func (r *Runner) changedSince(base string) ([]Change, error) {
 // and gitlinks that changed (a link can point a steering name anywhere), edits behind a steering
 // symlink, and steering files that are in the worktree but not in HEAD, ignored ones included.
 func (r *Runner) SteeringSince(base string) ([]string, error) {
-	cs, err := r.changedSince(base)
+	// first: what the configs say git will read or run. An include file inside the worktree is
+	// flagged whether it changed or not, and does not depend on git's own change detection.
+	g, err := r.configGuards()
 	if err != nil {
 		return nil, err
 	}
-	links := linkPaths(cs)
+	st, links, err := r.steeringSince(base, g)
+	if err != nil && !errors.Is(err, ErrIncomplete) {
+		// With an include in the config, H1 refuses to run git at all. The included files that
+		// live in the worktree are already the finding; report them rather than a bare refusal.
+		if errors.Is(err, ErrRefused) && strings.Contains(err.Error(), "include") && len(g.Forced) > 0 {
+			return withLinks(nil, g.Forced), nil
+		}
+		return nil, err
+	}
+	return withLinks(append(st, g.Forced...), links), err
+}
+
+func (r *Runner) steeringSince(base string, g Guards) (st, links []string, err error) {
+	cs, err := r.changedSince(base)
+	if err != nil {
+		return nil, nil, err
+	}
+	links = linkPaths(cs)
 	files := append([]string{}, links...)
 	for _, c := range cs {
 		files = append(files, c.Path)
@@ -83,7 +103,7 @@ func (r *Runner) SteeringSince(base string) ([]string, error) {
 		old, e1 := r.gitlinks(strings.TrimSpace(mb))
 		cur, e2 := r.gitlinks("HEAD")
 		if e1 != nil || e2 != nil {
-			return nil, fmt.Errorf("reading gitlinks: %v %v", e1, e2)
+			return nil, nil, fmt.Errorf("reading gitlinks: %v %v", e1, e2)
 		}
 		for p, sha := range cur {
 			if old[p] != sha {
@@ -94,23 +114,19 @@ func (r *Runner) SteeringSince(base string) ([]string, error) {
 	}
 	pend, err := r.Pending()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	st, err := r.SteeringFiles(append(files, pend...))
+	st, err = r.SteeringFiles(append(files, pend...))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	// what the OWNER's own git would run: changes under core.hooksPath and include.path, nested repos
-	guards, err := r.configGuards()
-	if err != nil {
-		return nil, err
+	// what the owner's own git would run: changes under core.hooksPath and include.path, nested repos
+	extra := underAny(append(append([]string{}, files...), pend...), g.Prefixes)
+	nested, nerr := r.NestedRepos() // ErrIncomplete comes with what was found
+	if nerr != nil && !errors.Is(nerr, ErrIncomplete) {
+		return nil, nil, nerr
 	}
-	extra := underAny(append(append([]string{}, files...), pend...), guards)
-	nested, err := r.NestedRepos()
-	if err != nil {
-		return nil, err
-	}
-	return withLinks(st, append(append(links, extra...), nested...)), nil
+	return append(st, extra...), append(append(links, extra...), nested...), nerr
 }
 
 // withLinks adds the changed symlink and gitlink paths to a steering list: a link can point a

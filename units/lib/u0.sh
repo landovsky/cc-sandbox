@@ -36,6 +36,9 @@ k8s_machine = "${K8S_MACHINE}"
 k8s_side_image = "${SIDE_IMAGE}"
 hub_url = "${HUB_URL}"
 hub_secret = "/etc/ccsbx/hub-admin.secret"
+# the doors' owner listeners that take the signed revoke when a pod generation ends (F2x). None until the doors exist (M1): empty = the
+# verb's audit line says "no revoke_doors" and the token expires by itself (k8s_token_hours). Pass --revoke-doors at M1 and re-run install.
+revoke_doors = [${REVOKE_DOORS_TOML}]
 EOT
   note "the hub's admin secret (the shared SB_SECRET), for ccsbx-root's relay mint: the first line of $HUB_SECRET_FROM, root 0600, never printed, never leaves hp"
   # plan never reads the file (and `plan -v` must not print it): the placeholder stands in for it
@@ -122,7 +125,7 @@ u0_hostd() {
   note "ccsbx-root's run directory (it makes it itself, root-owned 0755; made here so hostd's unit can bind it read-write)"
   cmd install -d -o root -g root -m 0755 /var/lib/ccsbx-run
   note "hostd's unit gets the same roots as ccsbx-root ($WORKTREE_ROOT, as --worktree-root) and the fence image ($IMAGE, by digest) and machine name ($MACHINE)"
-  put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < <(sed -e "s|@WORKTREE_ROOT@|$WORKTREE_ROOT|g" -e "s|@IMAGE@|$IMAGE|g" -e "s|@MACHINE@|$MACHINE|g" "$UNITS_DIR/systemd/ccsbx-hostd.service")
+  put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < <(sed -e "s|@WORKTREE_ROOT@|$WORKTREE_ROOT|g" -e "s|@IMAGE@|$IMAGE|g" -e "s|@MACHINE@|$MACHINE|g" -e "s|@REVOKE_DOOR@|\"$REVOKE_DOORS\"|g" "$UNITS_DIR/systemd/ccsbx-hostd.service")
   note "the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced"
   if [ "$MODE" != install ] || [ ! -e "$(pth /var/lib/ccsbx/listen.token)" ]; then
     cmd runuser -u ccsbx -- sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /var/lib/ccsbx/listen.token'

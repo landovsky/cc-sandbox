@@ -39,6 +39,8 @@
 #   --side-image REF      the sidecar image of pod sessions, BY DIGEST: ghcr.io/landovsky/ccsbx@sha256:<64 hex> (CCSBX_SIDE_IMAGE, required;
 #                         written to ccsbx-root.toml as k8s_side_image). A tag is refused. The digest comes from the side-image Actions run (#3wsr)
 #   (rotating SB_SECRET: re-run `install --yes`: it copies the new first line again; the other steps are idempotent)
+#   --revoke-doors U,V    the doors' owner-listener base URLs that take a token revoke (F2x); written as revoke_doors in ccsbx-root.toml and as
+#                         hostd's --revoke-door (CCSBX_REVOKE_DOORS, default EMPTY: there are no doors before M1, and nothing is revoked without them)
 #   --hub-url URL         where the hub is: http://A.B.C.D:PORT, an IPv4 literal (CCSBX_HUB_URL, REQUIRED; written to ccsbx-root.toml as hub_url). On hp
 #                         today the hub listens on the tailnet address only (http://100.101.219.96:4011), not on loopback. The B9 gate checks the url
 #                         against the live listeners: every listener on the port must be the owner's, and one must have that address
@@ -66,7 +68,7 @@ case "${1:-}" in
   *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
-MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"; SIDE_IMAGE="${CCSBX_SIDE_IMAGE:-}"; HUB_URL="${CCSBX_HUB_URL:-}"
+MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"; SIDE_IMAGE="${CCSBX_SIDE_IMAGE:-}"; HUB_URL="${CCSBX_HUB_URL:-}"; REVOKE_DOORS="${CCSBX_REVOKE_DOORS:-}"
 HUB_SECRET_FROM="${CCSBX_HUB_SECRET_FROM:-}"; K8S_MACHINE="${CCSBX_K8S_MACHINE:-future-two}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
@@ -80,6 +82,7 @@ while [ $# -gt 0 ]; do
     --pairs) PAIRS="${2:?--pairs P}"; shift ;;
     --image) IMAGE="${2:?--image REF}"; shift ;;
     --side-image) SIDE_IMAGE="${2:?--side-image REF}"; shift ;;
+    --revoke-doors) REVOKE_DOORS="${2:?--revoke-doors URL,URL}"; shift ;;
     --hub-url) HUB_URL="${2:?--hub-url http://A.B.C.D:PORT}"; shift ;;
     --hub-secret-from) HUB_SECRET_FROM="${2:?--hub-secret-from FILE}"; shift ;;
     --k8s-machine) K8S_MACHINE="${2:?--k8s-machine NAME}"; shift ;;
@@ -149,6 +152,16 @@ elif [[ "$IMAGE" != *@sha256:* ]]; then ROOT_ERRORS+=("image '$IMAGE' is a tag: 
 elif ! [[ "$IMAGE" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("image '$IMAGE' is not ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the only repo a candidate may come from)"); fi
 # the hub's address: an IPv4 literal, with a port (no host names: nothing to resolve or trick)
 [[ "$HUB_URL" =~ ^http://((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]):[1-9][0-9]{0,4}$ ]] || ROOT_ERRORS+=("no hub url: pass --hub-url http://A.B.C.D:PORT (a canonical IPv4 literal, no leading zeros; on hp today http://100.101.219.96:4011, the hub is on the tailnet address, not loopback); got '${HUB_URL}'")
+# the doors' revoke URLs: empty, or a comma list of plain base URLs (they land in a systemd ExecStart and a TOML list, so no quotes, spaces or paths)
+REVOKE_DOORS_TOML=""
+if [ -n "$REVOKE_DOORS" ]; then
+  IFS=, read -r -a _rd <<<"$REVOKE_DOORS"
+  for _u in "${_rd[@]}"; do
+    if [[ "$_u" =~ ^https?://[A-Za-z0-9._-]+(:[1-9][0-9]{0,4})?$ ]]; then REVOKE_DOORS_TOML+="\"$_u\", "
+    else ROOT_ERRORS+=("revoke door '$_u' is not a plain http(s)://host[:port] base URL (--revoke-doors)"); fi
+  done
+  REVOKE_DOORS_TOML="${REVOKE_DOORS_TOML%, }"
+fi
 # the sidecar image: by digest from our own repo only; ccsbx-root's pod-create refuses a config without it
 if [ -z "$SIDE_IMAGE" ]; then ROOT_ERRORS+=("no sidecar image: pass --side-image ghcr.io/landovsky/ccsbx@sha256:<64 hex> (the digest of the side-image Actions run, #3wsr); a tag is refused")
 elif ! [[ "$SIDE_IMAGE" =~ ^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("sidecar image '$SIDE_IMAGE' is not ghcr.io/landovsky/ccsbx@sha256:<64 hex> (a tag, or another repo, is refused)"); fi
@@ -156,7 +169,7 @@ elif ! [[ "$SIDE_IMAGE" =~ ^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$ ]]; th
 MANAGED_PATHS+=(/etc/ccsbx/pins.toml)
 [ -f "$REPO_DIR/pins.toml" ] || ROOT_ERRORS+=("no $REPO_DIR/pins.toml to install as /etc/ccsbx/pins.toml")
 RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
-export OWNER MACHINE PAIRS IMAGE SIDE_IMAGE HUB_URL WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+export OWNER MACHINE PAIRS IMAGE SIDE_IMAGE HUB_URL REVOKE_DOORS REVOKE_DOORS_TOML WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()

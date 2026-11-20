@@ -9,6 +9,8 @@
 # wt/, gd/, quarantine/ or home/); --pins is the ROOT-OWNED copy /etc/ccsbx/pins.toml written by the installer (no --profiles: profiles are embedded);
 # --image is a DIGEST (a tag is refused with image_not_pinned) and --machine the lowercased `hostname -s`, the name root uses;
 # @WORKTREE_ROOT@ is the SAME comma list as ccsbx-root.toml's allowed_roots and @IMAGE@ the fence image: both are filled in at install.
+# --signer-socket + --revoke-door (F2x): a docker generation's token is revoked at the doors when its outbox is drained; nothing happens
+# without BOTH, and --revoke-door is "" until the doors exist (M1: the install gets --revoke-doors then).
 # --local-socket, --socket-group, --signer, --listen (loopback only), --listen-token-file. An unknown flag is
 # fatal in hostd, so confirm them with `ccsbx-hostd run --help` before the gate. The token file (0600, ccsbx) is made by the installer. hostd sends messages with `send-keys` into the
 # tmux server it owns on --tmux-socket (an absolute path, `tmux -S`, in /run/ccsbx, 0700 ccsbx: reached by `sudo ccsbx-root attach`, never directly).
@@ -31,7 +33,7 @@ Type=simple
 User=ccsbx
 Group=ccsbx
 SupplementaryGroups=ccsbx-clients
-ExecStart=/usr/local/libexec/ccsbx/ccsbx-hostd run --state /var/lib/ccsbx --local-socket /run/ccsbx-api/hostd.sock --socket-group ccsbx-clients --signer /run/ccsbx-signer/sign.sock --listen 127.0.0.1:7480 --listen-token-file /var/lib/ccsbx/listen.token --tmux-socket /run/ccsbx/tmux.sock --run-dir /var/lib/ccsbx-run --pins /etc/ccsbx/pins.toml --worktree-root @WORKTREE_ROOT@ --image @IMAGE@ --machine @MACHINE@
+ExecStart=/usr/local/libexec/ccsbx/ccsbx-hostd run --state /var/lib/ccsbx --local-socket /run/ccsbx-api/hostd.sock --socket-group ccsbx-clients --signer /run/ccsbx-signer/sign.sock --listen 127.0.0.1:7480 --listen-token-file /var/lib/ccsbx/listen.token --tmux-socket /run/ccsbx/tmux.sock --run-dir /var/lib/ccsbx-run --pins /etc/ccsbx/pins.toml --worktree-root @WORKTREE_ROOT@ --image @IMAGE@ --machine @MACHINE@ --signer-socket /run/ccsbx-signer/sign.sock --revoke-door @REVOKE_DOOR@
 StateDirectory=ccsbx
 StateDirectoryMode=0750
 RuntimeDirectory=ccsbx-api

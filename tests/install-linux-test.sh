@@ -629,6 +629,17 @@ for bad in "" "http://100.64.0.009:4011" "http://127.0.0.1:4011/" "http://localh
 done
 t "R2-M1: hub-probe has no 'localhost' and no ss: the listener rule is hub_listen.py" bash -c '! grep -nE "localhost|ss -ltn" "$1"' _ "$hp"
 
+echo "# F2x (A's 33f1f15): revoke_doors, hostd --signer-socket and --revoke-door"
+d="$(fx rd)"; ins "$d" install --yes >/dev/null 2>&1; hdu="$d/root/etc/systemd/system/ccsbx-hostd.service"
+t "F2x: by default revoke_doors is an empty list (no doors before M1) and says why" bash -c 'grep -qx "revoke_doors = \[\]" "$1" && grep -q "None until the doors exist" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+t "F2x: hostd's unit has --signer-socket (its own) and an EMPTY --revoke-door, so nothing is revoked" bash -c 'l="$(grep "^ExecStart=" "$1")"; grep -q -- "--signer-socket /run/ccsbx-signer/sign.sock" <<<"$l" && grep -q -- "--revoke-door \"\"" <<<"$l"' _ "$hdu"
+d="$(fx rd2)"; ins "$d" install --yes --revoke-doors http://100.64.0.5:8091,https://door.example:8443 >/dev/null 2>&1
+t "F2x: --revoke-doors goes to both: the root config list and hostd's flag" bash -c 'grep -qx "revoke_doors = \[\"http://100.64.0.5:8091\", \"https://door.example:8443\"\]" "$1/root/etc/ccsbx/ccsbx-root.toml" && grep "^ExecStart=" "$1/root/etc/systemd/system/ccsbx-hostd.service" | grep -q -- "--revoke-door \"http://100.64.0.5:8091,https://door.example:8443\""' _ "$d"
+for bad in 'http://x/y' 'ftp://x' 'http://x" --evil' 'http://x y' 'http://x:0'; do
+  d="$(fx rd3)"; ins "$d" install --yes --revoke-doors "$bad" >/dev/null 2>&1; rc=$?
+  t "F2x: --revoke-doors '$bad' is refused (exit 3), nothing changed" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/rec/cmds" ]' _ "$rc" "$d"
+done
+
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"
 

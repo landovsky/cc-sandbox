@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/hostd"
+	"github.com/landovsky/cc-sandbox/internal/journal"
 )
 
 type relayRig struct {
@@ -274,5 +275,103 @@ func TestRelayRefusesARepliesDirectoryOfAnotherOwner(t *testing.T) {
 	cfg.OwnUID = os.Getuid() + 1
 	if _, err := NewRelay(cfg); err == nil {
 		t.Fatal("a replies directory owned by another uid was accepted")
+	}
+}
+
+type fakeJournal struct {
+	mu   sync.Mutex
+	evs  []journal.Event
+	fail bool
+}
+
+func (f *fakeJournal) Append(e journal.Event) (journal.Record, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fail {
+		return journal.Record{}, fmt.Errorf("disk full")
+	}
+	f.evs = append(f.evs, e)
+	return journal.Record{}, nil
+}
+
+// context "the session journal is what the cockpit later reads about a generation": each decision is one
+// record whose id is the id the relay minted (the same one in the forwarded request and the reply), whose
+// identity is the sidecar's, and which never carries a byte of the fence's request body.
+func TestRelayJournalsEachDecisionWithTheMintedIDAndNoBody(t *testing.T) {
+	r := newRelayRig(t)
+	j := &fakeJournal{}
+	r.put("good.json", `{"type":"msg.send","text":"SECRET-BODY-TEXT"}`)
+	r.put("bad.json", `{"type":"nonsense","text":"SECRET-BODY-TEXT"}`)
+	r.relay(func(c *RelayConfig) { c.Journal = j }).Scan(context.Background())
+	if len(j.evs) != 2 {
+		t.Fatalf("%d records, want 2: %+v", len(j.evs), j.evs)
+	}
+	by := map[string]journal.Event{}
+	for _, e := range j.evs {
+		by[e.Type] = e
+		if e.Sid != "sAAAAAAAAA" || e.Gen != 2 || e.Src != "host" || strings.Contains(string(e.Data), "SECRET") {
+			t.Errorf("record %+v: wrong identity or leaks the body", e)
+		}
+	}
+	if f := by["relay.forwarded"]; f.ID != r.forwarded[0].ID || f.ID == "" || !strings.Contains(string(f.Data), `"status":"ok"`) {
+		t.Errorf("forwarded record %+v vs request id %s", f, r.forwarded[0].ID)
+	}
+	if e := by["relay.refused"]; e.ID != r.replyOf("bad").ID || !strings.Contains(string(e.Data), "unknown_type") {
+		t.Errorf("refused record %+v vs reply id %s", e, r.replyOf("bad").ID)
+	}
+}
+
+// context "the journal volume fills up": the ledger is the replay guard, the journal only observes, so a
+// failing journal must not stop requests from being forwarded.
+func TestRelayKeepsForwardingWhenTheJournalFails(t *testing.T) {
+	r := newRelayRig(t)
+	r.put("a.json", `{"type":"msg.send"}`)
+	st := r.relay(func(c *RelayConfig) { c.Journal = &fakeJournal{fail: true} }).Scan(context.Background())
+	if st.Accepted != 1 || len(r.forwarded) != 1 || r.replyOf("a").Status != "ok" {
+		t.Fatalf("stats %+v", st)
+	}
+}
+
+// context "a flood past the cap would otherwise write a journal record per scan forever": shed summaries
+// have a fixed per-lifetime bound, and the bound is asserted on a small fixed flood.
+func TestRelayShedSummariesInTheJournalAreBounded(t *testing.T) {
+	r := newRelayRig(t)
+	j := &fakeJournal{}
+	x := r.relay(func(c *RelayConfig) { c.Journal = j; c.MaxTotal = 2; c.MaxShedLogs = 3 })
+	for round := 0; round < 8; round++ {
+		for i := 0; i < 4; i++ {
+			r.put(fmt.Sprintf("f%d-%d.json", round, i), `{"type":"msg.send"}`)
+		}
+		x.Scan(context.Background())
+	}
+	n := 0
+	for _, e := range j.evs {
+		if e.Type == "relay.shed" {
+			n++
+		}
+	}
+	if n != 3 {
+		t.Fatalf("%d shed summaries, want exactly the bound of 3", n)
+	}
+}
+
+// context "the real journal rejects what is not a daemon-style record": the relay's ULIDs and event shape
+// must be accepted by journal.Store, and replay must return them in order.
+func TestRelayRecordsReplayFromTheRealJournal(t *testing.T) {
+	r := newRelayRig(t)
+	js, err := journal.Open(t.TempDir(), "future-two", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer js.Close()
+	r.put("a.json", `{"type":"msg.send"}`)
+	r.put("b.json", `{"type":"nonsense"}`)
+	r.relay(func(c *RelayConfig) { c.Journal = js }).Scan(context.Background())
+	recs, err := js.After(0, js.Epoch(), "", 10)
+	if err != nil || len(recs) != 2 || recs[0].Seq != 1 || recs[1].Seq != 2 {
+		t.Fatalf("%v %+v", err, recs)
+	}
+	if recs[0].ID != r.forwarded[0].ID {
+		t.Errorf("journal id %s, request id %s", recs[0].ID, r.forwarded[0].ID)
 	}
 }

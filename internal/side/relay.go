@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/hostd"
+	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/ulid"
 )
 
@@ -37,8 +38,19 @@ type RelayConfig struct {
 	MaxTotal       int     // requests per generation lifetime; beyond that they are shed (default 20000)
 	ShedReplies    int     // refusal replies per scan once the bucket is empty (default 20)
 	Forward        func(context.Context, hostd.Request) hostd.Reply
-	Now            func() time.Time
-	Logf           func(string, ...any)
+	// Journal, when set, gets one record per decision (relay.forwarded, relay.refused) and a bounded number of
+	// relay.shed summaries. It is observability, not the replay guard (the ledger is), so an append failure is
+	// logged and the relay carries on. Size its volume: about 300 bytes a record, one per request, at most
+	// MaxTotal of them, so the default 20000 is about 6 MB on top of the ledger's 3 MB.
+	Journal     Appender
+	MaxShedLogs int // relay.shed summaries per lifetime (default 50): a flood must not grow the journal either
+	Now         func() time.Time
+	Logf        func(string, ...any)
+}
+
+// Appender is the part of journal.Store the relay uses.
+type Appender interface {
+	Append(journal.Event) (journal.Record, error)
 }
 
 // RelayStats counts what one Scan did.
@@ -49,11 +61,12 @@ type RelayStats struct {
 
 // Relay reads one generation's outbox.
 type Relay struct {
-	cfg    RelayConfig
-	seen   map[string]bool
-	total  int
-	tokens float64
-	last   time.Time
+	cfg      RelayConfig
+	seen     map[string]bool
+	total    int
+	shedLogs int
+	tokens   float64
+	last     time.Time
 }
 
 // NewRelay validates cfg and loads the ledger so a restart does not replay.
@@ -90,6 +103,9 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 	if cfg.ShedReplies == 0 {
 		cfg.ShedReplies = 20
 	}
+	if cfg.MaxShedLogs == 0 {
+		cfg.MaxShedLogs = 50
+	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
 	}
@@ -121,6 +137,18 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 		}
 	}
 	return r, nil
+}
+
+// note journals one decision. Identity comes from the config; data holds only what the sidecar decided
+// (the rid is nameRe-checked, the type is from the closed list), never a byte of the request body.
+func (r *Relay) note(id, typ string, data map[string]any) {
+	if r.cfg.Journal == nil {
+		return
+	}
+	b, _ := json.Marshal(data)
+	if _, err := r.cfg.Journal.Append(journal.Event{ID: id, Sid: r.cfg.Sid, Gen: r.cfg.Gen, Src: "host", Type: typ, Data: b}); err != nil {
+		r.cfg.Logf("side relay: journal append failed (%v)", err)
+	}
 }
 
 func (r *Relay) ledgerPath() string { return filepath.Join(r.cfg.State, "relay-ledger.jsonl") }
@@ -226,6 +254,7 @@ func (r *Relay) Scan(ctx context.Context) RelayStats {
 			code := hostd.Classify(err)
 			r.seen[n] = true
 			r.ledger(n, id, "refused:"+code)
+			r.note(id, "relay.refused", map[string]any{"rid": rid, "code": code})
 			st.Refused++
 			st.Reasons[code]++
 			r.reply(refusal(rid, id, code))
@@ -235,6 +264,7 @@ func (r *Relay) Scan(ctx context.Context) RelayStats {
 		if terr != nil {
 			r.seen[n] = true
 			r.ledger(n, id, "refused:bad_json")
+			r.note(id, "relay.refused", map[string]any{"rid": rid, "code": "bad_json"})
 			st.Refused++
 			st.Reasons["bad_json"]++
 			r.reply(refusal(rid, id, "bad_json"))
@@ -243,6 +273,7 @@ func (r *Relay) Scan(ctx context.Context) RelayStats {
 		if !hostd.Types[typ] {
 			r.seen[n] = true
 			r.ledger(n, id, "refused:unknown_type")
+			r.note(id, "relay.refused", map[string]any{"rid": rid, "code": "unknown_type"})
 			st.Refused++
 			st.Reasons["unknown_type"]++
 			r.reply(refusal(rid, id, "unknown_type"))
@@ -262,6 +293,11 @@ func (r *Relay) Scan(ctx context.Context) RelayStats {
 			FullID: r.cfg.FullID, Type: typ, Received: now.UTC(), Body: json.RawMessage(data)})
 		rep.Rid, rep.ID = rid, id
 		r.reply(rep)
+		r.note(id, "relay.forwarded", map[string]any{"rid": rid, "type": typ, "status": rep.Status})
+	}
+	if st.Shed > 0 && r.shedLogs < r.cfg.MaxShedLogs {
+		r.shedLogs++
+		r.note("", "relay.shed", map[string]any{"shed": st.Shed, "refused": st.Refused})
 	}
 	return st
 }

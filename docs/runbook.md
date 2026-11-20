@@ -591,6 +591,14 @@ tmux, not an API route.) hostd also warns at start when `--owner-devices` lists 
 
 ## Attaching to a pod session (F5)
 
+(Round 2: kubectl runs as the pane of a **host-side tmux server owned by the keys user** (socket in
+`keys_run_dir`, default `/run/ccsbx-keys`, made 0700 by root), with `allow-passthrough` and `set-clipboard`
+off, no prefix, no bindings, no mouse, no status line, and the owner's terminal attaches to that server:
+the pod's tmux runs as the agent, so its raw bytes (OSC 52, passthrough) must not reach the owner's terminal.
+Only the owner, or root by login, may attach to a pod session; the service user may not. The kubeconfig and
+token must be unreadable by group and others; the keys user's primary group may not be root's or the service
+group. The docker attach also sets `set-clipboard` and `allow-passthrough` off.)
+
 `ccsbx attach <sid>` is unchanged for the owner; `ccsbx-root attach` reads the session record, and when it
 says `backend: "k8s"` it execs `kubectl exec -it -c fence <pod> -- tmux attach-session -t =<sid>:` as the
 keys user (`ccsbx-keys`) instead of tmux as the service user. Config keys in `/etc/ccsbx/ccsbx-root.toml`
@@ -618,3 +626,6 @@ UID must equal the recorded one first). A failed start deletes the pod by name a
 only with a generation key, and they are closed to hostd's uid. Not built: resume of a pod session, the
 git clone inside the pod (F3c), a hostd revoke client (`Daemon.Revoke` is nil in hostd), a pod-aware
 `ccsbx stop`. Not run against a cluster (Gate M).
+
+The sidecar has a `journal` volume of its own (emptyDir, 16Mi, disk-backed, sidecar only, mounted at
+`/run/ccsbx/journal`), apart from the 8Mi `side-state` that holds the ledger.

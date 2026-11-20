@@ -4,23 +4,13 @@
 package rootcmd
 
 import (
-	"bytes"
 	"context"
-	"errors"
-	"fmt"
-	"strings"
-	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/k8s"
+	"github.com/landovsky/cc-sandbox/internal/side"
 	"github.com/landovsky/cc-sandbox/internal/signer"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
-
-// sideControl is the sidecar's control socket (internal/k8s mounts side-state at /run/ccsbx/side).
-const sideControl = "/run/ccsbx/side/ctl/ctl.sock"
-
-// maxSecrets is the sidecar's limit on what it reads.
-const maxSecrets = 64 << 10
 
 type podImpl struct{ b *k8s.Backend }
 
@@ -51,29 +41,11 @@ func (p *podImpl) Delete(ctx context.Context, sid string, gen int, uid string) e
 	return p.b.Delete(ctx, sid, gen, uid)
 }
 
-// Load mirrors the sidecar package's LoadInto (the same command, stdin only, 30 s, the sidecar's text
-// back and never the secrets); it is replaced by a call to it once that package is on main. Backend.Exec
-// re-reads the pod and refuses unless its live UID is ref.UID, before any stdin is read.
+// Load is the sidecar package's LoadInto: the same command, stdin only, 30 s, the sidecar's text back
+// and never the secrets. Backend.Exec re-reads the pod and refuses unless its live UID is ref.UID,
+// before any stdin is read.
 func (p *podImpl) Load(ctx context.Context, ref k8s.Ref, secrets []byte) error {
-	if len(secrets) == 0 || len(secrets) > maxSecrets {
-		return fmt.Errorf("secrets must be 1..%d bytes", maxSecrets)
-	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	var out, errb bytes.Buffer
-	code, err := p.b.Exec(ctx, ref, "side", []string{"ccsbx", "side", "load", "--control", sideControl},
-		k8s.IO{Stdin: bytes.NewReader(secrets), Stdout: &out, Stderr: &errb})
-	if err != nil {
-		return err
-	}
-	if code != 0 {
-		msg := strings.ToValidUTF8(errb.String(), "?")
-		if len(msg) > 300 {
-			msg = strings.ToValidUTF8(msg[:300], "")
-		}
-		return errors.New("side load refused: " + msg)
-	}
-	return nil
+	return side.LoadInto(ctx, p.b, ref, secrets)
 }
 
 func realMint(ctx context.Context, cfg *Config, c token.Claims) ([]byte, error) {

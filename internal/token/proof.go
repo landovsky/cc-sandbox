@@ -74,7 +74,7 @@ func SignProof(g *GenKey, method, path, aud, tok string, body []byte, now time.T
 // Verifier is a door's token check. Safe for concurrent use.
 type Verifier struct {
 	ringMu sync.RWMutex
-	ring   Keyring // swapped whole by SetRing; read through Ring()
+	ring   Keyring        // swapped whole by SetRing; read through Ring()
 	source func() Keyring // when set, Ring() asks it on every request (SetRingSource)
 	aud    string
 

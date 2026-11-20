@@ -72,6 +72,8 @@ func (e *env) attach(sid string) error {
 		"set-option", "-g", "prefix", "None", ";",
 		"set-option", "-g", "prefix2", "None", ";",
 		"set-option", "-g", "mouse", "off", ";",
+		"set-option", "-g", "set-clipboard", "off", ";",
+		"set-option", "-g", "allow-passthrough", "off", ";",
 		"unbind-key", "-a", ";",
 		"unbind-key", "-a", "-T", "root", ";",
 		"attach", "-t", "=" + sid + ":"}

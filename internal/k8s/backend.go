@@ -240,6 +240,10 @@ func (b *Backend) Exec(ctx context.Context, ref Ref, container string, cmd []str
 	return b.X.Exec(ctx, ref.Namespace, ref.Name, container, cmd, io)
 }
 
+// AttachTerm is the TERM the in-pod tmux is attached with: kubectl exec does not forward the caller's
+// TERM and the fence sets none, so tmux would find no terminal; a fixed, ubiquitous name works.
+const AttachTerm = "xterm-256color"
+
 // AttachArgv is the command line that attaches a terminal to the fence's tmux (F5): kubectl exec -it
 // into the fence container, by exact pod name derived here from the sid and generation (a caller
 // names the session, never the pod), with the kubeconfig under ccsbx-keys. The caller execs it as the
@@ -260,5 +264,5 @@ func (b *Backend) AttachArgv(sid string, gen int) ([]string, error) {
 	}
 	a := append([]string{b.Kubectl}, connArgs(b.Kubeconfig, b.Server, b.CAFile)...)
 	return append(a, "-n", ref.Namespace, "exec", "-it", "-c", "fence", ref.Name, "--",
-		"tmux", "attach-session", "-t", "="+sid+":"), nil
+		"env", "TERM="+AttachTerm, "tmux", "attach-session", "-t", "="+sid+":"), nil
 }

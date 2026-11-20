@@ -406,6 +406,9 @@ func (e *env) gcCmd() *cli.Command {
 				seen[o.Sid] = true
 				w, _ := e.prelude("gc")
 				rec, err := loadRecord(e.cfg.StateDir, o.Sid, w.service, e.cfg.TrustedUID)
+				if err == nil && rec.Backend == "k8s" {
+					continue // a pod session has no host worktree: nothing here is root's to clean
+				}
 				if err == nil {
 					err = e.stripSession(rec)
 				}

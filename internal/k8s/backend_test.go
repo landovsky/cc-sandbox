@@ -791,3 +791,45 @@ func TestDeleteIsPreconditionedOnTheUID(t *testing.T) {
 		t.Errorf("the right UID: %v (%d pods)", err, len(f.pods))
 	}
 }
+
+// LiveUID is what makes "live UID == recorded UID" mean the right pod: the pod must be the one named by
+// sid and generation (name and labels), have a UID, and not be on its way out.
+func TestLiveUIDIsTheUIDOfTheRightLivePodOnly(t *testing.T) {
+	ctx := context.Background()
+	b, f := newBackend(t)
+	made, err := b.Create(ctx, goodSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if uid, err := b.LiveUID(ctx, "s0abcdefgh", 2); err != nil || uid != made.UID {
+		t.Fatalf("the happy path: %q %v", uid, err)
+	}
+	name := PodName("s0abcdefgh", 2)
+	cases := map[string]func(m map[string]any){
+		"another generation's labels": func(m map[string]any) { dig(m, "metadata", "labels").(map[string]any)["ccsbx.gen"] = "9" },
+		"another session's labels":    func(m map[string]any) { dig(m, "metadata", "labels").(map[string]any)["ccsbx.sid"] = "s0zzzzzzzz" },
+		"a pod of another name":       func(m map[string]any) { dig(m, "metadata").(map[string]any)["name"] = "ccsbx-s-s0zzzzzzzz-g2" },
+		"no UID":                      func(m map[string]any) { delete(dig(m, "metadata").(map[string]any), "uid") },
+		"a pod being deleted": func(m map[string]any) {
+			dig(m, "metadata").(map[string]any)["deletionTimestamp"] = "2026-11-20T10:00:00Z"
+		},
+	}
+	for why, mod := range cases {
+		orig := f.pods[name]
+		raw, _ := json.Marshal(orig)
+		var cp map[string]any
+		json.Unmarshal(raw, &cp)
+		mod(cp)
+		f.pods[name] = cp
+		if uid, err := b.LiveUID(ctx, "s0abcdefgh", 2); err == nil {
+			t.Errorf("%s gave UID %q", why, uid)
+		}
+		f.pods[name] = orig
+	}
+	if _, err := b.LiveUID(ctx, "s0abcdefgh", 3); !errors.Is(err, ErrNotFound) {
+		t.Errorf("a pod that is not there: %v", err)
+	}
+	if _, err := b.LiveUID(ctx, "../x", 2); err == nil {
+		t.Error("a bad sid became a request")
+	}
+}

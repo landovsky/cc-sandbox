@@ -342,59 +342,119 @@ where = "any"
 id = "git-hooks-off"
 title = "host git runs with hooks disabled"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestHooksOffAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestHooksOffBlock"
+invariants = [24, 25]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-dotgit-redirect"
 title = "a .git redirect in the worktree is not followed"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestDotgitRedirectAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestDotgitRedirectBlock"
+invariants = [24, 25]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-gitattributes-filter"
 title = "a gitattributes filter does not run on the host"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestGitattributesFilterAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestGitattributesFilterBlock"
+invariants = [24, 25]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-submodule-ignored"
 title = "a submodule in the worktree is ignored by host git"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestSubmoduleIgnoredAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestSubmoduleIgnoredBlock"
+invariants = [24, 25]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-steering-flag"
-title = "a steering flag (-c, --exec-path) from the fence is refused"
+title = "a commit that touches steering files (also via symlinks, ignored or uncommitted files) names them in a trailer the agent cannot forge"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagBlock && tests/twin-go.sh ./internal/gitroute TestGlobalOptionsAreNotVerbs"
+invariants = [24, 25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-nested-repo"
+title = "host git never runs inside an agent-made nested repo, and never records one"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestNestedRepoAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestNestedRepoStatusBlock"
+invariants = [24, 25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-version-and-probe"
+title = "git older than 2.41, or one that ignores GIT_ATTR_SOURCE, is refused with the remedy"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestVersionGate"
+block = "tests/twin-go.sh ./internal/gitroute TestOldGitIsRefused"
+invariants = [24]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-commit-scan"
+title = "a commit is refused for symlinks out of the worktree, special files and oversized trees (the live-fence race blocks F3/C22)"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestCommitScanRefusals"
+block = "tests/twin-go.sh ./internal/gitroute TestEmbeddedRepoIsNotRecorded"
+invariants = [24]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-steering-links-ignored"
+title = "steering symlinks, edits behind them, and ignored or uncommitted steering files are reported"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestIsSteeringSegments"
+block = "tests/twin-go.sh ./internal/gitroute TestSteeringSymlinks"
+invariants = [25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-trailer-injection"
+title = "file names and messages cannot forge trailers or write to the terminal"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestTrailerAndTerminalInjection"
+invariants = [25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-config-gpg-timeout"
+title = "gpg placeholders, config includes and hung git processes are stopped"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestHooksOffAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestConfigIncludesRefused"
+invariants = [24]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "fence-cannot-commit"
 title = "the fence cannot commit; commits go through the outbox"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
+allow = "tests/fence-test.sh fence-cannot-commit allow"
+block = "tests/fence-test.sh fence-cannot-commit block"
+invariants = [24, 25]
 backends = ["docker"]
 where = "hp"
 
@@ -1038,5 +1098,15 @@ suite = "doors"
 allow = "tests/go-test.sh ./internal/fwd 'TestForwardsWithTokenAndProof$'"
 block = "tests/go-test.sh ./internal/fwd 'TestDoorAddressesArePinned$'"
 invariants = [4]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "git-args-allowlist"
+title = "host git runs only allowlisted read flags by exact name (no -F, --pathspec-from-file, branch -f, symbolic-ref, cat-file --filters, abbreviations); the gitdir must be host-owned with no info/attributes; renames can't hide a steering file"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestArgsAllowlistAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestArgsAllowlistBlock"
+invariants = [24, 25]
 backends = ["unit"]
 where = "any"

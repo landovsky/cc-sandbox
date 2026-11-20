@@ -20,6 +20,7 @@ const (
 	ExitOK      = 0
 	ExitFail    = 1
 	ExitRefused = 2 // a refusal by policy (no billing, not approved, ...)
+	ExitFlagged = 3 // the check ran and found something to review (steering-check)
 	ExitUsage   = 64
 )
 

@@ -24,7 +24,14 @@ cleanup_guard() {
 }
 
 # Files the fence wrote (uid 10001) can't be removed by the host user: sweep them from a container.
-rmstate() { docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"; }
+rmstate() {
+  # Dirs a test made outside STATE (listed in $STATE/trash): only /var/tmp/ccsbx-cc-<6 chars>, nothing else.
+  local d
+  for d in $(cat "$STATE/trash" 2>/dev/null); do
+    case "$d" in /var/tmp/ccsbx-cc-??????) docker run --rm --user 0 -v "$d:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$d";; esac
+  done
+  docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"
+}
 
 cleanup() {
   cleanup_guard || return 1

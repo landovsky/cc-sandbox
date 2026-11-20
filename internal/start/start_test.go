@@ -432,3 +432,23 @@ func TestWorkdirOutsideRootIsRefused(t *testing.T) {
 		}
 	}
 }
+
+// H1-N3: the steering check must not fall back to a gitdir inside a worktree that a session record
+// names (the agent may have written it).
+func TestSessionForWorkdir(t *testing.T) {
+	d, _ := newDaemon(t)
+	rep, err := d.Start(spec(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(d.WorktreeRoot, "wt")
+	if sid, ok := SessionForWorkdir(d.StateDir, wt); !ok || sid != rep.Sid {
+		t.Fatalf("worktree of a session not recognised: %q %v", sid, ok)
+	}
+	if _, ok := SessionForWorkdir(d.StateDir, d.WorktreeRoot); ok {
+		t.Fatal("a directory that is not a session's worktree was matched")
+	}
+	if _, ok := SessionForWorkdir(t.TempDir(), wt); ok {
+		t.Fatal("matched in an empty state dir")
+	}
+}

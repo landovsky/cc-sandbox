@@ -54,7 +54,7 @@ Recipes:
                      --owners tomas --machines hp-ubuntu --profiles 'dev-*' --billings api,subscription \
                      > /var/lib/ccsbx-keys/signer.scope        (run as ccsbx-keys)
   ask for a token: printf '%s' '{"sub":"tomas/hp-ubuntu/sX/g1","billing":"api","profile":"dev-default",
-                     "aud":["ccsbx-model"],"cnf":"<b64 pubkey>"}' | nc -U /run/ccsbx-signer/sign.sock
+                     "aud":["ccsbx-model"],"cnf":"<b64 pubkey>"}' | nc -N -U /run/ccsbx-signer/sign.sock
 Exit codes: 0 ok, 1 runtime failure, 2 refused to start (bad key, scope, socket or flags).
 `
 

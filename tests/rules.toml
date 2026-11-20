@@ -56,11 +56,31 @@ where = "hp"
 
 [[rule]]
 id = "image-no-secret"
-title = "the fence image holds no credential, token or key"
+title = "the fence image holds no credential, token or key: not in its config, build history, files or any layer (a deleted file is still in its layer)"
 suite = "fence"
-allow = "pending"
-block = "pending"
+allow = "tests/image-test.sh image-no-secret allow"
+block = "tests/image-test.sh image-no-secret block"
 invariants = [2, 26]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "image-claude-pin"
+title = "the image's Claude Code is the pinned version, and a wrong sha256 stops the build"
+suite = "fence"
+allow = "tests/image-test.sh image-claude-pin allow"
+block = "tests/image-test.sh image-claude-pin block"
+invariants = [26]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "image-git-shim"
+title = "in the fence, git reads pass through, commit and push become outbox requests, every other write verb and push flags are refused"
+suite = "fence"
+allow = "tests/image-test.sh image-git-shim allow"
+block = "tests/image-test.sh image-git-shim block"
+invariants = [12]
 backends = ["docker"]
 where = "hp"
 

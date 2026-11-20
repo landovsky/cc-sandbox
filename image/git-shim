@@ -1,0 +1,82 @@
+#!/bin/sh
+# image/git-shim: the `git` a fenced agent runs (plan §3 U1a). It exists because the fence has no
+# credentials and cannot write the git dir (mounted read-only): a commit or push is not done here but
+# ASKED for, as a request file in the outbox (/run/ccsbx/out/requests), which the host daemon reads,
+# judges and performs; the answer comes back in /run/ccsbx/in/replies. Read verbs go to the real git.
+# This is convenience, not a boundary: the real git is still /usr/bin/git, and what keeps the fence
+# from writing history is the read-only git dir and the missing credentials, not this script.
+#
+#   git status|log|diff|show|...   passed to /usr/bin/git unchanged (the read list below)
+#   git commit -m MSG [-a]         request {"type":"git.commit","message":MSG,"all":bool}
+#   git push [REMOTE [REFSPEC]]    request {"type":"git.push","remote":..,"refspec":..}
+#   anything else                  refused with exit 1 and a message
+# Recipes: CCSBX_OUT / CCSBX_IN override the outbox/inbox (tests); CCSBX_GIT_TIMEOUT seconds to wait
+# for the answer (default 120). The request format is the shim's side of the contract; the daemon's
+# handler for git.* is built in the git route (not in this image).
+set -u
+REAL=/usr/bin/git
+OUT=${CCSBX_OUT:-/run/ccsbx/out}
+IN=${CCSBX_IN:-/run/ccsbx/in}
+WAIT=${CCSBX_GIT_TIMEOUT:-120}
+
+verb=""
+for a in "$@"; do
+  case "$a" in -*) ;; *) verb=$a; break;; esac
+done
+[ $# -eq 0 ] && exec "$REAL"
+
+case "$verb" in
+  "") exec "$REAL" "$@" ;;   # git --version, git --help
+  status|log|diff|show|blame|rev-parse|rev-list|ls-files|ls-tree|cat-file|grep|describe|shortlog|\
+  name-rev|merge-base|diff-tree|diff-files|diff-index|show-ref|for-each-ref|check-ignore|help|version|\
+  whatchanged|count-objects|var|cherry|range-diff|reflog)
+    exec "$REAL" "$@" ;;
+  commit|push) ;;
+  *) echo "git $verb: not available in the fence; reads, 'git commit' and 'git push' are. (The host does the writing: see $0.)" >&2; exit 1 ;;
+esac
+
+# --- build the request -------------------------------------------------------------------------
+case "$verb" in
+  commit)
+    msg=""; all=false
+    while [ $# -gt 0 ] && [ "$1" != commit ]; do shift; done
+    shift
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -m) msg=${2:-}; shift 2 || { echo "git commit: -m needs a message" >&2; exit 1; };;
+        -a|--all) all=true; shift;;
+        -am) all=true; msg=${2:-}; shift 2 || exit 1;;
+        *) echo "git commit: only -m MESSAGE and -a are supported in the fence (got '$1')" >&2; exit 1;;
+      esac
+    done
+    [ -n "$msg" ] || { echo "git commit: -m MESSAGE is required" >&2; exit 1; }
+    body=$(jq -cn --arg m "$msg" --argjson a "$all" '{type:"git.commit",message:$m,all:$a}') ;;
+  push)
+    while [ $# -gt 0 ] && [ "$1" != push ]; do shift; done
+    shift
+    remote=""; refspec=""
+    for a in "$@"; do
+      case "$a" in
+        -*) echo "git push: no flags in the fence (got '$a'); the host decides how it pushes" >&2; exit 1;;
+        *) if [ -z "$remote" ]; then remote=$a; elif [ -z "$refspec" ]; then refspec=$a; else echo "git push: too many arguments" >&2; exit 1; fi;;
+      esac
+    done
+    body=$(jq -cn --arg r "$remote" --arg s "$refspec" '{type:"git.push",remote:$r,refspec:$s}') ;;
+esac
+
+# --- send it and wait for the answer -------------------------------------------------------------
+rid="git-$(date +%s%N)-$$"          # time-ordered, matches the daemon's name rule [A-Za-z0-9_-]{1,64}
+dir="$OUT/requests"
+[ -d "$dir" ] || { echo "git $verb: no outbox at $dir (is this a ccsbx fence?)" >&2; exit 1; }
+printf '%s\n' "$body" > "$dir/.$rid.tmp" && mv "$dir/.$rid.tmp" "$dir/$rid.json" \
+  || { echo "git $verb: cannot write the request" >&2; exit 1; }
+reply="$IN/replies/$rid.json"
+i=0
+while [ ! -s "$reply" ]; do
+  i=$((i + 1))
+  [ "$i" -gt $((WAIT * 4)) ] && { echo "git $verb: no answer from the host within ${WAIT}s (request $rid)" >&2; exit 1; }
+  sleep 0.25
+done
+status=$(jq -r '.status // "error"' "$reply")
+echo "git $verb: $(jq -c '.result // {}' "$reply")"
+case "$status" in ok|queued) exit 0;; *) echo "git $verb: refused by the host ($status)" >&2; exit 1;; esac

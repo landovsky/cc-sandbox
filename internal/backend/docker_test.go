@@ -1067,3 +1067,40 @@ func TestGenerationFilesAreNeverWrittenThroughALink(t *testing.T) {
 		t.Errorf("mode %v", st.Mode())
 	}
 }
+
+// context: the installer passes the same list (~/git,~/wt) to hostd and to ccsbx-root's allowed_roots.
+// A workdir inside ANY entry is accepted, one inside none is refused, and a bad entry stops every
+// start, so hostd never accepts a workdir ccsbx-root would refuse or the other way round.
+func TestCheckWorkdirTakesACommaSeparatedListOfRoots(t *testing.T) {
+	a, b := vt(t), vt(t)
+	state := filepath.Join(a, "state")
+	os.MkdirAll(state, 0o755)
+	inA := filepath.Join(a, "proj")
+	inB := filepath.Join(b, "other")
+	os.MkdirAll(inA, 0o755)
+	os.MkdirAll(inB, 0o755)
+	list := a + "," + b
+	for _, w := range []string{inA, inB} {
+		if got, err := CheckWorkdir(w, list, state); err != nil || got != w {
+			t.Errorf("%s in the list was refused: %v", w, err)
+		}
+	}
+	if _, err := CheckWorkdir(t.TempDir(), list, state); err == nil {
+		t.Error("a workdir inside none of the roots was accepted")
+	}
+	if _, err := CheckWorkdir(a, list, state); err == nil {
+		t.Error("a root itself is not strictly inside it")
+	}
+	for name, bad := range map[string]string{
+		"an empty entry":   a + ",",
+		"a relative entry": a + ",rel/dir",
+		"/ among others":   a + ",/",
+		"an unclean entry": a + "," + b + "/",
+		"a missing entry":  a + "," + b + "/nope",
+		"a space":          a + ", " + b,
+	} {
+		if _, err := CheckWorkdir(inA, bad, state); err == nil {
+			t.Errorf("%s: accepted (%q)", name, bad)
+		}
+	}
+}

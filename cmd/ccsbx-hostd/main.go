@@ -1,6 +1,8 @@
-// Command ccsbx-hostd is the session daemon's outbox watcher (U3a). It reads fence requests
-// from every live outbox under the state directory, stamps them from the path and the session
-// record, and answers them into in/replies/. Zero third-party modules.
+// Command ccsbx-hostd is the session daemon (U3a and what grew on it): it reads fence requests from
+// every live outbox under the run directory (found through its own session records, never by
+// listing), stamps them from the path and the record, answers them into in/replies/, journals
+// events, delivers messages, serves the daemon API on a local socket, and starts sessions for the
+// owner who asks over that socket. Zero third-party modules.
 package main
 
 import (
@@ -11,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -63,6 +66,13 @@ func app() *cli.App {
 				f.Int("event-burst", 500, "event bucket size per outbox")
 				f.Int("max-total", 20000, "requests per generation in its lifetime; beyond that they are shed")
 				f.String("root", "auto", "privilege mode: auto (helper if /usr/local/sbin/ccsbx-root is installed and root-owned, else direct), direct, or helper (panes run sudo -n ccsbx-root run; no docker for the daemon)")
+				f.String("run-dir", "", "where generations' outboxes are read: <run-dir>/s/<sid>/g<n>/{out,in,CLOSED} (default: the state dir). Helper mode: ccsbx-root's run dir, /var/lib/ccsbx-run, where out/ is 10001:ccsbx 02750 (hostd reads it through the group and never writes it) and s/ and s/<sid> are not listable by hostd, so every path is derived from its session records; every openat2/fstat check (owner uid = --fence-uid) still applies")
+				f.String("pins", "/etc/ccsbx/pins.toml", "production pins file for session starts (digests that may run under any profile); the same file ccsbx-root reads")
+				f.Int("min-uid", 1000, "session starts: a caller with a uid below this, root, or hostd's own uid is refused (ccsbx-root refuses them anyway; a start must not hold a label and a slot first)")
+				f.String("worktree-root", home, "session starts: comma-separated absolute directories (the syntax and meaning of ccsbx-root.toml allowed_roots, e.g. /home/u/git,/home/u/wt): a workdir must be strictly inside one of them after symlinks are resolved; a bad entry stops every start; hidden dirs of the home are refused when a root is the home")
+				f.String("cc-version", "", "Claude Code version recorded in a started session's pin")
+				f.Int("max-live", 8, "session starts: machine_full above this many live sessions")
+				f.Int("max-per-hour", 20, "session starts: rate_capped above this many starts per caller per hour")
 				f.String("tmux-socket", "ccsbx", "tmux server the session panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (a socket shared between uids; hostd makes it 0660)")
 				f.String("machine", hostname(), "this machine's name, stamped on journal records")
 				f.String("journal", "", "journal directory (default <state>/journal)")
@@ -115,7 +125,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	defer q.Close()
 	q.TTL = time.Duration(num("lease-ttl")) * time.Second
 	q.MaxPending = num("queue-max")
-	q.Reply = replyWriter(get("state"), d)
+	q.Reply = replyWriter(runDirOr(get("run-dir"), get("state")), d)
 	lg := log.New(stderr, "ccsbx-hostd: ", log.LstdFlags)
 	jdir := get("journal")
 	if jdir == "" {
@@ -139,8 +149,12 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	if get("hear") == "true" {
 		onEvent = hearFunc(rt)
 	} // a message is typed only into a pane whose last hook event is Stop
-	h := hostd.New(hostd.Config{Journal: j, OnEvent: onEvent, OnTick: func() { rt.Pump(pumpReply(get("state"))) },
-		StateDir: get("state"), FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
+	runDir := get("run-dir")
+	if runDir == "" {
+		runDir = get("state")
+	}
+	h := hostd.New(hostd.Config{Journal: j, OnEvent: onEvent, OnTick: func() { rt.Pump(pumpReply(runDir)) },
+		StateDir: get("state"), RunDir: runDir, FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
 		Handler: m.handle, Rate: float64(num("rate")), Burst: num("burst"), EventRate: float64(num("event-rate")), EventBurst: num("event-burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
 	})
 	if get("once") == "true" {
@@ -166,7 +180,11 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ccsbx-hostd:", err)
 		return cli.ExitRefused
 	}
-	sd := &start.Daemon{StateDir: abs(get("state")), Machine: get("machine"), Root: mode, Exe: exe, Backend: "docker",
+	if mode == "helper" && get("run-dir") == "" {
+		fmt.Fprintln(stderr, "ccsbx-hostd: helper mode needs --run-dir (ccsbx-root's run dir, /var/lib/ccsbx-run): without it hostd would look for outboxes in the state dir and see none")
+		return cli.ExitRefused
+	}
+	sd := &start.Daemon{StateDir: abs(get("state")), RunDir: runDir, Machine: get("machine"), Root: mode, Exe: exe, Backend: "docker",
 		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Helper: mode == "helper", Env: []string{"--state", abs(get("state")),
 			"--profiles", abs(get("profiles")), "--machine", get("machine"), "--image", get("image"), "--root", mode}}}
 	var servers []*http.Server
@@ -178,6 +196,13 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		}
 		return rec.Gen, nil
 	}
+	// Session start for helper mode: the owner's `ccsbx start` asks here; hostd writes the record in
+	// its state dir and launches the pane. The caller's uid is the socket peer's, not the spec's.
+	srv.Start = startHandler(sd, startPolicy{
+		Profiles: abs(get("profiles")), Pins: get("pins"), WorktreeRoots: get("worktree-root"), Image: get("image"),
+		CCVersion: get("cc-version"), TmuxSocket: get("tmux-socket"), RunDir: runDir,
+		MaxLive: num("max-live"), MaxPerHour: num("max-per-hour"), MinUID: num("min-uid"), LookupID: user.LookupId,
+	})
 	sock := get("local-socket")
 	if sock == "" {
 		sock = get("socket")
@@ -190,7 +215,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "ccsbx-hostd: %s: %v\n", what, err)
 			return false
 		}
-		hs := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second}
+		hs := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, ConnContext: daemonapi.PeerContext}
 		servers = append(servers, hs)
 		go hs.Serve(l)
 		lg.Printf("api on %s", what)
@@ -227,7 +252,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() { <-sig; close(stop) }()
-	lg.Printf("watching %s every %s (direct mode: results are not evidence)", get("state"), iv)
+	lg.Printf("watching outboxes under %s (state %s) every %s (direct mode: results are not evidence)", runDir, get("state"), iv)
 	h.Run(iv, stop)
 	for _, hs := range servers {
 		hs.Close()
@@ -274,6 +299,14 @@ func readToken(path string) (string, error) {
 		return "", fmt.Errorf("%s: the token must be at least 16 characters", path)
 	}
 	return t, nil
+}
+
+// runDirOr is the run dir, or the state dir when none is given.
+func runDirOr(run, state string) string {
+	if run != "" {
+		return run
+	}
+	return state
 }
 
 func hostname() string { h, _ := os.Hostname(); return h }

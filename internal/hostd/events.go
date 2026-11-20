@@ -113,6 +113,7 @@ func (h *Hostd) ingestEvents(gdir string, rec *start.Record, gen string, box *ou
 	if err != nil {
 		if !os.IsNotExist(err) {
 			st.Reasons["events_"+classify(err)]++
+			h.logOnce(box, "events", "hostd: %s: out/events.jsonl cannot be read (%s): its events are skipped until it can", rec.Sid, classify(err))
 		}
 		return
 	}

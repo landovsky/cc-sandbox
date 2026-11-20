@@ -1434,3 +1434,45 @@ block = "tests/twin-go.sh ./cmd/ccsbx TestEveryRefusalIsPassedThroughAndNeverFal
 invariants = [8]
 backends = ["unit"]
 where = "hp"
+
+# ---- helper mode: hostd records and starts sessions, reads the run dir (n1-g-helper). Direct mode: not evidence. ----
+
+[[rule]]
+id = "start-owner-only"
+title = "session start is an owner operation on the local socket: the caller is the socket peer (not the spec), and the loopback port refuses it"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/daemonapi TestStartOverTheSocketUsesThePeerUidNotTheBodyAllow"
+block = "tests/twin-go.sh ./internal/daemonapi TestStartIsRefusedOnTheLoopbackPortBlock"
+invariants = [5]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "hostd-run-dir"
+title = "hostd reads outboxes and the CLOSED marker under --run-dir with every file check intact (owner uid, no symlink)"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestRequestsInTheRunDirAreHandledAndAnsweredThereAllow"
+block = "tests/twin-go.sh ./internal/hostd TestRunDirKeepsEveryOutboxCheckBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "start-owner-from-peer"
+title = "a session's owner (in its id: the journal and token identity) is the socket peer's passwd name; a spec naming another owner is refused"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/start TestOwnerComesFromThePeerNotTheSpecAllow"
+block = "tests/twin-go.sh ./cmd/ccsbx-hostd TestStartHandlerRefusesASpecWithAnotherOwner"
+invariants = [5, 13]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "hostd-no-run-dir-listing"
+title = "hostd finds generations from its own session records, never by listing the run dir (root's s/ is searchable but not listable); a failed reply write is logged and counted"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestWatcherFindsGenerationsWithoutListingTheRunDirAllow"
+block = "tests/twin-go.sh ./internal/hostd TestFailedReplyWriteIsLoggedAndCounted"
+invariants = [10, 28]
+backends = ["unit"]
+where = "hp"

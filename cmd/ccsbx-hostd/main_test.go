@@ -143,3 +143,14 @@ func TestEventBudgetHasFlags(t *testing.T) {
 		}
 	}
 }
+
+// context: the installer's unit passes the run dir and the start-policy limits; each is a flag with an
+// env var and a --help line.
+func TestRunDirAndStartPolicyFlags(t *testing.T) {
+	_, h := runHostd("run", "--help")
+	for _, w := range []string{"-run-dir", "CCSBX_RUN_DIR", "-pins", "-worktree-root", "-max-live", "-max-per-hour", "-cc-version"} {
+		if !strings.Contains(h, w) {
+			t.Errorf("--help does not list %s", w)
+		}
+	}
+}

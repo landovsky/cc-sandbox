@@ -34,7 +34,7 @@ func newFixture(t *testing.T, mut func(*Config)) *fixture {
 	t.Helper()
 	state := t.TempDir()
 	f := &fixture{t: t, state: state, g: filepath.Join(state, "s", sid, "g1")}
-	for _, d := range []string{"out/requests", "in"} {
+	for _, d := range []string{"out/requests", "in/replies"} {
 		if err := os.MkdirAll(filepath.Join(f.g, d), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -582,4 +582,201 @@ func directModeWorktree(t *testing.T) (root, wt string) {
 	wt = filepath.Join(root, "wt")
 	os.Mkdir(wt, 0o755)
 	return root, wt
+}
+
+// ---- --run-dir: helper mode reads outboxes under ccsbx-root's run dir ---------------------------
+
+// runDirFixture is the fixture with its generation moved to a separate run dir, as in helper mode:
+// the session record is in the state dir, s/<sid>/g1/{out,in} is under the run dir.
+func runDirFixture(t *testing.T, mut func(*Config)) (*fixture, string) {
+	t.Helper()
+	run := t.TempDir()
+	f := newFixture(t, func(c *Config) {
+		c.RunDir = run
+		if mut != nil {
+			mut(c)
+		}
+	})
+	if err := os.Rename(filepath.Join(f.state, "s"), filepath.Join(run, "s")); err != nil {
+		t.Fatal(err)
+	}
+	f.g = filepath.Join(run, "s", sid, "g1")
+	return f, run
+}
+
+// context: after Gate M the outboxes are not in hostd's state dir any more but in ccsbx-root's run
+// dir. A request there is handled, stamped from the path and the record, and answered in that
+// generation's in/replies; the state dir has no s/ at all.
+func TestRequestsInTheRunDirAreHandledAndAnsweredThereAllow(t *testing.T) {
+	f, run := runDirFixture(t, nil)
+	f.req("r1.json", `{"type":"ccf.mark"}`)
+	st := f.h.Scan()
+	if st.Accepted != 1 || len(f.got) != 1 || f.got[0].Sid != sid {
+		t.Fatalf("%+v %v", st, f.got)
+	}
+	if _, err := os.Stat(filepath.Join(run, "s", sid, "g1", "in", "replies", "r1.json")); err != nil {
+		t.Fatalf("the reply is not in the run dir: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(f.state, "s")); err == nil {
+		t.Fatal("hostd made an s/ in the state dir")
+	}
+}
+
+// context: the run dir is read through a group, so every file check still has to hold there: a file
+// whose owner is not the fence uid is refused, and a symlink is not followed.
+func TestRunDirKeepsEveryOutboxCheckBlock(t *testing.T) {
+	f, _ := runDirFixture(t, func(c *Config) { c.FenceUID = os.Getuid() + 1 }) // the file's owner is not the fence uid
+	f.req("r1.json", `{"type":"ccf.mark"}`)
+	f.h.Scan()
+	if len(f.got) != 0 || f.code("r1") != "refused:wrong_owner" {
+		t.Fatalf("%v %s", f.got, f.code("r1"))
+	}
+	g, _ := runDirFixture(t, nil)
+	os.Symlink("/etc/passwd", filepath.Join(g.g, "out", "requests", "evil.json"))
+	g.h.Scan()
+	if len(g.got) != 0 || g.code("evil") != "refused:unsafe_path" {
+		t.Fatalf("%v %s", g.got, g.code("evil"))
+	}
+}
+
+// context: the CLOSED marker of a generation is root's, in the run dir; hostd needs only to see it
+// there to drain the generation one last time and journal its end.
+func TestClosedMarkerIsLookedForInTheRunDir(t *testing.T) {
+	f, _ := runDirFixture(t, nil)
+	j := f.withJournal(t.TempDir())
+	f.appendEvents(`{"type":"hook.Stop","data":{}}` + "\n")
+	f.h.Scan()
+	if err := os.WriteFile(filepath.Join(f.g, "CLOSED"), []byte("closed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f.h.Scan()
+	recs, _ := j.After(0, "", "", 0)
+	if !contains(types(recs), "host:session.ended") {
+		t.Fatalf("the end was not journaled: %v", types(recs))
+	}
+}
+
+// ---- in/replies is made by the launcher, never by hostd; an unreadable fence file is skipped ----
+
+// context: in helper mode in/ is root's (it holds session.json, written by root); only in/replies is
+// the daemon's. hostd must not create anything in in/, so with no in/replies a reply is an error and
+// nothing appears under in/.
+func TestReplyNeverCreatesTheInboxDirectories(t *testing.T) {
+	g := t.TempDir()
+	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	if err := WriteReply(g, Reply{Rid: "r1", Status: "ok"}); err == nil {
+		t.Fatal("a reply was written although in/replies does not exist")
+	}
+	if ents, _ := os.ReadDir(filepath.Join(g, "in")); len(ents) != 0 {
+		t.Fatalf("hostd created %d entries in in/", len(ents))
+	}
+	os.Mkdir(filepath.Join(g, "in", "replies"), 0o755)
+	if err := WriteReply(g, Reply{Rid: "r1", Status: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// context: the fence can chmod its own files. A request or events file the daemon (a group member,
+// not the owner) can't open gives EACCES: it must be logged with the session and the file name,
+// answered, never retried in a loop, and never stop the other requests.
+func TestUnreadableFenceFilesAreLoggedAndSkippedNotFatal(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root reads everything")
+	}
+	var logs []string
+	f := newFixture(t, func(c *Config) {
+		c.Logf = func(format string, a ...any) { logs = append(logs, fmt.Sprintf(format, a...)) }
+	})
+	j := f.withJournal(t.TempDir())
+	secret := f.req("locked.json", `{"type":"ccf.mark"}`)
+	os.Chmod(secret, 0o000)
+	f.req("fine.json", `{"type":"ccf.mark"}`)
+	f.appendEvents(`{"type":"hook.Stop","data":{}}` + "\n")
+	os.Chmod(filepath.Join(f.g, "out", "events.jsonl"), 0o000)
+	f.h.Scan()
+	f.h.Scan() // a second scan must not log again or loop
+	if len(f.got) != 1 || f.got[0].Rid != "fine" {
+		t.Fatalf("the readable request was not served: %+v", f.got)
+	}
+	if f.code("locked") != "refused:unreadable" {
+		t.Fatalf("reply %s", f.code("locked"))
+	}
+	all := strings.Join(logs, "\n")
+	if !strings.Contains(all, sid) || !strings.Contains(all, "locked.json") || !strings.Contains(all, "events.jsonl") {
+		t.Fatalf("the log does not name the session and files:\n%s", all)
+	}
+	if n := strings.Count(all, "events.jsonl"); n != 1 {
+		t.Fatalf("the events problem was logged %d times, not once", n)
+	}
+	recs, _ := j.After(0, "", "", 0)
+	for _, r := range recs {
+		if r.Src == "fence" {
+			t.Fatal("an unreadable events file produced events")
+		}
+	}
+}
+
+// ---- review of PR #12: no listing of the run dir; a failed reply is surfaced ---------------------
+
+// context: in helper mode s/ and s/<sid> are root's 0711: searchable but NOT listable by the service
+// uid, so a Glob finds nothing and the daemon goes deaf. hostd must find a generation from its own
+// session records. Here the directories are made unreadable for their owner (mode 0311), which is
+// what "not listable" means in a one-uid test: a Glob of them finds nothing, a Stat by name works.
+func TestWatcherFindsGenerationsWithoutListingTheRunDirAllow(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root lists everything")
+	}
+	f, run := runDirFixture(t, nil)
+	s, sd := filepath.Join(run, "s"), filepath.Join(run, "s", sid)
+	os.Chmod(sd, 0o311)
+	os.Chmod(s, 0o311)
+	t.Cleanup(func() { os.Chmod(s, 0o755); os.Chmod(sd, 0o755) })
+	if m, _ := filepath.Glob(filepath.Join(s, "s*", "g*")); len(m) != 0 {
+		t.Fatalf("the test directories are still listable: %v", m)
+	}
+	f.req("r1.json", `{"type":"ccf.mark"}`)
+	st := f.h.Scan()
+	if st.Accepted != 1 || len(f.got) != 1 {
+		t.Fatalf("the request was not found without listing: %+v", st)
+	}
+	if _, ok := f.reply("r1"); !ok {
+		t.Fatal("no reply")
+	}
+}
+
+// context: the old generations of a session are found too (1..record.Gen), and a corrupt record
+// does not stop the others.
+func TestWatcherCoversEveryGenerationOfARecordAndSurvivesABadRecord(t *testing.T) {
+	f := newFixture(t, nil)
+	f.setRecord(func(r *start.Record) { r.Gen = 2; r.Reply.ID = "tomas/hp/" + sid + "/g2" })
+	os.MkdirAll(filepath.Join(f.state, "s", sid, "g2", "out", "requests"), 0o755)
+	os.MkdirAll(filepath.Join(f.state, "s", sid, "g2", "in", "replies"), 0o755)
+	os.WriteFile(filepath.Join(f.state, "sessions", "s0broken1.json"), []byte("{not json"), 0o600)
+	f.req("old.json", `{"type":"ccf.mark"}`) // in g1, now a superseded generation
+	os.WriteFile(filepath.Join(f.state, "s", sid, "g2", "out", "requests", "new.json"), []byte(`{"type":"ccf.mark"}`), 0o644)
+	f.h.Scan()
+	if f.code("old") != "stale:stale_generation" {
+		t.Fatalf("g1: %s", f.code("old"))
+	}
+	if len(f.got) != 1 || f.got[0].Rid != "new" {
+		t.Fatalf("g2's request was not handled: %+v", f.got)
+	}
+}
+
+// context: a reply that cannot be written (no in/replies, or it is not writable) used to be dropped
+// silently, so the session just waited. It is logged with the session and counted.
+func TestFailedReplyWriteIsLoggedAndCounted(t *testing.T) {
+	var logs []string
+	f := newFixture(t, func(c *Config) {
+		c.Logf = func(format string, a ...any) { logs = append(logs, fmt.Sprintf(format, a...)) }
+	})
+	os.RemoveAll(filepath.Join(f.g, "in", "replies"))
+	f.req("r1.json", `{"type":"ccf.mark"}`)
+	st := f.h.Scan()
+	if st.Reasons["reply_failed"] == 0 {
+		t.Fatalf("not counted: %+v", st.Reasons)
+	}
+	if all := strings.Join(logs, "\n"); !strings.Contains(all, sid) || !strings.Contains(all, "r1") || !strings.Contains(all, "could not be written") {
+		t.Fatalf("not logged with the session and rid:\n%s", all)
+	}
 }

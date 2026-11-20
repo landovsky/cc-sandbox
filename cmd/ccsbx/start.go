@@ -27,7 +27,7 @@ func stateFlags(f *cli.Flags) {
 	f.String("state", defaultState(), "daemon state directory (session records, lock)")
 	f.String("profiles", "profiles", "directory of <name>.json profiles")
 	f.String("machine", hostname(), "this machine's name; a spec for another machine is refused")
-	f.String("worktree-root", home, "every worktree must be strictly inside this directory (symlinks resolved); hidden dirs of it are refused when it is the home")
+	f.String("worktree-root", home, "comma-separated directories (like ccsbx-root.toml allowed_roots): every worktree must be strictly inside one (symlinks resolved); hidden dirs of the home are refused when a root is the home")
 	f.String("pins", "pins.toml", "production pins file (digests that may run under any profile)")
 	f.String("root", "auto", modeFlagHelp)
 }
@@ -53,7 +53,7 @@ func daemonFrom(f *cli.Flags) (*start.Daemon, error) {
 	}
 	d := &start.Daemon{
 		StateDir: abs(get("state")), ProfilesDir: abs(get("profiles")), Machine: get("machine"), Uid: os.Getuid(),
-		Backend: "docker", Root: mode, Exe: exe, PinsFile: abs(get("pins")), WorktreeRoot: abs(get("worktree-root")),
+		Backend: "docker", Root: mode, Exe: exe, PinsFile: abs(get("pins")), WorktreeRoot: start.AbsRoots(get("worktree-root")),
 	}
 	return d, nil
 }

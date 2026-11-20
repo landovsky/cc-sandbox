@@ -32,6 +32,7 @@ import (
 
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
+	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
 )
 
@@ -43,6 +44,10 @@ type Server struct {
 	Dir msg.Directory
 	// Replace ends a session's pane and starts generation+1 with a brief (C9b); nil: 404.
 	Replace func(sid, brief string) (gen int, err error)
+	// Start is session start (helper mode): the owner's `ccsbx start` sends its LaunchSpec here and
+	// hostd records and launches the session. uid is the CALLER's, from the socket's peer
+	// credentials, never from the body. A policy refusal is a *start.Refusal. nil: 404.
+	Start   func(uid int, spec []byte) (*start.StartReply, error)
 	Token   string        // bearer token the TCP listener requires (the unix socket needs none: it is 0600)
 	MaxWait time.Duration // longest long-poll
 	Info    map[string]any
@@ -79,6 +84,7 @@ func (s *Server) mux() *http.ServeMux {
 	m.HandleFunc("/v1/resolve", s.resolve)
 	m.HandleFunc("/v1/sessions", s.sessions)
 	m.HandleFunc("/v1/sessions/", s.deliver)
+	m.HandleFunc("/v1/start", s.startSession)
 	m.HandleFunc("/v1/info", s.info)
 	m.HandleFunc("/v1/events", s.events)
 	m.HandleFunc("/v1/events/stream", s.stream)
@@ -477,6 +483,44 @@ func (s *Server) status(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, st)
+}
+
+// ---- session start (helper mode) ----
+
+type peerKey struct{}
+
+// startSession: POST /v1/start, body = the LaunchSpec JSON. Owner class: the unix socket only,
+// never the loopback port (a token holder must not be able to start fenced sessions). 200 with the
+// StartReply; 409 with the Refusal; 500 {"error"}.
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request) {
+	if !isLocal(r) || r.Method != http.MethodPost {
+		writeJSON(w, 403, map[string]any{"error": "owner operation: POST on the unix socket"})
+		return
+	}
+	if s.Start == nil {
+		writeJSON(w, 404, map[string]any{"error": "no_start"})
+		return
+	}
+	uid, ok := r.Context().Value(peerKey{}).(int)
+	if !ok {
+		writeJSON(w, 500, map[string]any{"error": "no peer credentials on this connection: refusing to start a session for an unknown caller"})
+		return
+	}
+	body, err := io.ReadAll(io.LimitReader(r.Body, 256<<10+1))
+	if err != nil || len(body) > 256<<10 {
+		writeJSON(w, 400, map[string]any{"error": "the spec is unreadable or larger than 256 KiB"})
+		return
+	}
+	rep, err := s.Start(uid, body)
+	var ref *start.Refusal
+	switch {
+	case errors.As(err, &ref):
+		writeJSON(w, 409, ref)
+	case err != nil:
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+	default:
+		writeJSON(w, 200, rep)
+	}
 }
 
 // ---- local message delivery (U3b, plan §4.4) ----

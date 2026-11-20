@@ -50,6 +50,7 @@ type Record struct {
 // Daemon holds the policy knobs and the state directory.
 type Daemon struct {
 	StateDir     string
+	RunDir       string // where generations' s/<sid>/g<n>/CLOSED live; empty: StateDir (helper mode: ccsbx-root's run dir)
 	ProfilesDir  string
 	Machine      string // this machine's name; a spec for another machine is refused
 	Uid          int    // the caller's uid (from the OS, never from the spec)
@@ -77,6 +78,26 @@ func (d *Daemon) now() time.Time {
 		return d.Now()
 	}
 	return time.Now()
+}
+
+// AbsRoots makes every entry of a comma-separated worktree-root list absolute (a relative entry is
+// taken from the current directory, as a single --worktree-root always was). Entries are not
+// otherwise touched: CheckWorkdir validates them exactly as ccsbx-root validates allowed_roots.
+func AbsRoots(list string) string {
+	parts := strings.Split(list, ",")
+	for i, p := range parts {
+		if a, err := filepath.Abs(p); err == nil && p != "" {
+			parts[i] = a
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
+func (d *Daemon) runRoot() string {
+	if d.RunDir != "" {
+		return d.RunDir
+	}
+	return d.StateDir
 }
 
 func (d *Daemon) path(parts ...string) string {
@@ -381,7 +402,7 @@ func (d *Daemon) Replace(sid, brief string) (*Record, error) {
 	if err := st.Stop(sid); err != nil {
 		return nil, fmt.Errorf("end the old pane: %w", err)
 	}
-	closed := d.path("s", sid, fmt.Sprintf("g%d", prev.Gen), "CLOSED")
+	closed := filepath.Join(d.runRoot(), "s", sid, fmt.Sprintf("g%d", prev.Gen), "CLOSED")
 	wait := d.ReplaceWait
 	if wait == 0 {
 		wait = 15 * time.Second

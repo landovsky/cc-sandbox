@@ -31,7 +31,7 @@ func (l *stopLauncher) Stop(sid string) error {
 	l.mu.Unlock()
 	if l.closes {
 		rec, _ := l.d.Load(sid)
-		g := filepath.Join(l.d.StateDir, "s", sid, "g"+string(rune('0'+rec.Gen)))
+		g := filepath.Join(l.d.runRoot(), "s", sid, "g"+string(rune('0'+rec.Gen)))
 		os.MkdirAll(g, 0o700)
 		os.WriteFile(filepath.Join(g, "CLOSED"), []byte("closed\n"), 0o600)
 	}
@@ -111,5 +111,22 @@ func TestReplaceWhoseLaunchFailsMarksTheSessionEnded(t *testing.T) {
 	rec, _ := d.Load(sid)
 	if rec.Gen != 1 || rec.Ended == nil {
 		t.Fatalf("record after a failed replace: gen %d ended %v", rec.Gen, rec.Ended)
+	}
+}
+
+// context: in helper mode the generation's CLOSED marker is ccsbx-root's, in the run dir, not in the
+// state dir; Replace must wait for it THERE before it starts generation+1 (two fences must never hold
+// one workdir and home at once).
+func TestReplaceWaitsForTheCloseMarkerInTheRunDir(t *testing.T) {
+	d, sl, sid := running(t)
+	d.RunDir = t.TempDir()
+	if _, err := d.Replace(sid, "b"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(d.RunDir, "s", sid, "g1", "CLOSED")); err != nil {
+		t.Fatalf("the marker the launcher wrote is not in the run dir: %v", err)
+	}
+	if !sl.Alive(sid) {
+		t.Fatal("generation 2 is not running")
 	}
 }

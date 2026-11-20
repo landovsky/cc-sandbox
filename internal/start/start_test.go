@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -506,5 +507,28 @@ func TestReplyDoesNotClaimEvidenceFromTheModeAlone(t *testing.T) {
 	d2.Root, d2.HelperProven, d2.Image, d2.PinsFile = "helper", true, d.Image, d.PinsFile
 	if rep2, err := d2.Start(spec(nil)); err != nil || rep2.NotEv {
 		t.Errorf("a proven helper does not get evidence: %v %v", rep2, err)
+	}
+}
+
+// context: the owner is part of a session's id, which the journal and the session token trust. In
+// helper mode any process that reaches hostd's socket could otherwise start a session "as" another
+// user by writing that name in the spec. The owner is the socket peer's passwd name; a different one
+// is refused.
+func TestOwnerComesFromThePeerNotTheSpecAllow(t *testing.T) {
+	lookup := func(id string) (*user.User, error) { return &user.User{Uid: id, Username: "tomas"}, nil }
+	if err := CheckOwner(1000, "tomas", lookup); err != nil {
+		t.Fatalf("the caller's own name was refused: %v", err)
+	}
+}
+
+func TestSpecClaimingAnotherOwnerIsRefusedBlock(t *testing.T) {
+	lookup := func(id string) (*user.User, error) { return &user.User{Uid: id, Username: "tomas"}, nil }
+	err := CheckOwner(1000, "root", lookup)
+	if r, ok := err.(*Refusal); !ok || r.Code != BadSpec {
+		t.Fatalf("a spec under another owner's name was accepted: %v", err)
+	}
+	unknown := func(string) (*user.User, error) { return nil, os.ErrNotExist }
+	if err := CheckOwner(4242, "tomas", unknown); err == nil {
+		t.Fatal("a caller with no passwd entry was accepted: fail closed")
 	}
 }

@@ -5,7 +5,9 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,7 +32,7 @@ func TestDoneIsQueuedThenAnsweredWhenTheCockpitApplies(t *testing.T) {
 	os.WriteFile(filepath.Join(state, "sessions", sid+".json"), b, 0o600)
 	g := filepath.Join(state, "s", sid, "g1")
 	os.MkdirAll(filepath.Join(g, "out", "requests"), 0o755)
-	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	os.MkdirAll(filepath.Join(g, "in", "replies"), 0o755)
 	os.WriteFile(filepath.Join(g, "out", "requests", "d1.json"), []byte(`{"type":"ccf.done"}`), 0o644)
 
 	d := &start.Daemon{StateDir: state}
@@ -114,7 +116,7 @@ func writeSession(t *testing.T, state, sid, label, manager string) {
 func askQuestion(t *testing.T, state, sid string) {
 	g := filepath.Join(state, "s", sid, "g1")
 	os.MkdirAll(filepath.Join(g, "out", "requests"), 0o755)
-	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	os.MkdirAll(filepath.Join(g, "in", "replies"), 0o755)
 	os.WriteFile(filepath.Join(g, "out", "requests", "q1.json"), []byte(`{"type":"ccf.question","data":{"text":"Which database?","options":["pg","sqlite"]}}`), 0o644)
 }
 
@@ -168,7 +170,7 @@ func TestOtherVerbsDoNotMessageTheManager(t *testing.T) {
 	writeSession(t, state, "s0worker1", "cc-sandbox:w1", "cc-sandbox:mgr")
 	g := filepath.Join(state, "s", "s0worker1", "g1")
 	os.MkdirAll(filepath.Join(g, "out", "requests"), 0o755)
-	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	os.MkdirAll(filepath.Join(g, "in", "replies"), 0o755)
 	os.WriteFile(filepath.Join(g, "out", "requests", "o1.json"), []byte(`{"type":"ccf.outcome","data":{"text":"x"}}`), 0o644)
 	d := &start.Daemon{StateDir: state}
 	hub := &recHub{}
@@ -200,5 +202,75 @@ func TestHearTellsTheManagerOfAPermissionPrompt(t *testing.T) {
 	hear(journal.Record{Type: "hook.Notification", Sid: "s0worker1", Node: "cc-sandbox:w1", Data: json.RawMessage(`{"notification_type":"permission_prompt"}`)})
 	if len(hub.got) != 1 || !strings.Contains(hub.got[0], "HEAR: cc-sandbox:w1 needs a decision from a human (permission_prompt)") {
 		t.Fatalf("%q", hub.got)
+	}
+}
+
+// ---- review of PR #12: the start handler (owner from the peer, who may start) ---------------------
+
+// wdir makes a real worktree directory under /var/tmp (/tmp is a fixed fence mount, so refused).
+func wdir(t *testing.T) string {
+	t.Helper()
+	d, err := os.MkdirTemp("/var/tmp", "ccsbx-hostd-wd-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(d) })
+	d, _ = filepath.EvalSymlinks(d)
+	return d
+}
+
+func policyFor(t *testing.T, lookup string) (*start.Daemon, startPolicy) {
+	t.Helper()
+	sd := &start.Daemon{StateDir: t.TempDir(), Machine: "hp-ubuntu", Root: "direct", Exe: "ccsbx", Backend: "docker", Launcher: start.NoLauncher{}}
+	return sd, startPolicy{Profiles: "../../profiles", Pins: "/nonexistent/pins.toml", WorktreeRoots: "/var/tmp", Image: "ccsbx-fence:dev",
+		MaxLive: 8, MaxPerHour: 20, MinUID: 1000,
+		LookupID: func(id string) (*user.User, error) { return &user.User{Uid: id, Username: lookup}, nil }}
+}
+
+const specOf = `{"v":1,"request_id":"r1","owner":"%s","machine":"hp-ubuntu","label":"cc-sandbox:x","harness":"claude","profile":"dev-default","billing":"stub","workdir":{"path":"%s"}}`
+
+// context: the owner is in the session's id (journal and token identity). Through the REAL handler
+// (not the function alone), a spec naming another owner is refused with the owner message and never
+// reaches Start; deleting the CheckOwner call from the handler turns this red, because the spec would
+// then fail later for another reason.
+func TestStartHandlerRefusesASpecWithAnotherOwner(t *testing.T) {
+	w := wdir(t)
+	sd, p := policyFor(t, "tomas")
+	h := startHandler(sd, p)
+	_, err := h(4000, []byte(fmt.Sprintf(specOf, "root", w)))
+	if r, ok := err.(*start.Refusal); !ok || !strings.Contains(r.Msg, "is not the caller") {
+		t.Fatalf("a foreign owner was not refused as such: %v", err)
+	}
+	_, err = h(4000, []byte(fmt.Sprintf(specOf, "tomas", w)))
+	if err != nil && strings.Contains(err.Error(), "is not the caller") {
+		t.Fatalf("the caller's own name was refused: %v", err)
+	}
+}
+
+// context: root, the service user and low uids can't start sessions: ccsbx-root would refuse the pane
+// anyway, but only after hostd had held the label and a live slot.
+func TestStartHandlerRefusesRootTheServiceUserAndLowUids(t *testing.T) {
+	w := wdir(t)
+	sd, p := policyFor(t, "tomas")
+	h := startHandler(sd, p)
+	for name, uid := range map[string]int{"root": 0, "the service user (hostd's own uid)": os.Getuid(), "below min-uid": 999} {
+		if uid != 0 && uid != os.Getuid() && uid >= p.MinUID {
+			continue
+		}
+		if _, err := h(uid, []byte(fmt.Sprintf(specOf, "tomas", w))); err == nil || !strings.Contains(err.Error(), "may not start sessions") {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}
+
+// context: hostd passes --worktree-root through unchanged, so a list ccsbx-root would refuse (a
+// relative entry, a trailing slash) is refused by hostd too instead of being silently repaired.
+func TestStartHandlerDoesNotRepairTheWorktreeRoots(t *testing.T) {
+	w := wdir(t)
+	sd, p := policyFor(t, "tomas")
+	p.WorktreeRoots = "/var/tmp/,wt"
+	_, err := startHandler(sd, p)(4000, []byte(fmt.Sprintf(specOf, "tomas", w)))
+	if err == nil || !strings.Contains(err.Error(), "worktree root") {
+		t.Fatalf("a list that ccsbx-root refuses was repaired and accepted: %v", err)
 	}
 }

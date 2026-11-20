@@ -233,6 +233,13 @@ func (s Spec) Prepare() error {
 			return err
 		}
 	}
+	if !helper {
+		// hostd writes replies ONLY into in/replies and never creates it (in helper mode ccsbx-root
+		// does): so direct mode makes it here, before the pane starts.
+		if err := os.Mkdir(filepath.Join(g, "in", "replies"), 0o755); err != nil {
+			return err
+		}
+	}
 	h := s.HomeDir()
 	if helper {
 		if err := os.MkdirAll(filepath.Dir(h), 0o711); err != nil {
@@ -512,15 +519,31 @@ func CheckWorkdir(w, root, stateDir string) (string, error) {
 	if root == "" {
 		return "", fmt.Errorf("no worktree root is configured (set --worktree-root or CCSBX_WORKTREE_ROOT)")
 	}
-	rr, err := filepath.EvalSymlinks(root)
-	if err != nil {
-		return "", fmt.Errorf("worktree root: %w", err)
+	// root is a comma-separated list, with the syntax and meaning of ccsbx-root's allowed_roots: each
+	// entry a clean absolute path, not "/", resolved through symlinks (to something that is not "/"
+	// either); the workdir must be strictly inside one of them. A bad entry is an error even if
+	// another would match, as in ccsbx-root (its whole config is refused), so the two never disagree.
+	var rr string
+	for _, r := range strings.Split(root, ",") {
+		if err := CheckPath(r); err != nil {
+			return "", fmt.Errorf("worktree root %q: %w", r, err)
+		}
+		if !filepath.IsAbs(r) || filepath.Clean(r) != r || r == "/" {
+			return "", fmt.Errorf("worktree root %q must be a clean absolute path and not /", r)
+		}
+		res, err := filepath.EvalSymlinks(r)
+		if err != nil {
+			return "", fmt.Errorf("worktree root %q: %w", r, err)
+		}
+		if res == "/" {
+			return "", fmt.Errorf("worktree root %q resolves to /: it would allow the whole host", r)
+		}
+		if rr == "" && strings.HasPrefix(rw, res+string(filepath.Separator)) {
+			rr = res
+		}
 	}
-	if rr == "/" {
-		return "", fmt.Errorf("worktree root / would allow the whole host")
-	}
-	if !strings.HasPrefix(rw, rr+string(filepath.Separator)) {
-		return "", fmt.Errorf("workdir %s is not inside the worktree root %s", rw, rr)
+	if rr == "" {
+		return "", fmt.Errorf("workdir %s is not inside the worktree root(s) %s", rw, root)
 	}
 	if st, err := filepath.EvalSymlinks(stateDir); err == nil {
 		if rw == st || strings.HasPrefix(rw, st+string(filepath.Separator)) || strings.HasPrefix(st, rw+string(filepath.Separator)) {

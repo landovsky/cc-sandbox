@@ -8,6 +8,8 @@ import (
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/fwd"
+	"github.com/landovsky/cc-sandbox/internal/machines"
+	"github.com/landovsky/cc-sandbox/internal/side"
 	"github.com/landovsky/cc-sandbox/internal/stub"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
@@ -43,6 +45,11 @@ func app() *cli.App {
 				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return fwd.Main(a, os.Stdin, o, e) },
 			},
 			{
+				Name: "side", Raw: true,
+				Summary: "the pod sidecar: receives the token over exec, runs the forwarder (F3a)",
+				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return side.Main(a, os.Stdin, o, e) },
+			},
+			{
 				Name: "stub", Raw: true,
 				Summary: "scripted model stub, local mode, e2e-* profiles only (C18)",
 				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return stub.Main(a, o, e) },
@@ -51,6 +58,13 @@ func app() *cli.App {
 				Name: "token", Raw: true,
 				Summary: "mint and verify session tokens, dev key file (U5)",
 				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return token.Main(a, o, e) },
+			},
+			{
+				Name: "machines", Raw: true,
+				Summary: "the trusted-key list: check, keyring lines, ConfigMap (M9)",
+				Run: func(_ *cli.Flags, a []string, o, e io.Writer) int {
+					return machines.Main(a, o, e, os.Getenv)
+				},
 			},
 			steeringCheckCmd(), seccompCmd(),
 		},

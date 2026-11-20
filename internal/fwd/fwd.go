@@ -30,10 +30,13 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -59,9 +62,39 @@ type Config struct {
 
 // Forwarder is an http.Handler.
 type Forwarder struct {
-	cfg    Config
-	proxy  *httputil.ReverseProxy
-	counts struct{ ok, denied atomic.Int64 }
+	cfg     Config
+	proxy   *httputil.ReverseProxy
+	counts  struct{ ok, denied atomic.Int64 }
+	classMu sync.Mutex
+	classes map[string]int64
+}
+
+// maxDenyClasses bounds the per-reason table; the reasons are a fixed set, this is the belt for the braces.
+const maxDenyClasses = 32
+
+// DenyClasses returns how many requests were refused for each fixed reason ("not a door route",
+// "refused: <verdict>", ...). The keys never contain request data.
+func (f *Forwarder) DenyClasses() map[string]int64 {
+	f.classMu.Lock()
+	defer f.classMu.Unlock()
+	out := make(map[string]int64, len(f.classes))
+	for k, v := range f.classes {
+		out[k] = v
+	}
+	return out
+}
+
+func (f *Forwarder) countDeny(why string) {
+	f.counts.denied.Add(1)
+	f.classMu.Lock()
+	defer f.classMu.Unlock()
+	if f.classes == nil {
+		f.classes = map[string]int64{}
+	}
+	if _, ok := f.classes[why]; !ok && len(f.classes) >= maxDenyClasses {
+		why = "other"
+	}
+	f.classes[why]++
 }
 
 // New builds a Forwarder. It refuses an unsafe configuration.
@@ -151,20 +184,15 @@ func New(cfg Config) (*Forwarder, error) {
 	}
 	f := &Forwarder{cfg: cfg}
 	f.proxy = &httputil.ReverseProxy{
-		Transport:     tr,
+		Transport:     &scrubbingTransport{rt: tr, token: cfg.Token},
 		FlushInterval: -1, // SSE from the model door
 		Rewrite:       f.rewrite,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			cfg.Logf("fwd: upstream error: %s", scrub(err.Error(), cfg.Token))
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		},
-		// Redirects are responses to the fence; fwd never follows them (a
-		// ReverseProxy doesn't), and Location is dropped below.
-		ModifyResponse: func(resp *http.Response) error {
-			resp.Header.Del("Location")
-			resp.Header.Del("Set-Cookie")
-			return nil
-		},
+		// Redirects are responses to the fence; fwd never follows them (a ReverseProxy doesn't), and
+		// Location is dropped by scrubbingTransport, together with everything that echoes the token.
 	}
 	return f, nil
 }
@@ -203,7 +231,7 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deny := func(code int, why string) {
-		f.counts.denied.Add(1)
+		f.countDeny(why)
 		f.cfg.Logf(`{"fwd":"deny","method":%q,"path":%q,"why":%q}`, r.Method, r.URL.Path, why)
 		http.Error(w, why, code)
 	}
@@ -213,6 +241,12 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method != strings.ToUpper(r.Method) { // "put" must not slip past a door rule written for PUT
 		deny(http.StatusForbidden, "method must be upper case")
+		return
+	}
+	// A protocol switch would turn the connection into a tunnel the door rules never see (the proxy hijacks
+	// it and copies bytes both ways), so it is refused here rather than left to the proxy's defaults.
+	if r.Header.Get("Upgrade") != "" || headerHasToken(r.Header, "Connection", "upgrade") {
+		deny(http.StatusForbidden, "protocol upgrade refused")
 		return
 	}
 	clean, ok := CleanPath(r.URL)
@@ -312,4 +346,83 @@ func scrub(s, tok string) string {
 		return s
 	}
 	return strings.ReplaceAll(s, tok, "[token]")
+}
+
+// scrubbingTransport removes from every response the fence will see: Location and Set-Cookie, and any
+// header or trailer value that holds the session token (a door that echoes Authorization back). It sits
+// at the transport, not in ModifyResponse, because ReverseProxy relays 1xx responses (103 Early Hints)
+// and trailers WITHOUT calling ModifyResponse. Bodies are not scanned (a stream can't be, cheaply); a
+// door that echoes the token in a body is a door bug.
+type scrubbingTransport struct {
+	rt    http.RoundTripper
+	token string
+}
+
+func (t *scrubbingTransport) scrub(h map[string][]string) {
+	if h == nil {
+		return
+	}
+	delete(h, "Location")
+	delete(h, "Set-Cookie")
+	if t.token == "" {
+		return
+	}
+	for k, vs := range h {
+		for _, v := range vs {
+			if strings.Contains(v, t.token) {
+				delete(h, k)
+				break
+			}
+		}
+	}
+}
+
+func (t *scrubbingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Registered after ReverseProxy's own trace, so this hook runs first and the proxy copies the
+	// already-scrubbed 1xx header to the fence.
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		Got1xxResponse: func(_ int, h textproto.MIMEHeader) error { t.scrub(h); return nil },
+	}))
+	resp, err := t.rt.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	t.scrub(resp.Header)
+	// Always wrapped: a door can send a trailer it never announced, and then resp.Trailer is nil here and
+	// only filled in at EOF.
+	resp.Body = &scrubBody{ReadCloser: resp.Body, resp: resp, t: t}
+	return resp, nil
+}
+
+// scrubBody scrubs the trailers once the body has been read (they are filled in only then).
+type scrubBody struct {
+	io.ReadCloser
+	resp *http.Response
+	t    *scrubbingTransport
+}
+
+func (b *scrubBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.t.scrub(b.resp.Trailer)
+	}
+	return n, err
+}
+
+func (b *scrubBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.t.scrub(b.resp.Trailer)
+	return err
+}
+
+// headerHasToken reports whether any value of header k lists token (comma separated, case-insensitive).
+func headerHasToken(h http.Header, k, token string) bool {
+	for _, v := range h.Values(k) {
+		for _, t := range strings.Split(v, ",") {
+			if strings.EqualFold(strings.TrimSpace(t), token) {
+				return true
+			}
+		}
+	}
+	return false
 }

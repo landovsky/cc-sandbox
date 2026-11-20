@@ -22,7 +22,9 @@ func (e *env) attachCmd() *cli.Command {
 		Summary: "attach the caller's terminal to one session's pane (as the service uid)",
 		Recipes: `  sudo -n /usr/local/sbin/ccsbx-root attach s0k1dry66qg     # 'ccsbx attach <sid>' runs this for you
   Takes only the sid; --read-only and every other flag are refused (exit 64). The caller must own
-  the session (or be the service user). Detach with the outer tmux's own controls.`,
+  the session (or be the service user). Detach with the outer tmux's own controls.
+  A session whose record says backend "k8s" (a pod) is attached with kubectl exec instead, as the
+  keys user; config keys kubectl, kubeconfig, k8s_conn, keys_user, k8s_namespace (see the runbook).`,
 		Run: func(_ *cli.Flags, args []string, _, stderr io.Writer) int {
 			sid, ok := oneSid("attach", args, stderr)
 			if !ok {
@@ -41,8 +43,12 @@ func (e *env) attach(sid string) error {
 	if err != nil {
 		return err
 	}
-	if _, err := e.session(w, sid); err != nil {
+	rec, err := e.sessionAny(w, sid)
+	if err != nil {
 		return err
+	}
+	if rec.Backend == "k8s" {
+		return e.attachK8s(w, rec)
 	}
 	tmux, err := e.cfg.binary(e.cfg.Tmux)
 	if err != nil {

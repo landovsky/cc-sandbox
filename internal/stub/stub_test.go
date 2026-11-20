@@ -5,7 +5,10 @@ package stub
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +20,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/fwd"
+	"github.com/landovsky/cc-sandbox/internal/machines"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
@@ -215,5 +219,92 @@ func TestStubRefusesToRunWithoutDurableState(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(xdg, "ccsbx", "ccsbx-stub-7777.json")); err != nil {
 		t.Fatalf("no default state file: %v", err)
+	}
+}
+
+// context "a door given both a keyring and the trusted-key list would trust the wider of the two, or
+// neither would be tested": exactly one source is allowed, and a bad list stops the door at start.
+func TestStubTakesExactlyOneKeySource(t *testing.T) {
+	var o, e bytes.Buffer
+	for _, args := range [][]string{
+		{"--listen", "127.0.0.1:0"},
+		{"--listen", "127.0.0.1:0", "--keyring", "/nonexistent", "--machines-dir", t.TempDir()},
+		{"--listen", "127.0.0.1:0", "--machines-dir", t.TempDir()}, // an empty list
+	} {
+		if rc := Main(args, &o, &e); rc != 2 {
+			t.Errorf("%v: rc=%d, want 2 (%s)", args, rc, e.String())
+		}
+	}
+}
+
+// context "the stub is a door that follows the trusted-key list": a key removed from the list must stop
+// working in a RUNNING stub, with no restart. This is the wiring test: delete the refresher goroutine or
+// the ring source and it goes red.
+func TestStubFollowsTheListAndDropsARemovedKey(t *testing.T) {
+	dir := t.TempDir()
+	os.Chmod(dir, 0o700)
+	type mk struct {
+		k    *token.Key
+		m    string
+		file string
+	}
+	var ms []mk
+	for _, m := range []string{"mac", "hp-ubuntu"} {
+		k, err := token.LoadOrCreateKeyFile(filepath.Join(t.TempDir(), "k"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e := machines.Entry{Machine: m, Owners: []string{"tomas"}, MaySignMachines: []string{m},
+			PublicKeys: []machines.KeyRef{{KID: k.KID, Key: base64.StdEncoding.EncodeToString(k.Public)}},
+			MaxProfile: []string{"e2e-*"}, MaxBilling: []string{"stub"}, Pairs: map[string][]string{"e2e-default": {"stub"}}}
+		f := filepath.Join(dir, m+".json")
+		if err := os.WriteFile(f, []byte(machines.Canonical(&e)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ms = append(ms, mk{k, m, f})
+	}
+	const stale = 300 * time.Millisecond
+	v, err := Verifier("", dir, DefaultAud, 20*time.Millisecond, stale, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, _ := token.NewGenKey()
+	call := func(x mk, gen int) error {
+		now := time.Now()
+		tok, err := token.Mint(x.k, token.Claims{Sub: fmt.Sprintf("tomas/%s/sS1/g%d", x.m, gen), Label: "l", Billing: "stub", Profile: "e2e-default",
+			Aud: []string{DefaultAud}, Cnf: token.CnfOf(g.Public)}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, _ := token.SignProof(g, "POST", "/x", DefaultAud, tok, nil, now)
+		_, err = v.Verify(tok, p, "POST", "/x", nil, now)
+		return err
+	}
+	for _, x := range ms {
+		if err := call(x, 1); err != nil {
+			t.Fatalf("allow twin: a listed key of %s: %v", x.m, err)
+		}
+	}
+	os.Remove(ms[0].file) // one machine leaves; the other file is still there, so the load keeps succeeding
+	gone := false
+	for i := 2; i < 400 && !gone; i++ {
+		gone = errors.Is(call(ms[0], i), token.ErrUnknownKID)
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !gone {
+		t.Fatal("the removed key still verifies in the running stub")
+	}
+	// Past the stale limit the other key must still verify: that only holds while the refresher
+	// goroutine keeps running (a stub that never refreshes would lose ALL keys at the stale limit).
+	time.Sleep(3 * stale)
+	if err := call(ms[1], 9); err != nil {
+		t.Fatalf("the remaining key stopped verifying past the stale limit: %v", err)
+	}
+}
+
+func TestStubRefusesBadListTimings(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Verifier("", dir, DefaultAud, time.Second, time.Millisecond, nil); err == nil || !strings.Contains(err.Error(), "at least the poll") {
+		t.Fatalf("a stale limit under the poll: %v", err)
 	}
 }

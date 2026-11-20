@@ -191,7 +191,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 			return nil, err
 		}
 		// First start only: the worktree has not been written by an agent of this session yet.
-		gd, err := backend.ResolveGitDir(rw)
+		gd, err := backend.ResolveGitDir(rw, d.Uid)
 		if err != nil {
 			return nil, refuse(BadSpec, "workdir git metadata: %v", err)
 		}

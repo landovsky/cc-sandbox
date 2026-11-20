@@ -1,3 +1,7 @@
+// Tests for the docker backend (U1b): the flags a fence is started with, the per-generation
+// directories, the gitdir and worktree path rules, the home sweep and the orphan reaper. They exist
+// so that every refusal in this package has a block twin that goes red when the check is removed
+// (invariant 23), and none of them needs a docker daemon: they build argv and touch temp dirs only.
 package backend
 
 import (
@@ -148,14 +152,14 @@ func linked(t *testing.T) (repo, wt string) {
 // mounted read-only, so host-side git keeps working for the session.
 func TestGitDirFromRecordAllow(t *testing.T) {
 	repo, wt := linked(t)
-	gd, err := ResolveGitDir(wt)
+	gd, err := ResolveGitDir(wt, os.Getuid())
 	if err != nil || gd != filepath.Join(repo, ".git", "worktrees", "wt") {
 		t.Fatalf("linked worktree: %q %v", gd, err)
 	}
-	if gd, err := ResolveGitDir(repo); err != nil || gd != filepath.Join(repo, ".git") {
+	if gd, err := ResolveGitDir(repo, os.Getuid()); err != nil || gd != filepath.Join(repo, ".git") {
 		t.Fatalf("plain repo: %q %v", gd, err)
 	}
-	if gd, err := ResolveGitDir(vt(t)); err != nil || gd != "" {
+	if gd, err := ResolveGitDir(vt(t), os.Getuid()); err != nil || gd != "" {
 		t.Fatalf("no git: %q %v", gd, err)
 	}
 	s := spec(t)
@@ -191,14 +195,14 @@ func TestGitDirFromRecordBlock(t *testing.T) {
 		"not a gitdir line at all":                "hello\n",
 	} {
 		write(content)
-		if gd, err := ResolveGitDir(wt); err == nil {
+		if gd, err := ResolveGitDir(wt, os.Getuid()); err == nil {
 			t.Errorf("%s: accepted, gitdir %q", name, gd)
 		}
 	}
 	// a symlinked .git
 	os.Remove(filepath.Join(wt, ".git"))
 	os.Symlink("/etc", filepath.Join(wt, ".git"))
-	if gd, err := ResolveGitDir(wt); err == nil {
+	if gd, err := ResolveGitDir(wt, os.Getuid()); err == nil {
 		t.Errorf(".git symlink accepted: %q", gd)
 	}
 	// mount specs can't be bent by a comma or colon in a path
@@ -314,5 +318,224 @@ func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
 	}
 	if _, err := os.Stat(h.GenDir()); err == nil {
 		t.Fatal("helper mode left a generation directory behind after refusing")
+	}
+}
+
+// RC-1: a gitdir that a fence could write (another uid owns it, or it is world- or foreign-group
+// writable) must not be accepted for a new session: it may be a directory the earlier fence
+// planted, and mounting it would show this fence that fence's files.
+func TestGitDirMustBeHostOwned(t *testing.T) {
+	repo, wt := linked(t)
+	common := filepath.Join(repo, ".git")
+	gd := filepath.Join(common, "worktrees", "wt")
+	uid := os.Getuid()
+	if _, err := ResolveGitDir(wt, uid); err != nil {
+		t.Fatalf("a host-owned gitdir was refused: %v", err)
+	}
+	hook := filepath.Join(common, "hooks", "pre-commit")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	info := filepath.Join(common, "info", "extra")
+	if err := os.WriteFile(info, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for name, path := range map[string]string{
+		"gitdir": gd, "gitdir HEAD": filepath.Join(gd, "HEAD"), "common config": filepath.Join(common, "config"),
+		"common hooks dir": filepath.Join(common, "hooks"), "a hook file": hook, "info dir": filepath.Join(common, "info"),
+		"a file in info/": info, "worktrees parent": filepath.Join(common, "worktrees"), "commondir root": common,
+	} {
+		st, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		mode := st.Mode().Perm()
+		if err := os.Chmod(path, mode|0o002); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ResolveGitDir(wt, uid); err == nil {
+			t.Errorf("a world-writable %s was accepted", name)
+		}
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := ResolveGitDir(wt, uid); err != nil {
+		t.Fatalf("restored: %v", err)
+	}
+	// a plain .git directory inside the worktree is the same case
+	plain := vt(t)
+	sh(t, plain, "git", "init", "-q", "-b", "main", ".")
+	if err := os.Chmod(filepath.Join(plain, ".git"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveGitDir(plain, uid); err == nil {
+		t.Error("a world-writable .git directory was accepted")
+	}
+}
+
+// The owner is the caller named by the daemon, not whoever runs the check: in helper mode the
+// process is root, and a gitdir of the caller's must be accepted for them and refused for another.
+func TestGitDirOwnerIsTheCaller(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("needs a non-root user to be a different owner")
+	}
+	_, wt := linked(t)
+	if _, err := ResolveGitDir(wt, 0); err == nil || !strings.Contains(err.Error(), "owned by uid") {
+		t.Errorf("a gitdir owned by the test user was not refused as not root's: %v", err)
+	}
+	if _, err := ResolveGitDir(wt, os.Getuid()); err != nil {
+		t.Errorf("the caller's own gitdir was refused: %v", err)
+	}
+}
+
+// Units for the owner rules with injected owner and group: a foreign uid or group cannot be created
+// without root, so the rule is exercised directly.
+func TestOwnerRules(t *testing.T) {
+	o := owner{uid: 1000, gids: map[int]bool{1000: true, 50: true, FenceUID: true}}
+	cases := []struct {
+		name     string
+		perm     os.FileMode
+		uid, gid int
+		ok       bool
+	}{
+		{"own file", 0o644, 1000, 1000, true},
+		{"foreign uid", 0o644, 1001, 1000, false},
+		{"root-owned", 0o755, 0, 0, false},
+		{"world-writable", 0o666, 1000, 1000, false},
+		{"group-writable by the caller's group", 0o664, 1000, 50, true},
+		{"group-writable by a foreign group", 0o664, 1000, 77, false},
+		{"group-writable by the fence's gid", 0o664, 1000, FenceUID, false},
+		{"foreign group, not writable", 0o644, 1000, 77, true},
+	}
+	for _, c := range cases {
+		if err := o.checkMode("p", c.perm, c.uid, c.gid); (err == nil) != c.ok {
+			t.Errorf("%s: err=%v, want ok=%v", c.name, err, c.ok)
+		}
+	}
+}
+
+// noOwner is a FileInfo whose Sys() carries no uid, as on a platform without Stat_t.
+type noOwner struct{ os.FileInfo }
+
+func (noOwner) Sys() any { return nil }
+
+// Fail closed: a stat with no owner information must be refused, not waved through.
+func TestOwnerCheckFailsClosedWithoutOwnerInfo(t *testing.T) {
+	st, err := os.Lstat(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	o, err := ownerOf(os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := o.check("p", noOwner{st}); err == nil {
+		t.Error("a stat without owner information was accepted")
+	}
+	if err := o.check("p", st); err != nil {
+		t.Errorf("a real stat of the user's own dir was refused: %v", err)
+	}
+}
+
+// A symlink where git expects a file or directory could point the mount's contents anywhere.
+func TestGitDirRefusesSymlinksInside(t *testing.T) {
+	repo, wt := linked(t)
+	common := filepath.Join(repo, ".git")
+	uid := os.Getuid()
+	elsewhere := filepath.Join(vt(t), "x")
+	if err := os.WriteFile(elsewhere, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{filepath.Join(common, "config"), filepath.Join(common, "hooks", "pre-commit"), filepath.Join(common, "info", "exclude")} {
+		bak := p + ".bak"
+		if err := os.Rename(p, bak); err != nil && !os.IsNotExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(elsewhere, p); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ResolveGitDir(wt, uid); err == nil {
+			t.Errorf("a symlink at %s was accepted", p)
+		}
+		os.Remove(p)
+		if _, err := os.Stat(bak); err == nil {
+			os.Rename(bak, p)
+		}
+	}
+	if _, err := ResolveGitDir(wt, uid); err != nil {
+		t.Fatalf("restored: %v", err)
+	}
+}
+
+// commondir decides which directory holds the shared config and hooks. If it cannot be read, or
+// names something that is not a git directory, the shared part cannot be vouched for.
+func TestGitDirCommondirIsVerified(t *testing.T) {
+	repo, wt := linked(t)
+	gd := filepath.Join(repo, ".git", "worktrees", "wt")
+	cd := filepath.Join(gd, "commondir")
+	orig, err := os.ReadFile(cd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid := os.Getuid()
+	// unreadable as a file (here: a directory) is an error that is not "does not exist"
+	os.Remove(cd)
+	if err := os.Mkdir(cd, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveGitDir(wt, uid); err == nil {
+		t.Error("an unreadable commondir was treated as 'not a linked worktree'")
+	}
+	os.Remove(cd)
+	// naming a directory that is not a git dir
+	if err := os.WriteFile(cd, []byte(vt(t)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveGitDir(wt, uid); err == nil {
+		t.Error("a commondir that is not a git directory was accepted")
+	}
+	// reached through a symlink: resolved first, and then judged by what it points at
+	link := filepath.Join(vt(t), "common")
+	if err := os.Symlink(filepath.Join(repo, ".git"), link); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cd, []byte(link), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveGitDir(wt, uid); err != nil {
+		t.Errorf("a commondir reached through a symlink, with a clean gitdir, was refused: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(repo, ".git", "config"), 0o666); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ResolveGitDir(wt, uid); err == nil {
+		t.Error("a world-writable config behind a symlinked commondir was not seen")
+	}
+	os.Chmod(filepath.Join(repo, ".git", "config"), 0o644)
+	if err := os.WriteFile(cd, orig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// Check and mount are a whole session apart: every later generation re-checks the recorded
+// gitdir, so a gitdir that became writable after generation 1 is refused for generation 2.
+func TestPrepareRechecksTheRecordedGitDirOnResume(t *testing.T) {
+	repo, wt := linked(t)
+	gd, err := ResolveGitDir(wt, os.Getuid())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := spec(t)
+	s.Workdir, s.WorktreeRoot, s.GitDir, s.Uid = wt, filepath.Dir(wt), gd, os.Getuid()
+	if err := s.Prepare(); err != nil {
+		t.Fatalf("generation 1: %v", err)
+	}
+	if err := os.Chmod(filepath.Join(repo, ".git", "hooks"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	s.Gen = 2
+	if err := s.Prepare(); err == nil {
+		t.Error("generation 2 mounted a gitdir whose hooks became world-writable")
 	}
 }

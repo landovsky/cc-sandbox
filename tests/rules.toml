@@ -977,3 +977,13 @@ block = "tests/twin-go.sh ./internal/backend TestWorldWritableLeavesAreDirectMod
 invariants = [11, 14]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "gitdir-host-owned"
+title = "a gitdir is mounted into a fence only if the host owns it (and its config, info, hooks, commondir) and no other group or the world can write it"
+suite = "fence"
+allow = "tests/twin-go.sh ./internal/backend TestGitDirFromRecordAllow"
+block = "tests/twin-go.sh ./internal/backend TestGitDirMustBeHostOwned"
+invariants = [2, 4, 25]
+backends = ["unit"]
+where = "any"

@@ -17,10 +17,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io/fs"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 )
 
 // FenceUID is the uid and gid inside the fence.
@@ -41,6 +44,7 @@ type Spec struct {
 	Cmd          []string // command in the fence; default ["claude"]
 	TTY          bool
 	NotEvid      bool // direct mode
+	Uid          int  // the host user who owns the session (record uid); the gitdir must be theirs
 }
 
 // Names derived from the sid and gen, so cleanup targets exactly what this run created.
@@ -124,6 +128,10 @@ func (s Spec) Prepare() error {
 		if err := CheckPath(s.GitDir); err != nil {
 			return err
 		}
+		// Every generation, not only the first: the gitdir is mounted again and may have changed.
+		if err := hostOwnedGitDir(s.GitDir, s.Uid); err != nil {
+			return err
+		}
 	}
 	g := s.GenDir()
 	if err := os.MkdirAll(filepath.Dir(g), 0o700); err != nil {
@@ -176,7 +184,7 @@ func bind(src, dst string, ro bool) string {
 // linked worktree whose own `gitdir` file points back at this worktree's `.git`. That
 // back-reference is something git writes and a random host directory cannot have, so
 // `gitdir: /var/run/x` or `gitdir: /etc` fail. A `.git` symlink is refused.
-func ResolveGitDir(workdir string) (string, error) {
+func ResolveGitDir(workdir string, uid int) (string, error) {
 	wt, err := filepath.EvalSymlinks(workdir)
 	if err != nil {
 		return "", err
@@ -195,6 +203,9 @@ func ResolveGitDir(workdir string) (string, error) {
 	case st.IsDir():
 		if !isGitDir(p) {
 			return "", fmt.Errorf("%s is not a git directory", p)
+		}
+		if err := hostOwnedGitDir(p, uid); err != nil {
+			return "", err
 		}
 		return p, nil
 	}
@@ -228,7 +239,129 @@ func ResolveGitDir(workdir string) (string, error) {
 	if err := CheckPath(t); err != nil {
 		return "", err
 	}
+	if err := hostOwnedGitDir(t, uid); err != nil {
+		return "", err
+	}
 	return t, nil
+}
+
+// hostOwnedGitDir applies, for a gitdir about to be mounted, the same rule host git applies before
+// it runs (internal/gitroute): the gitdir and what git reads from it are owned by the calling host
+// user (uid, never the uid of this process: in helper mode that is root) and are not writable by
+// the world, by the fence's gid, or by a group the caller is not in. What is checked: the gitdir
+// and, for a linked worktree, its commondir and the parent that holds the gitdir; in each, HEAD,
+// config, config.worktree, commondir, gitdir, and everything under hooks/ and info/. A symlink
+// anywhere in that set is refused, and so is any stat that does not carry an owner (fail closed).
+// Known limit: POSIX ACLs and xattrs that grant the fence uid write access do not show in mode bits.
+func hostOwnedGitDir(gd string, uid int) error {
+	o, err := ownerOf(uid)
+	if err != nil {
+		return err
+	}
+	roots := []string{gd}
+	switch cd, err := os.ReadFile(filepath.Join(gd, "commondir")); {
+	case err == nil: // a linked worktree
+		c := strings.TrimSpace(string(cd))
+		if !filepath.IsAbs(c) {
+			c = filepath.Join(gd, c)
+		}
+		c, err = filepath.EvalSymlinks(c)
+		if err != nil {
+			return fmt.Errorf("commondir of %s: %w", gd, err)
+		}
+		if !isGitDir(c) {
+			return fmt.Errorf("commondir of %s (%s) is not a git directory", gd, c)
+		}
+		// the parent of the gitdir (.git/worktrees): a writable one allows a swap after the check
+		if err := o.checkOne(filepath.Dir(gd)); err != nil {
+			return err
+		}
+		roots = append(roots, c)
+	case !os.IsNotExist(err):
+		return fmt.Errorf("commondir of %s: %w", gd, err)
+	}
+	for _, d := range roots {
+		for _, p := range []string{d, filepath.Join(d, "HEAD"), filepath.Join(d, "config"), filepath.Join(d, "config.worktree"), filepath.Join(d, "commondir"), filepath.Join(d, "gitdir")} {
+			if err := o.checkOne(p); err != nil {
+				return err
+			}
+		}
+		for _, sub := range []string{"hooks", "info"} {
+			err := filepath.WalkDir(filepath.Join(d, sub), func(p string, _ fs.DirEntry, err error) error {
+				if err != nil {
+					if os.IsNotExist(err) && p == filepath.Join(d, sub) {
+						return nil
+					}
+					return err
+				}
+				return o.checkOne(p)
+			})
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// owner is who must own a gitdir and which groups may write it.
+type owner struct {
+	uid  int
+	gids map[int]bool
+}
+
+func ownerOf(uid int) (owner, error) {
+	o := owner{uid: uid, gids: map[int]bool{}}
+	u, err := user.LookupId(strconv.Itoa(uid))
+	if err != nil {
+		return o, fmt.Errorf("uid %d: %w", uid, err)
+	}
+	gs, err := u.GroupIds()
+	if err != nil {
+		return o, fmt.Errorf("groups of uid %d: %w", uid, err)
+	}
+	for _, g := range append(gs, u.Gid) {
+		if n, err := strconv.Atoi(g); err == nil {
+			o.gids[n] = true
+		}
+	}
+	return o, nil
+}
+
+// checkOne lstats p (a missing path is fine: git does not need it) and applies check.
+func (o owner) checkOne(p string) error {
+	st, err := os.Lstat(p)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return o.check(p, st)
+}
+
+func (o owner) check(p string, st fs.FileInfo) error {
+	if st.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink", p)
+	}
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("%s: no owner information on this platform, refusing", p)
+	}
+	return o.checkMode(p, st.Mode().Perm(), int(sys.Uid), int(sys.Gid))
+}
+
+func (o owner) checkMode(p string, perm fs.FileMode, uid, gid int) error {
+	if perm&0o002 != 0 {
+		return fmt.Errorf("%s is world-writable", p)
+	}
+	if uid != o.uid {
+		return fmt.Errorf("%s is owned by uid %d, not by the host user %d", p, uid, o.uid)
+	}
+	if perm&0o020 != 0 && (gid == FenceUID || !o.gids[gid]) {
+		return fmt.Errorf("%s is writable by group %d, which the host user is not in (or is the fence's)", p, gid)
+	}
+	return nil
 }
 
 func isGitDir(d string) bool {

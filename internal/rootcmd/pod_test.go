@@ -291,7 +291,7 @@ func TestPodLoadWaitsThenMintsThenLoadsWithTheRecordedUID(t *testing.T) {
 	}
 	var rb map[string]any
 	json.Unmarshal([]byte(pf.hub[0].body), &rb)
-	if rb["role"] != "relay" || rb["sid"] != sid || rb["gen"] != "2" || rb["pub"] != relayPub || fmt.Sprint(rb["may_reach"]) != "[]" {
+	if rb["role"] != "relay" || rb["sid"] != sid || rb["gen"] != "2" || rb["pub"] != relayPub || fmt.Sprint(rb["may_reach"]) != "[]" || rb["manager"] != "" {
 		t.Errorf("relay request %s", pf.hub[0].body)
 	}
 	if !strings.Contains(string(pf.pod.loaded), `"relay_token":"sbp1.RELAYTOKEN"`) || strings.Contains(pf.audit.String(), "RELAYTOKEN") || strings.Contains(pf.audit.String(), hubSecretText) {
@@ -624,5 +624,68 @@ func TestStopOfAPodSessionDeletesThePodAndTouchesNoDocker(t *testing.T) {
 	}
 	if len(pf.pod.deleted) != 1 || pf.pod.deleted[0] != [3]string{sid, "2", podUID} || len(pf.fb.stopped) != 0 {
 		t.Errorf("deleted %v, docker stops %d", pf.pod.deleted, len(pf.fb.stopped))
+	}
+}
+
+// ---- the sidecar's command line comes from the record and root's config (F2w, B's final paths) ----
+
+func TestPodCreateBuildsTheSidecarCommandFromTheRecordAndConfig(t *testing.T) {
+	pf := newPodFx(t)
+	pf.rec.PodUID = ""
+	pf.rec.Label = "cc-sandbox:x"
+	pf.rec.Spec.MsgScope = json.RawMessage(`{"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":["p1"],"peer_machines":{"p1":"mac"}}`)
+	pf.rec.Reply.ID = "tomas/future-two/" + sid + "/g2"
+	pf.writeRecord()
+	pf.writeConfigPod(t, true, "k8s_hub_url = \"http://hub-egress.cc-sandbox.svc:4011\"\nk8s_doors = [\"model=http://ccsp-model.cc-sandbox-doors.svc:8080\"]\n")
+	pf.wire()
+	if code, out := pf.call("pod-create", sid); code != 0 {
+		t.Fatalf("%d %s", code, out)
+	}
+	got := strings.Join(pf.pod.created[0].SideCmd, " ")
+	want := "/usr/local/bin/ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
+		"--out /run/ccsbx/out --in /run/ccsbx/in --fence-uid 10001 --sid " + sid + " --gen 2 --label cc-sandbox:x --full-id tomas/future-two/" + sid + "/g2 --machine future-two " +
+		`--scope {"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":["p1"],"peer_machines":{"p1":"mac"}} ` +
+		"--hub-url http://hub-egress.cc-sandbox.svc:4011 --door model=http://ccsp-model.cc-sandbox-doors.svc:8080"
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
+}
+
+func TestPodCreateRefusesARecordTheSidecarCouldNotBeToldAbout(t *testing.T) {
+	for why, mod := range map[string]func(pf *podFx){
+		"a scope that is not an object": func(pf *podFx) { pf.rec.Spec.MsgScope = json.RawMessage(`["x"]`) },
+		"no scope":                      func(pf *podFx) { pf.rec.Spec.MsgScope = nil },
+		"a label with a newline":        func(pf *podFx) { pf.rec.Label = "a\nb" },
+		"a full id of another session":  func(pf *podFx) { pf.rec.Reply.ID = "tomas/future-two/s0zzzzzzzz/g2" },
+	} {
+		pf := newPodFx(t)
+		pf.rec.PodUID = ""
+		mod(pf)
+		pf.writeRecord()
+		code, out := pf.call("pod-create", sid)
+		if code != 2 || len(pf.pod.created) != 0 || len(pf.dropped) != 0 {
+			t.Errorf("%s: exit %d created=%d dropped=%d: %s", why, code, len(pf.pod.created), len(pf.dropped), out)
+		}
+	}
+}
+
+func TestSidecarConfigKeysAreValidated(t *testing.T) {
+	f := newFx(t)
+	p := f.dir + "/etc/c.toml"
+	base := "allowed_roots = [\"" + f.roots + "\"]\nmachine = \"m\"\n"
+	for why, extra := range map[string]string{
+		"a hub URL with credentials": "k8s_hub_url = \"http://u:p@hub:4011\"\n",
+		"a hub URL that is a path":   "k8s_hub_url = \"hub:4011\"\n",
+		"a door with no name":        "k8s_doors = [\"http://x\"]\n",
+		"a door that is ftp":         "k8s_doors = [\"model=ftp://x\"]\n",
+	} {
+		put(t, p, base+extra, 0o644)
+		if _, err := LoadConfig(p, os.Getuid()); err == nil {
+			t.Errorf("%s was accepted", why)
+		}
+	}
+	put(t, p, base+"k8s_hub_url = \"https://hub.example:4011\"\n", 0o644)
+	if _, err := LoadConfig(p, os.Getuid()); err != nil {
+		t.Errorf("a good hub URL: %v", err)
 	}
 }

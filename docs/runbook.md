@@ -495,8 +495,7 @@ hostd's rights (tracking a fenced identity, reading hostd's frames), and the rev
   is not a regular file of the hub's user that others cannot write. A fenced manager that MOVES to another machine
   needs its workers' specs updated (their record names the old machine, so `SendRemote` ends `dropped`).
 - **Fenced to unfenced.** A relay reaches an unfenced target only if (a) that target's node is in the relay's
-  `may_reach`, fixed at mint by root from the session's record (the MANAGER only for now: Tomas's open
-  question #3cy2 decides peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held
+  `may_reach`, fixed at mint by root from the session's record (the manager, then the placed peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held
   by more than one live entry (which of them is the manager is not for it to guess): `msg.dropped`.
 - **A spoke principal's deliver** may reach its own machine's sessions and any FENCED session (the receiving
   hostd verifies and scopes it); focus, rename, drop and read stay on its own machine.
@@ -660,8 +659,9 @@ The sidecar has a `journal` volume of its own (emptyDir, 16Mi, disk-backed, side
 `docs/relay-mint-spec.md`). Root config keys: `hub_url` (default `http://127.0.0.1:4011`, loopback only, refused
 otherwise) and `hub_secret` (default `/etc/ccsbx/hub-admin.secret`, root-owned, mode 0600, directory not
 group/other-writable; the installer creates it from the hub's admin secret, it is never copied off hp). The
-relay's `may_reach` is the record's `msg_scope.manager` as `<machine>/<node>`, empty when the record names no
-manager machine; there is no argument for it (peers are Tomas's open question #3cy2). Exit 2: refused (not
+relay's `may_reach` is the record's `msg_scope.manager`, then its `peers`, each as `<machine>/<node>` (machine from
+`manager.machine` / `peer_machines`; a node with no machine is left out; at most 32; empty when none is placed);
+there is no argument for it. Exit 2: refused (not
 the service user, stale or ended or not running or another machine's generation, rate, bad arguments), exit
 3: the hub or the secret (status code only on stderr). One audit line per mint and revoke on stderr (the first
 8 hex of sha256(pub), never a token or the secret). The relay is revoked (`DELETE /v1/principals/relay:<sid>%2F<gen>`)
@@ -699,3 +699,26 @@ controls); the session runs with `LANG=C.UTF-8`.
 Systemd sockets of the signer are picked **by name**, never by order: the main socket unit sets
 `FileDescriptorName=main`, the keys peer's `FileDescriptorName=launch`, and the signer refuses to start
 unless `LISTEN_FDNAMES` is exactly those two names (either order) with `LISTEN_FDS=2`.
+
+**The sidecar's command line.** `pod-create` builds the sidecar's `ccsbx side serve ...` from the record and root's
+config (`internal/k8s/side.go`), run as `/usr/local/bin/ccsbx` (an absolute path: the image is FROM scratch, so no PATH; the load exec uses it too): `--sid --gen --label --full-id --machine --scope` (the record's `msg_scope`,
+compacted, an object of at most 8 KiB) and the fixed paths (`--control /run/ccsbx/side/ctl/ctl.sock`, `--state
+/run/ccsbx/side/state`, `--journal-dir /run/ccsbx/journal/s`, `--out /run/ccsbx/out`, `--in /run/ccsbx/in`,
+`--fence-uid 10001`, `--listen 127.0.0.1:8080`), plus `--hub-url` from root config `k8s_hub_url` (empty until the
+operator egress Service exists, then the flag is left out) and one `--door NAME=URL` per entry of `k8s_doors`.
+Every value is checked again before it goes in the pod spec, and the pod contract holds the sidecar to
+`ccsbx side serve`. No secret is in the spec: the relay token travels in the one load. The `relay-cred` volume is gone.
+
+The relay mint body also carries `manager` = `<machine>/<node>` from `msg_scope.manager` (`""` when it is not placed),
+separate from `may_reach`: the hub allows an unfenced target only to the manager and a fenced one only within `may_reach`.
+
+**Round 5 of the pod spec.** The sidecar's command is always `/usr/local/bin/ccsbx side serve ...` (a pod with no
+command, a different binary, or any `args` on either container is refused: Kubernetes appends args to the command, so
+they could override a flag). `--scope` is rebuilt from the typed message scope (exact, lower-case keys, each once; null,
+duplicates, unknown keys and trailing data are refused) and door names are unique. The label, full id and scope are in
+the pod spec and so readable by whoever can `get` the pod (the launcher's service account, cluster admins): accepted.
+The pod's `fsGroup` is 10003 (`ccsbx-work`, neither user's primary group; the contract refuses any other), so the fence
+(10001) and the sidecar (10002) share `/work`; the files themselves are group-writable only if the process that makes
+them has a group-writable umask (the sidecar's checkout must use 002). A sidecar-only `snapshot` volume (disk-backed,
+as large as the worktree) is mounted at `/run/ccsbx/side/snapshot`, nested in the side-state volume's path. Whether the
+cluster's admission accepts `fsGroup` and the nested mount is a Gate M question.

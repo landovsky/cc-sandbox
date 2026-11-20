@@ -122,3 +122,15 @@ func TestSideLoadExitCodes(t *testing.T) {
 		t.Errorf("a bad payload: exit %d", c)
 	}
 }
+
+// context "the sidecar image is FROM scratch": kubectl exec has no PATH to find ccsbx by, so the load runs
+// the binary by its absolute path.
+func TestLoadRunsTheBinaryByAbsolutePath(t *testing.T) {
+	f := &fakeX{}
+	if err := LoadInto(context.Background(), f, k8s.Ref{UID: "uid-1"}, []byte(`{"token":"T","key":"K"}`)); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.cmd) < 3 || f.cmd[0] != "/usr/local/bin/ccsbx" || f.cmd[1] != "side" || f.cmd[2] != "load" || f.cont != "side" {
+		t.Errorf("%q in %q", f.cmd, f.cont)
+	}
+}

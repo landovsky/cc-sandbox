@@ -141,7 +141,7 @@ func (e *env) relayMint(sid, genS, pub string, after401 bool, stdout io.Writer) 
 // reach from the record's scope. The secret is the caller's, already read from its trusted file. The
 // token comes back to the caller only (the verb prints it; pod-load puts it in the sidecar's payload).
 func (e *env) registerRelay(ctx context.Context, secret string, scope json.RawMessage, sid string, gen int, pub string) (string, error) {
-	body, _ := json.Marshal(map[string]any{"role": "relay", "sid": sid, "gen": strconv.Itoa(gen), "pub": pub, "may_reach": mayReach(scope)})
+	body, _ := json.Marshal(map[string]any{"role": "relay", "sid": sid, "gen": strconv.Itoa(gen), "pub": pub, "may_reach": mayReach(scope), "manager": managerOf(scope)})
 	code, resp, err := e.hubCall(ctx, "POST", "/v1/principals", secret, body)
 	if errors.Is(err, errHubUntrusted) {
 		e.audit("relay-mint", sid, gen, pub, "refused: "+err.Error())
@@ -162,17 +162,55 @@ func (e *env) registerRelay(ctx context.Context, secret string, scope json.RawMe
 
 var sidMintRe = regexp.MustCompile(`^s[0-9a-z]{4,32}$`)
 
-// mayReach is derived from the record and never supplied: the session's manager as <machine>/<node>.
-// A record that names no manager machine (or a malformed one) gives an empty list: the relay then
-// reaches fenced sessions only. Peers are not in it.
-func mayReach(scope json.RawMessage) []string {
+// managerOf is the session's manager as <machine>/<node> from the record's msg_scope.manager, "" when it is
+// not placed (no machine, or a malformed machine or node). The hub cannot tell the manager from the order
+// of may_reach: it allows an UNFENCED target only to this one, and a fenced one only within may_reach.
+func managerOf(scope json.RawMessage) string {
 	var s struct {
 		Manager struct{ Node, Machine string }
 	}
 	if json.Unmarshal(scope, &s) != nil || !mrMachine.MatchString(s.Manager.Machine) || !mrNode.MatchString(s.Manager.Node) {
-		return []string{}
+		return ""
 	}
-	return []string{s.Manager.Machine + "/" + s.Manager.Node}
+	return s.Manager.Machine + "/" + s.Manager.Node
+}
+
+// maxMayReach is the hub's own limit on the list.
+const maxMayReach = 32
+
+// mayReach is derived from the record and never supplied: the session's manager first, then its peers,
+// each as <machine>/<node> with the machine the record binds that node to (msg_scope.manager.machine and
+// msg_scope.peer_machines, written from the owner's start spec, never from the fence). A node whose machine
+// is missing or malformed is left out (a node belongs to the machine its record names; a bare node would
+// be refused by the hub), so a record that names no manager machine and no placed peer gives an empty
+// list: the relay then reaches fenced sessions only. The record cannot say which peers are fenced; the hub
+// needs the entry only for an UNFENCED target, so listing a fenced peer changes nothing for it. Duplicates
+// are dropped and the list is cut at the hub's 32.
+func mayReach(scope json.RawMessage) []string {
+	var s struct {
+		Manager      struct{ Node, Machine string }
+		Peers        []string
+		PeerMachines map[string]string `json:"peer_machines"`
+	}
+	out := []string{}
+	if json.Unmarshal(scope, &s) != nil {
+		return out
+	}
+	seen := map[string]bool{}
+	add := func(machine, node string) {
+		if !mrMachine.MatchString(machine) || !mrNode.MatchString(node) || len(out) >= maxMayReach {
+			return
+		}
+		if e := machine + "/" + node; !seen[e] {
+			seen[e] = true
+			out = append(out, e)
+		}
+	}
+	add(s.Manager.Machine, s.Manager.Node)
+	for _, p := range s.Peers {
+		add(s.PeerMachines[p], p)
+	}
+	return out
 }
 
 // rateLimit: one mint per generation per 10 s; --after-401 allows one more inside the window. The

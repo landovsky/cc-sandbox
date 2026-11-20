@@ -139,8 +139,8 @@ func TestRelayMintRegistersTheKeyWithTheManagerAsTheOnlyReach(t *testing.T) {
 	var body map[string]any
 	json.Unmarshal([]byte(reqs[0].body), &body)
 	reach, _ := body["may_reach"].([]any)
-	if body["role"] != "relay" || body["sid"] != sid || body["gen"] != "2" || body["pub"] != relayPub || len(reach) != 1 || reach[0] != "hp-ubuntu/cc-sandbox:#6b3s" || len(body) != 5 {
-		t.Errorf("body %s (the relay reaches the manager as <machine>/<node> and nobody else, peers included)", reqs[0].body)
+	if body["role"] != "relay" || body["sid"] != sid || body["gen"] != "2" || body["pub"] != relayPub || len(reach) != 2 || reach[0] != "hp-ubuntu/cc-sandbox:#6b3s" || reach[1] != "mac/cc-sandbox:#aaaa" || body["manager"] != "hp-ubuntu/cc-sandbox:#6b3s" || len(body) != 6 {
+		t.Errorf("body %s (the relay reaches the manager, then the placed peers, each as <machine>/<node> from the record, and nobody else)", reqs[0].body)
 	}
 	if strings.Contains(r.audit.String(), "TOKENVALUE") || strings.Contains(r.audit.String(), hubSecretText) || !strings.Contains(r.audit.String(), "relay-mint") || !strings.Contains(r.audit.String(), "sid="+sid) {
 		t.Errorf("audit: %q", r.audit.String())
@@ -149,12 +149,19 @@ func TestRelayMintRegistersTheKeyWithTheManagerAsTheOnlyReach(t *testing.T) {
 
 func TestMayReachComesFromTheRecordAndIsEmptyWithoutAManagerMachine(t *testing.T) {
 	for why, c := range map[string]struct{ scope, want string }{
-		"no manager machine":     {`{"manager":{"node":"cc-sandbox:#6b3s"}}`, "[]"},
-		"no manager at all":      {`{}`, "[]"},
-		"a machine with a slash": {`{"manager":{"node":"n","machine":"a/b"}}`, "[]"},
-		"a node with a space":    {`{"manager":{"node":"a b","machine":"mac"}}`, "[]"},
-		"a node over 128 chars":  {`{"manager":{"node":"` + strings.Repeat("n", 129) + `","machine":"mac"}}`, "[]"},
-		"another machine's node": {`{"manager":{"node":"cc-sandbox:#6b3s","machine":"mac"}}`, `["mac/cc-sandbox:#6b3s"]`},
+		"no manager machine":                          {`{"manager":{"node":"cc-sandbox:#6b3s"}}`, "[]"},
+		"no manager at all":                           {`{}`, "[]"},
+		"a machine with a slash":                      {`{"manager":{"node":"n","machine":"a/b"}}`, "[]"},
+		"a node with a space":                         {`{"manager":{"node":"a b","machine":"mac"}}`, "[]"},
+		"a node over 128 chars":                       {`{"manager":{"node":"` + strings.Repeat("n", 129) + `","machine":"mac"}}`, "[]"},
+		"another machine's node":                      {`{"manager":{"node":"cc-sandbox:#6b3s","machine":"mac"}}`, `["mac/cc-sandbox:#6b3s"]`},
+		"manager and peers, in that order":            {`{"manager":{"node":"m","machine":"hp"},"peers":["p1","p2"],"peer_machines":{"p1":"mac","p2":"future-two"}}`, `["hp/m","mac/p1","future-two/p2"]`},
+		"a peer with no machine is left out":          {`{"manager":{"node":"m","machine":"hp"},"peers":["p1","p2"],"peer_machines":{"p2":"mac"}}`, `["hp/m","mac/p2"]`},
+		"a peer with a malformed machine":             {`{"manager":{"node":"m","machine":"hp"},"peers":["p1"],"peer_machines":{"p1":"a/b"}}`, `["hp/m"]`},
+		"a peer with a malformed node":                {`{"manager":{"node":"m","machine":"hp"},"peers":["p 1"],"peer_machines":{"p 1":"mac"}}`, `["hp/m"]`},
+		"no manager machine, a placed peer":           {`{"manager":{"node":"m"},"peers":["p1"],"peer_machines":{"p1":"mac"}}`, `["mac/p1"]`},
+		"the same node twice":                         {`{"manager":{"node":"m","machine":"hp"},"peers":["m","m"],"peer_machines":{"m":"hp"}}`, `["hp/m"]`},
+		"a machine map for a node that is not a peer": {`{"manager":{"node":"m","machine":"hp"},"peers":[],"peer_machines":{"x":"mac"}}`, `["hp/m"]`},
 	} {
 		r := newRelayFx(t)
 		r.rec.Spec.MsgScope = json.RawMessage(c.scope)
@@ -164,10 +171,24 @@ func TestMayReachComesFromTheRecordAndIsEmptyWithoutAManagerMachine(t *testing.T
 		}
 		var body struct {
 			MayReach json.RawMessage `json:"may_reach"`
+			Manager  *string         `json:"manager"`
 		}
 		json.Unmarshal([]byte(r.hubCalls()[0].body), &body)
 		if string(body.MayReach) != c.want {
 			t.Errorf("%s: may_reach %s, want %s", why, body.MayReach, c.want)
+		}
+		// the manager is its own field (never inferred from the order of may_reach): <machine>/<node>, or ""
+		// when the record does not place it, even if a peer is placed
+		wantMgr := ""
+		var sc struct {
+			Manager struct{ Node, Machine string }
+		}
+		json.Unmarshal([]byte(c.scope), &sc)
+		if sc.Manager.Machine != "" && sc.Manager.Node != "" && strings.HasPrefix(c.want, `["`+sc.Manager.Machine+"/"+sc.Manager.Node+`"`) {
+			wantMgr = sc.Manager.Machine + "/" + sc.Manager.Node
+		}
+		if body.Manager == nil || *body.Manager != wantMgr {
+			t.Errorf("%s: manager %v, want %q", why, body.Manager, wantMgr)
 		}
 	}
 }
@@ -501,5 +522,20 @@ func TestProcNetParsing(t *testing.T) {
 	}
 	if len(parseProcNet(strings.NewReader(""), 80)) != 0 || len(parseProcNet(strings.NewReader(tcp), 1)) != 0 {
 		t.Error("nothing was expected")
+	}
+}
+
+// the hub's list holds at most 32 entries
+func TestMayReachIsCutAtTheHubsLimit(t *testing.T) {
+	peers, machines := []string{}, map[string]string{}
+	for i := 0; i < 40; i++ {
+		n := fmt.Sprintf("p%02d", i)
+		peers = append(peers, n)
+		machines[n] = "mac"
+	}
+	b, _ := json.Marshal(map[string]any{"manager": map[string]string{"node": "m", "machine": "hp"}, "peers": peers, "peer_machines": machines})
+	got := mayReach(b)
+	if len(got) != 32 || got[0] != "hp/m" || got[31] != "mac/p30" {
+		t.Errorf("%d entries, first %q last %q", len(got), got[0], got[len(got)-1])
 	}
 }

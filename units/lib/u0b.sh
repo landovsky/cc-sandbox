@@ -177,7 +177,11 @@ u0b_check() {
   if grep -q '^hub_url' "$(pth /etc/ccsbx/ccsbx-root.toml)" 2>/dev/null; then
     hs="$(stat -c '%U:%G %a' "$(pth /etc/ccsbx/hub-admin.secret)" 2>/dev/null || echo missing)"
     [ "$hs" = "root:root 600" ] && ok "/etc/ccsbx/hub-admin.secret is root:root 600" || bad "/etc/ccsbx/hub-admin.secret is $hs (want root:root 600)"
-  else note_check "ccsbx-root.toml has no hub_url: this install does not depend on the hub (relay-mint and pod relays refuse until it is re-run with --hub-url)"; fi
+  else
+    note_check "ccsbx-root.toml has no hub_url: this install does not depend on the hub (relay-mint and pod relays refuse until it is re-run with --hub-url)"
+    [ ! -e "$(pth /etc/ccsbx/hub-admin.secret)" ] && ok "no /etc/ccsbx/hub-admin.secret (the refusal without a hub relies on this file being absent)" \
+      || bad "/etc/ccsbx/hub-admin.secret exists but ccsbx-root.toml has no hub_url: a stale secret from an earlier install with a hub; re-run the install (it removes it)"
+  fi
   local own; own="$(stat -c '%U:%a' "$(pth $KEYS_DIR)" 2>/dev/null || echo missing)"
   [ "$own" = "ccsbx-keys:700" ] && ok "$KEYS_DIR is ccsbx-keys:700" || bad "$KEYS_DIR is $own (want ccsbx-keys:700)"
   local k

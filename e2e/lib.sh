@@ -128,7 +128,7 @@ e2e_candidate() {
   docker run --rm "$base" python3 -c 'import json' >/dev/null 2>&1 || { E2E_CAND_WHY="the base image $base has no python3 with json (rebuild it with image/build.sh from pins that have PYTHON3_MINIMAL_VERSION)"; return 1; }
   local dist="$E2E_ROOT/ccf-dist"; mkdir -p "$dist"
   "$ccf/ccf-pack" --out "$dist" >/dev/null 2>&1 || { E2E_CAND_WHY="ccf-pack failed"; return 1; }
-  local tar; tar="$(ls "$dist"/ccf-*.tar 2>/dev/null | head -1)"
+  local tar; tar="$dist/$(sed -n 's/.*"tar":"\([^"]*\)".*/\1/p' "$dist/candidate.json" 2>/dev/null | head -1)"   # the one ccf-pack just wrote, not a stale one
   [ -n "$tar" ] || { E2E_CAND_WHY="ccf-pack made no tar"; return 1; }
   local out; out="$("$REPO/image/build-ccf.sh" --ccf-tar "$tar" --base "$base" 2>&1)" || { E2E_CAND_WHY="build-ccf.sh: $(echo "$out" | tail -2 | tr '\n' ' ')"; return 1; }
   E2E_CAND="$(echo "$out" | awk '/^candidate /{print $2}' | tail -1)"

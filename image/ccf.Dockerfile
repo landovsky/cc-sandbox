@@ -2,15 +2,16 @@
 # the layer reaches the fence the way plan H2 says, as a digest that can be tried under e2e-* profiles and promoted later,
 # and not by baking it into the base image (which keeps /opt/ccf EMPTY, tests/image-test.sh checks that). The layer is a
 # tar made by dotfiles ccf/ccf-pack (reproducible, files at the tar's root: ccf-hook, ccf-mcp, ...). The result is root-owned
-# and read-only to the fence (uid 10001): `touch /opt/ccf/x` fails, so a session cannot edit its own hooks. Build it with
-# image/build-ccf.sh, which checks the tar's digest and what landed.
+# and read-only to the fence (uid 10001): the files cannot be edited. That protects the BYTES; what RUNS is protected by the
+# managed settings (internal/settings: `/usr/bin/python3 -I`, pinned CCF_* env), not by this file. Build it with
+# image/build-ccf.sh, which checks the tar's exact file list and digest, scans /opt/ccf for credentials and setid files, and
+# checks what landed.
 ARG BASE_IMAGE=ccsbx-fence:dev
 FROM ${BASE_IMAGE}
-ARG CCF_TAR
 ARG CCF_DIGEST
 USER 0
 # ADD of a local tar unpacks it; ownership and mode are then forced, whatever the tar said
-ADD ${CCF_TAR} /opt/ccf/
+ADD ccf.tar /opt/ccf/
 RUN set -eu; test -n "$CCF_DIGEST"; \
     chown -R 0:0 /opt/ccf; \
     find /opt/ccf -type d -exec chmod 0555 {} +; \

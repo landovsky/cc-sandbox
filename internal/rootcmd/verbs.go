@@ -158,11 +158,15 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	res, err := settings.Compile(p, settings.Params{BaseURL: e.cfg.BaseURL, FetchURL: e.cfg.FetchURL})
+	docker, err := e.cfg.binary(e.cfg.Docker)
 	if err != nil {
 		return 0, err
 	}
-	docker, err := e.cfg.binary(e.cfg.Docker)
+	hasLayer, err := backend.ImageHasLayer(docker, image) // the image is a pinned digest here; its label is part of what the digest names
+	if err != nil {
+		return 0, err
+	}
+	res, err := settings.Compile(p, settings.Params{BaseURL: e.cfg.BaseURL, FetchURL: e.cfg.FetchURL, NoCCF: !hasLayer})
 	if err != nil {
 		return 0, err
 	}

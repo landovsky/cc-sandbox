@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"regexp"
 	"sort"
+	"strings"
 
 	"github.com/landovsky/cc-sandbox/internal/profile"
 )
@@ -34,8 +36,19 @@ type Params struct {
 	BaseURL  string // the forwarder's model route, e.g. http://fwd:8080
 	FetchURL string // the forwarder's fetch route (HTTPS_PROXY); empty = no web fetch route
 	CCFDir   string // where the client layer is installed in the fence image (default /opt/ccf; read-only, root-owned)
-	CCFCmd   string // command of the one managed MCP server, "ccf" (default <CCFDir>/ccf-mcp)
+	// NoCCF: the image carries no client layer (no org.ccsbx.ccf.digest label). Then there are no hooks, no statusLine and no ccf MCP
+	// server: a hook whose script is missing makes python exit 2, which Claude Code treats as BLOCKING, so wiring a layer the image
+	// does not have would block every prompt of the session.
+	NoCCF  bool
+	CCFCmd string // command of the one managed MCP server, "ccf" (default <CCFDir>/ccf-mcp)
 }
+
+// ccfPython is the interpreter the client layer's scripts run under, always with -I (isolated: no PYTHON* environment, no user
+// site-packages, no script directory on sys.path first). The fence's home is a writable mount and a worktree's settings can add env
+// keys, so a script started as `env python3 script` would run whatever a planted .pth or PYTHONPATH says; started this way it cannot.
+const ccfPython = "/usr/bin/python3"
+
+var ccfDirRe = regexp.MustCompile(`^/[A-Za-z0-9/_.-]+$`)
 
 // CCFHookEvents is the one list of hook events the fence reports (plan C3 / U17): the compile OWNS it, and the dotfiles
 // fragment (ccf/managed-settings.json) is checked against it by a contract test, so the two cannot drift. These are the
@@ -64,12 +77,15 @@ func Compile(p *profile.Profile, par Params) (*Result, error) {
 	if par.CCFDir == "" {
 		par.CCFDir = "/opt/ccf"
 	}
+	if !ccfDirRe.MatchString(par.CCFDir) || strings.Contains(par.CCFDir, "..") { // it goes into a command string
+		return nil, fmt.Errorf("CCFDir %q must be a plain absolute path", par.CCFDir)
+	}
 	if par.CCFCmd == "" {
 		par.CCFCmd = par.CCFDir + "/ccf-mcp" // the layer is flat: its tar has no bin/
 	}
 	hooks := map[string]any{}
 	for _, ev := range CCFHookEvents {
-		hooks[ev] = []any{map[string]any{"matcher": "", "hooks": []any{map[string]any{"type": "command", "command": par.CCFDir + "/ccf-hook " + ev}}}}
+		hooks[ev] = []any{map[string]any{"matcher": "", "hooks": []any{map[string]any{"type": "command", "command": ccfPython + " -I " + par.CCFDir + "/ccf-hook " + ev}}}}
 	}
 	env := map[string]string{
 		"ANTHROPIC_BASE_URL":                       par.BaseURL,
@@ -80,6 +96,11 @@ func Compile(p *profile.Profile, par Params) (*Result, error) {
 		// The ccf tools are ten small ones the agent must always have in its first request. Claude Code otherwise defers
 		// MCP tools behind ToolSearch, so a scripted session (the stub) never sees them and a real one spends a round trip.
 		"ENABLE_TOOL_SEARCH": "false",
+		// What the layer's processes inherit from a worktree's settings is pinned: a project .claude/settings.json can add env keys,
+		// and these would silence or redirect reporting (CCF_OUT, CCF_IN), swap the interpreter (PATH) or run code (BASH_ENV, ENV).
+		// Managed env wins for the keys it sets; PYTHON* is neutralised by -I and PYTHONNOUSERSITE.
+		"CCF_OUT": "/run/ccsbx/out", "CCF_IN": "/run/ccsbx/in", "CCF_WAIT": "3",
+		"PATH": "/usr/local/bin:/usr/bin:/bin", "BASH_ENV": "", "ENV": "", "PYTHONNOUSERSITE": "1",
 	}
 	if par.FetchURL != "" {
 		env["HTTPS_PROXY"] = par.FetchURL
@@ -91,8 +112,7 @@ func Compile(p *profile.Profile, par Params) (*Result, error) {
 		},
 		// Only managed hooks and managed permission rules count; the worktree's can't add or widen.
 		"allowManagedHooksOnly":           true,
-		"hooks":                           hooks,
-		"statusLine":                      map[string]any{"type": "command", "command": par.CCFDir + "/ccf-statusline", "padding": 0},
+		"disableAllHooks":                 false, // explicit: a lower settings file cannot turn the managed hooks (and the statusLine) off
 		"allowManagedPermissionRulesOnly": true,
 		// Managed MCP is `ccf` only (see managed-mcp.json); worktree .mcp.json servers never load.
 		"allowedMcpServers":                 []map[string]string{{"serverName": "ccf"}},
@@ -103,9 +123,17 @@ func Compile(p *profile.Profile, par Params) (*Result, error) {
 		"skipDangerousModePermissionPrompt": p.Mode == "bypassPermissions",
 		"env":                               env,
 	}
-	mcp := map[string]any{"mcpServers": map[string]any{
-		"ccf": map[string]any{"type": "stdio", "command": par.CCFCmd, "args": []string{}},
-	}}
+	mcp := map[string]any{"mcpServers": map[string]any{"ccf": ccfServer(par)}}
+	if par.NoCCF {
+		mcp = map[string]any{"mcpServers": map[string]any{}}
+		s["allowedMcpServers"] = []map[string]string{}
+		for _, k := range []string{"CCF_OUT", "CCF_IN", "CCF_WAIT"} {
+			delete(env, k)
+		}
+	} else {
+		s["hooks"] = hooks
+		s["statusLine"] = map[string]any{"type": "command", "command": ccfPython + " -I " + par.CCFDir + "/ccf-statusline", "padding": 0}
+	}
 	sb, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return nil, err
@@ -115,6 +143,16 @@ func Compile(p *profile.Profile, par Params) (*Result, error) {
 		return nil, err
 	}
 	return &Result{Settings: append(sb, '\n'), MCP: append(mb, '\n')}, nil
+}
+
+// ccfServer is the one managed MCP server. With the default command it runs under the isolated interpreter with its own
+// CCF_* (the MCP process's env comes from this config, not only from settings); a caller-supplied command is used as given.
+func ccfServer(par Params) map[string]any {
+	env := map[string]string{"CCF_OUT": "/run/ccsbx/out", "CCF_IN": "/run/ccsbx/in", "CCF_WAIT": "3", "PYTHONNOUSERSITE": "1"}
+	if par.CCFCmd == par.CCFDir+"/ccf-mcp" {
+		return map[string]any{"type": "stdio", "command": ccfPython, "args": []string{"-I", par.CCFCmd}, "env": env}
+	}
+	return map[string]any{"type": "stdio", "command": par.CCFCmd, "args": []string{}, "env": env}
 }
 
 // denyList is base + profile, deduplicated, base entries first.

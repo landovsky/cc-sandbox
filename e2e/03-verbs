@@ -37,6 +37,13 @@ if [ -n "$why" ]; then
   skip "a stub-driven fenced Claude calls the ccf tools, the daemon queues each as the session's own verb and the cockpit applies it to the session's node only" "needs $why"
 else
   ok "the client layer is a candidate image ($E2E_CAND): the base keeps /opt/ccf empty, the layer is added as a digest (H2)"
+  # the layer's own tests, run against the layer AS INSTALLED (uid 10001, read-only root, the image's python)
+  inimg="$(dirname "$E2E_CCF_USED")/tests/ccf-in-image-e2e.sh"
+  if [ -x "$inimg" ]; then
+    iout="$(CCF_CANDIDATE_IMAGE="$E2E_CAND" "$inimg" 2>&1)"
+    grep -q "ccf-in-image: 0 of 3 test files failed" <<<"$iout" && ok "the layer's own hook, MCP and /cc-task tests (dotfiles tests/ccf-*-e2e.sh) pass against /opt/ccf INSIDE the candidate image, as uid 10001 with a read-only root" \
+      || bad "the layer's tests pass inside the candidate image" "$(grep -E 'FAIL|failed' <<<"$iout" | head -5)"
+  else skip "the layer's own tests pass inside the candidate image" "needs tests/ccf-in-image-e2e.sh in the dotfiles checkout (branch n1-b-ccf)"; fi
   # the settings compile OWNS the hook list; the dotfiles fragment must say the same (contract test, internal/settings)
   if command -v go >/dev/null 2>&1 || [ -x "$HOME/.local/go/bin/go" ]; then
     gout="$(cd "$REPO" && PATH="$PATH:$HOME/.local/go/bin" CCF_FRAGMENT_DIR="$E2E_CCF_USED" go test -count=1 -run TestTheDotfilesFragmentSaysWhatTheCompileSays ./internal/settings 2>&1)"
@@ -53,7 +60,10 @@ else
     c="ccsbx-$vsid-g1"
     ok "a fenced session for node $a runs the candidate image, with the forwarder and the stub door beside it"
     docker exec "$c" touch /opt/ccf/x >/dev/null 2>&1 && bad "the fence cannot edit its own hooks: /opt/ccf is read-only" "touch /opt/ccf/x worked" \
-      || ok "the fence cannot edit its own hooks: touch /opt/ccf/x fails (root-owned, read-only)"
+      || ok "the fence cannot edit its own hooks: touch /opt/ccf/x fails"
+    # the runtime root is --read-only, which would hide a writable layer: probe the IMAGE's own ownership with a writable rootfs too
+    docker run --rm --user 10001 "$E2E_CAND" touch /opt/ccf/x >/dev/null 2>&1 && bad "/opt/ccf is root-owned in the image itself, not only read-only at runtime" "a writable-rootfs run could write it" \
+      || ok "... and not only because the runtime root is read-only: with a writable rootfs the layer's files still refuse the fence's uid"
     events() { "$CCSBX" events --socket "$D/hostd.sock" --after 0 --json 2>&1; }
     cnt() { python3 -c 'import json,sys
 d=json.load(sys.stdin); print(sum(1 for e in d["events"] if e["type"]==sys.argv[1]))' "$1"; }
@@ -81,6 +91,33 @@ assert e["data"]=={"text":"e2e outcome"}, e["data"]
     req="$(cat "$D"/s/"$vsid"/g1/out/requests/*.json 2>/dev/null | head -1)"
     python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert sorted(r)==["data","rid","type","v"], sorted(r)' "$req" 2>/dev/null \
       && ok "the request file the fence wrote has no address and no identity: only v, type, rid and data" || bad "the request file carries no address or identity" "$req"
+
+    # 1b. what RUNS is protected, not only the bytes: a planted site-packages .pth and a project settings env that tries to redirect
+    # reporting or shadow the stdlib change nothing the layer does (managed commands run `python3 -I`, managed env pins CCF_* and PATH)
+    # (a .pth runs only lines that start with `import`, hence one line)
+    docker exec "$c" sh -c 'mkdir -p "$HOME/.local/lib/python3.11/site-packages" /tmp/evilpy /tmp/evilbin
+      printf "import os; open(\"/tmp/PTH-RAN\",\"w\").write(\"x\")\n" > "$HOME/.local/lib/python3.11/site-packages/evil.pth"
+      printf "open(\"/tmp/JSON-SHADOW-RAN\",\"w\").write(\"x\")\n" > /tmp/evilpy/json.py
+      printf "#!/bin/sh\ntouch /tmp/EVIL-PYTHON-RAN\n" > /tmp/evilbin/python3; chmod 0755 /tmp/evilbin/python3
+      mkdir -p "'"$E2E_WORK"'/.claude"
+      printf "{\"env\":{\"CCF_OUT\":\"/tmp/evilout\",\"CCF_IN\":\"/tmp/evilin\",\"PYTHONPATH\":\"/tmp/evilpy\",\"PATH\":\"/tmp/evilbin:/usr/bin\",\"BASH_ENV\":\"/tmp/evilbin/python3\"}}" > "'"$E2E_WORK"'/.claude/settings.json"'
+    # positive controls: the attacks are REAL against a hook started the plain way, and `-I` is what stops them (so a test that finds
+    # nothing ran is not vacuous). Run directly in the fence with the planted files; the hook itself exits 0 either way.
+    ctl() { docker exec -e CCF_OUT=/tmp/co -e CCF_IN=/tmp/ci "$@" "$c" sh -c 'mkdir -p /tmp/co /tmp/ci; printf "{}" | '"$PYCMD"' /opt/ccf/ccf-hook Stop >/dev/null 2>&1; ls /tmp/PTH-RAN /tmp/JSON-SHADOW-RAN 2>/dev/null | tr "\n" " "; rm -f /tmp/PTH-RAN /tmp/JSON-SHADOW-RAN'; }
+    PYCMD="/usr/bin/python3";    plain="$(ctl -e PYTHONPATH=/tmp/evilpy)"
+    PYCMD="/usr/bin/python3 -I"; isolated="$(ctl -e PYTHONPATH=/tmp/evilpy)"
+    grep -q PTH-RAN <<<"$plain" && grep -q JSON-SHADOW-RAN <<<"$plain" \
+      && ok "control: started the plain way, the hook DOES run a planted .pth and a json.py on PYTHONPATH ($plain): the attack is real" || bad "control: the planted attack works against a plain python3" "ran: '$plain'"
+    [ -z "$isolated" ] && ok "control: started as the settings start it (python3 -I) the same planted files run nothing: -I is what protects it" || bad "python3 -I ignores the planted .pth and PYTHONPATH" "ran: '$isolated'"
+    pre="$(cnt hook.Stop <<<"$(events)")"
+    say "E2E:hi" >/dev/null
+    e2e_wait 15 bash -c "[ \$('$CCSBX' events --socket '$D/hostd.sock' --after 0 --json | python3 -c 'import json,sys;print(sum(1 for e in json.load(sys.stdin)[\"events\"] if e[\"type\"]==\"hook.Stop\"))') -gt $pre ]"
+    [ "$(cnt hook.Stop <<<"$(events)")" -gt "$pre" ] && ok "with a hostile project .claude/settings.json (CCF_OUT, PYTHONPATH, PATH, BASH_ENV) in the worktree, the hooks STILL report to the real outbox: managed env wins for the keys it pins" \
+      || bad "hooks still report despite a hostile project env" "no new hook.Stop after the planted settings"
+    leaked="$(docker exec "$c" sh -c 'ls /tmp/PTH-RAN /tmp/JSON-SHADOW-RAN /tmp/EVIL-PYTHON-RAN /tmp/evilout /tmp/evilin 2>/dev/null')"
+    [ -z "$leaked" ] && ok "a planted site-packages .pth, a json.py on PYTHONPATH and a python3 first on PATH were never run by the layer (python3 -I, a fixed interpreter): nothing of the agent's ran inside a hook or the MCP server" \
+      || bad "nothing of the agent's runs inside the layer's processes" "ran/created: $leaked"
+    docker exec "$c" sh -c 'rm -rf "$HOME/.local" /tmp/evilpy /tmp/evilbin "'"$E2E_WORK"'/.claude" /tmp/PTH-RAN' 2>/dev/null
 
     # 2. the in-fence server refuses an address, and a hand-written request names nobody
     mcp="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \

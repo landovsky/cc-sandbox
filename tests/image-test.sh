@@ -289,11 +289,11 @@ hardening_check() {
   echo "$o" | grep -q '^/usr/local/bin:/usr/bin:/bin$' || { echo "PATH is not set explicitly with the shim first"; return 1; }
   # the client layer (/opt/ccf, plan C3) is stdlib-only Python 3 and the fence has no other interpreter: python3 must be there at the
   # PINNED version (image/pins.env), able to `import json` (python3-minimal alone cannot), and must not be a way to a privilege
-  o=$(docker run --rm "$img" sh -c 'python3 --version 2>&1; python3 -c "import json,os,sys,time; print(\"stdlib-ok\")" 2>&1; dpkg-query -W -f="\${Version}\n" python3-minimal libpython3.11-stdlib 2>&1; ls -l /usr/bin/python3 2>&1 | cut -c1-10') || { echo "python check could not run"; return 1; }
+  o=$(docker run --rm "$img" sh -c 'python3 --version 2>&1; python3 -c "import json,os,sys,time; print(\"stdlib-ok\")" 2>&1; dpkg-query -W -f="\${Version}\n" python3-minimal libpython3.11-stdlib 2>&1') || { echo "python check could not run"; return 1; }
   echo "$o" | grep -q '^Python 3\.11\.' || { echo "python3 is not in the image or is not 3.11: $(echo "$o" | head -1)"; return 1; }
   echo "$o" | grep -qx 'stdlib-ok' || { echo "python3 cannot import the stdlib the client layer needs (json, os, sys, time): $(echo "$o" | sed -n 2p)"; return 1; }
-  echo "$o" | grep -qx "$(pin PYTHON3_MINIMAL_VERSION)" || { echo "python3-minimal is not the pinned $(pin PYTHON3_MINIMAL_VERSION)"; return 1; }
-  echo "$o" | grep -qx "$(pin LIBPYTHON3_STDLIB_VERSION)" || { echo "libpython3.11-stdlib is not the pinned $(pin LIBPYTHON3_STDLIB_VERSION)"; return 1; }
+  echo "$o" | grep -Fqx "$(pin PYTHON3_MINIMAL_VERSION)" || { echo "python3-minimal is not the pinned $(pin PYTHON3_MINIMAL_VERSION)"; return 1; }
+  echo "$o" | grep -Fqx "$(pin LIBPYTHON3_STDLIB_VERSION)" || { echo "libpython3.11-stdlib is not the pinned $(pin LIBPYTHON3_STDLIB_VERSION)"; return 1; }
   return 0
 }
 image_hardening_allow() { local o; o=$(hardening_check "$IMG") || fail "$o"; ok "no setid file, no sudo, empty read-only /opt/ccf, the shim is the only git on an explicit PATH, python3 at its pinned version with the stdlib the client layer needs"; }

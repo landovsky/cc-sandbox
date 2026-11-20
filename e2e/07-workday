@@ -17,7 +17,7 @@ sid="$(e2e_sid "$out")"
   && ok "the workday session starts under e2e-default and billing=stub with its brief (daemon side)" \
   || bad "the workday session starts with its brief" "rc=$rc $out"
 
-stub_note="the ccf client layer in the image (/opt/ccf is empty: C3 hook, C5 MCP, C6 verb writer) + the stub's tool calls"
+stub_note="a session on a CANDIDATE image (this script runs on the base image, which has no client layer); the verbs are real in 03-verbs"
 S() { skip "$1" "needs $2"; }
 
 if [ -z "$sid" ]; then
@@ -38,6 +38,12 @@ else
   c="ccsbx-$sid-g1"
   if e2e_wait 30 docker inspect "$c"; then
     ok "the fence for the workday session is up (ccsbx run, real image, base URL = the forwarder's stub route)"
+    # this is the BASE image: no client layer, so the managed settings must not wire hooks or the ccf server onto files that are not there
+    # (a missing hook script is a python exit 2, which Claude Code treats as BLOCKING: every prompt would be refused)
+    ms="$(cat "$CCSBX_STATE/s/$sid/g1/managed/managed-settings.json" 2>/dev/null)"
+    { ! grep -q '"hooks"\|/opt/ccf' <<<"$ms" && grep -q 'carries no client layer' "$E2E_ROOT/run.log"; } \
+      && ok "the base image has no client layer, so its session gets no hooks, statusLine or ccf server (and says so), instead of hooks that would block every prompt" \
+      || bad "a layer-less image gets no hooks" "$(grep -c hooks <<<"$ms") hooks mention(s); run.log: $(head -c 200 "$E2E_ROOT/run.log")"
     # the repo here was made by the host user, a real session's worktree is prepared for the fence's uid by the daemon:
     # so git is told the directory is safe (this is the test's convenience, not something the fence may do to its own gitdir)
     gx=(-e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=$W" -e CCSBX_GIT_TIMEOUT=2)

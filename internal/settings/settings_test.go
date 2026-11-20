@@ -182,21 +182,28 @@ func TestTheClientLayerIsWiredAtItsFlatPaths(t *testing.T) {
 	}
 	for _, ev := range CCFHookEvents {
 		raw, _ := json.Marshal(hooks[ev])
-		if !strings.Contains(string(raw), `"command":"/opt/ccf/ccf-hook `+ev+`"`) {
+		if !strings.Contains(string(raw), `"command":"/usr/bin/python3 -I /opt/ccf/ccf-hook `+ev+`"`) {
 			t.Errorf("event %s: %s", ev, raw)
 		}
 	}
-	if sl, _ := s["statusLine"].(map[string]any); sl["command"] != "/opt/ccf/ccf-statusline" || sl["type"] != "command" {
+	if sl, _ := s["statusLine"].(map[string]any); sl["command"] != "/usr/bin/python3 -I /opt/ccf/ccf-statusline" || sl["type"] != "command" {
 		t.Errorf("statusLine: %v", s["statusLine"])
 	}
-	if cmd := mcp["mcpServers"].(map[string]any)["ccf"].(map[string]any)["command"]; cmd != "/opt/ccf/ccf-mcp" {
-		t.Errorf("MCP command %v", cmd)
+	srv := mcp["mcpServers"].(map[string]any)["ccf"].(map[string]any)
+	if args, _ := json.Marshal(srv["args"]); srv["command"] != "/usr/bin/python3" || string(args) != `["-I","/opt/ccf/ccf-mcp"]` {
+		t.Errorf("MCP command %v %s", srv["command"], args)
+	}
+	if env, _ := srv["env"].(map[string]any); env["CCF_OUT"] != "/run/ccsbx/out" || env["CCF_IN"] != "/run/ccsbx/in" || env["PYTHONNOUSERSITE"] != "1" {
+		t.Errorf("the MCP server's own env: %v", srv["env"])
+	}
+	if s["disableAllHooks"] != false {
+		t.Error("disableAllHooks must be an explicit false in managed settings")
 	}
 	if s["allowManagedHooksOnly"] != true {
 		t.Error("the worktree's own hooks must not count")
 	}
 	r, err := Compile(prof("bypassPermissions"), Params{BaseURL: "http://fwd:8080", CCFDir: "/opt/other"})
-	if err != nil || !strings.Contains(string(r.Settings), "/opt/other/ccf-hook SessionStart") || !strings.Contains(string(r.MCP), "/opt/other/ccf-mcp") {
+	if err != nil || !strings.Contains(string(r.Settings), "/usr/bin/python3 -I /opt/other/ccf-hook SessionStart") || !strings.Contains(string(r.MCP), "/opt/other/ccf-mcp") {
 		t.Errorf("the layer directory is a parameter: %v %s", err, r.Settings)
 	}
 }
@@ -221,16 +228,82 @@ func TestTheDotfilesFragmentSaysWhatTheCompileSays(t *testing.T) {
 	}
 	s, mcp := compiled(t, prof("bypassPermissions"))
 	frag := read("managed-settings.json")
-	for _, k := range []string{"hooks", "statusLine", "allowManagedHooksOnly"} {
+	for _, k := range []string{"hooks", "statusLine", "allowManagedHooksOnly", "disableAllHooks"} {
 		if !reflect.DeepEqual(frag[k], s[k]) {
 			a, _ := json.Marshal(frag[k])
 			b, _ := json.Marshal(s[k])
 			t.Errorf("%s differs:\n  dotfiles: %s\n  compile:  %s", k, a, b)
 		}
 	}
-	fm := read("managed-mcp.json")["mcpServers"].(map[string]any)["ccf"].(map[string]any)
-	cm := mcp["mcpServers"].(map[string]any)["ccf"].(map[string]any)
-	if fm["command"] != cm["command"] {
-		t.Errorf("MCP command: dotfiles %v, compile %v", fm["command"], cm["command"])
+	fm := read("managed-mcp.json")["mcpServers"].(map[string]any)["ccf"]
+	cm := mcp["mcpServers"].(map[string]any)["ccf"]
+	if !reflect.DeepEqual(fm, cm) { // command, args, env and type: all of it decides what runs
+		a, _ := json.Marshal(fm)
+		b, _ := json.Marshal(cm)
+		t.Errorf("the MCP server entry differs:\n  dotfiles: %s\n  compile:  %s", a, b)
+	}
+}
+
+// context "the agent controls its HOME (a writable mount) and a project .claude/settings.json can add env keys": the layer's
+// processes must run under the isolated interpreter and with the keys that decide where they report pinned by managed env, or a
+// planted site-packages .pth, PYTHONPATH, PATH, BASH_ENV or CCF_OUT would change or silence them without touching a managed file.
+func TestTheLayersProcessesRunIsolatedWithTheirEnvPinned(t *testing.T) {
+	s, mcp := compiled(t, prof("bypassPermissions"))
+	env := s["env"].(map[string]any)
+	for k, want := range map[string]string{"CCF_OUT": "/run/ccsbx/out", "CCF_IN": "/run/ccsbx/in", "CCF_WAIT": "3",
+		"PATH": "/usr/local/bin:/usr/bin:/bin", "BASH_ENV": "", "ENV": "", "PYTHONNOUSERSITE": "1"} {
+		if got, ok := env[k]; !ok || got != want {
+			t.Errorf("managed env %s = %v (present %v), want %q", k, got, ok, want)
+		}
+	}
+	raw, _ := json.Marshal(s)
+	for _, line := range strings.Split(strings.ReplaceAll(string(raw), `"command":"`, "\n"), "\n")[1:] {
+		cmd := line[:strings.Index(line, `"`)]
+		if !strings.HasPrefix(cmd, "/usr/bin/python3 -I /opt/ccf/") {
+			t.Errorf("a managed command does not start the layer under the isolated interpreter: %q", cmd)
+		}
+	}
+	if m, _ := json.Marshal(mcp); strings.Contains(string(m), "env python3") || strings.Contains(string(m), `"command":"/opt/ccf`) {
+		t.Errorf("the MCP server must not start through a shebang or a PATH lookup: %s", m)
+	}
+}
+
+// context "CCFDir goes into a command string": nothing but a plain absolute path is accepted.
+func TestCCFDirIsAPlainPath(t *testing.T) {
+	for _, d := range []string{"opt/ccf", "/opt/ccf; id", "/opt/c cf", "/opt/../etc", "/opt/ccf$(x)"} {
+		if _, err := Compile(prof("bypassPermissions"), Params{BaseURL: "http://fwd:8080", CCFDir: d}); err == nil {
+			t.Errorf("CCFDir %q accepted", d)
+		}
+	}
+}
+
+// context "the image has no client layer (the base image, a dev image)": hooks wired to /opt/ccf/ccf-hook would make python exit 2 on the
+// missing script, and Claude Code treats a hook exit 2 as BLOCKING, so every prompt would be refused. Without the layer the session
+// gets no hooks, no statusLine and no ccf server, and keeps everything else (managed hooks only, the deny list, the forwarder).
+func TestNoLayerNoHooksNoStatuslineNoServer(t *testing.T) {
+	r, err := Compile(prof("bypassPermissions"), Params{BaseURL: "http://fwd:8080", NoCCF: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s, mcp map[string]any
+	json.Unmarshal(r.Settings, &s)
+	json.Unmarshal(r.MCP, &mcp)
+	for _, k := range []string{"hooks", "statusLine"} {
+		if _, has := s[k]; has {
+			t.Errorf("%s must be absent without the layer", k)
+		}
+	}
+	if len(mcp["mcpServers"].(map[string]any)) != 0 || len(s["allowedMcpServers"].([]any)) != 0 {
+		t.Errorf("no MCP server may be wired or allowed without the layer: %s | %v", r.MCP, s["allowedMcpServers"])
+	}
+	env := s["env"].(map[string]any)
+	if _, has := env["CCF_OUT"]; has {
+		t.Error("CCF_* env is for the layer's processes only")
+	}
+	if s["allowManagedHooksOnly"] != true || env["ANTHROPIC_BASE_URL"] != "http://fwd:8080" || len(denies(s)) == 0 {
+		t.Errorf("everything else stays: %v", s)
+	}
+	if strings.Contains(string(r.Settings), "/opt/ccf") || strings.Contains(string(r.MCP), "/opt/ccf") {
+		t.Error("a path under /opt/ccf without the layer")
 	}
 }

@@ -1840,10 +1840,10 @@ where = "any"
 
 [[rule]]
 id = "settings-wire-the-client-layer"
-title = "the managed settings wire every hook event cc-tree reads to the read-only client layer at /opt/ccf, its statusLine and its one MCP server at the layer's flat paths, and the dotfiles fragment says exactly what the compile says"
+title = "the managed settings wire every hook event cc-tree reads to the read-only client layer at /opt/ccf, its statusLine and its one MCP server at the layer's flat paths, run under the isolated interpreter with the env that decides where they report pinned (a planted .pth, PYTHONPATH or worktree env cannot change them); the dotfiles fragment contract is checked in e2e/03-verbs"
 suite = "settings"
 allow = "tests/go-test.sh ./internal/settings 'TestFreshFenceStartsWithoutPrompts$'"
-block = "tests/go-test.sh ./internal/settings 'TestTheClientLayerIsWiredAtItsFlatPaths$|TestTheDotfilesFragmentSaysWhatTheCompileSays$'"
+block = "tests/go-test.sh ./internal/settings 'TestTheClientLayerIsWiredAtItsFlatPaths$|TestTheLayersProcessesRunIsolatedWithTheirEnvPinned$|TestCCFDirIsAPlainPath$'"
 invariants = [12]
 backends = ["unit"]
 where = "any"
@@ -1854,6 +1854,36 @@ title = "the scripted stub calls the ccf tool under the name Claude Code gives i
 suite = "fence"
 allow = "tests/go-test.sh ./internal/stub 'TestOnlyTheCcfServersToolMatches$'"
 block = "tests/go-test.sh ./internal/stub 'TestTheRealMcpToolNameIsCalled$|TestATrailingSystemEntryDoesNotHideTheUsersTurn$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "image-ccf-candidate-gate"
+title = "a client-layer candidate is built only from a tar holding exactly the six layer files as plain files (and the pinned digest, when given), and only if the image holds nothing else, root-owned and unwritable for the fence's uid, with no setid file, no credential pattern, and a hook that runs; a refused layer leaves no image"
+suite = "fence"
+allow = "tests/build-ccf-test.sh allow"
+block = "tests/build-ccf-test.sh block"
+invariants = [3, 26]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "settings-wire-the-layer-only-onto-an-image-that-has-it"
+title = "the managed settings wire the client layer's hooks, statusLine and ccf MCP server only onto an image that carries it (the build's digest label); a hook whose script is missing would exit 2, which Claude Code treats as blocking, and refuse every prompt"
+suite = "settings"
+allow = "tests/go-test.sh ./internal/settings 'TestFreshFenceStartsWithoutPrompts$'"
+block = "tests/go-test.sh ./internal/settings 'TestNoLayerNoHooksNoStatuslineNoServer$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "backend-reads-the-layer-label"
+title = "a run learns whether its image carries the client layer from the image's digest label; an unreadable image or a label that is not a digest is an error, never a quiet no-layer"
+suite = "settings"
+allow = "tests/go-test.sh ./internal/backend 'TestEnvIsExplicit$'"
+block = "tests/go-test.sh ./internal/backend 'TestTheLayerIsThereOnlyWhenTheImageSaysSo$'"
 invariants = [12]
 backends = ["unit"]
 where = "any"

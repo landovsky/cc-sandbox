@@ -182,7 +182,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 				VolumeMounts: []VolumeMount{
 					{Name: "worktree", MountPath: "/work"}, {Name: "out", MountPath: "/run/ccsbx/out", ReadOnly: true},
 					{Name: "in", MountPath: "/run/ccsbx/in"}, {Name: "managed", MountPath: "/etc/claude-code"},
-					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "snapshot", MountPath: "/run/ccsbx/side/snapshot"},
+					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "snapshot", MountPath: "/run/ccsbx/side/snapshot"}, {Name: "gitdir", MountPath: "/run/ccsbx/side/git"},
 					{Name: "side-tmp", MountPath: "/tmp"}, {Name: "journal", MountPath: "/run/ccsbx/journal"},
 				},
 			}},
@@ -198,7 +198,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			}},
 			Volumes: []Volume{
 				vol("worktree", s.WorktreeMB, false), vol("out", 64, false), vol("in", 16, false), vol("managed", 8, false),
-				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("journal", 16, false), vol("snapshot", s.WorktreeMB, false),
+				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("journal", 16, false), vol("snapshot", s.WorktreeMB, false), vol("gitdir", s.WorktreeMB, false),
 			},
 		},
 	}
@@ -320,7 +320,7 @@ const (
 // place for the process that holds the token.
 var volumeOwner = map[string]string{
 	"worktree": "both", "out": "both", "in": "both", "managed": "both",
-	"side-state": "side", "side-tmp": "side", "journal": "side", "snapshot": "side",
+	"side-state": "side", "side-tmp": "side", "journal": "side", "snapshot": "side", "gitdir": "side",
 	"home": "fence", "tmp": "fence",
 }
 

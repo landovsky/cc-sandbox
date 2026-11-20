@@ -190,6 +190,9 @@ func contractCases() []contractCase {
 		{"the fence mounting the sidecar's state", func(p *Pod) {
 			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "side-state", MountPath: "/s"})
 		}, "alone"},
+		{"the fence mounting the git directory", func(p *Pod) {
+			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "gitdir", MountPath: "/g"})
+		}, "alone"},
 		{"the fence mounting the snapshot", func(p *Pod) {
 			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "snapshot", MountPath: "/snap"})
 		}, "alone"},
@@ -465,5 +468,36 @@ func setRO(c *Container, vol string, ro bool) {
 		if c.VolumeMounts[i].Name == vol {
 			c.VolumeMounts[i].ReadOnly = ro
 		}
+	}
+}
+
+// F3c S5: the clone's object store goes on a disk-backed volume of its own (as large as the worktree), not on the
+// 8 MiB in-memory side-state; it is the sidecar's alone, and the fence never sees it.
+func TestTheGitDirectoryIsASidecarOnlyDiskVolume(t *testing.T) {
+	p := goodPod(t)
+	var g, st *Volume
+	for i := range p.Spec.Volumes {
+		switch p.Spec.Volumes[i].Name {
+		case "gitdir":
+			g = &p.Spec.Volumes[i]
+		case "side-state":
+			st = &p.Spec.Volumes[i]
+		}
+	}
+	if g == nil || g.EmptyDir == nil || g.EmptyDir.Medium != "" || g.EmptyDir.SizeLimit != miQty(10240) {
+		t.Fatalf("gitdir %+v (disk-backed, as large as the worktree)", g)
+	}
+	if st == nil || st.EmptyDir.Medium != "Memory" || st.EmptyDir.SizeLimit != "8Mi" {
+		t.Errorf("side-state %+v must stay the small in-memory one", st)
+	}
+	for _, c := range append(append([]Container{}, p.Spec.InitContainers...), p.Spec.Containers...) {
+		for _, m := range c.VolumeMounts {
+			if m.Name == "gitdir" && (c.Name != "side" || m.MountPath != "/run/ccsbx/side/git" || m.ReadOnly) {
+				t.Errorf("%s mounts the git directory at %s", c.Name, m.MountPath)
+			}
+		}
+	}
+	if volumeOwner["gitdir"] != "side" {
+		t.Error("the git directory is not sidecar-only")
 	}
 }

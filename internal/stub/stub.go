@@ -89,10 +89,17 @@ func (r *request) lastUser() (text string, isToolResult bool) {
 	if len(r.Messages) == 0 {
 		return "", false
 	}
-	m := r.Messages[len(r.Messages)-1]
-	if m.Role != "user" {
+	// Claude Code (2.1.311, seen in the e2e suite) ends the messages array with a {"role":"system"} entry after the user's turn;
+	// the turn the stub answers is the last USER message, so trailing system entries are skipped. An assistant message last
+	// (a prefill) is still no user turn.
+	i := len(r.Messages) - 1
+	for i >= 0 && r.Messages[i].Role == "system" {
+		i--
+	}
+	if i < 0 || r.Messages[i].Role != "user" {
 		return "", false
 	}
+	m := r.Messages[i]
 	var s string
 	if json.Unmarshal(m.Content, &s) == nil {
 		return s, false
@@ -199,10 +206,12 @@ func messages(w http.ResponseWriter, r *http.Request) {
 	stream(w, msg, content, stop)
 }
 
-// findTool returns the offered tool matching verb: mcp__ccf__<verb> or ccf_<verb>.
+// findTool returns the offered tool matching verb. Claude Code names an MCP tool mcp__<server>__<tool>, and the ccf server
+// (dotfiles ccf/ccf-mcp) names its tools ccf_<verb>, so the real name is mcp__ccf__ccf_<verb>; the shorter forms stay
+// for scripts and tests that offer them.
 func findTool(req *request, verb string) (string, map[string]json.RawMessage) {
 	for _, t := range req.Tools {
-		if t.Name == "mcp__ccf__"+verb || t.Name == "ccf_"+verb { // exact: a same-suffix tool of another server must not match
+		if t.Name == "mcp__ccf__ccf_"+verb || t.Name == "mcp__ccf__"+verb || t.Name == "ccf_"+verb { // exact: a same-suffix tool of another server must not match
 			return t.Name, t.InputSchema.Properties
 		}
 	}

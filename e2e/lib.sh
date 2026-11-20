@@ -14,6 +14,7 @@
 # Tunables (env): E2E_ROOT (default: a fresh mktemp -d, removed on exit; set it to keep the realm),
 #   CCSBX_BIN (default <repo>/bin/ccsbx), E2E_S0_DIR (where `make standalone` lives, default ~/.dotfiles),
 #   E2E_IMAGE (the fence image the docker steps run, default ccsbx-fence:dev; never pulled),
+#   E2E_CCF / E2E_BASE_IMAGE (the client layer's ccf/ directory and the python-bearing fence image the candidate is built on),
 #   E2E_DOTFILES (a dotfiles checkout with the session-bus test library lib-sb-hub.sh and a hub with B10/B11/M2b;
 #   default ~/.dotfiles/.worktrees/n1-g-hub2), E2E_CCTREE (a dotfiles checkout with the remote start path, C12/C16;
 #   default ~/.dotfiles/.worktrees/n2-f-c16). A leg whose piece is missing is a SKIP that says which.
@@ -111,6 +112,28 @@ e2e_wait() { local t=$(( $1 * 5 )); shift; while [ $t -gt 0 ]; do "$@" >/dev/nul
 
 # e2e_port: a free loopback port (the spare-port rule: nothing here ever uses a live service's port)
 e2e_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+
+# e2e_candidate: the CANDIDATE image (fence image + the client layer at /opt/ccf, plan C3/H2), built once and cached by the
+# layer's digest. Sets E2E_CAND to its tag and returns 0, or returns 1 with E2E_CAND_WHY saying which piece is missing.
+#   E2E_CCF       a dotfiles ccf/ directory (default: .worktrees/n1-b-ccf/ccf, else .worktrees/n1-g-cc/ccf)
+#   E2E_BASE_IMAGE  the fence image to build on (default $E2E_IMAGE); it must have python3 (image/pins.env PYTHON3_MINIMAL_VERSION)
+# It runs `docker build` (an image per layer digest stays as a cache; nothing here removes images) and never pulls.
+e2e_candidate() {
+  E2E_CAND=""; E2E_CAND_WHY=""
+  local ccf="${E2E_CCF:-}" base="${E2E_BASE_IMAGE:-$E2E_IMAGE}"
+  [ -n "$ccf" ] || for ccf in "$HOME/.dotfiles/.worktrees/n1-b-ccf/ccf" "$HOME/.dotfiles/.worktrees/n1-g-cc/ccf"; do [ -x "$ccf/ccf-pack" ] && break; done
+  [ -x "$ccf/ccf-pack" ] || { E2E_CAND_WHY="no dotfiles ccf/ directory with ccf-pack (set E2E_CCF; the layer is on dotfiles n1-g-cc / n1-b-ccf, not on main)"; return 1; }
+  E2E_CCF_USED="$ccf"
+  docker image inspect "$base" >/dev/null 2>&1 || { E2E_CAND_WHY="the base image $base is not present"; return 1; }
+  docker run --rm "$base" python3 -c 'import json' >/dev/null 2>&1 || { E2E_CAND_WHY="the base image $base has no python3 with json (rebuild it with image/build.sh from pins that have PYTHON3_MINIMAL_VERSION)"; return 1; }
+  local dist="$E2E_ROOT/ccf-dist"; mkdir -p "$dist"
+  "$ccf/ccf-pack" --out "$dist" >/dev/null 2>&1 || { E2E_CAND_WHY="ccf-pack failed"; return 1; }
+  local tar; tar="$dist/$(sed -n 's/.*"tar":"\([^"]*\)".*/\1/p' "$dist/candidate.json" 2>/dev/null | head -1)"   # the one ccf-pack just wrote, not a stale one
+  [ -n "$tar" ] || { E2E_CAND_WHY="ccf-pack made no tar"; return 1; }
+  local out; out="$("$REPO/image/build-ccf.sh" --ccf-tar "$tar" --base "$base" 2>&1)" || { E2E_CAND_WHY="build-ccf.sh: $(echo "$out" | tail -2 | tr '\n' ' ')"; return 1; }
+  E2E_CAND="$(echo "$out" | awk '/^candidate /{print $2}' | tail -1)"
+  [ -n "$E2E_CAND" ] || { E2E_CAND_WHY="build-ccf.sh printed no candidate"; return 1; }
+}
 
 have_image() { docker image inspect "$E2E_IMAGE" >/dev/null 2>&1; }
 

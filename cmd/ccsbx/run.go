@@ -99,7 +99,15 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ccsbx run:", err)
 		return cli.ExitFail
 	}
-	res, err := settings.Compile(p, settings.Params{BaseURL: get("base-url"), FetchURL: get("fetch-url")})
+	hasLayer, err := backend.ImageHasLayer(get("docker"), get("image"))
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx run:", err)
+		return cli.ExitFail
+	}
+	if !hasLayer {
+		fmt.Fprintf(stderr, "ccsbx run: image %s carries no client layer (no %s label): this session has no hooks, statusLine or ccf MCP server\n", get("image"), backend.LayerLabel)
+	}
+	res, err := settings.Compile(p, settings.Params{BaseURL: get("base-url"), FetchURL: get("fetch-url"), NoCCF: !hasLayer})
 	if err != nil {
 		fmt.Fprintln(stderr, "ccsbx run:", err)
 		return cli.ExitFail

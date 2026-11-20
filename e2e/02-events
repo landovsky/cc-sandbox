@@ -100,7 +100,7 @@ assert st["sid"]==sid and st["gen"]==1 and st["src"]=="fence", st
   fi
 fi
 
-skip "the real ccf-hook (UserPromptSubmit, Stop+usage, status) in the image writes those lines" "needs C3 (ccf-hook baked into the fence image; the image here predates it or the stub drive is not wired)"
+skip "the real ccf-hook's Stop carries usage, and the statusLine writes a 'status' event" "the hook types themselves are REAL in 03-verbs (SessionStart, UserPromptSubmit, PreToolUse, PostToolUse, Stop from a real Claude Code); the Stop usage payload and the statusLine event are not asserted yet (claude -p does not run the statusLine)"
 skip "tab colour and tree state follow working/asks/background/waiting/cold/done within 5 s" "needs C4a on dotfiles main (cc-tree follow --write is on branch n1-f) + a stub-driven session"
 skip "a reader machine shows the same states as the writer" "needs C4b + M3 (a second machine)"
 skip "a daemon cut off for 5 min shows 'away', then fills in with no duplicates" "needs C4b (dotfiles n2-f-c4b) + a second daemon"

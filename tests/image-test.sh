@@ -57,10 +57,10 @@ scan_image() {
   env=$(docker image inspect "$img" --format '{{range .Config.Env}}{{println .}}{{end}}') || { echo "inspect failed"; return 1; }
   echo "$env" | grep -Eiq '(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|PAT)=' && { echo "a secret-like variable in the image config"; return 1; }
   hist=$(docker history --no-trunc --format '{{.CreatedBy}}' "$img") || { echo "history failed"; return 1; }
-  # The final stage has no ARG but SNAPSHOT: any other ARG line, or the `|N NAME=value` prefix docker adds to a RUN that
-  # saw build args, means a build arg reached this image's history.
-  # The one allowed arg is SNAPSHOT, a public date pin (it shows as `ARG SNAPSHOT` and a `|1 SNAPSHOT=... ` prefix).
-  echo "$hist" | sed -E 's/(^|[[:space:]])ARG SNAPSHOT(=[0-9TZ]+)?([[:space:]]|$)/ /; s/^RUN \|1 SNAPSHOT=[0-9TZ]+ /RUN /' | grep -Eq '(^|[[:space:]])ARG [A-Za-z_]|^RUN \|[0-9]+ ' && { echo "a build arg in the image history"; return 1; }
+  # The final stage has no ARG but three public pins: any other ARG line, or the `|N NAME=value` prefix docker adds to a RUN
+  # that saw build args, means a build arg reached this image's history. The allowed ones are SNAPSHOT (a date) and the two
+  # python package versions (image/pins.env): they show as `ARG NAME` and one `|3 NAME=... NAME=... NAME=...` prefix.
+  echo "$hist" | sed -E 's/(^|[[:space:]])ARG (SNAPSHOT(=[0-9TZ]+)?|PYTHON3_MINIMAL_VERSION(=[0-9A-Za-z.+~-]+)?|LIBPYTHON3_STDLIB_VERSION(=[0-9A-Za-z.+~-]+)?)([[:space:]]|$)/ /; s/^RUN \|3 ((SNAPSHOT=[0-9TZ]+|PYTHON3_MINIMAL_VERSION=[0-9A-Za-z.+~-]+|LIBPYTHON3_STDLIB_VERSION=[0-9A-Za-z.+~-]+) ){3}/RUN /' | grep -Eq '(^|[[:space:]])ARG [A-Za-z_]|^RUN \|[0-9]+ ' && { echo "a build arg in the image history"; return 1; }
   echo "$hist" | grep -Eq "$SECRET_RE" && { echo "a credential pattern in the build history"; return 1; }
   # The final filesystem (text files; the claude binary excluded). rc: 0 hits, 1 none, 2+ error.
   out=$(docker run --rm --user 0 "$img" sh -c "grep -rIlE '$SECRET_RE' / --exclude-dir=proc --exclude-dir=sys --exclude-dir=dev --exclude=claude; echo \"grep-rc=\$?\"") || { echo "the file scan could not run"; return 1; }
@@ -287,9 +287,16 @@ hardening_check() {
   echo "$o" | grep -q '^/usr/local/bin/git$' || { echo "git on PATH is not the shim"; return 1; }
   echo "$o" | grep -q 'No such file' || { echo "the real git is still at /usr/bin/git"; return 1; }
   echo "$o" | grep -q '^/usr/local/bin:/usr/bin:/bin$' || { echo "PATH is not set explicitly with the shim first"; return 1; }
+  # the client layer (/opt/ccf, plan C3) is stdlib-only Python 3 and the fence has no other interpreter: python3 must be there at the
+  # PINNED version (image/pins.env), able to `import json` (python3-minimal alone cannot), and must not be a way to a privilege
+  o=$(docker run --rm "$img" sh -c 'python3 --version 2>&1; python3 -c "import json,os,sys,time; print(\"stdlib-ok\")" 2>&1; dpkg-query -W -f="\${Version}\n" python3-minimal libpython3.11-stdlib 2>&1') || { echo "python check could not run"; return 1; }
+  echo "$o" | grep -q '^Python 3\.11\.' || { echo "python3 is not in the image or is not 3.11: $(echo "$o" | head -1)"; return 1; }
+  echo "$o" | grep -qx 'stdlib-ok' || { echo "python3 cannot import the stdlib the client layer needs (json, os, sys, time): $(echo "$o" | sed -n 2p)"; return 1; }
+  echo "$o" | grep -Fqx "$(pin PYTHON3_MINIMAL_VERSION)" || { echo "python3-minimal is not the pinned $(pin PYTHON3_MINIMAL_VERSION)"; return 1; }
+  echo "$o" | grep -Fqx "$(pin LIBPYTHON3_STDLIB_VERSION)" || { echo "libpython3.11-stdlib is not the pinned $(pin LIBPYTHON3_STDLIB_VERSION)"; return 1; }
   return 0
 }
-image_hardening_allow() { local o; o=$(hardening_check "$IMG") || fail "$o"; ok "no setid file, no sudo, empty read-only /opt/ccf, the shim is the only git on an explicit PATH"; }
+image_hardening_allow() { local o; o=$(hardening_check "$IMG") || fail "$o"; ok "no setid file, no sudo, empty read-only /opt/ccf, the shim is the only git on an explicit PATH, python3 at its pinned version with the stdlib the client layer needs"; }
 image_hardening_block() {
   local id
   id=$(build_bad <<'EOF'
@@ -318,6 +325,13 @@ FROM @IMG@
 ENV PATH=/usr/bin:/usr/local/bin
 EOF
 ); must_be_red "a PATH without the shim first" "$id" hardening_check
+  id=$(build_bad <<'EOF'
+FROM @IMG@
+USER 0
+RUN rm -f /usr/bin/python3 /usr/bin/python3.11
+USER 10001
+EOF
+); must_be_red "no python3 for the client layer" "$id" hardening_check
   hardening_check "$IMG" > "$WORK/h.out" 2>&1 || fail "the real image failed: $(cat "$WORK/h.out")"
   ok "each hardening check went red on its bad image and the real image passes"
 }

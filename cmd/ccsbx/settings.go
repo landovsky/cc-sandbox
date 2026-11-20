@@ -25,7 +25,7 @@ func settingsCmd() *cli.Command {
 			f.String("profile", "dev-default", "profile to compile")
 			f.String("base-url", "", "the forwarder's model route (required)")
 			f.String("fetch-url", "", "the forwarder's fetch route, becomes HTTPS_PROXY (optional)")
-			f.String("ccf-cmd", "", "command of the managed ccf MCP server (default /opt/ccf/bin/ccf-mcp)")
+			f.String("ccf-cmd", "", "command of the managed ccf MCP server (default: /usr/bin/python3 -I /opt/ccf/ccf-mcp)")
 			f.String("out", "-", "directory to write both files into, or - to print managed-settings.json")
 		},
 		Run: func(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {

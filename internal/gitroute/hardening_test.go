@@ -611,3 +611,40 @@ func TestCommitHoldsTheProofUntilTheCommitIsMade(t *testing.T) {
 		t.Error("a refused hold did not stop the commit")
 	}
 }
+
+// M1: a range is split exactly as git splits it. A file the fence made with a range-shaped name
+// ("HEAD..main.HEAD", whose pieces are all revisions) must not slip through and be read by git as a
+// path; and a tag with dots is a revision like any other.
+func TestRunForFenceSplitsRangesExactlyAndAlwaysEndsWithDashDash(t *testing.T) {
+	r, gd, wt := repo(t)
+	sh(t, wt, "git", "--git-dir", gd, "branch", "main")
+	sh(t, wt, "git", "--git-dir", gd, "tag", "v1.2")
+	for _, name := range []string{"HEAD..main.HEAD", "HEAD..HEAD.", "a..b.c", "main..HEAD.x", "v1.2...HEAD.y"} {
+		write(t, wt, name, "TOP SECRET in "+name+"\n")
+		out, err := r.RunForFence("diff", name)
+		if err == nil || strings.Contains(out, "SECRET") {
+			t.Errorf("diff %s was answered for the fence: %q %v", name, out, err)
+		}
+	}
+	for _, args := range [][]string{{"diff", "v1.2..HEAD"}, {"diff", "v1.2...main"}, {"diff", "main..HEAD"}, {"diff", "..HEAD"}, {"log", "-1", "v1.2"}} {
+		if _, err := r.RunForFence(args...); err != nil {
+			t.Errorf("git %v was refused: %v", args, err)
+		}
+	}
+	// whatever got past the checks would meet "--": the argument list git is given ends with it
+	log := filepath.Join(t.TempDir(), "args")
+	r2 := &Runner{GitDir: gd, Worktree: wt, Git: fakeGit(t, `for a; do [ "$a" = diff ] && printf '%s\n' "$*" >> `+log+`; done`)}
+	if _, err := r2.RunForFence("diff", "HEAD", "HEAD"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(log)
+	if !strings.HasSuffix(strings.TrimSpace(string(b)), "HEAD HEAD --") {
+		t.Errorf("git was given %q: no -- after the positionals", b)
+	}
+	// N5: git's implicit and explicit no-index reads stay refused for the fence
+	for _, args := range [][]string{{"diff", "--no-index", "HEAD", "HEAD"}, {"diff", "/etc/passwd", "HEAD"}, {"diff", "HEAD", "../x"}} {
+		if _, err := r.RunForFence(args...); err == nil {
+			t.Errorf("git %v was accepted", args)
+		}
+	}
+}

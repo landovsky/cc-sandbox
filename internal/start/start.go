@@ -266,6 +266,12 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		case old.Spec.Workdir.Path != rw:
 			return nil, refuse(BadSpec, "resume: workdir must be the same, the transcript is keyed by it")
 		}
+		// a commit (or a fence) holds the session: a new generation must not start now
+		if rel, err := d.TrySessionLock(old.Sid); err != nil {
+			return nil, refuse(SessionBusy, "resume: %v", err)
+		} else {
+			rel()
+		}
 		cp := *old
 		prev = &cp
 		rec = old

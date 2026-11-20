@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func script(t *testing.T, body string) string {
@@ -22,7 +23,7 @@ func TestDockerRuntimeAsksByTheExactName(t *testing.T) {
 	if ok, err := (DockerRuntime{Docker: d}).Running("s0abcdefgh", 3); err != nil || !ok {
 		t.Fatalf("%v %v", ok, err)
 	}
-	if b, _ := os.ReadFile(log); string(b) != "inspect --format {{.State.Running}} ccsbx-s0abcdefgh-g3\n" {
+	if b, _ := os.ReadFile(log); string(b) != "inspect --type container --format {{.State.Running}} ccsbx-s0abcdefgh-g3\n" {
 		t.Errorf("docker was asked: %q", b)
 	}
 	if ok, err := (DockerRuntime{Docker: script(t, `echo false`)}).Running("s0abcdefgh", 1); err != nil || ok {
@@ -67,5 +68,32 @@ func TestHelperRuntimeAsksRootsStatusVerb(t *testing.T) {
 	}
 	if _, err := (HelperRuntime{}).Running("../x", 1); err == nil {
 		t.Error("a bad sid was sent to root")
+	}
+}
+
+// Docker answers for the generation AND the one before it (one question from the proof).
+func TestDockerRuntimeCoversThePreviousGeneration(t *testing.T) {
+	d := script(t, `case "$*" in *-g3) echo false;; *-g2) echo true;; *) echo "Error: No such object"; exit 1;; esac`)
+	if ok, err := (DockerRuntime{Docker: d}).Running("s0abcdefgh", 3); err != nil || !ok {
+		t.Errorf("a running previous generation was missed: %v %v", ok, err)
+	}
+	if ok, err := (DockerRuntime{Docker: d}).Running("s0abcdefgh", 4); err != nil || ok {
+		t.Errorf("%v %v", ok, err)
+	}
+	// a hung docker is cut off: the question has a deadline
+	hang := script(t, `sleep 30`)
+	start := time.Now()
+	if _, err := (DockerRuntime{Docker: hang}).Running("s0abcdefgh", 1); err == nil || time.Since(start) > 15*time.Second {
+		t.Errorf("a hung docker was waited for: %v after %s", err, time.Since(start))
+	}
+}
+
+func TestHelperRuntimeIsCutOffWhenSudoHangs(t *testing.T) {
+	oldS := SudoBin
+	defer func() { SudoBin = oldS }()
+	SudoBin = script(t, `sleep 30`)
+	start := time.Now()
+	if _, err := (HelperRuntime{}).Running("s0abcdefgh", 1); err == nil || time.Since(start) > 15*time.Second {
+		t.Errorf("a hung sudo was waited for: %v after %s", err, time.Since(start))
 	}
 }

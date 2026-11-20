@@ -6,6 +6,8 @@ package start
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -54,8 +56,8 @@ func TestStoppedProof(t *testing.T) {
 	}
 }
 
-// R6: no pane (as with --launcher none) but the container runs: not stopped. The previous
-// generation's container counts too, and a runtime that cannot answer is a refusal, as is none.
+// R6: no pane (as with --launcher none) but the container runs: not stopped. A runtime that cannot
+// answer is a refusal, as is none.
 func TestStoppedProofAsksTheRuntime(t *testing.T) {
 	d, fl := newDaemon(t)
 	rt := &fakeRuntime{running: map[int]bool{}}
@@ -78,22 +80,14 @@ func TestStoppedProofAsksTheRuntime(t *testing.T) {
 	if err := try(); err == nil || !strings.Contains(err.Error(), "running container") {
 		t.Errorf("a running container with no pane was reported as stopped: %v", err)
 	}
-	rec, _ := d.Load(rep.Sid)
-	rec.Gen = 2 // as after a resume: generation 1 must be gone too
-	if err := d.save(rec); err != nil {
-		t.Fatal(err)
-	}
-	rt.running = map[int]bool{1: true}
-	if err := try(); err == nil || !strings.Contains(err.Error(), "generation 1") {
-		t.Errorf("the previous generation's container was not considered: %v", err)
-	}
 	rt.running, rt.err = map[int]bool{}, fmt.Errorf("docker is down")
 	if err := try(); err == nil || !strings.Contains(err.Error(), "cannot tell") {
 		t.Errorf("a runtime that could not answer was taken as stopped: %v", err)
 	}
 	rt.err = nil
-	if err := try(); err != nil {
-		t.Errorf("stopped everywhere was refused: %v", err)
+	rt.asked = nil
+	if err := try(); err != nil || len(rt.asked) != 1 {
+		t.Errorf("stopped everywhere: %v, the runtime was asked %d times (want 1)", err, len(rt.asked))
 	}
 	d.Runtime = nil
 	if err := try(); err == nil || !strings.Contains(err.Error(), "no way to ask") {
@@ -101,8 +95,11 @@ func TestStoppedProofAsksTheRuntime(t *testing.T) {
 	}
 }
 
-// R6: the lock is held from the proof until the commit is done: a start or resume waits for it.
-func TestStoppedProofHoldsTheSessionLockUntilReleased(t *testing.T) {
+// R6/S2: the per-session lock is held from the proof until the release. While it is, a second proof
+// (a second commit, or the same caller asking again: the lock is NOT re-entrant), a resume of the
+// session and a fence of it are refused with a clear error; a start of ANOTHER session, which the
+// daemon-wide lock would have stalled, is not affected.
+func TestStoppedProofHoldsOnlyTheSessionsLock(t *testing.T) {
 	d, fl := newDaemon(t)
 	d.Runtime = &fakeRuntime{}
 	rep, err := d.Start(spec(nil))
@@ -116,31 +113,75 @@ func TestStoppedProofHoldsTheSessionLockUntilReleased(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := d.StoppedProof(rep.Sid).Hold(); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Errorf("a second hold of the same session did not fail with a clear busy error: %v", err)
+	}
+	if rel, err := d.TrySessionLock(rep.Sid); err == nil {
+		rel()
+		t.Error("a fence could take the lock while a commit held it")
+	}
+	// a resume of this session is refused...
+	_, err = d.Start(spec(func(s *LaunchSpec) { s.RequestID = "rid-2"; s.Resume = &Resume{Sid: rep.Sid} }))
+	if r, ok := err.(*Refusal); !ok || r.Code != SessionBusy {
+		t.Errorf("a resume during a commit: %v", err)
+	}
+	// ...while another session starts at once (nothing daemon-wide is held)
 	done := make(chan error, 1)
 	go func() {
-		_, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "rid-2"; s.Label = "cc-sandbox:b" }))
+		_, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "rid-3"; s.Label = "cc-sandbox:b" }))
 		done <- err
 	}()
 	select {
-	case <-done:
-		t.Fatal("a start ran while the stopped proof was held")
-	case <-time.After(300 * time.Millisecond):
-	}
-	release()
-	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("the start failed after the release: %v", err)
+			t.Fatalf("another session's start failed: %v", err)
 		}
 	case <-time.After(5 * time.Second):
-		t.Fatal("the start never ran after the release")
+		t.Fatal("another session's start waited for the commit")
 	}
-	// and a refused proof does not leave the lock held
+	release()
+	rel, err := d.TrySessionLock(rep.Sid)
+	if err != nil {
+		t.Fatalf("the lock was not released: %v", err)
+	}
+	// a fence holding the lock refuses the proof, the other way round
+	if _, err := d.StoppedProof(rep.Sid).Hold(); err == nil || !strings.Contains(err.Error(), "busy") {
+		t.Errorf("a proof was given while a fence held the lock: %v", err)
+	}
+	rel()
+	// and a refused proof leaves nothing held
 	d.Runtime = &fakeRuntime{running: map[int]bool{1: true}}
 	if _, err := d.StoppedProof(rep.Sid).Hold(); err == nil {
 		t.Fatal("expected a refusal")
 	}
-	if _, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "rid-3"; s.Label = "cc-sandbox:c" })); err != nil {
+	if rel, err := d.TrySessionLock(rep.Sid); err != nil {
 		t.Errorf("a refused proof left the lock held: %v", err)
+	} else {
+		rel()
+	}
+}
+
+// Helper mode: the lock file is root's. The daemon opens it read-only, never creates it and never
+// follows a link.
+func TestHelperModeLockFileIsOpenedReadOnlyAndNeverCreated(t *testing.T) {
+	d, _ := newDaemon(t)
+	d.Root, d.RunDir = "helper", t.TempDir()
+	if _, err := d.TrySessionLock("s0abcdefgh"); err == nil || !strings.Contains(err.Error(), "ccsbx-root creates it") {
+		t.Errorf("a missing lock file in helper mode: %v", err)
+	}
+	if _, err := os.Stat(d.lockPath("s0abcdefgh")); err == nil {
+		t.Error("the daemon created root's lock file")
+	}
+	os.MkdirAll(filepath.Join(d.RunDir, "locks"), 0o755)
+	os.WriteFile(d.lockPath("s0abcdefgh"), nil, 0o644)
+	rel, err := d.TrySessionLock("s0abcdefgh")
+	if err != nil {
+		t.Fatalf("a root-made lock file could not be locked read-only: %v", err)
+	}
+	rel()
+	os.Remove(d.lockPath("s0abcdefgh"))
+	os.Symlink("/etc/hostname", d.lockPath("s0abcdefgh"))
+	if _, err := d.TrySessionLock("s0abcdefgh"); err == nil {
+		t.Error("a symlinked lock file was followed")
 	}
 }

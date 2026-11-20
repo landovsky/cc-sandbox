@@ -470,7 +470,7 @@ func TestRunBlocks(t *testing.T) {
 		{"a profile that is not in this build", func(f *fx) { f.rec.Spec.Profile = "made-up" }, "not approved in this build"},
 		{"a profile name that is a path", func(f *fx) { f.rec.Spec.Profile = "../../etc/passwd" }, ""},
 		{"a profile not approved for the billing mode", func(f *fx) { f.rec.Spec.Billing = "subscription" }, "is not approved for machine"},
-		{"another user's session", func(f *fx) { f.env["SUDO_UID"] = fmt.Sprint(os.Getuid() + 7) }, "may not act"},
+		{"another user's session", func(f *fx) { f.env["SUDO_UID"] = fmt.Sprint(os.Getuid() + 7) }, "no such session"},
 		{"a gen that is not a generation", func(f *fx) { f.rec.Gen = 0 }, "out of range"},
 		{"a record that names another sid", func(f *fx) { f.rec.Sid = "s0zzzzzzzz" }, "names session"},
 	}
@@ -1253,7 +1253,7 @@ func TestStatusSaysRunningOrStopped(t *testing.T) {
 func TestStatusIsRefusedLikeTheOtherVerbs(t *testing.T) {
 	f := newFx(t)
 	f.env["SUDO_UID"] = fmt.Sprint(os.Getuid() + 7)
-	f.wantRefusedMsg("another user's session", "may not act", "status", "--", sid)
+	f.wantRefusedMsg("another user's session", "no such session", "status", "--", sid)
 	f = newFx(t)
 	f.sameNS = false
 	f.wantRefusedMsg("another mount namespace", "mount namespace", "status", "--", sid)
@@ -1269,5 +1269,122 @@ func TestStatusIsRefusedLikeTheOtherVerbs(t *testing.T) {
 		if c, _ := newFx(t).call(a...); c != 64 {
 			t.Errorf("%v: exit %d, want 64", a, c)
 		}
+	}
+}
+
+// ---- the session lock: a commit and a fence exclude each other ----
+
+func holdLock(t *testing.T, f *fx) (release func()) {
+	t.Helper()
+	dir := filepath.Join(f.run, "locks")
+	os.MkdirAll(dir, 0o755)
+	lf, err := os.OpenFile(filepath.Join(dir, sid+".lock"), os.O_RDWR|os.O_CREATE, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	return func() { lf.Close() }
+}
+
+// S1: `sudo ccsbx-root run` while the host holds the session (the stopped proof, during a commit) is
+// refused, before anything is prepared, so a fence cannot start under a commit.
+func TestRunIsRefusedWhileTheSessionLockIsHeld(t *testing.T) {
+	f := newFx(t)
+	release := holdLock(t, f)
+	f.wantRefusedMsg("a run during a commit", "is busy", "run", sid)
+	if _, err := os.Stat(filepath.Join(f.run, "s", sid)); err == nil {
+		t.Error("generation directories were made for a refused run")
+	}
+	release()
+	if c, out := f.call("run", sid); c != 7 {
+		t.Errorf("the run was refused after the lock was released: %d %s", c, out)
+	}
+}
+
+// A run holds the lock for as long as it runs (the fake backend runs inside the call: the lock is
+// released when the verb returns), and the lock file is root's, 0644, in root's directory.
+func TestRunLockFileIsRootsAndNotALink(t *testing.T) {
+	f := newFx(t)
+	var heldDuringRun bool
+	f.fb.beforeStage = func() {
+		lf, err := os.OpenFile(filepath.Join(f.run, "locks", sid+".lock"), os.O_RDWR, 0)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		defer lf.Close()
+		heldDuringRun = syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) != nil
+	}
+	if c, out := f.call("run", sid); c != 7 {
+		t.Fatalf("%d %s", c, out)
+	}
+	if !heldDuringRun {
+		t.Error("the session lock was not held while the fence ran")
+	}
+	if st, err := os.Stat(filepath.Join(f.run, "locks", sid+".lock")); err != nil || st.Mode().Perm() != 0o644 {
+		t.Errorf("%v %v", st, err)
+	}
+	// a symlink planted at the lock file is refused, not followed
+	g := newFx(t)
+	os.MkdirAll(filepath.Join(g.run, "locks"), 0o755)
+	victim := filepath.Join(g.dir, "victim")
+	os.WriteFile(victim, []byte("x"), 0o600)
+	os.Symlink(victim, filepath.Join(g.run, "locks", sid+".lock"))
+	g.wantRefusedMsg("a symlinked lock file", "lock file", "run", sid)
+}
+
+// status makes the lock file (so the daemon, which may only open it read-only, can lock it) and
+// calls a held lock "running".
+func TestStatusCreatesTheLockFileAndSeesAHeldLock(t *testing.T) {
+	f := newFx(t)
+	if c, out := f.call("status", "--", sid); c != 0 || strings.TrimSpace(out) != "stopped" {
+		t.Fatalf("%d %q", c, out)
+	}
+	if _, err := os.Stat(filepath.Join(f.run, "locks", sid+".lock")); err != nil {
+		t.Errorf("status did not make the lock file: %v", err)
+	}
+	release := holdLock(t, f)
+	defer release()
+	if c, out := f.call("status", "--", sid); c != 0 || strings.TrimSpace(out) != "running" {
+		t.Errorf("a held lock is not 'running': %d %q", c, out)
+	}
+}
+
+// S3: status can be turned off on its own; absent that it follows stop (old configs); an explicit
+// listing turns it on.
+func TestStatusCanBeSwitchedOffOnItsOwn(t *testing.T) {
+	f := newFx(t)
+	f.writeConfig("verbs = [\"run\", \"stop\"]\nstatus = \"off\"\n")
+	f.wantRefusedMsg("status = off", "not enabled", "status", "--", sid)
+	if c, _ := f.call("stop", sid); c != 0 {
+		t.Error("turning status off turned stop off")
+	}
+	f = newFx(t)
+	f.writeConfig("verbs = [\"status\"]\n")
+	if c, out := f.call("status", "--", sid); c != 0 {
+		t.Errorf("an explicit status was refused: %d %s", c, out)
+	}
+	f = newFx(t)
+	f.writeConfig("verbs = [\"run\"]\n")
+	f.wantRefusedMsg("neither stop nor status", "not enabled", "status", "--", sid)
+	p := filepath.Join(f.dir, "etc", "bad.toml")
+	put(t, p, "allowed_roots = [\""+f.roots+"\"]\nmachine = \"m\"\nstatus = \"maybe\"\n", 0o644)
+	if _, err := LoadConfig(p, os.Getuid()); err == nil {
+		t.Error("status = maybe was accepted")
+	}
+}
+
+// NIT: "no such session" and "not yours" read the same, so the caller learns nothing about another
+// owner's sessions.
+func TestNoSuchSessionAndNotYoursReadTheSame(t *testing.T) {
+	f := newFx(t)
+	f.env["SUDO_UID"] = fmt.Sprint(os.Getuid() + 7)
+	_, notYours := f.call("status", "--", sid)
+	_, noSuch := f.call("status", "--", "s0doesnotex")
+	strip := func(s string) string { return strings.ReplaceAll(strings.ReplaceAll(s, sid, "X"), "s0doesnotex", "X") }
+	if strip(notYours) != strip(noSuch) {
+		t.Errorf("the two refusals differ:\n%q\n%q", notYours, noSuch)
 	}
 }

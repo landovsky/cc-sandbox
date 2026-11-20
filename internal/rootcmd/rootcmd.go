@@ -130,12 +130,18 @@ func (e *env) prelude(verb string) (who, error) {
 
 // session loads, validates and authorises one session record for the caller.
 func (e *env) session(w who, sid string) (*start.Record, error) {
+	// one text for "there is no such session" and "it is not yours": the caller learns nothing
+	// about another owner's sessions from the difference
+	notYours := refuse("no such session %q (or it is not yours)", sid)
 	rec, err := loadRecord(e.cfg.StateDir, sid, w.service, e.cfg.TrustedUID)
+	if err == errNoRecord {
+		return nil, notYours
+	}
 	if err != nil {
 		return nil, refuse("%v", err)
 	}
 	if !w.mayAct(rec) {
-		return nil, refuse("uid %d may not act on session %s", w.uid, sid)
+		return nil, notYours
 	}
 	if rec.Uid < e.cfg.MinUID || rec.Uid == w.service {
 		return nil, refuse("session %s belongs to uid %d, which is not a login user (min_uid %d, not the service user)", sid, rec.Uid, e.cfg.MinUID)

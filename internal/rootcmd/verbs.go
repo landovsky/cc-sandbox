@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/cli"
@@ -168,6 +169,16 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	if err := e.ensureRunDir(); err != nil {
 		return 0, err
 	}
+	// The session's lock, held for as long as the fence runs: a commit (which holds it while the host
+	// reads the worktree) and a fence exclude each other, and neither waits.
+	lf, err := e.lockFile(rec.Sid)
+	if err != nil {
+		return 0, err
+	}
+	defer lf.Close()
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return 0, refuse("session %s is busy: a commit is in progress or a generation is running", rec.Sid)
+	}
 	seccompFile, err := e.seccomp()
 	if err != nil {
 		return 0, err
@@ -311,6 +322,22 @@ func (e *env) statusCmd() *cli.Command {
 			if err != nil {
 				return fail(stderr, "status", err)
 			}
+			// the session's lock file is made here if it is not there yet (root's, in root's
+			// directory) so the daemon can take the lock on it without creating anything; a held
+			// lock (a fence, or a commit) is "running"
+			if err := e.ensureRunDir(); err != nil {
+				return fail(stderr, "status", err)
+			}
+			lf, err := e.lockFile(rec.Sid)
+			if err != nil {
+				return fail(stderr, "status", err)
+			}
+			defer lf.Close()
+			if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+				fmt.Fprintln(stdout, "running")
+				return cli.ExitOK
+			}
+			syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
 			b := e.d.NewBackend(docker, e.d.Mounter)
 			for g := rec.Gen; g >= 1 && g >= rec.Gen-1; g-- {
 				running, err := b.Running(backend.Spec{Sid: rec.Sid, Gen: g})
@@ -505,4 +532,35 @@ func (e *env) hostNS() error {
 		return refuse("this process is not in the host's mount namespace (a sandboxed unit?): mounts and the workdir would not be the host's. Run ccsbx-root from the host's namespace")
 	}
 	return nil
+}
+
+// lockFile opens (creating it if needed) <RunDir>/locks/<sid>.lock: root's file in root's directory,
+// never a link, never anyone else's. The daemon only ever opens it read-only, which is enough for it
+// to take the lock.
+func (e *env) lockFile(sid string) (*os.File, error) {
+	dir := filepath.Join(e.cfg.RunDir, "locks")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0o755); err != nil {
+		return nil, err
+	}
+	if err := trustedFile(dir, e.cfg.TrustedUID, false); err != nil {
+		return nil, refuse("lock directory: %v", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, sid+".lock"), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o644)
+	if err != nil {
+		return nil, refuse("lock file: %v", err)
+	}
+	st, err := f.Stat()
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if err != nil || !st.Mode().IsRegular() || !ok || int(sys.Uid) != e.cfg.TrustedUID {
+		f.Close()
+		return nil, refuse("lock file for %s is not a regular file owned by root", sid)
+	}
+	if err := f.Chmod(0o644); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
 }

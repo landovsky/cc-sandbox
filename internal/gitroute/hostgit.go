@@ -541,19 +541,18 @@ func (r *Runner) RunForFence(args ...string) (string, error) {
 				break
 			}
 			if strings.HasPrefix(a, "-") {
-				continue // a flag, already allowlisted (and a format value has no revision in it)
+				continue // a flag: checkArgs allowlisted it (--no-index and the like are not on the list)
 			}
-			sides := []string{a}
-			if strings.Contains(a, "..") {
-				sides = strings.FieldsFunc(a, func(r rune) bool { return r == '.' })
-				if len(sides) == 0 {
-					return "", fmt.Errorf("%w: %q names no revision", ErrRefused, a)
-				}
+			sides, isRange := splitRange(a)
+			if isRange {
 				revs += 2
 			} else {
 				revs++
 			}
 			for _, x := range sides {
+				if x == "" {
+					continue // "a.." and "..b": the empty side is HEAD
+				}
 				if err := r.verifyRev(x); err != nil {
 					return "", err
 				}
@@ -571,11 +570,33 @@ func (r *Runner) RunForFence(args ...string) (string, error) {
 			return "", fmt.Errorf("%w: git diff needs two revisions here; one revision or none diffs the worktree", ErrRefused)
 		}
 	}
+	// "--" after the positionals, always: with it git takes every positional as a revision and dies
+	// on one that is not, instead of quietly reading it as a path of the worktree.
+	switch args[0] {
+	case "diff", "show", "log", "rev-list":
+		if !contains(args, "--") {
+			args = append(append([]string{}, args...), "--")
+		}
+	}
 	return r.exec(args...)
 }
 
+// splitRange splits `a...b` and `a..b` exactly as git does (the three-dot form first), so each
+// side is the string git will resolve; a name with other dots in it (v1.2, HEAD..main.HEAD's right
+// side "main.HEAD") stays whole.
+func splitRange(a string) ([]string, bool) {
+	if l, r, ok := strings.Cut(a, "..."); ok {
+		return []string{l, r}, true
+	}
+	if l, r, ok := strings.Cut(a, ".."); ok {
+		return []string{l, r}, true
+	}
+	return []string{a}, false
+}
+
 // verifyRev asks git (bounded, with the hardened environment) whether x names an object. A
-// `<rev>:<path>` is checked as written; anything else as `<x>^{object}`.
+// `<rev>:<path>` is checked as written (checkArgs has already refused a leading ":" , so this never
+// names the index); anything else as `<x>^{object}`.
 func (r *Runner) verifyRev(x string) error {
 	spec := x + "^{object}"
 	if strings.Contains(x, ":") {

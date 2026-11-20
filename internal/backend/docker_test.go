@@ -1292,7 +1292,7 @@ func TestRunningAsksByTheExactNameAndFailsClosed(t *testing.T) {
 	if ok, err := fake("echo true").Running(Spec{Sid: "s0abcdefgh", Gen: 4}); err != nil || !ok {
 		t.Fatalf("%v %v", ok, err)
 	}
-	if b, _ := os.ReadFile(log); string(b) != "inspect --format {{.State.Running}} ccsbx-s0abcdefgh-g4\n" {
+	if b, _ := os.ReadFile(log); string(b) != "inspect --type container --format {{.State.Running}} ccsbx-s0abcdefgh-g4\n" {
 		t.Errorf("%q", b)
 	}
 	if ok, err := fake("echo false").Running(Spec{Sid: "s0abcdefgh", Gen: 4}); err != nil || ok {

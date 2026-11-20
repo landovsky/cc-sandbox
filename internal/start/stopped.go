@@ -1,12 +1,13 @@
 // The proof that a session's fence is stopped, which gitroute.Commit demands before the host
-// runs git that reads the worktree. The daemon owns the session records, the launcher and the
-// session lock, so it is the one place that can say "no generation is running" AND keep it true: the
-// proof takes the session lock when Commit asks and gives it back when the commit is done, so a
-// start or a resume (which take the same lock) wait for the commit instead of racing it.
+// runs git that reads the worktree. The daemon owns the session records and the launcher, and the
+// per-session lock (lock.go) is what KEEPS the answer true: the proof takes it when Commit asks and
+// gives it back when the commit is done, so a fence (ccsbx-root run, ccsbx run) and a start or
+// resume of the same session are refused while the host reads the worktree. The daemon-wide lock is
+// not held (a commit of a big worktree would stall every other session's start).
 //
 // "Stopped" means: the record exists, no pane is alive, and the runtime says neither the current
-// generation's container nor the previous one's is running. Not being able to find that out is a
-// refusal.
+// generation's container nor the previous one's is running; then the session lock is taken without
+// waiting. Not being able to find any of that out is a refusal.
 package start
 
 import (
@@ -25,32 +26,28 @@ func (d *Daemon) StoppedProof(sid string) gitroute.Stopped { return stoppedProof
 
 func (p stoppedProof) Hold() (func(), error) {
 	d := p.d
-	unlock, err := d.lock()
-	if err != nil {
-		return nil, fmt.Errorf("session lock: %v", err)
-	}
-	fail := func(format string, a ...any) (func(), error) {
-		unlock()
-		return nil, fmt.Errorf(format, a...)
-	}
 	r, err := d.Load(p.sid)
 	if err != nil {
-		return fail("session %s: %v", p.sid, err)
+		return nil, fmt.Errorf("no such session %q", p.sid)
 	}
 	if r.Ended == nil && d.Launcher != nil && d.Launcher.Alive(p.sid) {
-		return fail("session %s still has a running pane", p.sid)
+		return nil, fmt.Errorf("session %s still has a running pane", p.sid)
 	}
 	if d.Runtime == nil {
-		return fail("session %s: no way to ask whether its container is running (refusing)", p.sid)
+		return nil, fmt.Errorf("session %s: no way to ask whether its container is running (refusing)", p.sid)
 	}
-	for g := r.Gen; g >= 1 && g >= r.Gen-1; g-- {
-		running, err := d.Runtime.Running(p.sid, g)
-		if err != nil {
-			return fail("session %s: cannot tell whether generation %d is running: %v", p.sid, g, err)
-		}
-		if running {
-			return fail("session %s: generation %d has a running container", p.sid, g)
-		}
+	// one question: the runtime answers for the generation and the one before it. In helper mode
+	// this also makes ccsbx-root create the session's lock file.
+	running, err := d.Runtime.Running(p.sid, r.Gen)
+	if err != nil {
+		return nil, fmt.Errorf("session %s: cannot tell whether it is running: %v", p.sid, err)
 	}
-	return unlock, nil
+	if running {
+		return nil, fmt.Errorf("session %s has a running container", p.sid)
+	}
+	release, err := d.TrySessionLock(p.sid)
+	if err != nil {
+		return nil, fmt.Errorf("session %s: %v", p.sid, err)
+	}
+	return release, nil
 }

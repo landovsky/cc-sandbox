@@ -75,7 +75,7 @@ Step 8 in detail (changed after the PR #2 review):
 - `install` prints `DONE` only after hostd and the signer are really up (it waits up to 10 s). A
   crash-looping hostd gives `NOT DONE` and the undo hint, not a false DONE;
 - known limit after the gate: hostd has no `--ccmsg-bin` (uid `ccsbx` cannot use the owner's bus sockets), so fenced to unfenced-manager messages wait for the hub spoke (B10/B11/M2b);
-- hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall gate is needed (S11).
+- hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
 
@@ -194,12 +194,13 @@ GATES (install refuses while any is unmet)
      $ systemctl daemon-reload
      $ systemctl enable --now ccsbx-signer.socket
 
-[05] U0 hostd unit and firewall
-     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 48 lines)
+[05] U0 hostd unit
+     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 52 lines)
+     # the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced
+     $ runuser -u ccsbx -- sh -c umask\ 077\;\ head\ -c\ 32\ /dev/urandom\ \|\ base64\ \>\ /var/lib/ccsbx/listen.token
      $ systemctl daemon-reload
      $ systemctl enable --now ccsbx-hostd.service
-     # hostd listens on 127.0.0.1:7480 only (with a token file); the firewall rule below is for the tailnet and is harmless while nothing listens there
-     $ ufw allow in on tailscale0 to any port 7480 proto tcp comment ccsbx\ hostd
+     # hostd listens on 127.0.0.1:7480 only (with a token file): no firewall rule is added (least privilege)
 
 [06] U0 sops: a root-owned binary (tomas-writable + sudo-runnable was a root path)
      $ chown root:root /usr/local/bin/sops

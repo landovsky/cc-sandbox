@@ -4,6 +4,7 @@
 package stub
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/machines"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
@@ -22,7 +24,7 @@ import (
 const Usage = `ccsbx stub — the scripted model stub, local mode (C18)
 
 Usage:
-  ccsbx stub --listen 127.0.0.1:PORT --keyring FILE [--aud NAME] [--state FILE]
+  ccsbx stub --listen 127.0.0.1:PORT (--keyring FILE | --machines-dir DIR) [--aud NAME] [--state FILE]
   ccsbx stub --print-catalog
 
 A fake Anthropic Messages API for e2e runs. Put it behind the forwarder as the
@@ -37,6 +39,10 @@ Flags: (each also CCSBX_STUB_<NAME>)
   --listen ADDR      loopback host:port                      (required)
   --keyring FILE     public keys that may sign tokens, with owner/machine scope; make it with
                      'ccsbx token pubkey'. A door never gets a signing key. (default $CCSBX_KEYRING)
+  --machines-dir DIR the trusted-key list (config/machines or its mounted ConfigMap, plan M9) instead of a
+                     keyring file: re-read every 15 s, so a removed key stops working with no restart, and
+                     each key's profile→billing pairs are enforced. Give this or --keyring, not both
+                     (CCSBX_STUB_MACHINES_DIR)
   --aud NAME         audience the token must list            (default ccsbx-stub)
   --state FILE       persist max_gen/revocations here; the stub refuses to start if it can't
                      (default $XDG_STATE_HOME/ccsbx/<aud>-<port>.json, else under ~/.local/state; one door per file)
@@ -69,6 +75,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", envOr("LISTEN", ""), "")
 	keyring := fs.String("keyring", envOr("KEYRING", os.Getenv("CCSBX_KEYRING")), "")
+	machinesDir := fs.String("machines-dir", envOr("MACHINES_DIR", ""), "")
 	aud := fs.String("aud", envOr("AUD", DefaultAud), "")
 	state := fs.String("state", envOr("STATE", ""), "")
 	ownerListen := fs.String("owner-listen", envOr("OWNER_LISTEN", ""), "")
@@ -87,12 +94,27 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "stub: --listen must be a loopback host:port (local mode only), got", *listen)
 		return 2
 	}
-	ring, err := token.LoadPublicKeyring(*keyring)
-	if err != nil {
+	if (*keyring == "") == (*machinesDir == "") {
+		fmt.Fprintln(stderr, "stub: give exactly one of --keyring and --machines-dir")
+		return 2
+	}
+	var ring token.Keyring
+	var rl *machines.Reloader
+	if *machinesDir != "" {
+		if rl, err = machines.NewReloader(*machinesDir); err != nil {
+			fmt.Fprintln(stderr, "stub:", err)
+			return 2
+		}
+		rl.Logf = func(f string, a ...any) { fmt.Fprintf(stderr, f+"\n", a...) }
+		ring = rl.Ring()
+	} else if ring, err = token.LoadPublicKeyring(*keyring); err != nil {
 		fmt.Fprintln(stderr, "stub:", err)
 		return 2
 	}
 	v := token.NewVerifier(ring, *aud)
+	if rl != nil {
+		go rl.Run(context.Background(), v.SetRing)
+	}
 	if err := persist(v, *state, *aud, *listen); err != nil {
 		fmt.Fprintln(stderr, "stub: cannot keep state, refusing to start:", err)
 		return 2

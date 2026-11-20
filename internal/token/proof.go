@@ -73,8 +73,9 @@ func SignProof(g *GenKey, method, path, aud, tok string, body []byte, now time.T
 
 // Verifier is a door's token check. Safe for concurrent use.
 type Verifier struct {
-	ring Keyring
-	aud  string
+	ringMu sync.RWMutex
+	ring   Keyring // swapped whole by SetRing; read through Ring()
+	aud    string
 
 	mu     sync.Mutex
 	nonces map[string]time.Time // nonce → expiry
@@ -87,6 +88,13 @@ type Verifier struct {
 	lock      *os.File // held for the life of the process: one door per state file
 	stateErr  error    // set when the last save failed; the door refuses requests until it clears
 }
+
+// Ring is the keyring in force now. A door built on the trusted-key list (M9) swaps it with SetRing, so
+// a removed key stops verifying at the next request. Callers must not change the returned map.
+func (v *Verifier) Ring() Keyring { v.ringMu.RLock(); defer v.ringMu.RUnlock(); return v.ring }
+
+// SetRing replaces the keyring. A nil or empty ring makes every token fail, which is the safe side.
+func (v *Verifier) SetRing(r Keyring) { v.ringMu.Lock(); v.ring = r; v.ringMu.Unlock() }
 
 // NewVerifier builds a verifier for one door. aud is the door's name
 // (for example "ccsbx-model"); tokens must list it and proofs are bound to it.
@@ -127,7 +135,8 @@ func (v *Verifier) MaxGen(owner, machine, sid string) int {
 // signature checks come first, and the nonce is recorded only after everything else
 // passed, so garbage can't fill the cache.
 func (v *Verifier) Verify(tok, proofHdr, method, path string, body []byte, now time.Time) (*Claims, error) {
-	c, err := parse(tok, v.ring)
+	ring := v.Ring() // one snapshot for this request
+	c, err := parse(tok, ring)
 	if err != nil {
 		return nil, err
 	}
@@ -136,7 +145,7 @@ func (v *Verifier) Verify(tok, proofHdr, method, path string, body []byte, now t
 		return nil, err
 	}
 	// Invariant 27: the signing key must be allowed to speak for this owner and machine.
-	if sc := v.ring[c.kid]; sc.Permits(c) != nil { // the same rule the signer applies
+	if sc := ring[c.kid]; sc.Permits(c) != nil { // the same rule the signer applies
 		return nil, ErrKeyScope
 	}
 	if err := c.validBilling(); err != nil { // invariant 18, checked again at the door

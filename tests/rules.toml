@@ -1647,3 +1647,32 @@ invariants = [5]
 backends = ["unit"]
 where = "hp"
 
+[[rule]]
+id = "machines-list-limits-stolen-key"
+title = "the trusted-key list lets a door refuse what a stolen machine key can sign: foreign machine, billing above the ceiling, a profile or billing outside the pairs"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/machines 'TestReadsAConfigMapVolumeLayout$'"
+block = "tests/go-test.sh ./internal/machines 'TestTheListLimitsAStolenKey$'"
+invariants = [18, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "machines-removed-key-refused"
+title = "a key removed from the trusted-key list stops verifying within minutes, and a list that stays unreadable ends trust"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/machines 'TestRenderAndRingLinesMatchTheRing$'"
+block = "tests/go-test.sh ./internal/machines 'TestRemovedKeyIsRefusedWithinTwoMinutes$|TestABrokenListKeepsTheLastGoodOneOnlyBriefly$|TestFirstLoadFailureStopsTheDoor$'"
+invariants = [18, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "machines-file-refuses-widening"
+title = "a machine file that would widen a key (unknown field, no pairs, pair above the ceiling, shared key, wrong name) is refused"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/machines 'TestReadsAConfigMapVolumeLayout$'"
+block = "tests/go-test.sh ./internal/machines 'TestFilesThatWouldWidenAKeyAreRefused$|TestOneKeyCannotBelongToTwoMachines$'"
+invariants = [18, 27]
+backends = ["unit"]
+where = "any"

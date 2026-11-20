@@ -217,3 +217,18 @@ func TestStubRefusesToRunWithoutDurableState(t *testing.T) {
 		t.Fatalf("no default state file: %v", err)
 	}
 }
+
+// context "a door given both a keyring and the trusted-key list would trust the wider of the two, or
+// neither would be tested": exactly one source is allowed, and a bad list stops the door at start.
+func TestStubTakesExactlyOneKeySource(t *testing.T) {
+	var o, e bytes.Buffer
+	for _, args := range [][]string{
+		{"--listen", "127.0.0.1:0"},
+		{"--listen", "127.0.0.1:0", "--keyring", "/nonexistent", "--machines-dir", t.TempDir()},
+		{"--listen", "127.0.0.1:0", "--machines-dir", t.TempDir()}, // an empty list
+	} {
+		if rc := Main(args, &o, &e); rc != 2 {
+			t.Errorf("%v: rc=%d, want 2 (%s)", args, rc, e.String())
+		}
+	}
+}

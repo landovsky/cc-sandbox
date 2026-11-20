@@ -33,6 +33,7 @@ import (
 	"os"
 	"path"
 	"strconv"
+	"sort"
 	"strings"
 	"time"
 )
@@ -577,4 +578,23 @@ func ValidName(n string) bool {
 		}
 	}
 	return true
+}
+
+// ValidBilling reports whether b is one of the three billings (invariant 18). The trusted-key list
+// uses it so a machine file can't name a fourth.
+func ValidBilling(b string) bool { return b == "api" || b == "subscription" || b == "stub" }
+
+// PairsString writes pairs back in the keyring's `profile:billing|billing,...` form, sorted, so the
+// same pairs always give the same line.
+func PairsString(p map[string][]string) string {
+	names := make([]string, 0, len(p))
+	for n := range p {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	items := make([]string, 0, len(names))
+	for _, n := range names {
+		items = append(items, n+":"+strings.Join(p[n], "|"))
+	}
+	return strings.Join(items, ",")
 }

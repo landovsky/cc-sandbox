@@ -54,8 +54,14 @@ sudo -n /usr/local/sbin/ccsbx-root relay-mint -- <sid> <gen> <pub>
 - Hub address: `hub_url` in `ccsbx-root.toml` (default `http://127.0.0.1:4011`, loopback only; a non-loopback
   host is refused at config load). No redirects followed. Timeout 10 s.
 - Request: `POST <hub_url>/v1/principals` with `Authorization: Bearer <admin secret>` and body
-  `{"role":"relay","sid":"<sid>","gen":"<gen>","pub":"<pub>","may_reach":["<machine>/<node>",...]}`.
-- **`may_reach` is derived by root, never supplied.** For now it is the session's MANAGER node only
+  `{"role":"relay","sid":"<sid>","gen":"<gen>","pub":"<pub>","manager":"<machine>/<node>","may_reach":["<machine>/<node>",...]}`.
+- **`manager` and `may_reach` are derived by root, never supplied.** `manager` is the record's manager as `<machine>/<node>`
+  (omitted when the record places none): the ONE target the hub lets a relay reach when it is UNFENCED. `may_reach` is the manager
+  followed by every placed peer (the record does not say which are fenced): the hub lets a relay reach a FENCED target only if it is in
+  `may_reach` (no more "any fenced session"), an unfenced one only if it equals `manager` and a spoke principal tracked it. A relay also
+  reads `GET /sessions` filtered to those entries and its own session, and is rate-limited at the hub (`SB_RELAY_RATE_PER_MIN`, 429).
+  (Older text below that says the list is the manager only is superseded by this.)
+- **`may_reach` (history):** For now it is the session's MANAGER node only
   (`msg_scope.manager.node`) together with the MACHINE the record binds it to (`msg_scope.manager.machine`, written
   from the owner's start spec, never from the fence), as the one entry `<machine>/<node>`, read by root from the
   SAME record it just validated: machine `[A-Za-z0-9._-]{1,64}`, node `[A-Za-z0-9._#:/-]{1,128}`. A record that

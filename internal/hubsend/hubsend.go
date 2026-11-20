@@ -48,8 +48,8 @@ type Target struct {
 //   - A node the record places on NO machine is not sent to, fenced or not (msg.ErrWrongMachine): a fenced session's
 //     node is only the label its starter gave it, so a decoy from another machine would otherwise receive the report.
 //   - The address is the entry's full uid (its short id is 24 bits of a hash, so another machine's owner can grind a
-//     colliding one): if ANY other entry in the list shares the chosen entry's uid, id or key the node is not sent to
-//     (msg.ErrAmbiguousNode), however many entries hold the node.
+//     colliding one): if ANY other entry's uid, key or id equals that address the node is not sent to
+//     (msg.ErrAmbiguousNode). A shared short id alone does not block: the hub never fans a full uid out.
 func Resolve(entries []map[string]any, node, wantMachine, myMachine string) (Target, error) {
 	var held []int // indexes into entries
 	for i, x := range entries {
@@ -85,7 +85,6 @@ func Resolve(entries []map[string]any, node, wantMachine, myMachine string) (Tar
 	}
 	id, _ := e["id"].(string)
 	sid, _ := e["uid"].(string)
-	key, _ := e["key"].(string)
 	addr := sid
 	if addr == "" {
 		addr = id
@@ -97,8 +96,11 @@ func Resolve(entries []map[string]any, node, wantMachine, myMachine string) (Tar
 		if i == at {
 			continue
 		}
+		// The hub resolves the address we post (the full uid) against every entry's uid, key and id; refuse when
+		// another entry would also answer to it. A shared SHORT id alone is no collision for a full-uid address
+		// (the hub never fans a uid out), so an entry grinding the manager's short id cannot block the send.
 		for _, k := range []string{"uid", "id", "key"} {
-			if v, _ := o[k].(string); v != "" && (v == addr || v == id || v == sid || v == key) {
+			if v, _ := o[k].(string); v != "" && v == addr {
 				return Target{}, msg.ErrAmbiguousNode
 			}
 		}

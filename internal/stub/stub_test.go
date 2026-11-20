@@ -168,6 +168,37 @@ func TestOnlyTheCcfServersToolMatches(t *testing.T) {
 	}
 }
 
+// context "Claude Code exposes the ccf server's tool ccf_outcome as mcp__ccf__ccf_outcome": that real name is the one the scripted
+// call must use (found by the e2e suite: the shorter names alone never matched a real session, so E2E:outcome made no tool call).
+func TestTheRealMcpToolNameIsCalled(t *testing.T) {
+	c := newChain(t, "e2e-basic", "stub")
+	code, out := c.post(t, prompt("E2E:outcome", `[{"name":"mcp__ccf__ccf_outcome","input_schema":{"properties":{"text":{"type":"string"}}}},{"name":"mcp__ccf__ccf_done","input_schema":{}}]`, false))
+	if code != 200 || !strings.Contains(out, "tool_use") || !strings.Contains(out, `"name":"mcp__ccf__ccf_outcome"`) {
+		t.Fatalf("the real MCP tool name was not called: %d %s", code, out)
+	}
+	if strings.Contains(out, "mcp__ccf__ccf_done") {
+		t.Fatalf("called a tool the script did not name: %s", out)
+	}
+}
+
+// context "a real Claude Code request ends with a system-role entry after the user's turn": the script is chosen from the last USER
+// message, not from the array's last entry (found by the e2e suite: every scripted prompt fell through to the default 'hi').
+func TestATrailingSystemEntryDoesNotHideTheUsersTurn(t *testing.T) {
+	var r request
+	body := `{"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>x</system-reminder>"},{"type":"text","text":"E2E:outcome"}]},{"role":"system","content":[{"type":"text","text":"# Environment"}]}]}`
+	if err := json.Unmarshal([]byte(body), &r); err != nil {
+		t.Fatal(err)
+	}
+	if text, tr := r.lastUser(); !strings.Contains(text, "E2E:outcome") || tr {
+		t.Fatalf("lastUser = %q, toolResult %v", text, tr)
+	}
+	body = `{"messages":[{"role":"user","content":"E2E:hi"},{"role":"assistant","content":"prefill"}]}`
+	json.Unmarshal([]byte(body), &r)
+	if text, _ := r.lastUser(); text != "" {
+		t.Fatalf("an assistant entry last is no user turn: %q", text)
+	}
+}
+
 // NIT C18-N2: "local mode" is an IP-literal check; a name is never trusted to be loopback.
 func TestLocalhostNameIsNotTrusted(t *testing.T) {
 	var out, errb bytes.Buffer

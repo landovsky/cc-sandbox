@@ -5,6 +5,8 @@ package settings
 
 import (
 	"encoding/json"
+	"os"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -123,7 +125,7 @@ func TestFreshFenceStartsWithoutPrompts(t *testing.T) {
 	want := map[string]string{
 		"ANTHROPIC_BASE_URL": "http://fwd:8080", "ANTHROPIC_AUTH_TOKEN": "dummy",
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1", "DISABLE_TELEMETRY": "1",
-		"DISABLE_AUTOUPDATER": "1", "HTTPS_PROXY": "http://fwd:8081",
+		"DISABLE_AUTOUPDATER": "1", "HTTPS_PROXY": "http://fwd:8081", "ENABLE_TOOL_SEARCH": "false",
 	}
 	for k, v := range want {
 		if env[k] != v {
@@ -167,4 +169,68 @@ func TestCompileRefusals(t *testing.T) {
 			t.Fatal("compile order depends on profile order")
 		}
 	})
+}
+
+// context "the client layer reports through hooks and the ccf MCP server, and only MANAGED ones count": the compile must wire every
+// event cc-tree reads to /opt/ccf/ccf-hook, the statusLine to /opt/ccf/ccf-statusline, and the one MCP server to the layer's
+// FLAT path (the layer's tar has no bin/, an earlier default pointed at /opt/ccf/bin/ccf-mcp and nothing would have started).
+func TestTheClientLayerIsWiredAtItsFlatPaths(t *testing.T) {
+	s, mcp := compiled(t, prof("bypassPermissions"))
+	hooks, _ := s["hooks"].(map[string]any)
+	if len(hooks) != len(CCFHookEvents) {
+		t.Fatalf("%d hook events, want %d: %v", len(hooks), len(CCFHookEvents), hooks)
+	}
+	for _, ev := range CCFHookEvents {
+		raw, _ := json.Marshal(hooks[ev])
+		if !strings.Contains(string(raw), `"command":"/opt/ccf/ccf-hook `+ev+`"`) {
+			t.Errorf("event %s: %s", ev, raw)
+		}
+	}
+	if sl, _ := s["statusLine"].(map[string]any); sl["command"] != "/opt/ccf/ccf-statusline" || sl["type"] != "command" {
+		t.Errorf("statusLine: %v", s["statusLine"])
+	}
+	if cmd := mcp["mcpServers"].(map[string]any)["ccf"].(map[string]any)["command"]; cmd != "/opt/ccf/ccf-mcp" {
+		t.Errorf("MCP command %v", cmd)
+	}
+	if s["allowManagedHooksOnly"] != true {
+		t.Error("the worktree's own hooks must not count")
+	}
+	r, err := Compile(prof("bypassPermissions"), Params{BaseURL: "http://fwd:8080", CCFDir: "/opt/other"})
+	if err != nil || !strings.Contains(string(r.Settings), "/opt/other/ccf-hook SessionStart") || !strings.Contains(string(r.MCP), "/opt/other/ccf-mcp") {
+		t.Errorf("the layer directory is a parameter: %v %s", err, r.Settings)
+	}
+}
+
+// context "the dotfiles fragment (ccf/managed-settings.json) and this compile each name the hooks": they must say the same thing.
+// CCF_FRAGMENT_DIR points at a dotfiles checkout's ccf/ directory; without it this is a SKIP, with it any drift is red.
+func TestTheDotfilesFragmentSaysWhatTheCompileSays(t *testing.T) {
+	dir := os.Getenv("CCF_FRAGMENT_DIR")
+	if dir == "" {
+		t.Skip("set CCF_FRAGMENT_DIR to a dotfiles checkout's ccf/ directory (e2e/lib.sh passes E2E_CCF)")
+	}
+	read := func(name string) map[string]any {
+		b, err := os.ReadFile(dir + "/" + name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		return m
+	}
+	s, mcp := compiled(t, prof("bypassPermissions"))
+	frag := read("managed-settings.json")
+	for _, k := range []string{"hooks", "statusLine", "allowManagedHooksOnly"} {
+		if !reflect.DeepEqual(frag[k], s[k]) {
+			a, _ := json.Marshal(frag[k])
+			b, _ := json.Marshal(s[k])
+			t.Errorf("%s differs:\n  dotfiles: %s\n  compile:  %s", k, a, b)
+		}
+	}
+	fm := read("managed-mcp.json")["mcpServers"].(map[string]any)["ccf"].(map[string]any)
+	cm := mcp["mcpServers"].(map[string]any)["ccf"].(map[string]any)
+	if fm["command"] != cm["command"] {
+		t.Errorf("MCP command: dotfiles %v, compile %v", fm["command"], cm["command"])
+	}
 }

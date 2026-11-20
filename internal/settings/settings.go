@@ -33,8 +33,15 @@ var BaseDeny = []string{
 type Params struct {
 	BaseURL  string // the forwarder's model route, e.g. http://fwd:8080
 	FetchURL string // the forwarder's fetch route (HTTPS_PROXY); empty = no web fetch route
-	CCFCmd   string // command of the one managed MCP server, "ccf" (default /opt/ccf/bin/ccf-mcp)
+	CCFDir   string // where the client layer is installed in the fence image (default /opt/ccf; read-only, root-owned)
+	CCFCmd   string // command of the one managed MCP server, "ccf" (default <CCFDir>/ccf-mcp)
 }
+
+// CCFHookEvents is the one list of hook events the fence reports (plan C3 / U17): the compile OWNS it, and the dotfiles
+// fragment (ccf/managed-settings.json) is checked against it by a contract test, so the two cannot drift. These are the
+// events cc-tree reads; each runs <CCFDir>/ccf-hook <Event>, which appends one line to the outbox's events.jsonl.
+var CCFHookEvents = []string{"SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Notification", "Stop",
+	"SubagentStart", "SubagentStop", "SessionEnd"}
 
 // Result is the compiled pair of files.
 type Result struct {
@@ -54,8 +61,15 @@ func Compile(p *profile.Profile, par Params) (*Result, error) {
 	if err := checkURL("FetchURL", par.FetchURL, false); err != nil {
 		return nil, err
 	}
+	if par.CCFDir == "" {
+		par.CCFDir = "/opt/ccf"
+	}
 	if par.CCFCmd == "" {
-		par.CCFCmd = "/opt/ccf/bin/ccf-mcp"
+		par.CCFCmd = par.CCFDir + "/ccf-mcp" // the layer is flat: its tar has no bin/
+	}
+	hooks := map[string]any{}
+	for _, ev := range CCFHookEvents {
+		hooks[ev] = []any{map[string]any{"matcher": "", "hooks": []any{map[string]any{"type": "command", "command": par.CCFDir + "/ccf-hook " + ev}}}}
 	}
 	env := map[string]string{
 		"ANTHROPIC_BASE_URL":                       par.BaseURL,
@@ -63,6 +77,9 @@ func Compile(p *profile.Profile, par Params) (*Result, error) {
 		"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
 		"DISABLE_TELEMETRY":                        "1",
 		"DISABLE_AUTOUPDATER":                      "1",
+		// The ccf tools are ten small ones the agent must always have in its first request. Claude Code otherwise defers
+		// MCP tools behind ToolSearch, so a scripted session (the stub) never sees them and a real one spends a round trip.
+		"ENABLE_TOOL_SEARCH": "false",
 	}
 	if par.FetchURL != "" {
 		env["HTTPS_PROXY"] = par.FetchURL
@@ -74,6 +91,8 @@ func Compile(p *profile.Profile, par Params) (*Result, error) {
 		},
 		// Only managed hooks and managed permission rules count; the worktree's can't add or widen.
 		"allowManagedHooksOnly":           true,
+		"hooks":                           hooks,
+		"statusLine":                      map[string]any{"type": "command", "command": par.CCFDir + "/ccf-statusline", "padding": 0},
 		"allowManagedPermissionRulesOnly": true,
 		// Managed MCP is `ccf` only (see managed-mcp.json); worktree .mcp.json servers never load.
 		"allowedMcpServers":                 []map[string]string{{"serverName": "ccf"}},

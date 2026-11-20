@@ -42,15 +42,18 @@ RUN set -eu; \
 # ---- stage 2: the image -------------------------------------------------------------------------
 FROM ${BASE}
 ARG SNAPSHOT
+ARG PYTHON3_MINIMAL_VERSION
+ARG LIBPYTHON3_STDLIB_VERSION
 # Packages come from the dated snapshot archive (apt still verifies the signed Release files with
 # the keyring in the base; the archive's Valid-Until has long passed, hence Check-Valid-Until=false).
 # One RUN, so nothing is created and then deleted in a later layer (a deletion leaves the file in
 # its layer): install, make the apt state go away, strip every setuid/setgid bit (chmod, not rm), move
-# the real git out of PATH (the shim at /usr/local/bin/git is the only caller), add uid 10001.
-RUN set -eu; test -n "$SNAPSHOT" || { echo "SNAPSHOT pin missing: build with image/build.sh" >&2; exit 1; }; \
+# the real git out of PATH (the shim at /usr/local/bin/git is the only caller), add uid 10001. python3 (stdlib only,
+# pinned) is there for the client layer a candidate adds at /opt/ccf; /opt/ccf itself stays EMPTY in this image.
+RUN set -eu; test -n "$SNAPSHOT" -a -n "$PYTHON3_MINIMAL_VERSION" -a -n "$LIBPYTHON3_STDLIB_VERSION" || { echo "SNAPSHOT or python pin missing: build with image/build.sh" >&2; exit 1; }; \
     printf 'Types: deb\nURIs: http://snapshot.debian.org/archive/debian/%s/\nSuites: bookworm bookworm-updates\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n\nTypes: deb\nURIs: http://snapshot.debian.org/archive/debian-security/%s/\nSuites: bookworm-security\nComponents: main\nSigned-By: /usr/share/keyrings/debian-archive-keyring.gpg\n' "$SNAPSHOT" "$SNAPSHOT" > /etc/apt/sources.list.d/debian.sources; \
     apt-get -o Acquire::Check-Valid-Until=false update \
- && apt-get install -y --no-install-recommends ca-certificates git ripgrep jq \
+ && apt-get install -y --no-install-recommends ca-certificates git ripgrep jq "python3-minimal=$PYTHON3_MINIMAL_VERSION" "libpython3.11-stdlib=$LIBPYTHON3_STDLIB_VERSION" \
  && rm -rf /var/lib/apt/lists/* \
  && find / -xdev -type f \( -perm -4000 -o -perm -2000 \) -exec chmod a-s {} + \
  && rm /usr/bin/git \

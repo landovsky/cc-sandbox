@@ -1,13 +1,20 @@
 #!/usr/bin/env bash
 # e2e/03-verbs — hook point 3: tree verbs land on the session's own node and nowhere else (plan §9 item 4).
-# Real tonight: the unfenced verbs on a scratch tree (what the fenced writer must reproduce) and the
-# stub's catalog contract. Skipped: everything from inside a fence.
+# Real: the unfenced verbs on a scratch tree (the baseline) and the stub's catalog; and, with the fence image, python3 in it,
+# the dotfiles client layer (ccf/, delivered as a CANDIDATE image, H2) and a cc-tree with the cockpit (C6): a REAL Claude Code
+# in the fence, driven by the stub ("E2E:outcome" ...), calls the ccf MCP tools; the daemon (ccsbx-hostd run, direct mode,
+# scratch state) queues and journals each as that session's own verb with no identity from the fence; `cc-tree cockpit up` and
+# `cc-tree follow --write` apply them to a scratch tree repo, only to the session's node, exactly once however often replayed.
+# Direct mode: not evidence. Skipped, naming the piece: pods (F4), stale-verb rules on a moved node (C15 case), the Tomas-only
+# verbs' own sender (the owner send box).
 . "$(dirname "$0")/lib.sh"; e2e_init
 cc-tree init e2e "E2E scratch" >/dev/null 2>&1
 a="$(cc-tree add e2e:root --no-derive --title "verbs A" "node a" | awk '/^e2e:/{print $1;exit}')"
 b="$(cc-tree add e2e:root --no-derive --title "verbs B" "node b" | awk '/^e2e:/{print $1;exit}')"
 cc-tree describe "$a" --outcome "RAN only-on-a" >/dev/null 2>&1
 t="$CC_TREE_REPO/e2e/tree.md"
+# block_of REF: the tree.md lines of that node up to the next node line (indented bullets of its own children are kept)
+under() { awk -v id="${1#e2e:}" '$0 ~ "n:"id {f=1; next} f && /<!-- n:/ {f=0} f' "$t"; }
 grep -q "only-on-a" "$t" && ok "an outcome written for node A is recorded" || bad "outcome recorded on A"
 awk -v b="${b#e2e:}" '$0 ~ "n:"b {f=1; next} f && /^ *- \[/ {f=0} f' "$t" | grep -q "only-on-a" \
   && bad "an outcome for A must not appear under B (a verb names only its own node)" \
@@ -16,8 +23,112 @@ if have_stub; then
   "$CCSBX" stub --print-catalog 2>/dev/null | grep -q outcome \
     && ok "the stub's fixed catalog has the 'outcome' script that e2e/03 drives with 'E2E:outcome'" \
     || bad "stub catalog has an outcome script" "$("$CCSBX" stub --print-catalog 2>&1 | head -5)"
-else skip "the stub's catalog has the 'outcome' script" "C18 (stream B, branch n1-b) is not on main yet"; fi
-skip "outcome, question, subtask, checkpoint, rename, mark, done land on the session's own node (say E2E:outcome in a fence)" "needs C5 (ccf MCP) + C6 (verb writer) baked into the image: /opt/ccf is empty, so the stub's tool call has no server to reach (the stub itself is on main and a fenced Claude reaches it: 07-workday)"
-skip "no verb can name another node; Tomas-only verbs are refused from the fence" "needs C5, C7"
-skip "replays are exact across a journal reset and a crash mid-verb" "needs C6 + M4 (verb queue)"
-skip "stale verbs are dropped (older than a human commit, on a moved node, after rename-tree)" "needs C15"
+else skip "the stub's catalog has the 'outcome' script" "C18 is not in this binary"; fi
+
+# ---- the verbs from a FENCED session
+HOSTD="${CCSBX_HOSTD_BIN:-$(dirname "$CCSBX")/ccsbx-hostd}"
+CTD="${E2E_CCTREE:-$HOME/.dotfiles/.worktrees/n1-g-cc}"
+why=""
+have_image || why="the fence image $E2E_IMAGE (U1a local build)"
+[ -z "$why" ] && [ ! -x "$HOSTD" ] && why="bin/ccsbx-hostd (make build)"
+[ -z "$why" ] && [ ! -f "$CTD/bin/lib/cc_tree_cockpit.py" ] && why="a dotfiles checkout with the cockpit and the verb writer, C6 (set E2E_CCTREE; branch n1-g-cc is not on dotfiles main)"
+[ -z "$why" ] && ! e2e_candidate && why="the client layer in a candidate image: $E2E_CAND_WHY"
+if [ -n "$why" ]; then
+  skip "a stub-driven fenced Claude calls the ccf tools, the daemon queues each as the session's own verb and the cockpit applies it to the session's node only" "needs $why"
+else
+  ok "the client layer is a candidate image ($E2E_CAND): the base keeps /opt/ccf empty, the layer is added as a digest (H2)"
+  # the settings compile OWNS the hook list; the dotfiles fragment must say the same (contract test, internal/settings)
+  if command -v go >/dev/null 2>&1 || [ -x "$HOME/.local/go/bin/go" ]; then
+    gout="$(cd "$REPO" && PATH="$PATH:$HOME/.local/go/bin" CCF_FRAGMENT_DIR="$E2E_CCF_USED" go test -count=1 -run TestTheDotfilesFragmentSaysWhatTheCompileSays ./internal/settings 2>&1)"
+    [ $? -eq 0 ] && ok "the dotfiles fragment ($E2E_CCF_USED) says exactly what the settings compile says: the same hooks, statusLine and MCP command" || bad "the dotfiles fragment equals the settings compile" "$gout"
+  else skip "the dotfiles fragment equals the settings compile" "needs the go toolchain"; fi
+  D="$E2E_ROOT/dstate"; mkdir -p "$D"; export CCSBX_STATE="$D"
+  "$HOSTD" run --state "$D" --run-dir "$D" --root direct --machine hp-ubuntu --interval 100ms --worktree-root /var/tmp \
+    --local-socket "$D/hostd.sock" --tmux-socket "e2e-$$" >"$E2E_ROOT/hostd.log" 2>&1 & E2E_PIDS+=("$!")
+  e2e_wait 15 test -S "$D/hostd.sock" || bad "ccsbx-hostd run comes up" "$(tail -3 "$E2E_ROOT/hostd.log")"
+  spec "$a" lid-v1 > "$E2E_ROOT/v1.json"
+  export CCSBX_IMAGE="$E2E_CAND" CCSBX_BASE_URL=http://fwd:8080/stub
+  out="$("$CCSBX" start --json --spec "$E2E_ROOT/v1.json" --run-cmd "sleep 600" 2>&1)"; vsid="$(e2e_sid "$out")"
+  if [ -n "$vsid" ] && e2e_wait 30 docker inspect "ccsbx-$vsid-g1" && e2e_fwd "$vsid"; then
+    c="ccsbx-$vsid-g1"
+    ok "a fenced session for node $a runs the candidate image, with the forwarder and the stub door beside it"
+    docker exec "$c" touch /opt/ccf/x >/dev/null 2>&1 && bad "the fence cannot edit its own hooks: /opt/ccf is read-only" "touch /opt/ccf/x worked" \
+      || ok "the fence cannot edit its own hooks: touch /opt/ccf/x fails (root-owned, read-only)"
+    events() { "$CCSBX" events --socket "$D/hostd.sock" --after 0 --json 2>&1; }
+    cnt() { python3 -c 'import json,sys
+d=json.load(sys.stdin); print(sum(1 for e in d["events"] if e["type"]==sys.argv[1]))' "$1"; }
+    say() { timeout 120 docker exec "$c" claude -p "$1" 2>&1; }
+    cc() { XDG_STATE_HOME="$E2E_ROOT/xdg" CC_EVENTS_DIR="$E2E_ROOT/xdg/ev" CCSBX_BIN="$CCSBX" CCSBX_STATE="$D" CCSBX_REALM=e2e "$CTD/bin/cc-tree" "$@"; }
+
+    # 1. a real session's hooks and the first verb
+    got="$(say "E2E:outcome")"
+    e2e_wait 20 bash -c "'$CCSBX' events --socket '$D/hostd.sock' --after 0 --json | grep -q ccf.outcome"
+    ev="$(events)"
+    [ "$got" = "E2E-DONE" ] && ok "REAL Claude Code in the fence, told 'E2E:outcome', called the ccf_outcome MCP tool through the stub and finished its turn ($got)" || bad "the stub-driven session calls ccf_outcome" "said: $got"
+    for h in SessionStart UserPromptSubmit PreToolUse PostToolUse Stop; do
+      [ "$(cnt hook.$h <<<"$ev")" -ge 1 ] && ok "the real ccf-hook reported hook.$h from a real Claude Code session into the daemon's journal" || bad "hook.$h reached the journal" "$(python3 -c 'import json,sys;print(",".join(e["type"] for e in json.load(sys.stdin)["events"]))' <<<"$ev")"
+    done
+    python3 -c '
+import json,sys
+sid,node=sys.argv[1:3]; d=json.load(sys.stdin)
+o=[e for e in d["events"] if e["type"]=="ccf.outcome"]
+assert len(o)==1, len(o)
+e=o[0]; assert e["src"]=="fence" and e["sid"]==sid and e["node"]==node, e
+assert e["data"]=={"text":"e2e outcome"}, e["data"]
+' "$vsid" "$a" <<<"$ev" 2>"$E2E_ROOT/o.chk" \
+      && ok "the daemon journalled ONE ccf.outcome as that session's own verb (src=fence, sid and node from its record, data only {text})" \
+      || bad "one ccf.outcome with the daemon's identity" "$(cat "$E2E_ROOT/o.chk")"
+    req="$(cat "$D"/s/"$vsid"/g1/out/requests/*.json 2>/dev/null | head -1)"
+    python3 -c 'import json,sys; r=json.loads(sys.argv[1]); assert sorted(r)==["data","rid","type","v"], sorted(r)' "$req" 2>/dev/null \
+      && ok "the request file the fence wrote has no address and no identity: only v, type, rid and data" || bad "the request file carries no address or identity" "$req"
+
+    # 2. the in-fence server refuses an address, and a hand-written request names nobody
+    mcp="$(printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
+      "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"ccf_outcome\",\"arguments\":{\"text\":\"x\",\"node\":\"$b\"}}}" \
+      | docker exec -i -e CCF_WAIT=0.2 "$c" /opt/ccf/ccf-mcp)"
+    grep -q "refused: no such argument: node" <<<"$mcp" && ok "ccf_outcome with a node argument is refused inside the fence: no tool takes an address" || bad "a node argument is refused" "$mcp"
+    docker exec "$c" sh -c "printf '%s' '{\"v\":1,\"type\":\"ccf.outcome\",\"rid\":\"hand1\",\"data\":{\"text\":\"HAND-WRITTEN\",\"node\":\"$b\",\"sid\":\"sEVIL00000\"}}' > /run/ccsbx/out/requests/.hand1.tmp && mv /run/ccsbx/out/requests/.hand1.tmp /run/ccsbx/out/requests/hand1.json"
+    docker exec "$c" sh -c "printf '%s' '{\"v\":1,\"type\":\"ccf.note\",\"rid\":\"note1\",\"data\":{\"text\":\"a Tomas-only verb\"}}' > /run/ccsbx/out/requests/.note1.tmp && mv /run/ccsbx/out/requests/.note1.tmp /run/ccsbx/out/requests/note1.json"
+    e2e_wait 15 test -s "$D/s/$vsid/g1/in/replies/note1.json"
+    nr="$(cat "$D/s/$vsid/g1/in/replies/note1.json" 2>/dev/null)"
+    [ "$(jget status <<<"$nr" 2>/dev/null)" = refused ] && ok "a Tomas-only verb (ccf.note) written by the fence is refused by the daemon: the fence's verbs are a closed list" || bad "ccf.note from the fence is refused" "$nr"
+    e2e_wait 15 bash -c "'$CCSBX' events --socket '$D/hostd.sock' --after 0 --json | grep -q HAND-WRITTEN"
+    python3 -c '
+import json,sys
+sid,node=sys.argv[1:3]; d=json.load(sys.stdin)
+h=[e for e in d["events"] if "HAND-WRITTEN" in json.dumps(e.get("data"))]
+assert len(h)==1 and h[0]["sid"]==sid and h[0]["node"]==node, h
+' "$vsid" "$a" <<<"$(events)" 2>"$E2E_ROOT/h.chk" \
+      && ok "a hand-written request that names another node and sid is journalled under THIS session's own sid and node: the daemon stamps who sent it" \
+      || bad "a hand-written request is stamped with the session's own identity" "$(cat "$E2E_ROOT/h.chk")"
+
+    # 3. the other verbs, from the same real session
+    say "E2E:question" >/dev/null; say "E2E:checkpoint" >/dev/null
+    e2e_wait 20 bash -c "'$CCSBX' events --socket '$D/hostd.sock' --after 0 --json | grep -q ccf.checkpoint"
+    [ "$(cnt ccf.question <<<"$(events)")" = 1 ] && [ "$(cnt ccf.checkpoint <<<"$(events)")" = 1 ] && ok "ccf_question and ccf_checkpoint from the same session are journalled once each" || bad "question and checkpoint journalled" "$(events | head -c 600)"
+
+    # 4. the cockpit applies them to the tree
+    cc cockpit up --wait 3 --no-follow >"$E2E_ROOT/cp.out" 2>&1
+    cc follow --write --once >"$E2E_ROOT/fw.out" 2>&1
+    under "$a" | grep -q "e2e outcome" && ok "cc-tree follow --write (C6) applied the verb to the session's OWN node: its Outcome says 'e2e outcome'" || bad "the outcome reached node A" "$(cat "$E2E_ROOT/fw.out") | $(cat "$E2E_ROOT/cp.out")"
+    under "$a" | grep -q "HAND-WRITTEN" && ok "the hand-written request was applied to the session's own node too (it named nobody), never to node B" || bad "the hand-written request lands on the session's own node" "$(under "$a" | head -5)"
+    under "$b" | grep -q "e2e outcome\|HAND-WRITTEN\|e2e question\|e2e checkpoint" && bad "no verb reaches another node: node B stayed untouched" "$(under "$b" | head -5)" || ok "node B has none of it: a fenced session's verbs reach only its own node"
+    grep -q "e2e question?" "$t" && ok "ccf_question opened a question under the session's task in the tree" || bad "the question is in the tree" "$(grep -n question "$t" | head -3)"
+    ls "$CC_TREE_REPO"/e2e/nodes/"${a#e2e:}"/checkpoints/*.md >/dev/null 2>&1 && grep -rq "e2e checkpoint" "$CC_TREE_REPO"/e2e/nodes/"${a#e2e:}"/checkpoints/ \
+      && ok "ccf_checkpoint wrote a write-once checkpoint file under the session's node" || bad "the checkpoint is a file under the node" "$(ls -R "$CC_TREE_REPO/e2e/nodes" 2>&1 | head -5)"
+    # 5. replay is exact
+    n0="$(git -C "$CC_TREE_REPO" rev-list --count HEAD)"; o0="$(grep -c 'e2e outcome' "$t")"
+    cc follow --write --once --replay-from 0 >/dev/null 2>&1; cc follow --write --once --replay-from 0 >/dev/null 2>&1
+    [ "$(git -C "$CC_TREE_REPO" rev-list --count HEAD)" = "$n0" ] && [ "$(grep -c 'e2e outcome' "$t")" = "$o0" ] \
+      && ok "replaying the whole journal from 0, twice, adds no commit and no second Outcome line (idempotent verbs)" \
+      || bad "a replay from 0 changes nothing" "commits $n0 -> $(git -C "$CC_TREE_REPO" rev-list --count HEAD), outcome lines $o0 -> $(grep -c 'e2e outcome' "$t")"
+    "$CCSBX" stop "$vsid" >/dev/null 2>&1
+  else
+    bad "a fenced session on the candidate image with the forwarder" "$out $(tail -3 "$E2E_ROOT/fwd.log" 2>&1)"
+  fi
+fi
+
+skip "ccf_done from the fence closes the node (a failed Check refuses it, and the refusal reaches the session)" "needs C22 (Check in a fence) for the refusal path; done itself is applied by the writer but is not driven here yet"
+skip "replays stay exact across a journal RESET (a new epoch) and a crash between the steps of one verb" "needs a daemon whose journal can be reset under the cockpit (T:fx-epoch-reset) and a kill point in the verb writer (T:fx-partial); dotfiles tests/cc-tree-cockpit-e2e.sh covers them against a stub daemon"
+skip "stale verbs are dropped (older than a human commit, on a moved node, after rename-tree)" "needs C15 on the base the cockpit runs from (dotfiles n1-g-cc has it; the real-session leg for it is not written)"
+skip "the fence's verbs from a POD reach the cockpit queue" "needs F4 (the in-cluster hostd holds the verb queue; the sidecar answers ccf.* unsupported_in_pod today)"

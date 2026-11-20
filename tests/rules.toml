@@ -1837,3 +1837,23 @@ block = "tests/go-test.sh ./internal/fwd 'TestARoutesFileCannotRouteGit$|TestABr
 invariants = [12]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "settings-wire-the-client-layer"
+title = "the managed settings wire every hook event cc-tree reads to the read-only client layer at /opt/ccf, its statusLine and its one MCP server at the layer's flat paths, and the dotfiles fragment says exactly what the compile says"
+suite = "settings"
+allow = "tests/go-test.sh ./internal/settings 'TestFreshFenceStartsWithoutPrompts$'"
+block = "tests/go-test.sh ./internal/settings 'TestTheClientLayerIsWiredAtItsFlatPaths$|TestTheDotfilesFragmentSaysWhatTheCompileSays$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "stub-calls-the-real-mcp-tool-and-reads-a-real-request"
+title = "the scripted stub calls the ccf tool under the name Claude Code gives it (mcp__ccf__ccf_<verb>), never another server's, and finds the user's turn in a real request that ends with a system-role entry"
+suite = "fence"
+allow = "tests/go-test.sh ./internal/stub 'TestOnlyTheCcfServersToolMatches$'"
+block = "tests/go-test.sh ./internal/stub 'TestTheRealMcpToolNameIsCalled$|TestATrailingSystemEntryDoesNotHideTheUsersTurn$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"

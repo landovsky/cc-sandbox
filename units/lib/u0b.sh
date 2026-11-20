@@ -84,7 +84,7 @@ sock_check() {
 # sign_check — ask the signer for a token for one in-scope test claim and expect {"token":...}: proves the
 # scope loads, the group is allowed and the key signs, not merely that the socket accepts a connection.
 sign_probe_py='import base64,json,os,socket,sys
-claims={"sub":sys.argv[2],"billing":sys.argv[3],"profile":sys.argv[4],"aud":["ccsbx-stub"],"cnf":base64.b64encode(os.urandom(32)).decode()}
+claims={"sub":sys.argv[2],"billing":sys.argv[3],"profile":sys.argv[4],"aud":["ccsbx-stub"],"cnf":base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")}   # base64url, no padding, 32 bytes: the signer refuses anything else
 s=socket.socket(socket.AF_UNIX); s.settimeout(5)
 try:
     s.connect(sys.argv[1]); s.sendall(json.dumps(claims).encode()); s.shutdown(socket.SHUT_WR)

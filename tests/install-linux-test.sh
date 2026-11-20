@@ -340,7 +340,7 @@ for bad_arg in "--profiles|bad prof" "--machine|Bad_Host" "--billings|api;x"; do
   d="$(fx sgbad)"; ins "$d" install --yes "${bad_arg%%|*}" "${bad_arg#*|}" >/dev/null 2>"$d/err"; rc=$?
   t "signer: ${bad_arg%%|*} '${bad_arg#*|}' is refused (exit 3), nothing changed" bash -c '[ '"$rc"' -eq 3 ] && [ ! -s "$1" ]' _ "$d/rec/cmds"
 done
-t "signer: plan prints the scope it will write" bash -c 'grep -q "signer scope:    owners=tomas machines=hp-ubuntu profiles=dev-default,e2e-default billings=api,subscription" <<<"$1"' _ "$(CCSBX_OWNER=tomas "$inst" plan --machine hp-ubuntu 2>&1)"
+t "signer: plan prints the scope it will write" bash -c 'grep -q "signer scope:    owners=tomas machines=hp-ubuntu profiles=dev-default,e2e-default billings=api,subscription,stub" <<<"$1"' _ "$(CCSBX_OWNER=tomas "$inst" plan --machine hp-ubuntu 2>&1)"
 # check asks the signer to sign one in-scope claim (a stub signer on a unix socket in the fake root)
 d="$(fx sgchk)"; mkdir -p "$d/root/run/ccsbx-signer"
 cat > "$tmp/fake-signer.py" <<'PY'
@@ -363,7 +363,7 @@ for mode in ok refuse; do
   kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
   if [ "$mode" = ok ]; then
     t "check: a token for the in-scope test claim is an ok line" grep -q '^ok    signer returned a token for the in-scope test claim' <<<"$out"
-    t "check: the claim it sent has the owner/machine sub, a scope profile and billing, and a cnf" bash -c 'python3 -I -c "import json,sys; c=json.load(open(sys.argv[1])); assert c[\"sub\"].startswith(\"tomas/hp-ubuntu/\") and c[\"billing\"]==\"api\" and c[\"profile\"].startswith(\"dev-\") and c[\"cnf\"] and c[\"aud\"]" "$1"' _ "$d/seen-ok"
+    t "check: the claim it sent has the owner/machine sub, a scope profile and billing, and a cnf" bash -c 'python3 -I -c "import base64,json,sys; c=json.load(open(sys.argv[1])); assert c[\"sub\"].startswith(\"tomas/hp-ubuntu/\") and c[\"billing\"]==\"api\" and c[\"profile\"].startswith(\"dev-\") and c[\"aud\"] and \"=\" not in c[\"cnf\"] and \"+\" not in c[\"cnf\"] and \"/\" not in c[\"cnf\"] and len(base64.urlsafe_b64decode(c[\"cnf\"]+\"=\"))==32 and \"iat\" not in c" "$1"' _ "$d/seen-ok"
   else t "check: a signer that refuses the in-scope claim is a FAIL with its reason (a connect alone is not enough)" grep -q "^FAIL  signer refused or failed the in-scope test claim: claims outside" <<<"$out"; fi
 done
 

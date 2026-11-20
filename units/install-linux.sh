@@ -31,7 +31,7 @@
 #   --allowed-roots A,B   ccsbx-root's workdir roots            (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt)
 #   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
 #   --profiles A,B        profile globs the signer may sign            (CCSBX_PROFILES, default: the names in <repo>/profiles/*.json)
-#   --billings A,B        billings the signer may sign                 (CCSBX_BILLINGS, default api,subscription)
+#   --billings A,B        billings the signer may sign                 (CCSBX_BILLINGS, default api,subscription,stub)
 #   --with-deploy         also the ccsbx-deploy sudoers rule (Q12 = yes, R10c)  (CCSBX_WITH_DEPLOY=1)
 #   --backup DIR          uninstall from this backup (must be under /var/backups/ccsbx-install), not the first one
 #   --purge-keys          uninstall also deletes the keys and the ccsbx-keys user (rotate M9 first!)
@@ -52,7 +52,7 @@ case "${1:-}" in
   *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
-MACHINE="${CCSBX_MACHINE:-}"; PROFILES="${CCSBX_PROFILES:-}"; BILLINGS="${CCSBX_BILLINGS:-api,subscription}"
+MACHINE="${CCSBX_MACHINE:-}"; PROFILES="${CCSBX_PROFILES:-}"; BILLINGS="${CCSBX_BILLINGS:-api,subscription,stub}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in

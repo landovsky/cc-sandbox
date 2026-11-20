@@ -29,6 +29,10 @@ type Command struct {
 	Summary string
 	Recipes string // examples, printed under the flags in --help
 	Setup   func(fs *Flags)
+	// Raw hands every argument after the command name to Run untouched: no flag parsing and no
+	// generic --help. For commands with their own richer flag set and --help (which must still
+	// print a "Flags:" line and run nothing).
+	Raw bool
 	// Run gets the parsed flags and the remaining args.
 	Run func(fs *Flags, args []string, stdout, stderr io.Writer) int
 }
@@ -115,6 +119,9 @@ func (a *App) Main(args []string, stdout, stderr io.Writer) int {
 	}
 	fs := &Flags{FlagSet: flag.NewFlagSet(a.Name+" "+c.Name, flag.ContinueOnError), Getenv: a.Getenv}
 	fs.SetOutput(stderr)
+	if c.Raw {
+		return c.Run(fs, args[1:], stdout, stderr)
+	}
 	if c.Setup != nil {
 		c.Setup(fs)
 	}

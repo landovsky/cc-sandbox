@@ -2,6 +2,10 @@
 // directories, the gitdir and worktree path rules, the home sweep and the orphan reaper. They exist
 // so that every refusal in this package has a block twin that goes red when the check is removed
 // (invariant 23), and none of them needs a docker daemon: they build argv and touch temp dirs only.
+
+// Tests for the docker backend. They guard against the fence's run arguments (mounts, network,
+// env, one outbox per generation, per-node home, worktree bounds) drifting from what the plan says.
+
 package backend
 
 import (

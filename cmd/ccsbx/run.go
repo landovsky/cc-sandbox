@@ -1,3 +1,6 @@
+// run.go is `ccsbx run`: it runs one fence generation on the docker backend, in the foreground. It
+// exists so recording a session (start) and running its container stay separate steps (U1b).
+
 package main
 
 import (

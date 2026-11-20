@@ -1,3 +1,6 @@
+// sweep.go moves steering files (memory, settings, hooks, shell startup) out of a node's home between
+// generations. It exists because a file an agent wrote there must be reviewed, not obeyed (invariant 25).
+
 package backend
 
 import (

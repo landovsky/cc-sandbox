@@ -1,3 +1,6 @@
+// Tests for profile loading. They guard against a profile admitting a machine, billing mode or tool
+// rule it should not, and check that the shipped e2e profile stays inside its limits.
+
 package profile
 
 import (

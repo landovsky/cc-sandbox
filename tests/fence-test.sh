@@ -2,7 +2,7 @@
 # Docker-backend twins for tests/rules.toml (U1b). Direct mode: results are NOT EVIDENCE.
 #
 #   tests/fence-test.sh <rule> <allow|block>
-#   rules: fence-flags no-internet no-dns-exfil outbox-per-gen
+#   rules: fence-flags no-internet no-dns-exfil outbox-per-gen no-token-in-fence
 #   tests/fence-test.sh --help
 #
 # Environment (all optional):
@@ -23,19 +23,7 @@ docker image inspect "$IMG" >/dev/null 2>&1 || { echo "FAIL: image $IMG not pres
 STATE=$(mktemp -d)
 mkdir -p /var/tmp/ccsbx-hello
 PIDS=()
-# Files the fence wrote (uid 10001) can't be removed by the host user: sweep them from a container.
-rmstate() { docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"; }
-cleanup() {
-  docker rm -f "ccsbx-canary-$$" >/dev/null 2>&1   # first: a connected peer blocks the network removal
-  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
-  wait 2>/dev/null   # let ccsbx run finish its own cleanup before we sweep
-  for s in $(cat "$STATE/sids" 2>/dev/null); do
-    docker rm -f "ccsbx-$s-g1" >/dev/null 2>&1
-    docker network rm "ccsbx-net-$s-g1" >/dev/null 2>&1
-    docker network inspect "ccsbx-net-$s-g1" >/dev/null 2>&1 && echo "WARN: network ccsbx-net-$s-g1 left behind" >&2
-  done
-  rmstate
-}
+. "$(dirname "$0")/fence-cleanup.sh"   # cleanup: exact names only, refuses empty or foreign values
 trap cleanup EXIT
 
 fail() { echo "FAIL [$RULE/$TWIN]: $*"; exit 1; }
@@ -187,6 +175,66 @@ outbox-per-gen/block)
   echo "$seen" | head -1 | grep -qx 0 || fail "a new session's out/ is not empty: $seen"
   echo "$seen" | tail -1 | grep -qx 0 || fail "another outbox is visible in the fence: $seen"
   ok "per-generation outbox, rerun refused, new session starts empty";;
+
+no-token-in-fence/allow|no-token-in-fence/block)
+  # The forwarder (with a loopback stub door behind it, local mode) runs as a peer on the fence's
+  # own network under the alias 'fwd', fed its token and key on STDIN. The fence holds neither.
+  sid=$(new_session nt) || fail "start"
+  fence_bg "$sid" sleep 60
+  net=ccsbx-net-$sid-g1
+  [ "$RULE" = no-token-in-fence ] || fail "internal"
+  BINABS=$(readlink -f "$BIN")
+  "$BIN" token mint --key-file "$STATE/dev.key" --sub "tomas/hp-ubuntu/$sid/g1" --label nt --billing stub --profile e2e-test \
+      --aud ccsbx-stub --fwd-secrets > "$STATE/secrets.json" || fail "mint"
+  chmod 0600 "$STATE/dev.key"
+  "$BIN" token pubkey --key-file "$STATE/dev.key" --owners tomas --machines hp-ubuntu --profiles 'e2e-*' --billings stub > "$STATE/keyring" || fail "pubkey"
+  docker run --rm -i --name "ccsbx-fwd-$$" --network "$net" --network-alias fwd \
+      -v "$BINABS:/ccsbx:ro" -v "$STATE/keyring:/keyring:ro" "$IMG" sh -c \
+      '/ccsbx stub --listen 127.0.0.1:8081 --keyring /keyring --state /tmp/stub-state.json & exec /ccsbx fwd --listen :8080 --door stub=http://127.0.0.1:8081' \
+      < "$STATE/secrets.json" >"$STATE/fwd.log" 2>&1 &
+  PIDS+=("$!")
+  call="import urllib.request,json
+r=urllib.request.Request('http://fwd:8080/stub/v1/messages',data=json.dumps({'model':'m','messages':[{'role':'user','content':'E2E:hi'}]}).encode(),headers={'content-type':'application/json'})
+print(urllib.request.urlopen(r,timeout=5).read().decode())"
+  got=""
+  for _ in $(seq 1 25); do got=$(docker exec "ccsbx-$sid-g1" $PY "$call" 2>&1) && break; sleep 0.4; done
+  if [ "$TWIN" = allow ]; then
+    echo "$got" | grep -q STUB-OK || fail "the fence could not use the model door through fwd: $got | fwd.log: $(cat "$STATE/fwd.log")"
+    ok "no-credential call through fwd reached the stub door: STUB-OK"
+  else
+    echo "$got" | grep -q STUB-OK || fail "precondition: fwd path not working, the scan would be vacuous: $got"
+    tok=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$STATE/secrets.json")
+    key=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["key"])' "$STATE/secrets.json")
+    # Everything the fence can read: every process's environ and cmdline, its env, and every
+    # readable regular file on EVERY mount the fence has (read from /proc/mounts: /tmp, the home,
+    # /run/ccsbx/*, the workdir are separate mounts that `find / -xdev` would skip); plus how docker
+    # describes the container.
+    scan='cat /proc/[0-9]*/environ /proc/[0-9]*/cmdline 2>/dev/null; env
+      while read -r _ mp fst _; do
+        case "$fst" in proc|sysfs|devpts|devtmpfs|cgroup|cgroup2|mqueue|securityfs|debugfs|tracefs|bpf|pstore) continue;; esac
+        find "$mp" -xdev -type f -readable -size -2M -exec cat {} + 2>/dev/null
+      done < /proc/mounts'
+    dump_now() { { docker exec "ccsbx-$sid-g1" sh -c "$scan"; docker inspect "ccsbx-$sid-g1"; } | tr '\0' '\n'; }
+    dump=$(dump_now)
+    [ -n "$dump" ] || fail "scan produced nothing"
+    echo "$dump" | grep -qF "$sid" || fail "scan control failed: the fence's own sid is not in the dump, so the scan sees too little"
+    sig=${tok##*.}; pay=$(echo "$tok" | cut -d. -f2)
+    for needle in "$sig" "$pay" "$key" "Bearer ey"; do
+      echo "$dump" | grep -qF -- "$needle" && fail "secret material visible in the fence (needle ${needle:0:12}…)"
+    done
+    # Positive controls (the scan must be able to fail): plant one piece of the token ONLY on each
+    # separate mount the agent writes to, re-run the same scan, and require every piece to show up.
+    # A scan that skips a mount goes red here.
+    docker exec "ccsbx-$sid-g1" sh -c "echo $sig > /tmp/planted" || fail "control: cannot write /tmp in the fence"
+    docker exec "ccsbx-$sid-g1" sh -c "echo $pay > \"\$HOME/planted\"" || fail "control: cannot write the fence's home"
+    d2=$(dump_now)
+    echo "$d2" | grep -qF "$sig" || fail "control: the token planted in /tmp was not found, the scan misses that mount"
+    echo "$d2" | grep -qF "$pay" || fail "control: the token planted in the home was not found, the scan misses that mount"
+    docker exec "ccsbx-$sid-g1" sh -c 'rm -f /tmp/planted "$HOME/planted"'
+    # fwd's own process is not in the fence's pid namespace.
+    docker exec "ccsbx-$sid-g1" sh -c "grep -l '[-][-]door' /proc/[0-9]*/cmdline 2>/dev/null" | grep -q . && fail "the forwarder process is visible from the fence"
+    ok "after a successful model call, no token, key or Bearer header anywhere the fence can read ($(echo "$dump" | wc -l) lines scanned, control found)"
+  fi;;
 
 *) echo "unknown rule/twin: $RULE/$TWIN"; exit 2;;
 esac

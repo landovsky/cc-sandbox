@@ -1,3 +1,6 @@
+// Tests for the ccsbx binary's command table. They guard against a subcommand whose --help
+// starts real work, and against an unbuilt command exiting 0 so a night run reads it as success.
+
 package main
 
 import (

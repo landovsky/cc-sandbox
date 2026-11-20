@@ -1,3 +1,6 @@
+// run.go executes the twins of selected rules and tallies pass, fail and pending. It exists so
+// `ccsbx selftest` and the nightly job share one runner and one definition of red.
+
 package rules
 
 import (

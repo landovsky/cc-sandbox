@@ -1,3 +1,6 @@
+// tty_linux.go answers "is this fd a terminal" on Linux. It exists because the standard library
+// has no such call and the repo takes no third-party modules; tty_darwin.go is the macOS twin.
+
 package main
 
 import (

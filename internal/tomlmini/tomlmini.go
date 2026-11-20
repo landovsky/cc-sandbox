@@ -1,4 +1,6 @@
 // Package tomlmini reads the small TOML subset ccsbx files use (rules.toml, pins.toml).
+// It exists because the repo takes no third-party modules, and these files need only tables,
+// strings, numbers and arrays.
 package tomlmini
 
 import (

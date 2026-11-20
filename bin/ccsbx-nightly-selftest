@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """ccsbx-nightly-selftest: the nightly allow/block run and its morning table (plan §3 P6).
 
+Why it exists: a block that quietly stops blocking must be found the next morning, by name,
+not when it is needed.
+
+
 Runs the legs of one machine set, keeps the result of the night as JSON, and prints (or sends) ONE
 table of at most 70 columns: a row per leg, and under it the name of every red test, so a forced
 red twin is in the morning message by name.  Results of a direct-mode run are "not evidence".

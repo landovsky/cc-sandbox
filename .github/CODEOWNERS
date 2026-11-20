@@ -1,19 +1,43 @@
 # Security-critical paths need Tomas's review (plan §2). Overnight work on these stays a PR.
+# Owner is a single account; with "Require review from Code Owners" on, the author's own approval
+# does not count, so Tomas needs admin bypass on his own PRs. Branch protection decides, not this file.
+# Install scripts live under /units/ (units/install-linux.sh, units/lib/) and are covered by it.
+
+# Isolation core and the host-side path
 /internal/fwd/          @landovsky
 /internal/backend/      @landovsky
 /internal/start/        @landovsky
-/tests/fence-test.sh    @landovsky
-/tests/rules.toml       @landovsky
-/cmd/ccsbx/steering.go  @landovsky
 /internal/gitroute/     @landovsky
 /internal/token/        @landovsky
 /internal/signer/       @landovsky
 /internal/hostd/        @landovsky
 /internal/door/         @landovsky
 /internal/approval/     @landovsky
+/internal/side/         @landovsky
 /cmd/ccsbx-root/        @landovsky
 /cmd/ccsbx-signer/      @landovsky
 /cmd/ccsbx-hostd/       @landovsky
 /units/                 @landovsky
+
+# Entry points that call the backend and the start path
+/cmd/ccsbx/             @landovsky
+
+# What a session may be: profiles, pins, managed settings
+/internal/settings/     @landovsky
+/internal/pins/         @landovsky
+/internal/profile/      @landovsky
+/pins.toml              @landovsky
+/profiles/              @landovsky
+
+# The gate itself: rule runner, catalogue, every test script, build, image, preflight
+/internal/rules/        @landovsky
+/internal/tomlmini/     @landovsky
+/tests/                 @landovsky
+/Makefile               @landovsky
+/image/                 @landovsky
+/bin/ccsbx-preflight    @landovsky
+/bin/ccsbx-harness-bump @landovsky
+/etc/preflight.toml     @landovsky
+
 /.github/CODEOWNERS     @landovsky
 /.claude/settings.json  @landovsky

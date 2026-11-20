@@ -150,3 +150,7 @@ func ParseSpec(b []byte) (*LaunchSpec, error) {
 	}
 	return &s, nil
 }
+
+// ValidSid reports whether s has the shape of a daemon-minted session id. Anything that names a
+// file or a container by sid checks this first.
+func ValidSid(s string) bool { return sidRe.MatchString(s) }

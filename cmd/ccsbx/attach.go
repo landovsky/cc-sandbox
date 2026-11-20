@@ -28,6 +28,14 @@ func socketReachable(path string) bool {
 	return true
 }
 
+// attachSudo and attachRoot are where sudo and the root door are (the installer puts the door at
+// attachRoot); attachExec replaces the process. Tests replace them.
+var (
+	attachSudo = "/usr/bin/sudo"
+	attachRoot = "/usr/local/sbin/ccsbx-root"
+	attachExec = syscall.Exec
+)
+
 var attachSid = regexp.MustCompile(`^s[0-9a-z]{4,32}$`)
 
 func attachCmd() *cli.Command {
@@ -54,19 +62,21 @@ func attachCmd() *cli.Command {
 			// record and attaches that one session as the service uid. Only when the socket is
 			// reachable (a dev run as the same uid) is it attached directly.
 			if tmuxsock.IsPath(sock) && !socketReachable(sock) {
-				if root, err := exec.LookPath("ccsbx-root"); err == nil {
+				if _, err := os.Stat(attachRoot); err == nil {
 					if f.Lookup("read-only").Value.String() == "true" {
 						fmt.Fprintln(stderr, "ccsbx attach: --read-only is not available through ccsbx-root attach")
 						return cli.ExitUsage
 					}
-					if err := syscall.Exec(root, []string{"ccsbx-root", "attach", args[0]}, os.Environ()); err != nil {
+					// ccsbx-root is the one NOPASSWD sudo target and refuses to run unless it is root,
+					// so it is reached through sudo, by absolute path (not through the caller's PATH).
+					if err := attachExec(attachSudo, []string{"sudo", "-n", attachRoot, "attach", args[0]}, os.Environ()); err != nil {
 						fmt.Fprintln(stderr, "ccsbx attach:", err)
 						return cli.ExitFail
 					}
 					return cli.ExitOK
 				}
 				fmt.Fprintf(stderr, "ccsbx attach: the tmux socket %s is not reachable by this user (it belongs to the service uid, mode 0600).\n"+
-					"  The way in is:  ccsbx-root attach %s\n  but ccsbx-root is not installed here (Gate M).\n", sock, args[0])
+					"  The way in is:  sudo -n ccsbx-root attach %s\n  but ccsbx-root is not installed here (Gate M).\n", sock, args[0])
 				return 2
 			}
 			bin, err := exec.LookPath("tmux")

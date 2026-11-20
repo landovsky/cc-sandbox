@@ -1,3 +1,7 @@
+// gc.go finds the containers and networks of generations whose `run` died, and removes them. It
+// exists because a SIGKILL or a crash skips the deferred cleanup, which would leave a fence running
+// with its outbox open and no generation owning it. Only what the daemon has a record of is touched.
+
 package backend
 
 import (
@@ -5,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
@@ -13,6 +18,12 @@ import (
 // Orphan is a container or network of a generation whose `ccsbx run` is gone (SIGKILL, a hard
 // pane kill, a crash): the deferred cleanup never ran, so the fence may still be running with
 // its outbox open and no generation owning it.
+// sidShape is the shape of a daemon-minted session id (the same as start.ValidSid; backend cannot
+// import start). A docker label that is not one is not ours.
+var sidShape = regexp.MustCompile(`^s[0-9a-z]{6,16}$`)
+
+func validSid(s string) bool { return sidShape.MatchString(s) }
+
 type Orphan struct {
 	Kind string // container | network
 	Name string
@@ -43,6 +54,16 @@ func ownerAlive(stateDir, sid string, gen int) bool {
 	return true
 }
 
+// sessionsDir is where the daemon's session records are: <stateDir>/sessions unless the records
+// live elsewhere than the generation directories (ccsbx-root: records are the daemon's, the
+// generation directories are root's).
+func (r *Runner) sessionsDir(stateDir string) string {
+	if r.SessionsDir != "" {
+		return r.SessionsDir
+	}
+	return filepath.Join(stateDir, "sessions")
+}
+
 // Orphans lists containers and networks labelled ccsbx.sid whose sid has a session record under
 // stateDir and whose owning run is dead. Resources of unknown sids (another state dir, another
 // tool) are never listed: gc only touches what this state dir created.
@@ -66,10 +87,18 @@ func (r *Runner) Orphans(stateDir string) ([]Orphan, error) {
 				continue
 			}
 			gen, err := strconv.Atoi(f[2])
-			if err != nil {
+			if err != nil || gen < 1 || gen > 9999 || !validSid(f[1]) {
 				continue
 			}
-			if _, err := os.Stat(filepath.Join(stateDir, "sessions", f[1]+".json")); err != nil {
+			// the name must be the one this sid and gen derive: labels alone are not believed
+			want := Spec{Sid: f[1], Gen: gen}.Container()
+			if k.kind == "network" {
+				want = Spec{Sid: f[1], Gen: gen}.Network()
+			}
+			if f[0] != want {
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(r.sessionsDir(stateDir), f[1]+".json")); err != nil {
 				continue // not ours
 			}
 			if ownerAlive(stateDir, f[1], gen) {
@@ -97,7 +126,11 @@ func (r *Runner) Reap(stateDir string, os_ []Orphan) error {
 			if out, err := exec.Command(r.docker(), args...).CombinedOutput(); err != nil {
 				errs = append(errs, fmt.Sprintf("%s %s: %v: %s", o.Kind, o.Name, err, strings.TrimSpace(string(out))))
 			}
-			_ = Spec{Sid: o.Sid, Gen: o.Gen, StateDir: stateDir}.Close()
+			sp := Spec{Sid: o.Sid, Gen: o.Gen, StateDir: stateDir}
+			if r.Unstage != nil {
+				r.Unstage(sp)
+			}
+			_ = sp.Close()
 		}
 	}
 	if len(errs) > 0 {

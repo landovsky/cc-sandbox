@@ -4,7 +4,6 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -69,17 +68,7 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ccsbx run:", err)
 		return cli.ExitFail
 	}
-	sess, _ := json.MarshalIndent(map[string]any{
-		"id": rec.Reply.ID, "sid": rec.Sid, "gen": rec.Gen, "label": rec.Label, "machine": d.Machine,
-		"owner": rec.Spec.Owner, "billing": rec.Spec.Billing, "profile": rec.Spec.Profile, "bus_id": "",
-	}, "", "  ")
-	files := map[string][]byte{
-		"managed/managed-settings.json": res.Settings, "managed/managed-mcp.json": res.MCP,
-		"in/session.json": sess, "in/scope.json": append(append([]byte(nil), rec.Spec.MsgScope...), '\n'),
-	}
-	if rec.Spec.Brief != nil {
-		files["in/brief.md"] = []byte(rec.Spec.Brief.Text + "\n")
-	}
+	files := rec.FenceFiles(d.Machine, res.Settings, res.MCP)
 	cmd := args
 	if len(cmd) == 0 {
 		cmd = append([]string{"claude"}, rec.Spec.HarnessArgs...)
@@ -88,7 +77,7 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 	spec := backend.Spec{
 		Sid: rec.Sid, Label: rec.Label, Gen: rec.Gen, Image: get("image"), StateDir: d.StateDir,
 		Workdir: rec.Spec.Workdir.Path, GitDir: rec.GitDir, Uid: rec.Uid, WorktreeRoot: d.WorktreeRoot,
-		MemoryMB: p.MemoryMB, Pids: p.Pids, Cmd: cmd, TTY: tty, NotEvid: d.Root != "helper",
+		MemoryMB: p.MemoryMB, Pids: p.Pids, Cmd: cmd, TTY: tty, NotEvid: d.Root != "helper", Class: backend.ClassOf(p.E2E),
 	}
 	if spec.NotEvid {
 		fmt.Fprintln(stderr, "ccsbx run: direct mode, NOT EVIDENCE (invariant 14 waived)")

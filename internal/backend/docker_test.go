@@ -9,6 +9,7 @@
 package backend
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -302,9 +303,9 @@ func TestMovedParsesSweepOutput(t *testing.T) {
 }
 
 // U1b-N1: the 0777 leaves are a direct-mode compromise (the fence's uid 10001 does not own them).
-// Helper mode wants 10001:10001 0700 leaves made by ccsbx-root. Until that exists, Prepare must
-// refuse in helper mode rather than quietly ship the direct-mode permissions.
-func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
+// Helper mode (ccsbx-root, as root) makes out/ and the home 10001:10001 0700, in/ and managed/
+// root-owned 0755, and nothing world-writable.
+func TestDirectModeLeavesAre0777(t *testing.T) {
 	d := spec(t)
 	if err := d.Prepare(); err != nil {
 		t.Fatal(err)
@@ -315,13 +316,52 @@ func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
 			t.Fatalf("direct mode leaf %s: %v %v", l, st, err)
 		}
 	}
+}
+
+// Helper mode (the block twin of the above): nothing is 0777 and the fence's directories are the
+// fence's, made fresh and chowned only after creation.
+func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
 	h := spec(t)
 	h.NotEvid = false // helper mode
-	if err := h.Prepare(); err == nil {
-		t.Fatal("helper mode created generation dirs with the direct-mode 0777 leaves")
+	owners := map[string][2]int{}
+	h.Chown = func(p string, uid, gid int) error { owners[p] = [2]int{uid, gid}; return nil }
+	if err := h.Prepare(); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(h.GenDir()); err == nil {
-		t.Fatal("helper mode left a generation directory behind after refusing")
+	want := map[string]struct {
+		mode os.FileMode
+		own  [2]int
+	}{
+		filepath.Join(h.GenDir(), "out"):     {0o700, [2]int{FenceUID, FenceUID}},
+		filepath.Join(h.GenDir(), "in"):      {0o755, [2]int{0, 0}},
+		filepath.Join(h.GenDir(), "managed"): {0o755, [2]int{0, 0}},
+		h.HomeDir():                          {0o700, [2]int{FenceUID, FenceUID}},
+	}
+	for p, w := range want {
+		st, err := os.Stat(p)
+		if err != nil || st.Mode().Perm() != w.mode {
+			t.Errorf("%s: %v %v, want %v", p, st, err, w.mode)
+		}
+		if owners[p] != w.own {
+			t.Errorf("%s chowned to %v, want %v", p, owners[p], w.own)
+		}
+	}
+	if st, _ := os.Stat(h.GenDir()); st.Mode().Perm() != 0o711 {
+		t.Errorf("the generation dir is %v, want 0711 (traversable by name, not listable)", st.Mode().Perm())
+	}
+	// a later generation reuses the home and must not chown the fence's files again
+	h2 := h
+	h2.Gen = 2
+	owners = map[string][2]int{}
+	if err := h2.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if _, again := owners[h.HomeDir()]; again {
+		t.Error("generation 2 chowned the existing home")
+	}
+	// the same generation twice is refused, as in direct mode
+	if err := h.Prepare(); err == nil {
+		t.Error("a generation directory was reused in helper mode")
 	}
 }
 
@@ -541,5 +581,356 @@ func TestPrepareRechecksTheRecordedGitDirOnResume(t *testing.T) {
 	s.Gen = 2
 	if err := s.Prepare(); err == nil {
 		t.Error("generation 2 mounted a gitdir whose hooks became world-writable")
+	}
+}
+
+// Stop removes exactly the container and network named from sid and gen. A fake docker records
+// its argv, so no daemon is needed.
+func TestStopRemovesExactNames(t *testing.T) {
+	d := vt(t)
+	log := filepath.Join(d, "log")
+	fake := filepath.Join(d, "docker")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho \"$@\" >> "+log+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Docker: fake}
+	if err := r.Stop(Spec{Sid: "s0abcdefgh", Gen: 3}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(log)
+	if string(b) != "rm -f ccsbx-s0abcdefgh-g3\nnetwork rm ccsbx-net-s0abcdefgh-g3\n" {
+		t.Fatalf("docker was asked: %q", b)
+	}
+}
+
+// S6: the node home is keyed by owner, class and label. The same label under another owner, or in
+// the e2e class, must be another directory, or a candidate image would read and write a production
+// node's transcripts and one owner could open another's.
+func TestHomeIsKeyedByOwnerClassAndLabel(t *testing.T) {
+	a := spec(t)
+	a.Uid, a.Class = 1000, "prod"
+	same := a
+	if a.HomeDir() != same.HomeDir() {
+		t.Fatal("the home is not stable")
+	}
+	b := a
+	b.Uid = 1001
+	c := a
+	c.Class = "e2e"
+	d := a
+	d.Label = "other"
+	for name, x := range map[string]Spec{"another owner": b, "the e2e class": c, "another label": d} {
+		if x.HomeDir() == a.HomeDir() {
+			t.Errorf("%s shares the home", name)
+		}
+	}
+	if ClassOf(true) != "e2e" || ClassOf(false) != "prod" {
+		t.Error("ClassOf")
+	}
+}
+
+// M1: docker is given the staging paths when there are any, and the container still sees the
+// original paths.
+func TestRunArgsMountTheStagedSources(t *testing.T) {
+	s := spec(t)
+	s.GitDir = "/h/repo/.git/worktrees/x"
+	s.MountWorkdir, s.MountGitDir = "/stage/wt", "/stage/gd"
+	a := s.RunArgs()
+	if !has(a, "--mount", "type=bind,src=/stage/wt,dst="+s.Workdir) || !has(a, "--mount", "type=bind,src=/stage/gd,dst="+s.GitDir+",readonly") {
+		t.Errorf("%v", a)
+	}
+	for _, x := range a {
+		if x == "type=bind,src="+s.Workdir+",dst="+s.Workdir {
+			t.Error("the original workdir path is still mounted")
+		}
+	}
+}
+
+// M2: helper mode has no container sweep at all: SweepArgs (the root-in-container sweep with
+// extra capabilities) is not reachable there.
+func TestHelperModeNeverBuildsTheContainerSweep(t *testing.T) {
+	h := spec(t)
+	h.NotEvid = false
+	defer func() {
+		if recover() == nil {
+			t.Error("SweepArgs was built in helper mode")
+		}
+	}()
+	h.SweepArgs()
+}
+
+// M2: the direct-mode sweep script no longer opens the quarantine to everyone.
+func TestSweepScriptDoesNotChmod(t *testing.T) {
+	if strings.Contains(sweepScript, "chmod") {
+		t.Error("the sweep script changes modes")
+	}
+}
+
+// M2: the helper-mode sweep moves each steering path, and a symlinked parent as the link it is,
+// and never follows a link out of the home.
+func TestSweepHomeGo(t *testing.T) {
+	s := spec(t)
+	s.NotEvid = false
+	s.Chown = func(string, int, int) error { return nil }
+	if err := s.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	h := s.HomeDir()
+	outside := filepath.Join(vt(t), "outside")
+	os.MkdirAll(outside, 0o755)
+	os.WriteFile(filepath.Join(outside, "settings.json"), []byte("host file"), 0o644)
+	os.MkdirAll(filepath.Join(h, ".claude"), 0o755)
+	os.WriteFile(filepath.Join(h, ".claude", "CLAUDE.md"), []byte("obey"), 0o644)
+	os.WriteFile(filepath.Join(h, ".bashrc"), []byte("evil"), 0o644)
+	os.Symlink(outside, filepath.Join(h, ".config")) // a symlink named like steering: moved as a link
+	os.MkdirAll(filepath.Join(h, ".claude", "projects"), 0o755)
+	os.WriteFile(filepath.Join(h, ".claude", "projects", "t.jsonl"), []byte("transcript"), 0o644)
+	m, err := s.sweepHomeGo()
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := s.QuarantineDir()
+	for _, p := range []string{".claude/CLAUDE.md", ".bashrc"} {
+		if _, err := os.Stat(filepath.Join(q, p)); err != nil {
+			t.Errorf("%s was not moved: %v", p, err)
+		}
+		if _, err := os.Lstat(filepath.Join(h, p)); err == nil {
+			t.Errorf("%s is still in the home", p)
+		}
+	}
+	if l, err := os.Readlink(filepath.Join(q, ".config")); err != nil || l != outside {
+		t.Errorf("the symlink was not moved as a link: %q %v", l, err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(outside, "settings.json")); string(b) != "host file" {
+		t.Error("the sweep wrote through a symlink")
+	}
+	if _, err := os.Stat(filepath.Join(h, ".claude", "projects", "t.jsonl")); err != nil {
+		t.Error("the transcript store was swept (resume needs it)")
+	}
+	if len(m) != 3 {
+		t.Errorf("moved %v", m)
+	}
+	if st, _ := os.Stat(q); st.Mode().Perm() != 0o700 {
+		t.Errorf("the quarantine is %v, want 0700", st.Mode().Perm())
+	}
+	// a run again finds nothing to move
+	if m, err := s.sweepHomeGo(); err != nil || len(m) != 0 {
+		t.Errorf("second sweep: %v %v", m, err)
+	}
+}
+
+// M2: a home whose steering parent was replaced by a symlink (.claude -> elsewhere) is moved as
+// that link; the sweep does not descend into it.
+func TestSweepHomeGoParentSymlink(t *testing.T) {
+	s := spec(t)
+	s.NotEvid = false
+	s.Chown = func(string, int, int) error { return nil }
+	if err := s.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(vt(t), "outside")
+	os.MkdirAll(outside, 0o755)
+	os.WriteFile(filepath.Join(outside, "CLAUDE.md"), []byte("host"), 0o644)
+	os.Symlink(outside, filepath.Join(s.HomeDir(), ".claude"))
+	m, err := s.sweepHomeGo()
+	if err != nil || len(m) != 1 || m[0] != ".claude" {
+		t.Fatalf("%v %v", m, err)
+	}
+	if _, err := os.Stat(filepath.Join(outside, "CLAUDE.md")); err != nil {
+		t.Error("the sweep moved a file out of a directory behind a symlink")
+	}
+}
+
+// N1: a docker label is not believed on its own: gc ignores a resource whose sid or gen is not
+// of the right shape, or whose name is not the one that sid and gen derive.
+func TestGcIgnoresForgedLabels(t *testing.T) {
+	d := vt(t)
+	state := filepath.Join(d, "state")
+	os.MkdirAll(filepath.Join(state, "sessions"), 0o700)
+	os.WriteFile(filepath.Join(state, "sessions", "s0abcdefgh.json"), []byte("{}"), 0o600)
+	fake := filepath.Join(d, "docker")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = ps ]; then\n" +
+		"printf 'ccsbx-s0abcdefgh-g1\\ts0abcdefgh\\t1\\n'\n" + // good
+		"printf 'ccsbx-evil\\ts0abcdefgh\\t1\\n'\n" + // name does not match the label
+		"printf 'ccsbx-s0abcdefgh-g99999\\ts0abcdefgh\\t99999\\n'\n" + // gen out of range
+		"printf 'ccsbx-..-g1\\t..\\t1\\n'\n" + // sid is a path
+		"fi\n"
+	os.WriteFile(fake, []byte(script), 0o755)
+	o, err := (&Runner{Docker: fake}).Orphans(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(o) != 1 || o[0].Name != "ccsbx-s0abcdefgh-g1" {
+		t.Fatalf("%+v", o)
+	}
+}
+
+// M2 end to end: a helper-mode run sweeps in Go and never starts a container for it, and the
+// staging hook runs before docker is asked for anything and is undone after.
+func TestHelperRunHasNoSweepContainerAndStagesFirst(t *testing.T) {
+	d := vt(t)
+	log := filepath.Join(d, "log")
+	fake := filepath.Join(d, "docker")
+	os.WriteFile(fake, []byte("#!/bin/sh\necho \"$@\" >> "+log+"\n"), 0o755)
+	s := spec(t)
+	s.NotEvid = false
+	s.Chown = func(string, int, int) error { return nil }
+	var order []string
+	r := &Runner{Docker: fake, Stage: func(Spec) (func(), error) {
+		order = append(order, "stage")
+		b, _ := os.ReadFile(log)
+		if len(b) != 0 {
+			t.Error("docker was called before the staging")
+		}
+		return func() { order = append(order, "undo") }, nil
+	}}
+	if code, err := r.Run(s); err != nil || code != 0 {
+		t.Fatalf("%d %v", code, err)
+	}
+	b, _ := os.ReadFile(log)
+	for _, l := range strings.Split(strings.TrimSpace(string(b)), "\n") {
+		if strings.Contains(l, "--cap-add") || strings.Contains(l, "--user 0:0") || strings.Contains(l, "sweep") {
+			t.Errorf("a sweep container was started: %s", l)
+		}
+	}
+	if strings.Join(order, ",") != "stage,undo" {
+		t.Errorf("order %v", order)
+	}
+	// a staging failure stops the run before docker is touched
+	s2 := spec(t)
+	s2.NotEvid = false
+	s2.Chown = func(string, int, int) error { return nil }
+	os.Remove(log)
+	r2 := &Runner{Docker: fake, Stage: func(Spec) (func(), error) { return nil, os.ErrPermission }}
+	if _, err := r2.Run(s2); err == nil {
+		t.Error("a failed staging did not stop the run")
+	}
+	if _, err := os.Stat(log); err == nil {
+		t.Error("docker ran after the staging failed")
+	}
+}
+
+// M2: the helper-mode run moves steering files out of the home by itself (in Go), before the
+// container starts, with no sweep container.
+func TestHelperRunSweepsTheHomeInGo(t *testing.T) {
+	d := vt(t)
+	fake := filepath.Join(d, "docker")
+	os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755)
+	s := spec(t)
+	s.NotEvid = false
+	s.Chown = func(string, int, int) error { return nil }
+	os.MkdirAll(s.HomeDir(), 0o700)
+	os.WriteFile(filepath.Join(s.HomeDir(), ".bashrc"), []byte("evil"), 0o644)
+	if _, err := (&Runner{Docker: fake}).Run(s); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(s.QuarantineDir(), ".bashrc")); err != nil {
+		t.Errorf("the steering file was not quarantined by the run: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(s.HomeDir(), ".bashrc")); err == nil {
+		t.Error("the steering file is still in the home")
+	}
+}
+
+// S2 host layer: a fence that left a setuid or setgid file in the worktree has the bits cleared,
+// by walking with directory fds, without following links and without touching the owner's own files.
+func TestStripSetidClearsPlantedBits(t *testing.T) {
+	d := vt(t)
+	os.MkdirAll(filepath.Join(d, "a", "b"), 0o755)
+	planted := []string{"x", "a/y", "a/b/z"}
+	for _, p := range planted {
+		os.WriteFile(filepath.Join(d, p), []byte("#!/bin/sh\n"), 0o755)
+		os.Chmod(filepath.Join(d, p), os.ModeSetuid|os.ModeSetgid|0o755)
+	}
+	os.WriteFile(filepath.Join(d, "mine"), nil, 0o755)
+	os.Chmod(filepath.Join(d, "mine"), os.ModeSetuid|0o755)
+	outside := filepath.Join(vt(t), "target")
+	os.WriteFile(outside, nil, 0o755)
+	os.Chmod(outside, os.ModeSetuid|0o755)
+	os.Symlink(outside, filepath.Join(d, "link"))
+	os.Symlink(filepath.Dir(outside), filepath.Join(d, "dirlink"))
+	os.MkdirAll(filepath.Join(d, "sgdir"), 0o755)
+	os.Chmod(filepath.Join(d, "sgdir"), os.ModeSetgid|0o755)
+	root, err := os.Open(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	// "owner" is someone else, so every file of this test user counts as planted by the fence...
+	var logged []string
+	n, err := stripSetid(root, os.Getuid()+1, os.Getuid(), func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) })
+	if err != nil || n != 4 { // x, a/y, a/b/z and mine
+		t.Fatalf("cleared %d: %v", n, err)
+	}
+	for _, p := range append(planted, "mine") {
+		if st, _ := os.Stat(filepath.Join(d, p)); st.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
+			t.Errorf("%s still has a setid bit", p)
+		}
+	}
+	if len(logged) != 4 || !strings.Contains(logged[0], "cleared setuid/setgid") {
+		t.Errorf("not every change was logged: %q", logged)
+	}
+	if st, _ := os.Stat(outside); st.Mode()&os.ModeSetuid == 0 {
+		t.Error("the sweep followed a symlink out of the worktree")
+	}
+	if st, _ := os.Stat(filepath.Join(d, "sgdir")); st.Mode()&os.ModeSetgid == 0 {
+		t.Error("a directory's setgid bit was cleared (only regular files are)")
+	}
+	if st, _ := os.Stat(filepath.Join(d, "x")); st.Mode().Perm() != 0o755 {
+		t.Errorf("the other mode bits changed: %v", st.Mode())
+	}
+}
+
+// The owner's own files are left alone: a setuid binary the owner built is theirs to keep.
+func TestStripSetidLeavesTheOwnersFiles(t *testing.T) {
+	d := vt(t)
+	os.WriteFile(filepath.Join(d, "mine"), nil, 0o755)
+	os.Chmod(filepath.Join(d, "mine"), os.ModeSetuid|0o755)
+	root, _ := os.Open(d)
+	defer root.Close()
+	if n, err := stripSetid(root, os.Getuid(), os.Getuid(), nil); err != nil || n != 0 {
+		t.Fatalf("%d %v", n, err)
+	}
+	if st, _ := os.Stat(filepath.Join(d, "mine")); st.Mode()&os.ModeSetuid == 0 {
+		t.Error("the owner's own setuid file was changed")
+	}
+}
+
+// Run's seccomp flag is present only when a profile is given.
+func TestRunArgsSeccomp(t *testing.T) {
+	s := spec(t)
+	if has(s.RunArgs(), "--security-opt", "seccomp=/etc/ccsbx/seccomp.json") {
+		t.Error("a seccomp flag without a profile")
+	}
+	s.Seccomp = "/etc/ccsbx/seccomp.json"
+	if !has(s.RunArgs(), "--security-opt", "seccomp=/etc/ccsbx/seccomp.json") {
+		t.Errorf("%v", s.RunArgs())
+	}
+}
+
+// R3: only what the fence owns is touched. A hardlink in the worktree to a setuid file of someone
+// else (with fs.protected_hardlinks=0, /usr/bin/sudo is one) is the same inode: clearing its bit
+// would clear it for the whole system.
+func TestStripSetidLeavesHardlinkedFilesOfOthers(t *testing.T) {
+	d, elsewhere := vt(t), vt(t)
+	target := filepath.Join(elsewhere, "sudo")
+	os.WriteFile(target, nil, 0o755)
+	os.Chmod(target, os.ModeSetuid|0o755)
+	if err := os.Link(target, filepath.Join(d, "innocent-name")); err != nil {
+		t.Skipf("no hardlinks here: %v", err)
+	}
+	root, _ := os.Open(d)
+	defer root.Close()
+	// the fence is "someone else" than the owner of this file, as uid 10001 is not root
+	n, err := stripSetid(root, os.Getuid()+1, os.Getuid()+2, nil)
+	if err != nil || n != 0 {
+		t.Fatalf("%d %v", n, err)
+	}
+	if st, _ := os.Stat(target); st.Mode()&os.ModeSetuid == 0 {
+		t.Error("a hardlinked setuid file of another owner lost its bit")
+	}
+	if FenceUID != 10001 {
+		t.Error("the production strip must be the fence's uid")
 	}
 }

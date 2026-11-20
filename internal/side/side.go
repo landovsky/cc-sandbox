@@ -79,6 +79,28 @@ type Config struct {
 type secrets struct {
 	Token string `json:"token"`
 	Key   string `json:"key"` // base64 of the 32-byte generation seed
+	// RelayToken is the hub relay credential ("sbp1."...) for this generation, minted by ccsbx-root pod-load
+	// with pub = this generation key's public half. Optional: without it the sidecar can't send on the bus.
+	// It arrives in the same one load as the rest, lives in memory only, and is never logged or journalled
+	// (the journal gets a hash).
+	RelayToken string `json:"relay_token,omitempty"`
+}
+
+// MaxRelayToken bounds the relay credential (a principal token is a few hundred bytes).
+const MaxRelayToken = 4 << 10
+
+// validRelayToken checks the shape only (the hub is the judge of the rest): the sbp1. prefix, printable
+// ASCII with no whitespace or control bytes, a sane size.
+func validRelayToken(t string) bool {
+	if !strings.HasPrefix(t, "sbp1.") || len(t) <= len("sbp1.") || len(t) > MaxRelayToken {
+		return false
+	}
+	for i := 0; i < len(t); i++ {
+		if t[i] <= ' ' || t[i] >= 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 type reply struct {
@@ -97,6 +119,7 @@ type Server struct {
 	loadCh  chan struct{} // closed once the secrets are in
 	failed  chan error    // the forwarder died
 	fwdp    atomic.Pointer[fwd.Forwarder]
+	relay   atomic.Pointer[RelayCred]
 	failLog appendFailures
 	logs    int // fwd.denied summaries written (Serve's goroutine only)
 	lastDen int64
@@ -226,6 +249,21 @@ func (s *Server) Serve(ctx context.Context) error {
 	}
 }
 
+// RelayCred is what the bus sender needs: the relay credential and the generation key that signs stamps.
+type RelayCred struct {
+	Token string
+	Key   *token.GenKey
+}
+
+// Relay returns the relay credential once the load brought one (ok is false before the load, or when the
+// load carried none). The caller must not log or journal the token.
+func (s *Server) Relay() (RelayCred, bool) {
+	if c := s.relay.Load(); c != nil {
+		return *c, true
+	}
+	return RelayCred{}, false
+}
+
 // note journals one lifecycle fact; a failing journal is logged and ignored (it observes, it does not gate).
 func (s *Server) note(typ string, data map[string]any) {
 	if s.cfg.Journal == nil {
@@ -339,6 +377,9 @@ func (s *Server) load(sec secrets) error {
 	}
 	priv := ed25519.NewKeyFromSeed(seed)
 	gk := &token.GenKey{Private: priv, Public: priv.Public().(ed25519.PublicKey)}
+	if sec.RelayToken != "" && !validRelayToken(sec.RelayToken) {
+		return errors.New("relay_token is not a relay credential")
+	}
 	c, err := token.UnverifiedClaims(sec.Token)
 	if err != nil {
 		return errors.New("token is not a session token")
@@ -364,11 +405,19 @@ func (s *Server) load(sec secrets) error {
 	mf.Close()
 	var h http.Handler = f
 	s.fwdp.Store(f)
+	if sec.RelayToken != "" {
+		s.relay.Store(&RelayCred{Token: sec.RelayToken, Key: gk})
+	}
 	s.handler.Store(&h)
 	s.expiry.Store(c.Exp)
 	s.loaded.Store(true)
 	sum := sha256.Sum256([]byte(c.Cnf))
-	s.note("fwd.loaded", map[string]any{"cnf": hex.EncodeToString(sum[:8]), "exp": c.Exp}) // a hash, never the key or token
+	ld := map[string]any{"cnf": hex.EncodeToString(sum[:8]), "exp": c.Exp, "relay": sec.RelayToken != ""} // hashes, never the key or a token
+	if sec.RelayToken != "" {
+		rs := sha256.Sum256([]byte(sec.RelayToken))
+		ld["relay_hash"] = hex.EncodeToString(rs[:8])
+	}
+	s.note("fwd.loaded", ld)
 	close(s.loadCh)
 	return nil
 }

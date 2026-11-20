@@ -1767,3 +1767,43 @@ block = "tests/go-test.sh ./internal/side 'TestRelayRefusesWhatTheOutboxChecksRe
 invariants = [12]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "side-bus-sends-signed-within-scope"
+title = "a pod's message to another machine goes out only to the record's manager or peers, signed by the generation key with the relay token, capped per node, with a 401 final and no retry, a refused presence read reported as itself, and a squatter on another machine getting nothing"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/side 'TestAPodMessageToTheManagerIsStampedAndPostedWithTheRelayToken$'"
+block = "tests/go-test.sh ./internal/side 'TestAnOutOfScopeNodeNeverReachesTheHub$|TestWithoutARelayCredentialNothingIsSent$|TestA401IsFinalInAPodAndIsJournalled$|TestA403FromTheHubIsFinalAndDropped$|TestAHubThatWontListSessionsIsNotReportedAsADroppedMessage$|TestASquatterOnAnotherMachineGetsNothing$|TestFailureFactsAreBoundedAndCarryNoMessageText$|TestAFloodToOneNodeIsCappedLikeHostdAndCostsTheHubNothing$|TestAPeerIsReachableOnItsOwnMachineOnly$|TestANodeOnThisMachineIsNotReportedAsSent$|TestTwoSessionsOnTheNodeMeansNoGuessing$|TestABusIDIsRefusedEvenNextToAValidNode$|TestTheOutboxRelayHandsAMsgSendToTheBus$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "side-relay-token-one-load-never-logged"
+title = "the hub relay credential arrives in the sidecar's one load, is shape-checked before anything is installed, and never reaches a log or the journal (a hash only)"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/side 'TestALoadWithoutARelayTokenStillWorks$'"
+block = "tests/go-test.sh ./internal/side 'TestRelayTokenArrivesInTheOneLoadAndStaysOutOfLogsAndJournal$|TestAMalformedRelayTokenIsRefusedAndDoesNotSpendTheLoad$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "side-session-journal-no-body"
+title = "the sidecar's session journal records each relay decision and the forwarder's lifecycle with the minted id and the sidecar's identity, never a request body, a header or a token, and stays bounded under a flood"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/side 'TestRelayRecordsReplayFromTheRealJournal$'"
+block = "tests/go-test.sh ./internal/side 'TestRelayJournalsEachDecisionWithTheMintedIDAndNoBody$|TestRelayJournalNeverHoldsABodyOnAnyRefusalPath$|TestRelayShedSummariesInTheJournalAreBounded$|TestDeniedSummariesAreBoundedAndCarryNoRequestData$|TestForwarderLifecycleIsJournalled$|TestRelayLogsAFailingJournalOnceNotPerRequest$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "side-serve-wires-relay-journal-bus"
+title = "`ccsbx side serve` runs the forwarder, the session journal, the outbox relay and the bus sender together, refuses a half-wired configuration, a scope with an unplaced node, state under a fence-writable mount or in a directory that is not ours and private, before anything listens, and waits for the relay's last journal write before it ends"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/side 'TestServeRunsTheForwarderTheRelayTheBusAndTheJournalTogether$'"
+block = "tests/go-test.sh ./internal/side 'TestServeRefusesAHalfWiredConfiguration$|TestScopeMustPlaceEveryNode$|TestUsageNamesTheNewFlags$|TestServeRefusesStateWhereTheFenceCanWrite$|TestServeRequiresItsStateToBePrivate$|TestServeMakesItsStateDirectoriesUnderAnOpenVolumeRoot$|TestServeRefusesMisconfigurationsThatWouldFailSilently$|TestServeWritesTheRelaysFinalShedSummaryBeforeItEnds$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"

@@ -5,7 +5,6 @@ Every check has an id (C-R<n> after the R-step it proves), the gates it belongs 
 (evening, morning, post-M1) and what a failure does: abort (the night doesn't start), skip
 (only the dependent pieces are parked and listed) or warn.  Checks only READ.  `--help` and
 `--list` print the table and run nothing: no process, no file, no connect.
-It exists so a missing prerequisite stops the night at the evening gate, not at 03:00.
 
 Recipes:
   ccsbx-preflight --evening                 the evening gate; exit 1 if anything failed

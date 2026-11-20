@@ -6,6 +6,7 @@ package signer
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -507,7 +508,7 @@ func TestHelpAndEnv(t *testing.T) {
 		t.Fatal("help")
 	}
 	for _, fl := range []string{"--keys", "--systemd-socket", "--socket", "--init", "--write-scope", "--owners", "--machines",
-		"--pairs", "--scope", "--audiences", "--max-ttl", "--allow-user", "--allow-group", "--max-request", "--timeout", "CCSBX_SIGNER_"} {
+		"--pairs", "--scope", "--audiences", "--max-ttl", "--allow-user", "--allow-group", "--keys-peer-user", "--keys-peer-machines", "--max-request", "--timeout", "CCSBX_SIGNER_"} {
 		if !strings.Contains(out.String(), fl) {
 			t.Errorf("--help lacks %s", fl)
 		}
@@ -672,5 +673,128 @@ func TestWriteScopeDestinationMustBeExplicit(t *testing.T) {
 	t.Setenv("CCSBX_SIGNER_SCOPE", filepath.Join(dir, ScopeName))
 	if Main(args, &out, &errb) != 0 {
 		t.Fatalf("a destination inside KEYS was refused: %s", errb.String())
+	}
+}
+
+// ---- the pod launcher as a second caller (F2w) ----
+
+// peers makes a signer in which the test process plays one of two uids: asHostd=true means the
+// process is the hostd uid and the keys peer is somebody else, false the other way round. future-two
+// is in the key's scope and belongs to the keys peer.
+func peers(t *testing.T, asHostd bool) *rig {
+	t.Helper()
+	me, other := uint32(os.Getuid()), uint32(os.Getuid())+1
+	return newRig(t, func(c *Config) {
+		c.Scope.Machines = append(c.Scope.Machines, "future-two")
+		c.KeysMachines = []string{"future-two"}
+		if asHostd {
+			c.AllowUID, c.KeysUID = me, &other
+		} else {
+			c.AllowUID, c.KeysUID = other, &me
+		}
+	})
+}
+
+func (r *rig) onMachine(m string) []byte {
+	return r.claims(func(c *token.Claims) { c.Sub = "tomas/" + m + "/sSIGN/g1" })
+}
+
+// context "hostd must not end up holding a pod session's token and key": the machine the pod launcher
+// owns is closed to hostd, while hostd keeps signing for its own machine.
+func TestHostdCannotSignForThePodMachine(t *testing.T) {
+	r := peers(t, true)
+	if out := r.ask(t, r.onMachine("hp-ubuntu")); out.Token == "" {
+		t.Fatalf("hostd lost its own machine: %+v", out)
+	}
+	out := r.ask(t, r.onMachine("future-two"))
+	if out.Token != "" || !strings.Contains(out.Error, "pod launcher") {
+		t.Fatalf("hostd got a pod-session token: %+v", out)
+	}
+}
+
+// context "the launcher asks for exactly its pod sessions": only its own machines, only with a cnf,
+// and still inside the key's scope (owner, profile and billing pair).
+func TestThePodLauncherSignsOnlyPodSessionsBoundToAKey(t *testing.T) {
+	r := peers(t, false)
+	if out := r.ask(t, r.onMachine("future-two")); out.Token == "" {
+		t.Fatalf("allow twin: %+v", out)
+	}
+	if out := r.ask(t, r.onMachine("hp-ubuntu")); out.Token != "" {
+		t.Error("the pod launcher signed for hostd's machine")
+	}
+	if out := r.ask(t, r.claims(func(c *token.Claims) { c.Sub = "tomas/future-two/sSIGN/g1"; c.Cnf = "" })); out.Token != "" || !strings.Contains(out.Error, "generation key") {
+		t.Errorf("the pod launcher's no-cnf request: %+v (refused by its own rule, not by chance)", out)
+	}
+	for why, mod := range map[string]func(*token.Claims){
+		"another owner": func(c *token.Claims) { c.Sub = "mallory/future-two/sSIGN/g1" },
+		"a pair off the scope": func(c *token.Claims) {
+			c.Sub = "tomas/future-two/sSIGN/g1"
+			c.Profile, c.Billing = "e2e-default", "api"
+		},
+	} {
+		if out := r.ask(t, r.claims(mod)); out.Token != "" {
+			t.Errorf("%s was signed for the pod launcher", why)
+		}
+	}
+}
+
+// context "a third uid": neither caller, refused as before.
+func TestAThirdUIDIsRefusedEvenWithTheKeysPeerConfigured(t *testing.T) {
+	r := newRig(t, func(c *Config) {
+		a, b := uint32(os.Getuid())+1, uint32(os.Getuid())+2
+		c.Scope.Machines = append(c.Scope.Machines, "future-two")
+		c.AllowUID, c.KeysUID, c.KeysMachines = a, &b, []string{"future-two"}
+	})
+	if out := r.ask(t, r.onMachine("future-two")); out.Token != "" {
+		t.Error("a third uid was served")
+	}
+}
+
+func TestKeysPeerConfigurationIsChecked(t *testing.T) {
+	me := uint32(os.Getuid())
+	k, _, err := Init(keyDir(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := Config{Key: k, Audiences: []string{"a"}, MaxTTL: time.Hour, MaxRequest: 10, ReadTimeout: time.Second, AllowUID: me}
+	other := me + 1
+	for why, mod := range map[string]func(*Config){
+		"a keys peer with no machines":   func(c *Config) { c.KeysUID = &other },
+		"machines with no keys peer":     func(c *Config) { c.KeysMachines = []string{"future-two"} },
+		"the keys peer is the hostd uid": func(c *Config) { c.KeysUID, c.KeysMachines = &me, []string{"future-two"} },
+	} {
+		c := base
+		mod(&c)
+		if _, err := New(c); err == nil {
+			t.Errorf("%s was accepted", why)
+		}
+	}
+}
+
+// The client builds what the sidecar's load reads, and the key never crosses the socket.
+func TestMintFwdSecretsBindsTheTokenToAKeyTheClientHolds(t *testing.T) {
+	r := peers(t, false)
+	var sent token.Claims
+	sign := func(ctx context.Context, c token.Claims) (string, error) {
+		sent = c
+		return Client{Socket: r.sock}.Sign(ctx, c)
+	}
+	b, err := MintFwdSecrets(context.Background(), sign, token.Claims{Sub: "tomas/future-two/sSIGN/g1", Billing: "api", Profile: "dev-default", Aud: []string{"ccsbx-model"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s map[string]string
+	if json.Unmarshal(b, &s) != nil || len(s) != 2 || s["token"] == "" {
+		t.Fatalf("%s", b)
+	}
+	seed, err := base64.StdEncoding.DecodeString(s["key"])
+	if err != nil || len(seed) != 32 {
+		t.Fatalf("key %q: %v", s["key"], err)
+	}
+	if sent.Cnf == "" || strings.Contains(r.log(), s["key"]) || strings.Contains(r.log(), s["token"]) {
+		t.Errorf("cnf %q, or a secret reached the signer's log", sent.Cnf)
+	}
+	if _, err := (Client{Socket: r.sock + "x"}).Sign(context.Background(), sent); err == nil {
+		t.Error("a missing socket signed")
 	}
 }

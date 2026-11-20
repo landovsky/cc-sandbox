@@ -40,6 +40,8 @@ type fakePod struct {
 	deleted  [][3]string
 	delErr   error
 	uid      string
+	gone     bool
+	goneEr   error
 }
 
 func (p *fakePod) note(s string) { *p.order = append(*p.order, s) }
@@ -67,6 +69,9 @@ func (p *fakePod) Get(context.Context, string, int) (*k8s.Status, error) {
 }
 func (p *fakePod) LiveUID(context.Context, string, int) (string, error) {
 	p.note("live")
+	if p.gone {
+		return "", k8s.ErrNotFound
+	}
 	return p.liveUID, p.liveErr
 }
 func (p *fakePod) Delete(_ context.Context, sid string, gen int, uid string) error {
@@ -127,6 +132,7 @@ func newPodFx(t *testing.T) *podFx {
 	f.writeConfigPod(t, true, "")
 	pf.pod = &fakePod{order: &pf.order, liveUID: podUID, uid: "new-uid-1", phases: []k8s.Status{ready}}
 	f.rec.PodUID, f.rec.Spec.Owner = podUID, "tomas"
+	f.env["SUDO_UID"] = fmt.Sprint(svcUID) // hostd: pod-create and pod-load are its steps
 	f.writeRecord()
 	pf.wire()
 	return pf
@@ -141,7 +147,7 @@ func (f *fx) writeConfigPod(t *testing.T, side bool, extra string) {
 	if side {
 		img = fmt.Sprintf("k8s_side_image = %q\n", sideImg)
 	}
-	f.writeConfig(fmt.Sprintf("kubectl = %q\nkubeconfig = %q\nk8s_conn = %q\nkeys_user = \"ccsbx-keys\"\nk8s_namespace = \"cc-sandbox\"\n%s%shub_secret = %q\nverbs = [\"run\", \"stop\", \"attach\", \"pod-create\", \"pod-load\", \"pod-stop\"]\n",
+	f.writeConfig(fmt.Sprintf("kubectl = %q\nkubeconfig = %q\nk8s_conn = %q\nkeys_user = \"ccsbx-keys\"\nk8s_namespace = \"cc-sandbox\"\n%s%shub_secret = %q\nverbs = [\"run\", \"stop\", \"attach\", \"pod-create\", \"pod-load\", \"pod-stop\", \"pod-status\"]\n",
 		f.dir+"/bin/kubectl", f.dir+"/keys/launcher.kubeconfig", f.dir+"/etc/k8s-conn.json", img, extra, f.dir+"/etc/hub.secret"))
 	// the config rewrite made a fresh Deps: carry over the k8s fakes of newK8sFx
 	f.d.LookupUser, f.d.LivePodUID, f.d.DropPrivs, f.d.Exec = old.LookupUser, old.LivePodUID, old.DropPrivs, old.Exec
@@ -557,3 +563,67 @@ func TestPodStopRevokesTheRelayBeforeTheDrop(t *testing.T) {
 type failTransport struct{}
 
 func (failTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, errors.New("down") }
+
+// pod-create and pod-load are hostd's (or root's): the owner re-running them would mint tokens at will
+// or take the pod's name before hostd does. pod-stop stays open to the owner.
+func TestOnlyHostdOrRootCreatesAndLoadsAPod(t *testing.T) {
+	for _, verb := range []string{"pod-create", "pod-load"} {
+		pf := newPodFx(t)
+		if verb == "pod-create" {
+			pf.rec.PodUID = ""
+			pf.writeRecord()
+		}
+		pf.env["SUDO_UID"] = fmt.Sprint(pf.rec.Uid) // the owner
+		pf.refused("the owner runs "+verb, verb, "for the service user")
+		if len(pf.dropped) != 0 || len(pf.pod.created) != 0 || len(pf.minted) != 0 {
+			t.Errorf("%s: acted for the owner", verb)
+		}
+	}
+	pf := newPodFx(t)
+	pf.env["SUDO_UID"] = fmt.Sprint(pf.rec.Uid)
+	if code, out := pf.call("pod-stop", sid); code != 0 {
+		t.Errorf("the owner could not stop their pod: %d %s", code, out)
+	}
+	pf = newPodFx(t)
+	delete(pf.env, "SUDO_UID") // root by login
+	if code, out := pf.call("pod-load", sid); code != 0 {
+		t.Errorf("root by login: %d %s", code, out)
+	}
+}
+
+// ---- pod-status, and stop for a pod session ----
+
+func TestPodStatusSaysPresentOrAbsentAndNeverActs(t *testing.T) {
+	pf := newPodFx(t)
+	pf.env["SUDO_UID"] = fmt.Sprint(pf.rec.Uid) // the owner may ask
+	if code, out := pf.call("pod-status", sid); code != 0 || strings.TrimSpace(out) != "present" {
+		t.Errorf("present: %d %q", code, out)
+	}
+	pf.pod.gone = true
+	if code, out := pf.call("pod-status", sid); code != 0 || strings.TrimSpace(out) != "absent" {
+		t.Errorf("absent: %d %q", code, out)
+	}
+	pf.pod.gone = false
+	pf.pod.liveUID = "a-planted-pod"
+	pf.refused("another pod under the name", "pod-status", "pod_conflict")
+	pf = newPodFx(t)
+	pf.rec.PodUID = ""
+	pf.writeRecord()
+	pf.refused("no UID recorded", "pod-status", "no pod UID")
+	if len(pf.pod.deleted)+len(pf.pod.created)+len(pf.pod.loads) != 0 {
+		t.Error("pod-status changed something")
+	}
+}
+
+// The owner's `ccsbx stop` is root's `stop`: for a pod session it deletes the pod by name and UID, and
+// docker is not involved.
+func TestStopOfAPodSessionDeletesThePodAndTouchesNoDocker(t *testing.T) {
+	pf := newPodFx(t)
+	pf.env["SUDO_UID"] = fmt.Sprint(pf.rec.Uid)
+	if code, out := pf.call("stop", sid); code != 0 || !strings.Contains(out, "deleted") {
+		t.Fatalf("%d %s", code, out)
+	}
+	if len(pf.pod.deleted) != 1 || pf.pod.deleted[0] != [3]string{sid, "2", podUID} || len(pf.fb.stopped) != 0 {
+		t.Errorf("deleted %v, docker stops %d", pf.pod.deleted, len(pf.fb.stopped))
+	}
+}

@@ -113,6 +113,9 @@ func (e *env) podCreate(sid string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	if err := e.serviceOrRoot(w, "pod-create"); err != nil {
+		return err
+	}
 	if rec.Ended != nil {
 		return refuse("session %s has ended", sid)
 	}
@@ -191,6 +194,9 @@ func (e *env) podLoadCmd() *cli.Command {
 func (e *env) podLoad(sid string, stdout io.Writer) error {
 	w, rec, err := e.podSession("pod-load", sid)
 	if err != nil {
+		return err
+	}
+	if err := e.serviceOrRoot(w, "pod-load"); err != nil {
 		return err
 	}
 	if rec.Ended != nil {
@@ -387,5 +393,71 @@ func (e *env) podStop(sid string, stdout io.Writer) error {
 		return podErr(err)
 	}
 	fmt.Fprintln(stdout, "deleted")
+	return nil
+}
+
+// serviceOrRoot: pod-create and pod-load are hostd's steps of a start. The session's owner has no use for
+// them, and a re-run by the owner would mint a fresh signed token on every call or create the pod before
+// hostd does (leaving hostd's own create to fail on a pod it does not own). pod-stop stays open to the owner.
+func (e *env) serviceOrRoot(w who, verb string) error {
+	if w.uid != w.service && w.uid != 0 {
+		return refuse("%s is for the service user (hostd) or root; the owner stops a pod session with pod-stop", verb)
+	}
+	return nil
+}
+
+func (e *env) podStatusCmd() *cli.Command {
+	return &cli.Command{
+		Name:    "pod-status",
+		Summary: "print present or absent for a pod session's pod (read-only)",
+		Recipes: `  sudo -n /usr/local/sbin/ccsbx-root pod-status s0k1dry66qg
+  Takes only the sid. Prints "present" if a live pod of the record's generation has the recorded UID,
+  "absent" if there is none, and refuses (pod_conflict) if another pod holds the name. hostd's sweep asks
+  this to end the record of a pod the owner already stopped. Changes nothing.`,
+		Run: func(_ *cli.Flags, args []string, stdout, stderr io.Writer) int {
+			sid, ok := oneSid("pod-status", args, stderr)
+			if !ok {
+				return cli.ExitUsage
+			}
+			if err := e.podStatus(sid, stdout); err != nil {
+				return fail(stderr, "pod-status", err)
+			}
+			return cli.ExitOK
+		},
+	}
+}
+
+func (e *env) podStatus(sid string, stdout io.Writer) error {
+	w, rec, err := e.podSession("pod-status", sid)
+	if err != nil {
+		return err
+	}
+	if rec.PodUID == "" {
+		return refuse("session %s has no pod UID recorded", sid)
+	}
+	kc, err := e.k8sSetup(w, rec)
+	if err != nil {
+		return err
+	}
+	if err := e.d.DropPrivs(kc.keysUID, kc.keysGID); err != nil {
+		return fmt.Errorf("cannot become %s: %v", e.cfg.KeysUser, err)
+	}
+	api, err := e.d.NewPod(e.cfg, kc)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	live, err := api.LiveUID(ctx, rec.Sid, rec.Gen)
+	switch {
+	case errors.Is(err, k8s.ErrNotFound):
+		fmt.Fprintln(stdout, "absent")
+		return nil
+	case err != nil:
+		return err
+	case live != rec.PodUID:
+		return refuse("pod_conflict: pod %s/%s is not the pod created for session %s (UID differs)", e.cfg.K8sNamespace, k8s.PodName(rec.Sid, rec.Gen), rec.Sid)
+	}
+	fmt.Fprintln(stdout, "present")
 	return nil
 }

@@ -98,10 +98,10 @@ type Deps struct {
 func App(cfg *Config, d *Deps, getenv func(string) string) *cli.App {
 	e := &env{cfg: cfg, d: d}
 	return &cli.App{
-		Name: "ccsbx-root", Summary: "the fixed-verb root door for the fence (U0): run stop renew gc attach exec-token pod-create pod-load pod-stop",
+		Name: "ccsbx-root", Summary: "the fixed-verb root door for the fence (U0): run stop renew gc attach exec-token pod-create pod-load pod-stop pod-status relay-mint",
 		Version: "dev", Getenv: getenv, EnvPrefix: "CCSBX_ROOT_",
 		Cmds: []*cli.Command{
-			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(), e.relayMintCmd(), e.podCreateCmd(), e.podLoadCmd(), e.podStopCmd(),
+			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(), e.relayMintCmd(), e.podCreateCmd(), e.podLoadCmd(), e.podStopCmd(), e.podStatusCmd(),
 			e.notWired("renew", "renew the machine's credentials (needs the signer, U0b)"),
 			e.notWired("exec-token", "mint an exec token for one session (needs the signer, U0b)"),
 		},

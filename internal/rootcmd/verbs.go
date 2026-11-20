@@ -272,6 +272,14 @@ func (e *env) stopCmd() *cli.Command {
 			if err != nil {
 				return fail(stderr, "stop", err)
 			}
+			// a pod session is stopped by deleting its pod (by name and UID): the same as pod-stop, which
+			// the owner may run; docker's mount-namespace rule does not apply to it
+			if prec, perr := e.sessionAny(w, sid); perr == nil && prec.Backend == "k8s" {
+				if err := e.podStop(sid, stdout); err != nil {
+					return fail(stderr, "stop", err)
+				}
+				return cli.ExitOK
+			}
 			if err := e.hostNS(); err != nil {
 				return fail(stderr, "stop", err)
 			}

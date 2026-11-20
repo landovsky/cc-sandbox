@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -164,10 +165,12 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	if err := os.MkdirAll(d.path("sessions"), 0o700); err != nil {
 		return nil, err
 	}
-	unlock, err := d.lock()
+	unlockFn, err := d.lock()
 	if err != nil {
 		return nil, err
 	}
+	var once sync.Once
+	unlock := func() { once.Do(unlockFn) } // a pod start lets go early (see startPod)
 	defer unlock()
 
 	recs, err := d.records()
@@ -187,7 +190,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	}
 
 	if d.Placements[s.Machine] == "k8s" {
-		return d.startPod(s, recs)
+		return d.startPod(s, recs, unlock)
 	}
 	if s.Machine != d.Machine {
 		return nil, refuse(WrongMachine, "spec is for %s, this is %s (the pane lives on the session's machine)", s.Machine, d.Machine)

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeRoot struct {
@@ -21,6 +22,8 @@ type fakeRoot struct {
 	loadEr          error
 	stopEr          error
 	uidOnDiskAtLoad string
+	gone            bool
+	goneEr          error
 }
 
 func (f *fakeRoot) Create(sid string) (string, error) {
@@ -35,6 +38,10 @@ func (f *fakeRoot) Load(sid string) error {
 	return f.loadEr
 }
 func (f *fakeRoot) Stop(sid string) error { f.calls = append(f.calls, "stop"); return f.stopEr }
+func (f *fakeRoot) Gone(sid string) (bool, error) {
+	f.calls = append(f.calls, "gone")
+	return f.gone, f.goneEr
+}
 
 func podDaemon(t *testing.T) (*Daemon, *fakeRoot, *[]string) {
 	t.Helper()
@@ -241,5 +248,165 @@ func TestPodRecordFieldsRoundTrip(t *testing.T) {
 	b, _ := json.Marshal(Record{Sid: "s0abcdefgh", Backend: "k8s", PodUID: "u"})
 	if !strings.Contains(string(b), `"backend":"k8s"`) || !strings.Contains(string(b), `"pod_uid":"u"`) {
 		t.Error(string(b))
+	}
+}
+
+func logs(d *Daemon) *[]string {
+	var l []string
+	d.Logf = func(f string, a ...any) { l = append(l, fmt.Sprintf(f, a...)) }
+	return &l
+}
+
+// A create whose answer is lost may have made a pod nobody recorded: the record stays (ended), and the log
+// names the exact pod. A create the root refused made nothing, and the start leaves no trace.
+func TestACreateThatMayHaveMadeAPodIsNotForgotten(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	l := logs(d)
+	fr.createEr = errors.New("ccsbx-root pod-create: signal: terminated")
+	_, err := d.Start(podSpec(nil))
+	files := d.recordFiles(t)
+	if err == nil || len(files) != 1 || len(*l) != 1 || !strings.Contains((*l)[0], "ccsbx-s-"+strings.TrimSuffix(files[0], ".json")+"-g1 may exist") {
+		t.Fatalf("%v records %v log %v", err, files, *l)
+	}
+	if rec, _ := d.Load(strings.TrimSuffix(files[0], ".json")); rec.Ended == nil {
+		t.Error("the record holds a live slot for a session that never started")
+	}
+	d, fr, _ = podDaemon(t)
+	l = logs(d)
+	fr.createEr = fmt.Errorf("%w: policy", ErrPodRefused)
+	d.Start(podSpec(nil))
+	if len(d.recordFiles(t)) != 0 || len(*l) != 0 {
+		t.Errorf("a refused create left a record %v or a log %v", d.recordFiles(t), *l)
+	}
+}
+
+// If the UID cannot be written down after the pod was made, the log names the pod and its UID and the
+// record no longer holds a slot.
+func TestAPodWhoseUIDCannotBeRecordedIsNamedInTheLog(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	l := logs(d)
+	dir := filepath.Join(d.StateDir, "sessions")
+	t.Cleanup(func() { os.Chmod(dir, 0o700) })
+	fr2 := &saveBreaker{fakeRoot: fr, dir: dir}
+	d.PodRoot = fr2
+	_, err := d.Start(podSpec(nil))
+	if err == nil || len(*l) == 0 || !strings.Contains((*l)[0], "pod-uid-1") || !strings.Contains((*l)[0], "delete exactly that pod by hand") {
+		t.Fatalf("%v log %v", err, *l)
+	}
+}
+
+// saveBreaker makes the record directory unwritable once the pod exists.
+type saveBreaker struct {
+	*fakeRoot
+	dir string
+}
+
+func (s *saveBreaker) Create(sid string) (string, error) {
+	uid, err := s.fakeRoot.Create(sid)
+	os.Chmod(s.dir, 0o500)
+	return uid, err
+}
+
+// The daemon's lock is not held through the pod's create and load (which take minutes): another start
+// goes through while a pod start waits for its pod.
+func TestAPodStartDoesNotHoldTheDaemonsLockWhileItWaits(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	entered, free := make(chan struct{}), make(chan struct{})
+	d.PodRoot = &blockingLoad{fakeRoot: fr, entered: entered, free: free}
+	done := make(chan error, 1)
+	go func() { _, err := d.Start(podSpec(nil)); done <- err }()
+	<-entered
+	got := make(chan error, 1)
+	go func() {
+		_, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID, s.Label = "rid-7", "cc-sandbox:other" }))
+		got <- err
+	}()
+	select {
+	case err := <-got:
+		if err != nil {
+			t.Errorf("the second start: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Error("a start waited for a pod's load (the lock is held through it)")
+	}
+	close(free)
+	if err := <-done; err != nil {
+		t.Error(err)
+	}
+}
+
+type blockingLoad struct {
+	*fakeRoot
+	entered, free chan struct{}
+}
+
+func (b *blockingLoad) Load(sid string) error { close(b.entered); <-b.free; return nil }
+
+// Pods must not outlive their sessions or hold live slots.
+func TestSweepPods(t *testing.T) {
+	d, fr, revoked := podDaemon(t)
+	l := logs(d)
+	now := time.Now()
+	d.Now = func() time.Time { return now }
+	rep, err := d.Start(podSpec(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr.calls = nil
+	d.SweepPods(8 * time.Hour)
+	if strings.Join(fr.calls, ",") != "gone" {
+		t.Errorf("a fresh pod is only asked about: %v", fr.calls)
+	}
+	if rec, _ := d.Load(rep.Sid); rec.Ended != nil {
+		t.Error("a live pod's record was ended")
+	}
+	// the owner stopped it: the pod is gone, the record ends and the token is dealt with
+	fr.gone, fr.calls = true, nil
+	d.SweepPods(8 * time.Hour)
+	if rec, _ := d.Load(rep.Sid); rec.Ended == nil || len(*revoked) != 1 {
+		t.Errorf("a gone pod: ended %v revoked %v", rec.Ended, *revoked)
+	}
+	// past its token's life it is stopped, not asked about
+	d2, fr2, rev2 := podDaemon(t)
+	d2.Now = func() time.Time { return now }
+	rep2, _ := d2.Start(podSpec(nil))
+	d2.Now = func() time.Time { return now.Add(9 * time.Hour) }
+	fr2.calls = nil
+	d2.SweepPods(8 * time.Hour)
+	if rec, _ := d2.Load(rep2.Sid); strings.Join(fr2.calls, ",") != "stop" || rec.Ended == nil || len(*rev2) != 1 {
+		t.Errorf("an expired pod: calls %v ended %v revoked %v", fr2.calls, rec.Ended, *rev2)
+	}
+	// an expired pod that cannot be deleted stays live, loudly
+	d3, fr3, _ := podDaemon(t)
+	l3 := logs(d3)
+	d3.Now = func() time.Time { return now }
+	rep3, _ := d3.Start(podSpec(nil))
+	d3.Now = func() time.Time { return now.Add(9 * time.Hour) }
+	fr3.stopEr = errors.New("api down")
+	d3.SweepPods(8 * time.Hour)
+	if rec, _ := d3.Load(rep3.Sid); rec.Ended != nil || len(*l3) == 0 {
+		t.Errorf("a pod that could not be deleted was ended (%v) or silent (%v)", rec.Ended, *l3)
+	}
+	// a start that never got a UID is ended after the grace period, naming the pod
+	d4, _, _ := podDaemon(t)
+	l4 := logs(d4)
+	os.MkdirAll(filepath.Join(d4.StateDir, "sessions"), 0o700)
+	rec := &Record{Sid: "s0abandone", Gen: 1, Backend: "k8s", Uid: 1000, Started: now.Add(-time.Hour), Spec: *podSpec(nil)}
+	d4.save(rec)
+	d4.Now = func() time.Time { return now }
+	d4.SweepPods(8 * time.Hour)
+	if r, _ := d4.Load("s0abandone"); r.Ended == nil || len(*l4) != 1 || !strings.Contains((*l4)[0], "ccsbx-s-s0abandone-g1") {
+		t.Errorf("abandoned: %v %v", r.Ended, *l4)
+	}
+	_ = l
+	// and a young one with no UID (a start in flight) is left alone
+	d5, _, _ := podDaemon(t)
+	os.MkdirAll(filepath.Join(d5.StateDir, "sessions"), 0o700)
+	young := &Record{Sid: "s0inflight", Gen: 1, Backend: "k8s", Uid: 1000, Started: now.Add(-time.Minute), Spec: *podSpec(nil)}
+	d5.save(young)
+	d5.Now = func() time.Time { return now }
+	d5.SweepPods(8 * time.Hour)
+	if r, _ := d5.Load("s0inflight"); r.Ended != nil {
+		t.Error("a start in flight was ended")
 	}
 }

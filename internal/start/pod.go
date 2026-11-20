@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/pins"
@@ -28,17 +29,23 @@ type PodRoot interface {
 	Load(sid string) error
 	// Stop deletes the pod by name and the recorded UID; an absent pod is fine.
 	Stop(sid string) error
+	// Gone says whether the generation's pod no longer exists (read-only; the owner's own `stop` leaves
+	// the record to be reconciled by the sweep).
+	Gone(sid string) (bool, error)
 }
 
 // Errors the pod verbs' exit codes map to.
 var (
 	ErrPodNotReady = errors.New("pod_not_ready")
 	ErrPodConflict = errors.New("pod_conflict")
+	// ErrPodRefused: the verb refused by policy (exit 2) before anything was created.
+	ErrPodRefused = errors.New("pod_refused")
 )
 
 // SudoPodRoot asks `sudo -n ccsbx-root pod-<verb> -- <sid>`.
 type SudoPodRoot struct {
-	// LoadWait bounds pod-load (the verb's own deadline plus loading), default 12 minutes.
+	// LoadWait bounds pod-load; default is the verb's own worst case (600 s ready deadline, 30 s of load
+	// retries, 90 s of API) plus 30 s, so hostd never gives up on a verb that is still within its limits.
 	LoadWait time.Duration
 }
 
@@ -50,6 +57,9 @@ func (r SudoPodRoot) run(verb, sid string, wait time.Duration) ([]byte, error) {
 	defer cancel()
 	c := exec.CommandContext(ctx, SudoBin, "-n", RootBin, verb, "--", sid)
 	c.WaitDelay = time.Second
+	// a timeout must reach the verb: SIGKILL to sudo cannot be passed on (the verb would go on, and
+	// might still mint), SIGTERM is relayed
+	c.Cancel = func() error { return c.Process.Signal(syscall.SIGTERM) }
 	c.Env = []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8"}
 	var out, errb bytes.Buffer
 	c.Stdout, c.Stderr = &out, &errb
@@ -68,6 +78,8 @@ func (r SudoPodRoot) run(verb, sid string, wait time.Duration) ([]byte, error) {
 			return nil, fmt.Errorf("%w: %s", ErrPodNotReady, msg)
 		case ee.ExitCode() == 2 && strings.Contains(msg, "pod_conflict"):
 			return nil, fmt.Errorf("%w: %s", ErrPodConflict, msg)
+		case ee.ExitCode() == 2:
+			return nil, fmt.Errorf("%w: %s", ErrPodRefused, msg)
 		}
 	}
 	return nil, fmt.Errorf("ccsbx-root %s: %v: %s", verb, err, msg)
@@ -88,10 +100,24 @@ func (r SudoPodRoot) Create(sid string) (string, error) {
 func (r SudoPodRoot) Load(sid string) error {
 	w := r.LoadWait
 	if w <= 0 {
-		w = 12 * time.Minute
+		w = 12*time.Minute + 30*time.Second
 	}
 	_, err := r.run("pod-load", sid, w)
 	return err
+}
+
+func (r SudoPodRoot) Gone(sid string) (bool, error) {
+	out, err := r.run("pod-status", sid, 60*time.Second)
+	if err != nil {
+		return false, err
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "present":
+		return false, nil
+	case "absent":
+		return true, nil
+	}
+	return false, fmt.Errorf("pod-status: unexpected answer %q", strings.TrimSpace(string(out)))
 }
 
 func (r SudoPodRoot) Stop(sid string) error {
@@ -101,7 +127,7 @@ func (r SudoPodRoot) Stop(sid string) error {
 
 // startPod is Start for a pod session. The checks that need no cluster are the docker path's (profile
 // for the machine, billing, a pinned image, caps, the label); what a pod cannot do yet is refused.
-func (d *Daemon) startPod(s *LaunchSpec, recs []*Record) (*StartReply, error) {
+func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*StartReply, error) {
 	if d.PodRoot == nil {
 		return nil, refuse(NotBuilt, "machine %s is a pod machine but this daemon has no pod launcher", s.Machine)
 	}
@@ -166,10 +192,13 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record) (*StartReply, error) {
 		Journal: Journal{Epoch: d.epoch(), Seq: len(recs)},
 		NotEv:   !(d.Root == "helper" && d.HelperProven),
 	}
-	// 1. the record, without a pod: root reads it
+	// 1. the record, without a pod: root reads it. It is also the reservation (label, live count), so the
+	// daemon's lock is released here: the create and the load can take minutes and must not block every
+	// other start and replace.
 	if err := d.save(rec); err != nil {
 		return nil, err
 	}
+	release()
 	abandon := func(cause error, code string) (*StartReply, error) {
 		// Delete whatever pod exists, by the recorded UID. If that fails the record stays (ended), so a
 		// later stop or gc can retry; otherwise the start leaves no trace and a retry is a fresh start.
@@ -188,13 +217,22 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record) (*StartReply, error) {
 	// 2. the pod; its UID goes into the record BEFORE anything secret is sent
 	uid, err := d.PodRoot.Create(sid)
 	if err != nil {
-		return abandon(err, PodLoadFailed)
+		if errors.Is(err, ErrPodConflict) || errors.Is(err, ErrPodRefused) {
+			return abandon(err, PodLoadFailed) // root refused: no pod was made
+		}
+		// The call may have got as far as the API (a lost answer, a timeout, unreadable output): a pod
+		// may exist that no record names. Keep the record, ended, and say which pod to look for.
+		d.logf("pod %s may exist (create failed: %v): the launcher's namespace holds it if so; delete exactly that pod by hand", PodName(sid, rec.Gen), err)
+		d.markEnded(rec)
+		return nil, fmt.Errorf("%s: pod create failed (%v); pod %s may exist, it is recorded as ended", PodLoadFailed, err, PodName(sid, rec.Gen))
 	}
 	rec.PodUID = uid
 	if err := d.save(rec); err != nil {
-		// the pod exists and the record cannot say so: delete it by the UID we hold; the record has no UID
-		// to give root, so root cannot, and the owner is told the name
-		return nil, fmt.Errorf("pod created but its UID could not be recorded (%v): delete pod %s by hand", err, sid)
+		// the pod exists and the record cannot say so: root cannot delete it without the UID. Say exactly
+		// which pod and what UID, and end the record (best effort) so it holds no slot.
+		d.logf("pod %s exists with UID %s but the record could not be written (%v): delete exactly that pod by hand", PodName(sid, rec.Gen), uid, err)
+		d.markEnded(rec)
+		return nil, fmt.Errorf("pod %s was created (UID %s) but its UID could not be recorded: %v; delete it by hand", PodName(sid, rec.Gen), uid, err)
 	}
 	// 3. wait and load: root mints the token in its own process and loads the sidecar
 	if err := d.PodRoot.Load(sid); err != nil {
@@ -216,6 +254,11 @@ func (d *Daemon) StopPod(sid string) error {
 	if d.PodRoot == nil {
 		return errors.New("no pod launcher")
 	}
+	unlock, err := d.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	rec, err := d.Load(sid)
 	if err != nil {
 		return err
@@ -244,5 +287,70 @@ func (d *Daemon) revokeOrSay(sid string, gen int) {
 	}
 	if d.Logf != nil {
 		d.Logf("pod session %s generation %d: a token may exist and is not revoked (no revoke client): revoke sid %s gen %d by hand", sid, gen, sid, gen)
+	}
+}
+
+// PodName is the pod's name for a generation (what the launcher derives; used in what we log).
+func PodName(sid string, gen int) string { return fmt.Sprintf("ccsbx-s-%s-g%d", sid, gen) }
+
+func (d *Daemon) logf(format string, a ...any) {
+	if d.Logf != nil {
+		d.Logf(format, a...)
+	}
+}
+
+// abandonedAfter is how long a pod record may sit with no UID before the sweep gives up on it: a start
+// that died between its first save and its create.
+const abandonedAfter = 15 * time.Minute
+
+// SweepPods keeps pods from outliving their sessions: a pod session past ttl (its token's life) is
+// stopped (the pod deleted by UID, the relay and token dealt with, the record ended); one whose pod is
+// already gone (the owner stopped it) is ended; one that never got a UID is ended after a grace period
+// and logged. Without this a pod keeps running after its token expires and holds a live slot forever.
+func (d *Daemon) SweepPods(ttl time.Duration) {
+	if d.PodRoot == nil {
+		return
+	}
+	recs, err := d.records()
+	if err != nil {
+		d.logf("pod sweep: %v", err)
+		return
+	}
+	now := d.now()
+	for _, r := range recs {
+		if r.Backend != "k8s" || r.Ended != nil {
+			continue
+		}
+		age := now.Sub(r.Started)
+		switch {
+		case r.PodUID == "":
+			if age > abandonedAfter {
+				d.logf("pod session %s never recorded a pod UID: pod %s may exist, delete exactly that pod by hand; the record is ended", r.Sid, PodName(r.Sid, r.Gen))
+				d.endRecord(r.Sid)
+			}
+		case age > ttl:
+			if err := d.StopPod(r.Sid); err != nil {
+				d.logf("pod sweep: stopping %s (expired): %v", r.Sid, err)
+			}
+		default:
+			if gone, err := d.PodRoot.Gone(r.Sid); err != nil {
+				d.logf("pod sweep: %s: %v", r.Sid, err)
+			} else if gone {
+				d.revokeOrSay(r.Sid, r.Gen)
+				d.endRecord(r.Sid)
+			}
+		}
+	}
+}
+
+// endRecord marks one session's record ended under the daemon's lock (the sweep races Start's saves).
+func (d *Daemon) endRecord(sid string) {
+	unlock, err := d.lock()
+	if err != nil {
+		return
+	}
+	defer unlock()
+	if r, err := d.Load(sid); err == nil && r.Ended == nil {
+		d.markEnded(r)
 	}
 }

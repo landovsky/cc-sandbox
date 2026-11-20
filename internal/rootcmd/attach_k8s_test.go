@@ -288,7 +288,7 @@ func TestPodSessionsAreOnlyAttachable(t *testing.T) {
 	f, _ := newK8sFx(t)
 	f.env["SUDO_UID"] = fmt.Sprint(os.Getuid() + 99)
 	f.refusedK8s("another user's pod", "no such session")
-	for _, v := range []string{"run", "stop", "status"} {
+	for _, v := range []string{"run", "status"} {
 		f, _ := newK8sFx(t)
 		code, out := f.call(v, sid)
 		if code != 2 || !strings.Contains(out, "runs as a pod") || len(f.fb.ran)+len(f.fb.stopped) != 0 {

@@ -21,7 +21,7 @@ import (
 
 // Verbs is every verb there is. The config's `verbs` lists the ones that are on (and `status = "off"`
 // turns that one off by itself); nothing outside this list can be switched on.
-var Verbs = []string{"run", "stop", "renew", "gc", "attach", "exec-token", "status", "pod-create", "pod-load", "pod-stop", "relay-mint"}
+var Verbs = []string{"run", "stop", "renew", "gc", "attach", "exec-token", "status", "pod-create", "pod-load", "pod-stop", "pod-status", "relay-mint"}
 
 // Config is the policy. TrustedUID is who must own the files root believes; it is 0 in production
 // and is never read from the file.

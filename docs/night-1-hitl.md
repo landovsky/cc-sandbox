@@ -7,6 +7,7 @@ need a question back. Risk / blast radius: High, Medium, Low.
 |---|---|---|---|---|
 | 1 | **DONE** Push main, watch the first fence-image and side-image Actions runs, close PR #7 (both runs green, built from main `2945647`) | hp, GitHub | Low | Medium (public repo, first package) |
 | 1b | **DONE** The two ghcr packages (`ccsbx-fence`, `ccsbx`) are public. Nothing has pulled them anonymously yet: the first anonymous pull is Gate M step 0/0b (`docker pull` of the digests, step 8b for the fence image) | GitHub, hp | Low | Medium |
+| 1c | **OPEN** Push main again (it now has `0883a50`, the CCF-IN python pins in the fence image, and more code merges), watch BOTH runs (fence-image, side-image), then read BOTH new `digest.txt` files (the fence digest changes with the image, the sidecar digest with every code merge) | hp, GitHub | Low | Low |
 | 2 | Decide the 6 P15 questions so the root installer stops refusing | this doc | Low | Low |
 | 3 | Install the seccomp profile and run its docker test (Gate M) | hp, sudo | Medium | Medium |
 | 4 | Run Gate M #4x65 (root install + reboot), moved to 2026-11-22 | hp, sudo | High | High |
@@ -14,11 +15,11 @@ need a question back. Risk / blast radius: High, Medium, Low.
 
 ## 1 · Push main, then the first fence-image and side-image runs
 
-**DONE** (main pushed, PR #7 closed, both Actions runs green, built from main `2945647`). The two digests Gate M passes:
+**DONE** (main pushed, PR #7 closed, both Actions runs green, built from main `2945647`). Both digests are STALE after the next push (see row 1c); the values below were built from main `2945647`:
 
 ```
-FENCE (--image):      ghcr.io/landovsky/ccsbx-fence@sha256:c815f83c1b51866dda94b81f9133d4c024828247a2cadb14c023e301988a3afe
-SIDECAR (--side-image): ghcr.io/landovsky/ccsbx@sha256:8806715af5c1179c133f52804dc2baf1c25e6845d3660eb03599eacfbb9812af
+FENCE (--image):        STALE, re-pin after the next push of main (it has 0883a50 and later): do not pass the earlier c815f83c… value
+SIDECAR (--side-image): STALE, re-pin after the next push of main (the sidecar is the ccsbx binary: it changes with every code merge): do not pass the earlier 8806715a… value
 ```
 
 **1b is DONE too: both ghcr packages are public.** The first anonymous pull happens at Gate M step 0/0b (and the fence `docker pull` in step 8b), so a failure there means the visibility did not take (check Packages → Package settings), not a missing login. The commands below are kept as the record of what was done.

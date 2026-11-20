@@ -50,6 +50,16 @@ Run on hp in `~/git/cc-sandbox` unless a step says otherwise. Order matters: the
 
 If a step fails: runbook §2 (rollback), and `sudo units/install-linux.sh uninstall --yes` undoes steps 8 to 9.
 
+**Right before step 8, by hand (the installer does not check these; the PR #2 review accepted them as manual steps):**
+1. **S5, binaries:** build `dist/` immediately before the install, with no agents running, so nothing
+   can swap a file between the checksum check and the copy.
+2. **S9, sudoers itself:** `sudo grep -n NOPASSWD /etc/sudoers` once. The installer cleans only
+   `/etc/sudoers.d/*`; a NOPASSWD line in `/etc/sudoers` itself would survive.
+3. **S14, lockout guard:** `sudo -k; sudo -v` must ask for your password; `sudo -l` must show
+   `(ALL : ALL) ALL` without NOPASSWD; keep a **second root shell open** until `check` passes.
+4. **S15, the code is the code you read:** `git status` is clean and `git rev-parse HEAD` is the merged
+   commit of the install PR.
+
 Step 8 in detail (changed after the PR #2 review):
 - the first thing `install` does, once every gate is met, is copy every file it will replace to
   `/var/backups/ccsbx-install/original/`. That backup is made once and never overwritten, so a second
@@ -62,6 +72,9 @@ Step 8 in detail (changed after the PR #2 review):
 - the signer's socket is made by systemd (`ccsbx-signer.socket`); `check` after the reboot connects
   to the signer's and hostd's sockets, so a `FAIL` there is a real finding, not a formality;
 - P15's file is read from the owner's home, not root's (`plan` prints the path).
+- `install` prints `DONE` only after hostd and the signer are really up (it waits up to 10 s). A
+  crash-looping hostd gives `NOT DONE` and the undo hint, not a false DONE;
+- hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
 
@@ -124,7 +137,7 @@ After the group change only password sudo can start them (`sudo docker start <na
   The installer parses it as root and refuses if a NOPASSWD line isn't one of docker, apt-get,
   dokku, sops (it won't guess).
 
-## `units/install-linux.sh plan` as of 2026-11-20 08:0x (owner tomas, after the PR #2 review fixes)
+## `units/install-linux.sh plan` as of 2026-11-20 (owner tomas, after the PR #2 re-check)
 
 ```
 install-linux plan  (owner=tomas, bin-dir=<repo>/dist)
@@ -181,10 +194,10 @@ GATES (install refuses while any is unmet)
      $ systemctl enable --now ccsbx-signer.socket
 
 [05] U0 hostd unit and firewall
-     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 44 lines)
+     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 48 lines)
      $ systemctl daemon-reload
      $ systemctl enable --now ccsbx-hostd.service
-     # 7480 only on the tailnet interface; the Mac and future-two reach hostd there
+     # hostd listens on 127.0.0.1:7480 only (with a token file); the firewall rule below is for the tailnet and is harmless while nothing listens there
      $ ufw allow in on tailscale0 to any port 7480 proto tcp comment ccsbx\ hostd
 
 [06] U0 sops: a root-owned binary (tomas-writable + sudo-runnable was a root path)
@@ -215,6 +228,9 @@ GATES (install refuses while any is unmet)
      $ gpasswd -d tomas lxd
      $ gpasswd -d tomas docker
      # NOW: sudo reboot  (a fresh tmux server has the new groups; the old one keeps docker)
+
+[10] post-install check: hostd and the signer must be up before DONE
+     # waits up to 10 s for ccsbx-hostd and ccsbx-signer.socket to be active and their sockets to exist; otherwise install stops, no DONE
 
 AFTER: reboot, then units/install-linux.sh check  and  bin/ccsbx-preflight --morning --post-M1
 UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the first backup, /var/backups/ccsbx-install/original; a failed install is undone the same way)

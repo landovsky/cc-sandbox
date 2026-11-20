@@ -41,4 +41,5 @@
 /etc/preflight.toml     @landovsky
 
 /.github/CODEOWNERS     @landovsky
+/.github/workflows/    @landovsky
 /.claude/settings.json  @landovsky

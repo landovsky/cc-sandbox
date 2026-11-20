@@ -769,11 +769,15 @@ func TestAnUnfencedNodeCountsOnlyOnTheMachineTheRecordBindsItToBlock(t *testing.
 		mach string
 		code string
 	}{
-		"the bound machine":                  {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "mac"}, "mac", ""},
-		"the same node from another machine": {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "x4"}, "mac", "scope"},
-		"no machine named by the record":     {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "mac"}, "", "scope"},
-		"no machine named by the hub":        {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a"}, "mac", "scope"},
-		"a fenced sender needs no machine":   {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "x4", Fenced: true}, "mac", ""},
+		"the bound machine":                    {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "mac"}, "mac", ""},
+		"the same node from another machine":   {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "x4"}, "mac", "scope"},
+		"no machine named by the record":       {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "mac"}, "", "scope"},
+		"no machine named by the hub":          {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a"}, "mac", "scope"},
+		"a fenced sender on the bound machine": {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "mac", Fenced: true}, "mac", ""},
+		// a fenced session is signed, but its node is only the label its starter gave it: an owner process on
+		// another machine can start one labelled with the worker's unfenced manager's node
+		"a fenced sender LABELLED as the manager on another machine": {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "x4", Fenced: true}, "mac", "scope"},
+		"a fenced sender when the record places the node nowhere":    {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "x4", Fenced: true}, "", ""},
 	} {
 		w := newWorld(t, sess("sT", "cc-sandbox:worker", true, "cc-sandbox:mgr"))
 		w.dir.s[0].Scope.Manager.Machine = c.mach

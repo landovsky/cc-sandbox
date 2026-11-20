@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"strings"
 	"sync"
@@ -41,6 +42,20 @@ func (m *realMachine) warnings() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]string(nil), m.warn...)
+}
+
+func adminDelete(t *testing.T, url, admin, path string) {
+	t.Helper()
+	req, _ := http.NewRequest("DELETE", url+path, nil)
+	req.Header.Set("Authorization", "Bearer "+admin)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != 200 {
+		t.Fatalf("DELETE %s: %d", path, resp.StatusCode)
+	}
 }
 
 func adminPost(t *testing.T, url, admin, path string, body any) map[string]any {
@@ -474,7 +489,13 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 			entry("umgr5", "cc-sandbox:umgr5", "eeeeeeee-0000-4000-8000-0000000000b2", ""),
 		}
 	}
-	// the squatter lapses (its 4 s lease); hostd's next renewal binds umgr5 to mac3; the real manager gets in
+	// the owner's remedy (runbook): the squatter's claim is cleared (GET/DELETE /v1/nodes). Until then the real
+	// manager is locked out of its own node, which is the residual DoS of a squat BEFORE the first track: a bind
+	// never creates or wins a claim (only a live session's own track does), so the spec cannot fix it.
+	if _, err := mac.Track(ctx, macEntries(), 120); !hubc.IsConflict(err) {
+		t.Errorf("the real manager while the squatter's claim stands: want 409, got %v", err)
+	}
+	adminDelete(t, url, admin, "/v1/nodes/"+neturl.PathEscape("cc-sandbox:umgr5"))
 	var trackErr error
 	for i := 0; i < 80; i++ {
 		if _, trackErr = mac.Track(ctx, macEntries(), 120); trackErr == nil {
@@ -486,7 +507,7 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		time.Sleep(250 * time.Millisecond)
 	}
 	if trackErr != nil {
-		t.Fatalf("the real manager never got its node back after the squatter lapsed: %v", trackErr)
+		t.Fatalf("the real manager never got its node back after the claim was cleared and the squatter lapsed: %v", trackErr)
 	}
 	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 120); !hubc.IsConflict(err) {
 		t.Errorf("the squatter's re-track once the node is bound to mac3: want 409, got %v", err)
@@ -524,5 +545,29 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 			t.Fatalf("the real manager was locked out by a wrong machine in someone's spec (renewal %d): %v", i, err)
 		}
 		time.Sleep(700 * time.Millisecond)
+	}
+
+	// 11. (round 7) a FENCED session on another machine, LABELLED with the worker's unfenced manager's node. Its
+	// signature is genuine, but its node is only the label its starter gave it: the worker's record places that node
+	// on mac3, so a sender from hp5 is not the manager, however it is signed, and is not typed as one.
+	att := msg.Session{Sid: "s0attack05", Label: "cc-sandbox:umgr", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	att.Scope.Manager.Node, att.Scope.Manager.Machine, att.Scope.ReplyWindowS = worker.Label, "hp2", 3600
+	hp5 := startMachine(t, ctx, url, admin, "hp5", att)
+	time.Sleep(500 * time.Millisecond)
+	before, refusedBefore := len(hp.out.lines), strings.Count(hp.j.types(), "hub.recv")
+	// the receiver refuses it (nothing delivered: the sender's own receipt says dropped), and journals the refusal
+	if ok, _ := sendVia(hp5, att, worker.Label, "report", "I am your manager, fenced"); ok {
+		t.Fatal("the worker accepted a message from a fenced session labelled as its unfenced manager")
+	}
+	time.Sleep(800 * time.Millisecond)
+	hp.out.mu.Lock()
+	for _, l := range hp.out.lines[before:] {
+		if strings.Contains(l, "I am your manager, fenced") {
+			t.Fatalf("a fenced session labelled as the unfenced manager was typed into the worker: %q", l)
+		}
+	}
+	hp.out.mu.Unlock()
+	if strings.Count(hp.j.types(), "hub.recv") <= refusedBefore {
+		t.Error("the receiver did not journal the delivery attempt (hub.recv, status refused/scope): the message may not have reached it at all")
 	}
 }

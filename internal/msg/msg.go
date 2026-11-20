@@ -383,10 +383,16 @@ func (r *Router) DeliverRemote(rs RemoteSender, targetSid, text string) Result {
 // remoteInScope: the sender's node is in the target's own scope, or the target messaged it lately.
 func (r *Router) remoteInScope(rs RemoteSender, target Session) bool {
 	if nodeInScope(target, rs.Node) {
-		// An UNFENCED sender is only a node name the hub's presence list vouches for, and any machine's owner
-		// token can publish any unclaimed node: so it counts only on the machine the target's record binds the
-		// node to. A fenced sender's signature identifies it, wherever it is.
-		return rs.Fenced || (rs.Machine != "" && target.Scope.MachineOf(rs.Node) == rs.Machine)
+		// A node belongs to the machine the target's record places it on: a sender of that node counts only when
+		// it is ON that machine, fenced or not. A fenced sender's signature proves who it is, but its NODE is only
+		// the label its starter gave it (an owner process on another machine can start a fenced session labelled
+		// with someone's manager node), so the signature alone must not make it that manager. Only when the
+		// record places the node nowhere does a fenced sender count by its signature (an unfenced one never does).
+		want := target.Scope.MachineOf(rs.Node)
+		if want != "" {
+			return rs.Machine == want
+		}
+		return rs.Fenced
 	}
 	win := time.Duration(target.Scope.ReplyWindowS) * time.Second
 	if win <= 0 {

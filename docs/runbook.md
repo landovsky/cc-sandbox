@@ -478,14 +478,19 @@ hostd's rights (tracking a fenced identity, reading hostd's frames), and the rev
   `GET /v1/nodes` (admin): another machine holds the claim. If it is a squatter that keeps renewing, it holds it
   indefinitely (the 30 days count from the last refresh): `DELETE /v1/nodes/<url-encoded node>`, then the real
   manager tracks. hostd's `binds` (its sessions' manager/peer machines, from their start specs) only cover nodes of
-  the hostd principal's `trees`, create or refresh a claim but NEVER move one: a claim whose machine has a live entry
-  for the node stays, and so does one another daemon bound within the last 90 s (two daemons disagreeing is a
-  conflict, the first wins, not a flip). The hub says so in the track reply and hostd logs `hub warning: <node> is
-  claimed by <machine>` once per ten minutes: it means the session's start spec put its manager on the wrong machine,
-  or someone is squatting; fix the spec's `manager.machine` (and re-start) or clear the claim. `--known-machines`
+  the hostd principal's `trees` and may only DEFEND a claim their own machine already holds: they never create, move or
+  win one (a claim comes only from a live session's own track on its machine), so a start spec naming a machine for a
+  manager that is offline (a sleeping Mac) pins nothing, and the manager's track succeeds when it returns. Where a claim
+  held by another machine disagrees with a daemon's bind, the hub says so in the track reply and hostd logs `hub warning:
+  <node> is claimed by <machine>` once per ten minutes: the session's start spec put its manager on the wrong machine, or
+  someone is squatting; fix the spec's `manager.machine` (and re-start) or clear the claim. **Residual window:** a squat
+  BEFORE the manager's first track (nobody has claimed the node yet) is accepted, and a squatter that keeps renewing keeps
+  the claim: an owner-uid process on any machine can lock a manager out that way (a DoS, no impersonation or leak: hostd
+  hears and sends by the record's machine, and now also for FENCED senders: a fenced session labelled with a manager's node
+  on another machine is refused). The remedy is the one above: GET /v1/nodes, DELETE /v1/nodes/<node>. `--known-machines`
   makes a start whose `msg_scope` names any other machine refuse (bad_spec) before anything is published. The claim
   table lives in memory unless `SB_NODE_CLAIMS_FILE` is set (a hub restart then reopens the first-publisher window
-  until each hostd re-tracks, seconds); the file is written in a 0700 directory through an exclusive random temp
+  until each hostd re-tracks, seconds); the file is written through an exclusive random temp, in a directory created 0700 if new (an existing directory is never chmod-ed: give the file one of its own)
   file, only when a claim appears or changes machine and every few minutes for the refresh times, and is ignored if it
   is not a regular file of the hub's user that others cannot write. A fenced manager that MOVES to another machine
   needs its workers' specs updated (their record names the old machine, so `SendRemote` ends `dropped`).

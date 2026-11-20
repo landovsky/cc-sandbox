@@ -32,8 +32,8 @@ import (
 	"fmt"
 	"os"
 	"path"
-	"strconv"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -578,6 +578,25 @@ func ValidName(n string) bool {
 		}
 	}
 	return true
+}
+
+// UnverifiedClaims decodes a token's payload WITHOUT checking its signature. The sidecar uses it to
+// sanity-check what the launcher handed it (the expiry, that the generation key matches cnf) before
+// serving; the doors still verify every request. Never use the result to decide what a caller may do.
+func UnverifiedClaims(tok string) (*Claims, error) {
+	parts := strings.Split(tok, ".")
+	if len(parts) != 3 {
+		return nil, ErrMalformed
+	}
+	pb, err := b64.DecodeString(parts[1])
+	if err != nil {
+		return nil, ErrMalformed
+	}
+	var c Claims
+	if err := json.Unmarshal(pb, &c); err != nil {
+		return nil, ErrMalformed
+	}
+	return &c, nil
 }
 
 // ValidBilling reports whether b is one of the three billings (invariant 18). The trusted-key list

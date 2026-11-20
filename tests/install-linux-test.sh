@@ -199,7 +199,7 @@ echo "# review S4: B9 must not pass when docker cannot be asked"
 b2="$tmp/bin2"; mkdir -p "$b2"
 printf '#!/bin/sh\ncase "$*" in *is-active*) exit 0;; *ExecStart*) echo /usr/bin/hub;; esac\nexit 0\n' > "$b2/systemctl"
 printf '#!/bin/sh\necho "permission denied" >&2\nexit 1\n' > "$b2/docker"; chmod +x "$b2/systemctl" "$b2/docker"
-out="$(PATH="$b2:$PATH" "$inst" plan 2>&1)"
+out="$(PATH="$b2:$PATH" "$inst" plan --hub-url http://100.64.0.9:4011 2>&1)"
 t "S4: docker ps failing is an UNMET B9 (it used to pass)" bash -c 'grep -q "B9 missing: cannot ask docker" <<<"$1"' _ "$out"
 
 echo "# review S5: every required binary must be listed in SHA256SUMS"
@@ -623,7 +623,7 @@ done
 t "R2-M1: --net-dir is refused outside the test hook (CCSBX_ROOT_PREFIX unset)" bash -c '! env -u CCSBX_ROOT_PREFIX python3 -I "$1" http://100.101.219.96:4011 1000 --net-dir "$2" >/dev/null 2>&1' _ "$hl" "$tmp/n1"
 d="$(fx hu)"; ins "$d" install --yes >/dev/null 2>&1
 t "R2-M1: ccsbx-root.toml gets the hub url that was passed (not a loopback default)" grep -qx 'hub_url = "http://100.64.0.9:4011"' "$d/root/etc/ccsbx/ccsbx-root.toml"
-for bad in "" "http://100.64.0.009:4011" "http://127.0.0.1:4011/" "http://localhost:4011" "https://100.64.0.9:4011" "http://100.64.0.9"; do
+for bad in "http://100.64.0.009:4011" "http://127.0.0.1:4011/" "http://localhost:4011" "https://100.64.0.9:4011" "http://100.64.0.9"; do
   d="$(fx hub)"; HUBURL="$bad" ins "$d" install --yes >/dev/null 2>&1; rc=$?
   t "R2-M1: --hub-url '${bad:-unset}' is refused (exit 3), nothing changed" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/rec/cmds" ]' _ "$rc" "$d"
 done
@@ -641,6 +641,23 @@ for bad in 'http://x/y' 'ftp://x' 'http://x" --evil' 'http://x y' 'http://x:0' '
 done
 d="$(fx rd4)"; ins "$d" install --yes --revoke-doors http://x:65535 >/dev/null 2>&1; rc=$?
 t "F2x: port 65535 is the highest accepted" test "$rc" -eq 0
+
+echo "# the install does not depend on the hub: --hub-url is optional (manager's decision, 2026-11-21)"
+d="$(fx nh)"; HUBURL="" HUBSRC="" ins "$d" install --yes >"$d/out" 2>"$d/err"; rc=$?; ntoml="$d/root/etc/ccsbx/ccsbx-root.toml"
+t "nohub: without --hub-url the install succeeds with no hub secret at all" bash -c '[ "$1" -eq 0 ]' _ "$rc"
+d2="$(fx nh2)"; B9=false HUBURL="" HUBSRC="" ins "$d2" install --yes >/dev/null 2>&1; rc2=$?
+t "nohub: …B9 is skipped: a failing B9 does not stop it (exit 0)" test "$rc2" -eq 0
+t "nohub: hub_url, hub_user and hub_secret are NOT in ccsbx-root.toml, and a comment says why" bash -c '! grep -qE "^(hub_url|hub_user|hub_secret)" "$1" && grep -q "NOT set: this install does not depend on the hub" "$1" && grep -qx "revoke_doors = \[\]" "$1"' _ "$ntoml"
+t "nohub: no hub secret file is written, none is read as the owner, and nothing about the secret is recorded" bash -c '[ ! -e "$1/root/etc/ccsbx/hub-admin.secret" ] && ! grep -q "python3 -I -c" "$1/rec/cmds" && ! grep -q "hub-admin" "$1/rec/cmds"' _ "$d"
+t "nohub: the install says so (B9 skipped, no hub dependency)" bash -c 'grep -q "B9 skipped (no --hub-url)" "$1" && grep -q "does not depend on the hub" "$1"' _ "$d/out"
+d="$(fx nh3)"; HUBURL="" HUBSRC="" ins "$d" install --yes --hub-secret-from "$d/hubsecret" >/dev/null 2>&1; rc=$?
+t "nohub: --hub-secret-from without --hub-url is refused (exit 3): it would be silently ignored" test "$rc" -eq 3
+d3="$(fx nh4)"; HUBURL="" HUBSRC="" ins "$d3" plan >"$d3/plan" 2>&1; rc3=$?
+t "nohub: plan works, prints the no-hub notes and no hub-admin.secret write" bash -c '[ "$1" -eq 0 ] && grep -q "no --hub-url" "$2" && ! grep -q "write /etc/ccsbx/hub-admin.secret" "$2"' _ "$rc3" "$d3/plan"
+out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
+t "nohub: check does not fail for a missing hub secret; it notes the install has no hub" bash -c '! grep -q "^FAIL  /etc/ccsbx/hub-admin.secret" <<<"$1" && grep -q "does not depend on the hub" <<<"$1"' _ "$out"
+d="$(fx wh)"; ins "$d" install --yes >/dev/null 2>&1
+t "nohub: WITH --hub-url everything is as before (hub_url, hub_user and hub_secret set, the secret written)" bash -c 'grep -qx "hub_url = \"http://100.64.0.9:4011\"" "$1/root/etc/ccsbx/ccsbx-root.toml" && grep -qx "hub_user = \"tomas\"" "$1/root/etc/ccsbx/ccsbx-root.toml" && [ -e "$1/root/etc/ccsbx/hub-admin.secret" ]' _ "$d"
 
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"

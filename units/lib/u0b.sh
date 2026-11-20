@@ -173,8 +173,11 @@ u0b_check() {
     [ "$tg" = "ccsbx-term" ] && ok "ccsbx-term has no group but its own" || bad "ccsbx-term is in groups: $tg"
     [ "$(getent passwd ccsbx-term | cut -d: -f7)" = /usr/sbin/nologin ] && ok "ccsbx-term has no shell" || bad "ccsbx-term has a shell"
   fi
-  local hs; hs="$(stat -c '%U:%G %a' "$(pth /etc/ccsbx/hub-admin.secret)" 2>/dev/null || echo missing)"
-  [ "$hs" = "root:root 600" ] && ok "/etc/ccsbx/hub-admin.secret is root:root 600" || bad "/etc/ccsbx/hub-admin.secret is $hs (want root:root 600)"
+  local hs
+  if grep -q '^hub_url' "$(pth /etc/ccsbx/ccsbx-root.toml)" 2>/dev/null; then
+    hs="$(stat -c '%U:%G %a' "$(pth /etc/ccsbx/hub-admin.secret)" 2>/dev/null || echo missing)"
+    [ "$hs" = "root:root 600" ] && ok "/etc/ccsbx/hub-admin.secret is root:root 600" || bad "/etc/ccsbx/hub-admin.secret is $hs (want root:root 600)"
+  else note_check "ccsbx-root.toml has no hub_url: this install does not depend on the hub (relay-mint and pod relays refuse until it is re-run with --hub-url)"; fi
   local own; own="$(stat -c '%U:%a' "$(pth $KEYS_DIR)" 2>/dev/null || echo missing)"
   [ "$own" = "ccsbx-keys:700" ] && ok "$KEYS_DIR is ccsbx-keys:700" || bad "$KEYS_DIR is $own (want ccsbx-keys:700)"
   local k

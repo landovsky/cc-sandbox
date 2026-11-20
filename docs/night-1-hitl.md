@@ -89,10 +89,10 @@ first would also cut every hp worker off from docker. A builds U1c by 11-21; D f
 in the Gate M list (go under sudo; the seccomp step moves into the table as 8b, so §3 above
 becomes part of the gate). Merged and ready: the signer, `ccsbx-root`, the fence image.
 What you pass and run at Gate M, beyond the old steps (all in the step table): step 0 and **0b** read the two image digests from the Actions runs; step 8 is
-`sudo units/install-linux.sh install --yes --image "$DIGEST" --side-image "$SIDE" --hub-url http://100.101.219.96:4011 --hub-secret-from ~/.config/session-bus/secret`
-(`--hub-url` is where the native hub listens and is required; re-read it from `ss -ltnH 'sport = :4011'` first; `--hub-secret-from` defaults to that path; the install refuses while the hub is still the docker container,
-because its listener is root's, not yours); **8c** `sudo units/hub-probe --owner "$USER" --hub <the same url>` must print `POST 201`, `DELETE 200`, `hub secret OK` (401/403: stop and uninstall).
-Not passed at Gate M: `--revoke-doors` (no doors before M1). Merge order: A's `ccsbx-root` change first (it accepts the non-loopback `hub_url` and the new keys).
+`sudo units/install-linux.sh install --yes --image "$DIGEST" --side-image "$SIDE"`. **The install does not depend on the hub** (decision 2026-11-21): no `--hub-url`, no `--hub-secret-from`,
+no hub check (B9 is skipped with a note), and relay-mint and pod relays refuse cleanly until the hub's own deploy gate (❓ 2xq4). One consequence to accept: after the reboot you are out of the docker group,
+so the hub container keeps running but you manage it with `sudo docker`. Step 8c (`hub-probe`, the hub secret check) moved to the hub's deploy gate, together with re-running the install with `--hub-url`
+(section "The hub's deploy gate" in `docs/night-1-morning.md`). Not passed at Gate M either: `--revoke-doors` (no doors before M1). Merge order: A's `ccsbx-root` change first (it accepts the new keys).
 Steps with commands: `docs/night-1-morning.md` (§ "Gate M, step by step"). The title of #4x65 says "ACL paste": that is step 11b there, a placeholder until the k3s PR number is known (`paste k3s PR <TBD>: steps follow`).
 
 ## 5 · Arm!

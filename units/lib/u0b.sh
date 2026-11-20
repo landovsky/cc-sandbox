@@ -1,4 +1,5 @@
 # units/lib/u0b.sh — U0b: host keys under the `ccsbx-keys` uid, and the signer (sourced).
+# Why: an agent on hp must not be able to read the keys that sign session tokens, so they live under a uid tomas is not.
 #
 #   plan:  ccsbx-keys + ccsbx uids, the key directory (0700), the machine key, the signer unit.
 #   check: as tomas: the key directory is ccsbx-keys:700, `test -r` on each key fails, the signer runs.

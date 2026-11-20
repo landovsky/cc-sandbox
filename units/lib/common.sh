@@ -1,4 +1,5 @@
 # units/lib/common.sh — shared by units/install-linux.sh (sourced, never run).
+# Why: so `plan` (what Tomas reads) can never differ from `install` (what runs).
 #
 # One code path for `plan` and `install`: every step calls cmd/put/note, and in plan mode those
 # only PRINT. So what `plan` shows is, by construction, what `install` runs. Read-only probes

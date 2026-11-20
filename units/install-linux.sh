@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # install-linux.sh — the root installer for Tom's Linux machines (I0, U0, U0b). plan | install | check | uninstall.
+# Why: U0 takes root paths away from tomas, so the morning install must be one reviewed, refusable, restorable script, not hand-typed sudo.
 #
 #   units/install-linux.sh plan                prints every step and the gate results; changes NOTHING; needs no root
 #   (as root) units/install-linux.sh install --yes   does it (the morning gate, R10). Refuses unless every gate is met

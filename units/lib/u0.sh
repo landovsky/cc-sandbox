@@ -1,4 +1,5 @@
 # units/lib/u0.sh — U0: leave docker and lxd on hp, remove the other root paths (sourced).
+# Why: any NOPASSWD docker/apt/sops grant is a root shell for every agent on hp; this closes them and leaves one fixed-verb door.
 #
 # After this, the only way from tomas to root is `sudo -n /usr/local/sbin/ccsbx-root <verb>`
 # (verbs: run stop renew gc attach exec-token; it refuses unpinned images, workdirs outside the

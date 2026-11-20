@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # install-linux-test.sh — tests for units/install-linux.sh, units/p15 and units/lib/sudoers_strip.py.
+# Why: the installer can lock Tomas out of his own machine, so its refusals and restores are proven without root.
 # Hermetic and rootless: the installer's test hooks put every path under a temp dir
 # (CCSBX_ROOT_PREFIX) and RECORD each command instead of running it (CCSBX_EXEC=record:FILE), and
 # every command that could change the host (sudo, snap, lxc, apt, docker, systemctl, gpasswd …)

@@ -1,4 +1,5 @@
 # ccsbx-hostd.service (U3a/U0). The per-machine daemon: journal, stamping, start API on :7480.
+# Why: the daemon runs unprivileged so a bug in it is not root; it asks ccsbx-root for the few things that need it.
 # It runs as uid ccsbx, can reach the signer's socket (group ccsbx) but never the key directory,
 # and reaches docker only through `sudo -n /usr/local/sbin/ccsbx-root <verb>`.
 # Flags are the design; hostd's Go code must accept exactly these.

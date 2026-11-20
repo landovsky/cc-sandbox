@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """sudoers_strip.py: remove NOPASSWD grants for docker, apt-get, dokku and sops from a sudoers file.
 
+Why: those grants are a root shell for any agent on hp; stripping must be exact and refuse what it cannot parse, never guess.
+
+
 U0 (hp-root cleanup, ❓ Q7). Reads a sudoers file, prints the cleaned file on stdout, and a
 report on stderr. It never touches anything else: Defaults, comments, other users' rules and
 NOPASSWD rules for other commands stay byte-for-byte. It is deliberately strict:

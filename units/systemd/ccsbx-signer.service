@@ -1,4 +1,5 @@
 # ccsbx-signer.service (U0b). The ONLY process that can read the machine key. It exposes
+# Why: one tiny process holds the key and signs on request, so no bigger process (hostd) ever has it in memory or on disk.
 # sign(token_claims) on a unix socket and nothing else, so hostd never holds the key.
 # The flags below are the design; the signer's Go code (U0b/U5) must accept exactly these.
 [Unit]

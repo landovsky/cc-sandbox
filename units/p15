@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # p15 — the P15 checklist: replacements for hp's docker and sudo users (from the P14 inventory).
+# Why: U0 removes tomas from docker; this list proves each thing that used it has a replacement before the install is allowed.
 #
 #   units/p15 status              every row: id, state, what (counts at the end); exit 0
 #   units/p15 check               exit 0 only when EVERY row is done or dropped; else names the open rows (exit 1)

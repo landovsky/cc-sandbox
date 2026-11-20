@@ -46,6 +46,11 @@ type Record struct {
 	// start. Later generations reuse it: the worktree's .git file is agent-written and is never
 	// read again.
 	GitDir string `json:"git_dir,omitempty"`
+	// Backend is "" for a docker session and "k8s" for one that runs as a pod. PodUID is the UID the
+	// API server gave the pod when we created it (k8s only): the identity every later step (exec
+	// with secrets, attach, delete) checks against the live pod.
+	Backend string `json:"backend,omitempty"`
+	PodUID  string `json:"pod_uid,omitempty"`
 }
 
 // Daemon holds the policy knobs and the state directory.

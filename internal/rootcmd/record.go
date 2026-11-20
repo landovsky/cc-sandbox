@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"syscall"
 
 	"github.com/landovsky/cc-sandbox/internal/start"
@@ -62,8 +63,16 @@ func loadRecord(stateDir, sid string, serviceUID, trustedUID int) (*start.Record
 	if rec.Uid < 0 {
 		return nil, fmt.Errorf("record of %s: uid %d", sid, rec.Uid)
 	}
+	if rec.Backend != "" && rec.Backend != "k8s" {
+		return nil, fmt.Errorf("record of %s: backend %q", sid, rec.Backend)
+	}
+	if rec.PodUID != "" && !podUIDRe.MatchString(rec.PodUID) {
+		return nil, fmt.Errorf("record of %s: pod_uid is not a UID", sid)
+	}
 	return &rec, nil
 }
+
+var podUIDRe = regexp.MustCompile(`^[A-Za-z0-9-]{1,64}$`)
 
 // ownedBy checks a path (not followed through a link) is owned by root-or-service and not
 // writable by group or others.

@@ -129,6 +129,22 @@ func (b *Backend) Create(ctx context.Context, s Spec) (*Ref, error) {
 	return &ref, nil
 }
 
+// LiveUID reads the UID of the generation's pod, requiring that it is that pod (name and labels).
+func (b *Backend) LiveUID(ctx context.Context, sid string, gen int) (string, error) {
+	ref, err := b.ref(sid, gen)
+	if err != nil {
+		return "", err
+	}
+	p, err := b.C.GetPod(ctx, ref.Namespace, ref.Name)
+	if err != nil {
+		return "", err
+	}
+	if !roundTrips(p, sid, gen) || p.Metadata.UID == "" || p.Metadata.DeletionTimestamp != nil {
+		return "", fmt.Errorf("the API returned a pod that is not a live %s", ref.Name)
+	}
+	return p.Metadata.UID, nil
+}
+
 // Get reports the pod's state; ErrNotFound if there is none.
 func (b *Backend) Get(ctx context.Context, sid string, gen int) (*Status, error) {
 	ref, err := b.ref(sid, gen)

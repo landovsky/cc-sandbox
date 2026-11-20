@@ -21,6 +21,7 @@ import (
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/cli"
+	"github.com/landovsky/cc-sandbox/internal/k8s"
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
@@ -71,6 +72,9 @@ type Deps struct {
 	Strip   func(root *os.File, owner int, logf func(string, ...any)) (int, error)
 	Mounter Mounter
 	HomeOf  func(uid int) (string, error)
+	// LivePodUID reads the UID of a session's pod from the API server (called after the drop to the
+	// keys user, who alone can read the launcher token).
+	LivePodUID func(conn *k8s.ConnConfig, namespace, sid string, gen int) (string, error)
 }
 
 // App builds the command table for a loaded config.
@@ -128,8 +132,21 @@ func (e *env) prelude(verb string) (who, error) {
 	return w, nil
 }
 
-// session loads, validates and authorises one session record for the caller.
+// session loads, validates and authorises one session record for the caller, and refuses a k8s
+// session: run, stop, status and gc speak docker, and must not act on a pod's session.
 func (e *env) session(w who, sid string) (*start.Record, error) {
+	rec, err := e.sessionAny(w, sid)
+	if err != nil {
+		return nil, err
+	}
+	if rec.Backend == "k8s" {
+		return nil, refuse("session %s runs as a pod; this verb handles docker sessions only", sid)
+	}
+	return rec, nil
+}
+
+// sessionAny is session without the backend rule (attach handles both).
+func (e *env) sessionAny(w who, sid string) (*start.Record, error) {
 	// one text for "there is no such session" and "it is not yours": the caller learns nothing
 	// about another owner's sessions from the difference
 	notYours := refuse("no such session %q (or it is not yours)", sid)
@@ -182,7 +199,7 @@ func Real(getenv func(string) string) *Deps {
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
 		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
-		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID,
 	}
 }
 

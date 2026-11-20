@@ -36,6 +36,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -61,9 +62,39 @@ type Config struct {
 
 // Forwarder is an http.Handler.
 type Forwarder struct {
-	cfg    Config
-	proxy  *httputil.ReverseProxy
-	counts struct{ ok, denied atomic.Int64 }
+	cfg     Config
+	proxy   *httputil.ReverseProxy
+	counts  struct{ ok, denied atomic.Int64 }
+	classMu sync.Mutex
+	classes map[string]int64
+}
+
+// maxDenyClasses bounds the per-reason table; the reasons are a fixed set, this is the belt for the braces.
+const maxDenyClasses = 32
+
+// DenyClasses returns how many requests were refused for each fixed reason ("not a door route",
+// "refused: <verdict>", ...). The keys never contain request data.
+func (f *Forwarder) DenyClasses() map[string]int64 {
+	f.classMu.Lock()
+	defer f.classMu.Unlock()
+	out := make(map[string]int64, len(f.classes))
+	for k, v := range f.classes {
+		out[k] = v
+	}
+	return out
+}
+
+func (f *Forwarder) countDeny(why string) {
+	f.counts.denied.Add(1)
+	f.classMu.Lock()
+	defer f.classMu.Unlock()
+	if f.classes == nil {
+		f.classes = map[string]int64{}
+	}
+	if _, ok := f.classes[why]; !ok && len(f.classes) >= maxDenyClasses {
+		why = "other"
+	}
+	f.classes[why]++
 }
 
 // New builds a Forwarder. It refuses an unsafe configuration.
@@ -200,7 +231,7 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	deny := func(code int, why string) {
-		f.counts.denied.Add(1)
+		f.countDeny(why)
 		f.cfg.Logf(`{"fwd":"deny","method":%q,"path":%q,"why":%q}`, r.Method, r.URL.Path, why)
 		http.Error(w, why, code)
 	}

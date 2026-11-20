@@ -21,7 +21,9 @@ package side
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +38,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/fwd"
+	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
@@ -56,9 +59,19 @@ type Config struct {
 	Marker string
 	// ControlTimeout bounds one control connection (default 5s).
 	ControlTimeout time.Duration
-	Logf           func(format string, a ...any)
-	Now            func() time.Time
-	Resolve        func(host string) ([]net.IP, error) // tests
+	// Journal, when set, gets the forwarder's lifecycle facts (fwd.loaded, fwd.expired, fwd.denied
+	// summaries), which the cockpit's idle and hear state is computed from. Sid and Gen are then required:
+	// identity comes from here, never from the token's say-so or the fence.
+	Journal Appender
+	Sid     string
+	Gen     int
+	// MaxFwdLogs caps fwd.denied summaries per lifetime (default 50); DenySummaryEvery is how often a
+	// changed denial count is written (default 30s).
+	MaxFwdLogs       int
+	DenySummaryEvery time.Duration
+	Logf             func(format string, a ...any)
+	Now              func() time.Time
+	Resolve          func(host string) ([]net.IP, error) // tests
 }
 
 // secrets is what `side load` sends (the same shape `ccsbx fwd` reads on stdin).
@@ -82,6 +95,9 @@ type Server struct {
 	loadMu  sync.Mutex
 	loadCh  chan struct{} // closed once the secrets are in
 	failed  chan error    // the forwarder died
+	fwdp    atomic.Pointer[fwd.Forwarder]
+	logs    int // fwd.denied summaries written (Serve's goroutine only)
+	lastDen int64
 }
 
 // New checks the configuration. It refuses a forwarder address that anything but the pod could reach.
@@ -99,6 +115,15 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.Marker == "" {
 		cfg.Marker = filepath.Join(filepath.Dir(cfg.Control), "loaded")
+	}
+	if cfg.Journal != nil && (cfg.Sid == "" || cfg.Gen < 1) {
+		return nil, errors.New("side: a journal needs --sid and --gen (identity comes from the config)")
+	}
+	if cfg.MaxFwdLogs == 0 {
+		cfg.MaxFwdLogs = 50
+	}
+	if cfg.DenySummaryEvery == 0 {
+		cfg.DenySummaryEvery = 30 * time.Second
 	}
 	if cfg.ControlTimeout == 0 {
 		cfg.ControlTimeout = 5 * time.Second
@@ -167,11 +192,20 @@ func (s *Server) Serve(ctx context.Context) error {
 	go s.control(cl)
 	s.cfg.Logf("side: forwarder on %s, waiting for secrets on %s", s.cfg.Listen, s.cfg.Control)
 
+	var tick <-chan time.Time
+	if s.cfg.Journal != nil {
+		t := time.NewTicker(s.cfg.DenySummaryEvery)
+		defer t.Stop()
+		tick = t.C
+	}
 	var expired <-chan time.Time
 	loadCh := s.loadCh // s.loadCh is closed by load; this copy is set to nil after it fires
 	for {
 		select {
+		case <-tick:
+			s.denySummary(false)
 		case <-ctx.Done():
+			s.denySummary(true)
 			srv.Close()
 			return nil
 		case err := <-s.failed:
@@ -181,10 +215,43 @@ func (s *Server) Serve(ctx context.Context) error {
 			expired = time.After(time.Until(time.Unix(s.expiry.Load(), 0)))
 		case <-expired:
 			s.cfg.Logf("side: the token has expired; ending with the generation")
+			s.denySummary(true)
+			s.note("fwd.expired", map[string]any{"exp": s.expiry.Load()})
 			srv.Close()
 			return nil
 		}
 	}
+}
+
+// note journals one lifecycle fact; a failing journal is logged and ignored (it observes, it does not gate).
+func (s *Server) note(typ string, data map[string]any) {
+	if s.cfg.Journal == nil {
+		return
+	}
+	b, _ := json.Marshal(data)
+	if _, err := s.cfg.Journal.Append(journal.Event{Sid: s.cfg.Sid, Gen: s.cfg.Gen, Src: "host", Type: typ, Data: b}); err != nil {
+		s.cfg.Logf("side: journal append failed (%v)", err)
+	}
+}
+
+// denySummary writes the cumulative refusal counts by fixed reason when they changed, at most MaxFwdLogs
+// times per lifetime; the periodic ones stop one short so the final one at the end still fits.
+func (s *Server) denySummary(final bool) {
+	f := s.fwdp.Load()
+	if f == nil || s.cfg.Journal == nil {
+		return
+	}
+	limit := s.cfg.MaxFwdLogs
+	if !final {
+		limit--
+	}
+	_, denied := f.Stats()
+	if denied == s.lastDen || s.logs >= limit {
+		return
+	}
+	s.lastDen = denied
+	s.logs++
+	s.note("fwd.denied", map[string]any{"total": denied, "classes": f.DenyClasses()})
 }
 
 func (s *Server) fatal(err error) {
@@ -293,9 +360,12 @@ func (s *Server) load(sec secrets) error {
 	fmt.Fprintf(mf, "{\"cnf\":%q,\"exp\":%d}\n", c.Cnf, c.Exp)
 	mf.Close()
 	var h http.Handler = f
+	s.fwdp.Store(f)
 	s.handler.Store(&h)
 	s.expiry.Store(c.Exp)
 	s.loaded.Store(true)
+	sum := sha256.Sum256([]byte(c.Cnf))
+	s.note("fwd.loaded", map[string]any{"cnf": hex.EncodeToString(sum[:8]), "exp": c.Exp}) // a hash, never the key or token
 	close(s.loadCh)
 	return nil
 }

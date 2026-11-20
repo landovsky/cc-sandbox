@@ -1122,6 +1122,16 @@ backends = ["unit"]
 where = "any"
 
 [[rule]]
+id = "signer-refuses-unscoped-claims"
+title = "the signer signs nothing outside its key's scope: owner, machine, exact profile-billing pairs, audience"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesUnscopedClaims$|TestPairsPairProfileWithBilling$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
 id = "stamp-from-outbox"
 title = "a request's identity comes from the outbox path and the session record, never from the file's bytes"
 suite = "outbox"
@@ -1262,5 +1272,85 @@ suite = "msg"
 allow = "pending"
 block = "pending"
 invariants = [13]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-caps-lifetime"
+title = "the signer refuses a token lifetime over its cap"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesOverLongExpiry$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-peer-is-hostd"
+title = "the signer answers only the allowed uid, from SO_PEERCRED"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesPeerThatIsNotTheAllowedUser$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-request-cap"
+title = "an oversized or stalled signer request is refused, and a client need not half-close"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestClientThatDoesNotHalfClose$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesOversizedRequest$|TestStalledClientTimesOut$|TestRefusesDataAfterTheRequest$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-key-checked"
+title = "the signer refuses a key or key directory with a loose mode, another owner or a symlink"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestKeyFileAccepted$'"
+block = "tests/go-test.sh ./internal/signer 'TestKeyFileIsChecked$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-scope-required"
+title = "the signer will not serve without a valid scope file it can trust"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestKeyFileAccepted$'"
+block = "tests/go-test.sh ./internal/signer 'TestWontServeWithoutAScope$|TestScopeFileIsChecked$|TestOversizedScopeIsRefused$|TestScopeNamesAreChecked$|TestWriteScopeDestinationMustBeExplicit$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-socket-from-systemd"
+title = "the signer serves only on a socket systemd handed it (LISTEN_PID, LISTEN_FDS)"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSystemdSocketAccepted$'"
+block = "tests/go-test.sh ./internal/signer 'TestSystemdSocketRefusals$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-env-is-strict"
+title = "a CCSBX_SIGNER_ value that does not parse stops the signer, never a default"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestWriteScopeCommand$'"
+block = "tests/go-test.sh ./internal/signer 'TestHelpAndEnv$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-accept-failure-exits"
+title = "a permanent Accept error ends the signer non-zero instead of looping"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestPermanentAcceptErrorEndsServe$'"
+invariants = [12, 27]
 backends = ["unit"]
 where = "any"

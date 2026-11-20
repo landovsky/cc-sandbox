@@ -1520,3 +1520,13 @@ block = "tests/twin-go.sh ./internal/backend TestEveryGitFileReadSiteIsBounded"
 invariants = [10]
 backends = ["unit"]
 where = "hp"
+
+[[rule]]
+id = "root-derives-the-gitdir"
+title = "ccsbx-root derives the gitdir from the worktree's own .git through the pinned descriptor (a plain repo's .git is mounted read-only, a linked worktree's gitdir must point back at it) and refuses a record that says anything else, an empty gitdir for a repo included"
+suite = "keys"
+allow = "tests/twin-go.sh ./internal/rootcmd TestPlainRepoDotGitIsDerivedAndMountedReadOnly && tests/twin-go.sh ./internal/rootcmd TestRunStagesPinnedDirectories"
+block = "tests/twin-go.sh ./internal/rootcmd TestPlainRepoWithAnEmptyGitDirIsRefused && tests/twin-go.sh ./internal/rootcmd TestGitDirMustEqualWhatIsDerived && tests/twin-go.sh ./internal/rootcmd TestDotGitFileIsHeldToWhatItNames && tests/twin-go.sh ./internal/rootcmd TestSwappedDotGitIsNotWhatGetsMounted && tests/twin-go.sh ./internal/rootcmd TestGitdirInAHiddenHomeDirectoryIsRefused"
+invariants = [24, 25]
+backends = ["unit"]
+where = "hp"

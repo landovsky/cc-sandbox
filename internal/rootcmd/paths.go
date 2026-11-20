@@ -83,10 +83,8 @@ func (c *Config) workdir(p string, owner int, home string) (string, string, erro
 	}
 	// a hidden directory of the owner's home (.ssh, .config, .claude ...) is never a workdir, and
 	// this does not depend on $HOME, which root's environment does not have
-	if home != "" {
-		if rel, ok := strings.CutPrefix(rp, filepath.Clean(home)+string(filepath.Separator)); ok && strings.HasPrefix(rel, ".") {
-			return "", "", refuse("workdir %s is in a hidden directory of the home (%s)", rp, strings.SplitN(rel, "/", 2)[0])
-		}
+	if h := hiddenInHome(rp, home); h != "" {
+		return "", "", refuse("workdir %s is in a hidden directory of the home (%s)", rp, h)
 	}
 	for _, s := range []string{c.StateDir, c.RunDir} {
 		if rp == s || strings.HasPrefix(rp, s+"/") || strings.HasPrefix(s, rp+"/") {
@@ -102,10 +100,13 @@ func (c *Config) workdir(p string, owner int, home string) (string, string, erro
 
 // gitdir validates the gitdir a record carries: same path rules, inside an allowed root, owned by
 // the session's owner. (The host-ownership and mode walk runs again in backend.Prepare.)
-func (c *Config) gitdir(p string, owner int) (string, error) {
+func (c *Config) gitdir(p string, owner int, home string) (string, error) {
 	rp, err := cleanPath(p)
 	if err != nil {
 		return "", err
+	}
+	if h := hiddenInHome(rp, home); h != "" {
+		return "", refuse("gitdir %s is in a hidden directory of the home (%s)", rp, h)
 	}
 	if c.insideRoot(rp) == "" {
 		return "", refuse("gitdir %s is not inside an allowed root", rp)
@@ -144,6 +145,11 @@ func pin(open func(string) (*os.File, error), path string, owner int) (*pinned, 
 	if err != nil {
 		return nil, refuse("%v", err)
 	}
+	return pinFile(f, path, owner)
+}
+
+// pinFile checks an already-open directory (it takes ownership of f) and wraps it.
+func pinFile(f *os.File, path string, owner int) (*pinned, error) {
 	st, err := f.Stat()
 	if err != nil || !st.IsDir() {
 		f.Close()
@@ -155,4 +161,16 @@ func pin(open func(string) (*os.File, error), path string, owner int) (*pinned, 
 		return nil, refuse("%q is not owned by the session's owner (uid %d)", path, owner)
 	}
 	return &pinned{f: f, path: path}, nil
+}
+
+// hiddenInHome returns the first path component below the owner's home when it starts with a dot
+// (.ssh, .config, .claude ...), or "". It does not depend on $HOME.
+func hiddenInHome(rp, home string) string {
+	if home == "" {
+		return ""
+	}
+	if rel, ok := strings.CutPrefix(rp, filepath.Clean(home)+string(filepath.Separator)); ok && strings.HasPrefix(rel, ".") {
+		return strings.SplitN(rel, "/", 2)[0]
+	}
+	return ""
 }

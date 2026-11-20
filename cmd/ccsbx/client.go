@@ -1,8 +1,8 @@
-package main
-
 // The daemon's client commands: what cc-tree (the cockpit) calls on a machine's daemon. Each one
 // is a thin wrapper over the daemon's unix socket (<state>/hostd.sock); none of them touches the
 // fence or the state directory itself. `ccsbx <command> --help` has the recipes.
+
+package main
 
 import (
 	"bytes"

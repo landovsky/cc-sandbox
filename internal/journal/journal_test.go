@@ -1,3 +1,7 @@
+// Tests of the journal. Why: its one promise is that an acknowledged event survives and replays
+// exactly once and in order, so cases cover a torn tail, a failed write, a restart across midnight,
+// retention, cursors, and the idle rule that rides on the same records.
+
 package journal
 
 import (

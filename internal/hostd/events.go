@@ -1,3 +1,8 @@
+// Ingest of a fence's out/events.jsonl into the journal (M3). It exists in hostd, not the journal,
+// because every line is untrusted: only a hook.<Name> type and a data object are kept, identity comes
+// from the daemon's record, the volume has a budget, and the offset is saved so a restart does not
+// journal a line twice.
+
 package hostd
 
 import (

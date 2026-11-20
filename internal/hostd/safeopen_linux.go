@@ -1,5 +1,7 @@
 //go:build linux && (amd64 || arm64)
 
+// The Linux half of safeopen.go: openat2 with RESOLVE_BENEATH|NO_SYMLINKS|NO_MAGICLINKS, so the
+// kernel refuses any path that leaves the outbox in one step and there is no check-then-open race.
 package hostd
 
 import (

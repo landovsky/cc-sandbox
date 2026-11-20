@@ -1,3 +1,7 @@
+// `ccsbx attach`: the owner's way into a fenced session's pane (C0a). It exists because the pane
+// lives on the ccsbx tmux server, not the user's, so a plain tmux attach would not find it; the
+// command wraps the nested attach and keeps the outer tmux's keys out of the way.
+
 package main
 
 import (

@@ -77,6 +77,6 @@ host)
   [ -s "$W/fields.txt" ] || { echo "no payloads recorded"; head -c 600 "$W/claude.err"; exit 1; }
   sort -u "$W/fields.txt" > "$OUT"; echo "wrote $OUT ($(wc -l < "$OUT") rows)"
   ;;
-diff) diff "$HERE/fields-host.txt" "$HERE/fields-fence.txt" && echo "parity: the host and the fence send the same hook payload fields" ;;
+diff) diff <(grep -v "^#" "$HERE/fields-host.txt") <(grep -v "^#" "$HERE/fields-fence.txt") && echo "parity: the host and the fence send the same hook payload fields" ;;
 *) echo "unknown arm $1 (--help)" >&2; exit 64 ;;
 esac

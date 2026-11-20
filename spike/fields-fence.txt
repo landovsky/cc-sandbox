@@ -1,3 +1,5 @@
+# C0c fence arm: the hook payload field names (event, field, JSON type) Claude Code sent inside the
+# fence flags. It exists so `spike/c0c.sh diff` can compare it with the host arm (cc-sandbox:#455c).
 PostToolUse	cwd	str
 PostToolUse	duration_ms	int
 PostToolUse	effort	dict

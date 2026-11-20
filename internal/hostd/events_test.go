@@ -1,3 +1,7 @@
+// Tests of the events.jsonl ingest. Why: the fence writes every byte of that file, so each case is
+// an abuse (forged identity, oversize lines, a flood, a shrunk file, a dead generation) or a restart
+// that must neither lose nor repeat an event.
+
 package hostd
 
 import (

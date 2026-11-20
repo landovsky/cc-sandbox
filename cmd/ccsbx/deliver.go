@@ -1,3 +1,7 @@
+// `ccsbx deliver`: the owner's device sends text into a live session through the daemon (U3b).
+// It exists so cc-tree never types into a fenced pane itself: the daemon checks the pane is at its
+// prompt and stamps the message as unfenced (owner device), never as a human.
+
 package main
 
 import (

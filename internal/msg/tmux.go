@@ -1,3 +1,7 @@
+// The tmux and ccmsg delivery of messages (U3b). It exists so the router stays testable: the router
+// decides, this types the line into a pane (bracketed paste, then Enter) or hands it to the bus, and
+// every call is bounded by a timeout so a wedged tmux can't stop the daemon.
+
 package msg
 
 import (

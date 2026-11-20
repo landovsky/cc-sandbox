@@ -1,8 +1,8 @@
-package main
-
 // session.prompt and session.replace (C9b, the daemon half): how cc-tree steers a FENCED session.
 // The model of a fenced session lives in the daemon's container, so a nudge, a roll or a reseed
 // can't fork its transcript or type into a host pane: it asks the daemon, over the 0600 socket.
+
+package main
 
 import (
 	"encoding/json"

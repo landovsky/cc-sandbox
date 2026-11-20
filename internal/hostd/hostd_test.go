@@ -1,3 +1,7 @@
+// Tests of the outbox watcher (U3a). Why: each Block twin is one way a fence could make the daemon
+// act on something it did not write (symlink, fifo, hardlink, sparse file, flood, a stale
+// generation, a replayed request); each Allow twin proves the legitimate case still passes.
+
 package hostd
 
 import (

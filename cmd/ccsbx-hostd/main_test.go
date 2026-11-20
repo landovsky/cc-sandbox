@@ -1,3 +1,6 @@
+// Tests of ccsbx-hostd's flag handling. Why: every tunable must be reachable as a flag/env var and
+// listed in --help, and a bad value must stop the daemon at start, not later.
+
 package main
 
 import (

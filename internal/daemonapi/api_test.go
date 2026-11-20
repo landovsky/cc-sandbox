@@ -1,3 +1,7 @@
+// Tests of the daemon API. Why: this is the one door cc-tree and the owner CLI use, so each case
+// names a property of it (replay is exact, stale epochs are told so, token holders never get owner
+// operations, replace never touches a mid-turn pane).
+
 package daemonapi
 
 import (
@@ -7,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -385,5 +390,67 @@ func TestOwnerDeliverToAnIdlePaneLands(t *testing.T) {
 	code, m := call(t, "POST", local.URL+"/v1/sessions/sM/deliver", "", `{"from":"cc-tree","text":"hi"}`)
 	if code != 200 || len(out.lines) != 1 || !strings.Contains(out.lines[0], "trust: unfenced (owner device)") {
 		t.Fatalf("%d %v %v", code, m, out.lines)
+	}
+}
+
+// ---- review of PR #4: C9b (session.prompt / session.replace) had no tests ----------------------
+
+func newSteerRig(t *testing.T, idle bool, rep func(sid, brief string) (int, error)) (*httptest.Server, *httptest.Server, *nopOut) {
+	j, _ := journal.Open(t.TempDir(), "hp-ubuntu", 0)
+	q, _ := verbq.Open(t.TempDir())
+	dir := fakeDirT{[]msg.Session{{Sid: "sM", Label: "cc-sandbox:mgr", Realm: "production", Live: true, Gen: 1}}}
+	out := &nopOut{}
+	rt := &msg.Router{Dir: dir, Out: out, Idle: idleT{idle}, StateDir: t.TempDir()}
+	s := &Server{J: j, Q: q, Msg: rt, Dir: dir, Token: "0123456789abcdef-token", Replace: rep}
+	local, tcp := httptest.NewServer(s.Handler()), httptest.NewServer(s.TCPHandler())
+	t.Cleanup(func() { local.Close(); tcp.Close(); j.Close(); q.Close() })
+	return local, tcp, out
+}
+
+// context: replace kills a pane. A pane that is mid-turn must come out untouched (409, and the
+// replace function never ran), or a turn's work is lost.
+func TestReplaceMidTurnIs409AndTouchesNothing(t *testing.T) {
+	ran := 0
+	local, _, _ := newSteerRig(t, false, func(string, string) (int, error) { ran++; return 2, nil })
+	if code, m := call(t, "POST", local.URL+"/v1/sessions/sM/replace", "", `{"brief":"new"}`); code != 409 || ran != 0 {
+		t.Fatalf("%d %v ran=%d", code, m, ran)
+	}
+}
+
+func TestReplaceAtTheBoundaryStartsTheNextGeneration(t *testing.T) {
+	var gotSid, gotBrief string
+	local, _, _ := newSteerRig(t, true, func(sid, b string) (int, error) { gotSid, gotBrief = sid, b; return 2, nil })
+	code, m := call(t, "POST", local.URL+"/v1/sessions/sM/replace", "", `{"brief":"new brief"}`)
+	if code != 200 || m["gen"] != float64(2) || gotSid != "sM" || gotBrief != "new brief" {
+		t.Fatalf("%d %v", code, m)
+	}
+	// a second replace straight after is refused: the pane was marked busy by the first
+	if code, _ := call(t, "POST", local.URL+"/v1/sessions/sM/replace", "", `{"brief":"again"}`); code != 409 {
+		t.Fatalf("second replace: %d", code)
+	}
+}
+
+func TestReplaceFailureIs500AndNotAnAcknowledgement(t *testing.T) {
+	local, _, _ := newSteerRig(t, true, func(string, string) (int, error) { return 0, os.ErrPermission })
+	if code, _ := call(t, "POST", local.URL+"/v1/sessions/sM/replace", "", `{"brief":"x"}`); code != 500 {
+		t.Fatalf("%d", code)
+	}
+}
+
+// context: steering text is typed only at the prompt, stamped as the owner's device, and the
+// loopback TCP port (token holders) can do neither prompt nor replace.
+func TestPromptOnlyAtThePromptAndNeverOverTheTokenPort(t *testing.T) {
+	local, tcp, out := newSteerRig(t, false, func(string, string) (int, error) { return 2, nil })
+	if code, _ := call(t, "POST", local.URL+"/v1/sessions/sM/prompt", "", `{"kind":"nudge","text":"checkpoint now"}`); code != 409 || len(out.lines) != 0 {
+		t.Fatalf("busy pane: %d %v", code, out.lines)
+	}
+	for _, p := range []string{"prompt", "replace"} {
+		if code, _ := call(t, "POST", tcp.URL+"/v1/sessions/sM/"+p, "0123456789abcdef-token", `{"text":"x","brief":"x"}`); code != 403 {
+			t.Fatalf("%s over the token port: %d", p, code)
+		}
+	}
+	local2, _, out2 := newSteerRig(t, true, nil)
+	if code, _ := call(t, "POST", local2.URL+"/v1/sessions/sM/prompt", "", `{"kind":"nudge","text":"checkpoint now"}`); code != 200 || len(out2.lines) != 1 {
+		t.Fatalf("idle pane: %d %v", code, out2.lines)
 	}
 }

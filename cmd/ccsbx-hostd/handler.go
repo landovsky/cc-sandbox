@@ -1,3 +1,7 @@
+// The request handlers of ccsbx-hostd: what a fence's request becomes. It exists apart from main.go so
+// that main only wires flags, and these (msg, verb queue + journal, question/hear, replies) can be
+// tested without a process: every fence request is untrusted, the daemon's records are the authority.
+
 package main
 
 import (

@@ -1,3 +1,6 @@
+// Tests of the ULID mint. Why: the daemon's ids are its idempotency keys, so they must be valid,
+// unique and sortable by time.
+
 package ulid
 
 import (

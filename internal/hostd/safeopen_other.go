@@ -1,5 +1,7 @@
 //go:build !(linux && (amd64 || arm64))
 
+// The fallback of safeopen.go where openat2 does not exist (the Mac): weaker, and said so in the
+// docs; it exists so the daemon builds everywhere, and refuses symlinks it can see with O_NOFOLLOW.
 package hostd
 
 import (

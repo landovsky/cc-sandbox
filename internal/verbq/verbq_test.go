@@ -1,3 +1,6 @@
+// Tests of the verb queue and cockpit lease (M4). Why: a verb a cockpit has not applied must never
+// be lost, one realm has one cockpit, and a lease can't be stolen or guessed.
+
 package verbq
 
 import (

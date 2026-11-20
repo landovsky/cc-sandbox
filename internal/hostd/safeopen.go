@@ -1,3 +1,7 @@
+// Safe reads of a fence's outbox (U3a). It exists because the fence owns every byte under out/ and
+// can swap names while the daemon looks: one open call that cannot leave the tree, then every check
+// (regular file, link count, owner, size) made on the opened descriptor, never on the path.
+
 package hostd
 
 import (

@@ -1,3 +1,7 @@
+// Tests of message routing and delivery (U3b). Why: the scope rule, the stamps and the idle gate are
+// what stop a fence from paging an arbitrary session or typing into a menu, so each case names the
+// abuse or the failure it guards against.
+
 package msg
 
 import (

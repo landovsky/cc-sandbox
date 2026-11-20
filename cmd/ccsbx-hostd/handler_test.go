@@ -1,3 +1,6 @@
+// Tests of the hostd handlers. Why: they are where an untrusted fence request turns into a message,
+// a queued verb or a journal record, so each case names the abuse it is meant to survive.
+
 package main
 
 import (

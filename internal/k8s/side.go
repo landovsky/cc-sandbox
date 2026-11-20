@@ -100,17 +100,17 @@ func SideArgv(i SideInfo) ([]string, error) {
 	return args, nil
 }
 
-// scopeDoc is the message scope the sidecar understands (internal/msg.Scope). The sidecar's own parser
+// ScopeDoc is the message scope the sidecar understands (internal/msg.Scope). The sidecar's own parser
 // is not the place to catch a duplicated or wrong-case key, so the launcher builds the flag from this
 // struct: what is written is exactly these fields, in this order, once each.
-type scopeDoc struct {
-	Manager      scopeNode         `json:"manager"`
+type ScopeDoc struct {
+	Manager      ScopeNode         `json:"manager"`
 	Peers        []string          `json:"peers"`
 	PeerMachines map[string]string `json:"peer_machines,omitempty"`
 	ReplyWindowS int               `json:"reply_window_s,omitempty"`
 }
 
-type scopeNode struct {
+type ScopeNode struct {
 	Node    string `json:"node"`
 	Machine string `json:"machine,omitempty"`
 }
@@ -119,39 +119,51 @@ type scopeNode struct {
 // its exact spelling (no duplicates, no "Manager", no extras, no null), and returns the compact JSON
 // of the typed struct.
 func canonicalScope(raw json.RawMessage) (string, error) {
-	if len(raw) == 0 || len(raw) > maxScope {
-		return "", fmt.Errorf("must be a JSON object of at most %d bytes", maxScope)
-	}
-	if err := strictKeys(raw, map[string]bool{"manager": true, "peers": true, "peer_machines": true, "reply_window_s": true}, false); err != nil {
+	d, err := ParseScope(raw)
+	if err != nil {
 		return "", err
-	}
-	var d scopeDoc
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&d); err != nil {
-		return "", err
-	}
-	// the manager object is held to the same rule
-	var top map[string]json.RawMessage
-	json.Unmarshal(raw, &top)
-	if m, ok := top["manager"]; ok {
-		if err := strictKeys(m, map[string]bool{"node": true, "machine": true}, false); err != nil {
-			return "", fmt.Errorf("manager: %v", err)
-		}
-	}
-	if pm, ok := top["peer_machines"]; ok {
-		if err := strictKeys(pm, nil, true); err != nil {
-			return "", fmt.Errorf("peer_machines: %v", err)
-		}
-	}
-	if d.Peers == nil {
-		d.Peers = []string{}
 	}
 	out, err := json.Marshal(d)
 	if err != nil {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// ParseScope reads a record's msg_scope as strictly as the sidecar's flag is built: a JSON object with
+// exactly the known keys, spelled exactly, each once, nothing after it. Everything that reads the scope out of a
+// record (the sidecar's flag, the relay's may_reach and manager) goes through it, so none of them sees a
+// record the others would refuse.
+func ParseScope(raw json.RawMessage) (*ScopeDoc, error) {
+	if len(raw) == 0 || len(raw) > maxScope {
+		return nil, fmt.Errorf("must be a JSON object of at most %d bytes", maxScope)
+	}
+	if err := strictKeys(raw, map[string]bool{"manager": true, "peers": true, "peer_machines": true, "reply_window_s": true}, false); err != nil {
+		return nil, err
+	}
+	var d ScopeDoc
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&d); err != nil {
+		return nil, err
+	}
+	// the manager object is held to the same rule
+	var top map[string]json.RawMessage
+	json.Unmarshal(raw, &top)
+	if m, ok := top["manager"]; ok {
+		if err := strictKeys(m, map[string]bool{"node": true, "machine": true}, false); err != nil {
+			return nil, fmt.Errorf("manager: %v", err)
+		}
+	}
+	if pm, ok := top["peer_machines"]; ok {
+		if err := strictKeys(pm, nil, true); err != nil {
+			return nil, fmt.Errorf("peer_machines: %v", err)
+		}
+	}
+	if d.Peers == nil {
+		d.Peers = []string{}
+	}
+	return &d, nil
 }
 
 // strictKeys walks one JSON object's top-level keys: each must be exactly spelled, listed (when free is

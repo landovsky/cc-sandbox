@@ -689,3 +689,13 @@ func TestSidecarConfigKeysAreValidated(t *testing.T) {
 		t.Errorf("a good hub URL: %v", err)
 	}
 }
+
+func TestPodLoadReadsTheScopeStrictlyToo(t *testing.T) {
+	pf := newPodFx(t)
+	pf.rec.Spec.MsgScope = json.RawMessage(`{"manager":{"node":"a","machine":"hp"},"manager":{"node":"b","machine":"mac"}}`)
+	pf.writeRecord()
+	pf.refused("a duplicate manager", "pod-load", "not well formed")
+	if len(pf.dropped) != 0 || len(pf.minted) != 0 || len(pf.hub) != 0 {
+		t.Error("acted on a scope that is not well formed")
+	}
+}

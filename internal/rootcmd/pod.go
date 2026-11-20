@@ -226,6 +226,10 @@ func (e *env) podLoad(sid string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	scope, err := k8s.ParseScope(rec.Spec.MsgScope)
+	if err != nil {
+		return refuse("msg_scope of %s is not well formed: %v", sid, err)
+	}
 	// The hub's admin secret is root's (0600): it is read here, before the drop, into memory, and used
 	// below, in this process as the launch user, to register the relay for the generation key made there.
 	// Neither the secret nor the relay token is ever printed, and hostd sees neither.
@@ -275,7 +279,7 @@ func (e *env) podLoad(sid string, stdout io.Writer) error {
 		Label: rec.Label, Billing: rec.Spec.Billing, Profile: rec.Spec.Profile, Aud: e.cfg.K8sAudiences, PlacedBy: e.cfg.Machine,
 		Exp: e.d.Now().Add(time.Duration(e.cfg.K8sTokenHours) * time.Hour).Unix(),
 	}, func(pub string) (string, error) {
-		tok, err := e.registerRelay(ctx, hubSecret, rec.Spec.MsgScope, rec.Sid, rec.Gen, pub)
+		tok, err := e.registerRelay(ctx, hubSecret, scope, rec.Sid, rec.Gen, pub)
 		registered = err == nil
 		return tok, err
 	})

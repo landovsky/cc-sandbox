@@ -427,3 +427,43 @@ func TestTheSharedWorktreeGroupAndTheSnapshotVolume(t *testing.T) {
 		}
 	}
 }
+
+// fsGroup makes every volume group-owned by a group both containers are in, so group-write bits on what the
+// sidecar writes into in/ and managed/ (or on what the fence writes into out/) would let the other side write
+// them. Only the read-only mounts stop that, so they are what is pinned: the fence's in/ and managed/, and the
+// sidecar's out/, are read-only, and flipping any of them is refused.
+func TestTheSharedGroupDoesNotLetTheFenceWriteWhatTheSidecarWrites(t *testing.T) {
+	p := goodPod(t)
+	ro := func(c Container, vol string) bool {
+		for _, m := range c.VolumeMounts {
+			if m.Name == vol {
+				return m.ReadOnly
+			}
+		}
+		t.Fatalf("%s does not mount %s", c.Name, vol)
+		return false
+	}
+	fence, side := p.Spec.Containers[0], p.Spec.InitContainers[0]
+	if !ro(fence, "in") || !ro(fence, "managed") || !ro(side, "out") {
+		t.Fatal("a mount that the shared group would make writable is not read-only")
+	}
+	for why, flip := range map[string]func(*Pod){
+		"the fence's in/ writable":      func(p *Pod) { setRO(&p.Spec.Containers[0], "in", false) },
+		"the fence's managed/ writable": func(p *Pod) { setRO(&p.Spec.Containers[0], "managed", false) },
+		"the sidecar's out/ writable":   func(p *Pod) { setRO(&p.Spec.InitContainers[0], "out", false) },
+	} {
+		q := goodPod(t)
+		flip(q)
+		if err := DefaultConfig().CheckContract(q); err == nil {
+			t.Errorf("%s passed the contract", why)
+		}
+	}
+}
+
+func setRO(c *Container, vol string, ro bool) {
+	for i := range c.VolumeMounts {
+		if c.VolumeMounts[i].Name == vol {
+			c.VolumeMounts[i].ReadOnly = ro
+		}
+	}
+}

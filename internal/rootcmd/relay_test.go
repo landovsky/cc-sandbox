@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
+	"github.com/landovsky/cc-sandbox/internal/k8s"
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
@@ -534,8 +535,33 @@ func TestMayReachIsCutAtTheHubsLimit(t *testing.T) {
 		machines[n] = "mac"
 	}
 	b, _ := json.Marshal(map[string]any{"manager": map[string]string{"node": "m", "machine": "hp"}, "peers": peers, "peer_machines": machines})
-	got := mayReach(b)
+	d, err := k8s.ParseScope(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mayReach(d)
 	if len(got) != 32 || got[0] != "hp/m" || got[31] != "mac/p30" {
 		t.Errorf("%d entries, first %q last %q", len(got), got[0], got[len(got)-1])
+	}
+}
+
+// The docker relay-mint reads the record's scope as strictly as pod-create does: a scope the sidecar's flag
+// would be refused for (duplicate or wrong-case keys, an unknown key, null, trailing data) gets no relay.
+func TestRelayMintReadsTheScopeAsStrictlyAsPodCreate(t *testing.T) {
+	for why, scope := range map[string]string{
+		"null":                       `null`,
+		"a duplicate manager":        `{"manager":{"node":"a","machine":"hp"},"manager":{"node":"b","machine":"mac"}}`,
+		"a wrong-case key":           `{"Manager":{"node":"a","machine":"hp"}}`,
+		"an unknown key":             `{"manager":{"node":"a","machine":"hp"},"extra":1}`,
+		"a duplicate key in manager": `{"manager":{"node":"a","node":"b","machine":"hp"}}`,
+		"a duplicate peer machine":   `{"manager":{"node":"a","machine":"hp"},"peers":["p"],"peer_machines":{"p":"mac","p":"hp"}}`,
+	} {
+		r := newRelayFx(t)
+		r.rec.Spec.MsgScope = json.RawMessage(scope)
+		r.writeRecord()
+		code, out := r.mint("--", sid, "2", relayPub)
+		if code != 2 || len(r.hubCalls()) != 0 || !strings.Contains(out, "not well formed") {
+			t.Errorf("%s: exit %d hub calls %d: %s", why, code, len(r.hubCalls()), out)
+		}
 	}
 }

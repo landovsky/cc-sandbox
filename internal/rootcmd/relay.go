@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
+	"github.com/landovsky/cc-sandbox/internal/k8s"
 )
 
 const (
@@ -124,13 +125,17 @@ func (e *env) relayMint(sid, genS, pub string, after401 bool, stdout io.Writer) 
 	if err := e.rateLimit(filepath.Join(gdir, "relay-mint.stamp"), after401); err != nil {
 		return err
 	}
+	scope, err := k8s.ParseScope(rec.Spec.MsgScope) // as strictly as pod-create reads it
+	if err != nil {
+		return refuse("msg_scope of %s is not well formed: %v", sid, err)
+	}
 	// everything checked: only now is the secret read
 	secret, err := e.hubSecret()
 	if err != nil {
 		e.audit("relay-mint", sid, gen, pub, "no secret")
 		return &codeError{exitHub, "the hub admin secret is not usable: " + err.Error()}
 	}
-	tok, err := e.registerRelay(context.Background(), secret, rec.Spec.MsgScope, sid, gen, pub)
+	tok, err := e.registerRelay(context.Background(), secret, scope, sid, gen, pub)
 	if err != nil {
 		return err
 	}
@@ -140,7 +145,7 @@ func (e *env) relayMint(sid, genS, pub string, after401 bool, stdout io.Writer) 
 // registerRelay asks the hub for a relay principal for one generation: its public key, and what it may
 // reach from the record's scope. The secret is the caller's, already read from its trusted file. The
 // token comes back to the caller only (the verb prints it; pod-load puts it in the sidecar's payload).
-func (e *env) registerRelay(ctx context.Context, secret string, scope json.RawMessage, sid string, gen int, pub string) (string, error) {
+func (e *env) registerRelay(ctx context.Context, secret string, scope *k8s.ScopeDoc, sid string, gen int, pub string) (string, error) {
 	body, _ := json.Marshal(map[string]any{"role": "relay", "sid": sid, "gen": strconv.Itoa(gen), "pub": pub, "may_reach": mayReach(scope), "manager": managerOf(scope)})
 	code, resp, err := e.hubCall(ctx, "POST", "/v1/principals", secret, body)
 	if errors.Is(err, errHubUntrusted) {
@@ -165,14 +170,11 @@ var sidMintRe = regexp.MustCompile(`^s[0-9a-z]{4,32}$`)
 // managerOf is the session's manager as <machine>/<node> from the record's msg_scope.manager, "" when it is
 // not placed (no machine, or a malformed machine or node). The hub cannot tell the manager from the order
 // of may_reach: it allows an UNFENCED target only to this one, and a fenced one only within may_reach.
-func managerOf(scope json.RawMessage) string {
-	var s struct {
-		Manager struct{ Node, Machine string }
-	}
-	if json.Unmarshal(scope, &s) != nil || !mrMachine.MatchString(s.Manager.Machine) || !mrNode.MatchString(s.Manager.Node) {
+func managerOf(d *k8s.ScopeDoc) string {
+	if !mrMachine.MatchString(d.Manager.Machine) || !mrNode.MatchString(d.Manager.Node) {
 		return ""
 	}
-	return s.Manager.Machine + "/" + s.Manager.Node
+	return d.Manager.Machine + "/" + d.Manager.Node
 }
 
 // maxMayReach is the hub's own limit on the list.
@@ -185,17 +187,10 @@ const maxMayReach = 32
 // be refused by the hub), so a record that names no manager machine and no placed peer gives an empty
 // list: the relay then reaches fenced sessions only. The record cannot say which peers are fenced; the hub
 // needs the entry only for an UNFENCED target, so listing a fenced peer changes nothing for it. Duplicates
-// are dropped and the list is cut at the hub's 32.
-func mayReach(scope json.RawMessage) []string {
-	var s struct {
-		Manager      struct{ Node, Machine string }
-		Peers        []string
-		PeerMachines map[string]string `json:"peer_machines"`
-	}
+// are dropped and the list is cut at the hub's 32. The scope was read by k8s.ParseScope (the same strict
+// reader as the sidecar's flag): a record that is not well formed never gets here.
+func mayReach(d *k8s.ScopeDoc) []string {
 	out := []string{}
-	if json.Unmarshal(scope, &s) != nil {
-		return out
-	}
 	seen := map[string]bool{}
 	add := func(machine, node string) {
 		if !mrMachine.MatchString(machine) || !mrNode.MatchString(node) || len(out) >= maxMayReach {
@@ -206,9 +201,9 @@ func mayReach(scope json.RawMessage) []string {
 			out = append(out, e)
 		}
 	}
-	add(s.Manager.Machine, s.Manager.Node)
-	for _, p := range s.Peers {
-		add(s.PeerMachines[p], p)
+	add(d.Manager.Machine, d.Manager.Node)
+	for _, p := range d.Peers {
+		add(d.PeerMachines[p], p)
 	}
 	return out
 }

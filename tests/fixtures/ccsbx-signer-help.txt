@@ -36,6 +36,8 @@ Flags: (each also CCSBX_SIGNER_<NAME>, e.g. CCSBX_SIGNER_KEYS; a value that does
   --max-ttl D         longest token lifetime, at most 12h                          (default 12h)
   --allow-user U      user name or numeric uid allowed to ask: the exact uid, not group membership (default ccsbx)
   --allow-group G     optional: the caller's primary gid must ALSO be this group (name or gid)  (default: not checked)
+  --keys-peer-user U  a second allowed caller (name or uid): the pod launcher, ccsbx-launch
+  --keys-peer-machines M,N   the machines only the pod launcher may sign for, e.g. future-two
   --max-request N     largest request in bytes                                     (default 8192)
   --timeout D         per-connection read and write deadline                       (default 5s)
 

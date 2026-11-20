@@ -36,6 +36,10 @@
 #   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
 #   --pairs P             what the signer may sign: exact profile:billing|billing,... (CCSBX_PAIRS; default: built from
 #                         <repo>/profiles/*.json that list this machine, e.g. dev-default:api|stub,e2e-default:stub)
+#   --hub-secret-from F   the owner's file holding the hub's shared secret (the hub's SB_SECRET), (CCSBX_HUB_SECRET_FROM, default
+#                         ~owner/.config/session-bus/secret). Its FIRST LINE is copied to /etc/ccsbx/hub-admin.secret, root 0600, for
+#                         ccsbx-root's relay mint; never printed. Must be a regular file (no symlink). Verify it at Gate M (night-1-morning.md, 8c)
+#   --k8s-machine NAME    the machine pod sessions run on; the signer's keys peer (ccsbx-launch) signs only for it  (CCSBX_K8S_MACHINE, default future-two)
 #   --with-deploy         also the ccsbx-deploy sudoers rule (Q12 = yes, R10c)  (CCSBX_WITH_DEPLOY=1)
 #   --backup DIR          uninstall from this backup (must be under /var/backups/ccsbx-install), not the first one
 #   --purge-keys          uninstall also deletes the keys and the ccsbx-keys user (rotate M9 first!)
@@ -57,6 +61,7 @@ case "${1:-}" in
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
 MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"
+HUB_SECRET_FROM="${CCSBX_HUB_SECRET_FROM:-}"; K8S_MACHINE="${CCSBX_K8S_MACHINE:-future-two}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -68,6 +73,8 @@ while [ $# -gt 0 ]; do
     --machine) MACHINE="${2:?--machine NAME}"; shift ;;
     --pairs) PAIRS="${2:?--pairs P}"; shift ;;
     --image) IMAGE="${2:?--image REF}"; shift ;;
+    --hub-secret-from) HUB_SECRET_FROM="${2:?--hub-secret-from FILE}"; shift ;;
+    --k8s-machine) K8S_MACHINE="${2:?--k8s-machine NAME}"; shift ;;
     --with-deploy) WITH_DEPLOY=1 ;;
     --backup) RESTORE_OVERRIDE="${2:?--backup DIR}"; shift ;;
     --purge-keys) PURGE_KEYS=1 ;;
@@ -101,6 +108,11 @@ PY
 # the signer's pairs come from the repo's profiles at install (the repo is reviewed and merged; profiles are embedded elsewhere)
 [ -n "$PAIRS" ] || PAIRS="$(pairs_from "$REPO_DIR/profiles")"
 SCOPE_ERRORS=()
+[[ "$K8S_MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] && [ "$K8S_MACHINE" != "$MACHINE" ] || SCOPE_ERRORS+=("k8s machine '$K8S_MACHINE' must be a plain host name other than this machine (--k8s-machine)")
+SCOPE_MACHINES="$MACHINE,$K8S_MACHINE"
+[ -n "$HUB_SECRET_FROM" ] || HUB_SECRET_FROM="$OWNER_HOME/.config/session-bus/secret"
+if [ ! -f "$HUB_SECRET_FROM" ] || [ -L "$HUB_SECRET_FROM" ]; then SCOPE_ERRORS+=("hub secret file $HUB_SECRET_FROM is not a regular file (no symlink); pass --hub-secret-from FILE: ccsbx-root's relay mint needs the hub's secret")
+elif [ -z "$(head -n1 "$HUB_SECRET_FROM" | tr -d '\r\n ')" ]; then SCOPE_ERRORS+=("hub secret file $HUB_SECRET_FROM has an empty first line"); fi
 [[ "$MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || SCOPE_ERRORS+=("machine name '$MACHINE' is not a plain host name (--machine)")
 _b='(api|subscription|stub)'
 [[ "$PAIRS" =~ ^[A-Za-z0-9._-]+:$_b(\|$_b)*(,[A-Za-z0-9._-]+:$_b(\|$_b)*)*$ ]] || SCOPE_ERRORS+=("pairs '$PAIRS' is empty or not name:billing|billing,... (--pairs; default: profiles/*.json that list machine $MACHINE)")
@@ -257,7 +269,7 @@ case "$MODE" in
     echo "Nothing below is run by 'plan'. The same steps run under 'install --yes' as root."
     eval_gates; print_gates
     echo "  P15 status file: $P15_FILE"; echo "  allowed roots:   ${ALLOWED_ROOTS_TOML:-(none)}"
-    echo "  signer scope:    owners=$OWNER machines=$MACHINE pairs=$PAIRS"
+    echo "  signer scope:    owners=$OWNER machines=$SCOPE_MACHINES pairs=$PAIRS"
     steps_install
     echo; echo "AFTER: reboot, then units/install-linux.sh check  and  bin/ccsbx-preflight --morning --post-M1"
     echo "UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the first backup, $BACKUP_DIR; a failed install is undone the same way)"

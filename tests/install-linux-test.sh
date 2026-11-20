@@ -28,13 +28,14 @@ fx() {                                   # fx NAME → a fresh fake root with su
   printf '%s\n' '# see sudoers(5)' > "$d/root/etc/sudoers.d/README"
   for b in ccsbx-root ccsbx-hostd ccsbx-signer ccsbx; do echo "bin $b" > "$d/dist/$b"; done
   (cd "$d/dist" && sha256sum ccsbx-root ccsbx-hostd ccsbx-signer ccsbx > SHA256SUMS)
+  printf 'hub-secret-value-not-printed\n' > "$d/hubsecret"
   printf 'id\tstate\twhat\taction\nA5\tdone\trunners\tmoved\nB-x\tdropped\tx\tgone\n' > "$d/p15.tsv"
   echo "$d"
 }
 ins() {                                  # ins FXDIR ARGS… — run the installer inside the fake root, recording commands
   local d="$1"; shift
   CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/rec/cmds" CCSBX_BIN_DIR="$d/dist" CCSBX_P15_FILE="$d/p15.tsv" \
-  CCSBX_OWNER=tomas CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" CCSBX_IMAGE="${IMG:-ghcr.io/landovsky/ccsbx-fence@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "$inst" "$@"
+  CCSBX_HUB_SECRET_FROM="${HUBSRC-$d/hubsecret}" CCSBX_OWNER=tomas CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" CCSBX_IMAGE="${IMG:-ghcr.io/landovsky/ccsbx-fence@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "$inst" "$@"
 }
 snapshot() { (cd "$1" && find root dist -type f -o -type l | sort | xargs -r sha256sum 2>/dev/null; cat rec/cmds 2>/dev/null); }
 
@@ -343,7 +344,7 @@ for bad_arg in "--pairs|bad prof" "--pairs|dev:subscription,x" "--machine|Bad_Ho
   d="$(fx sgbad)"; ins "$d" install --yes "${bad_arg%%|*}" "${bad_arg#*|}" >/dev/null 2>"$d/err"; rc=$?
   t "signer: ${bad_arg%%|*} '${bad_arg#*|}' is refused (exit 3), nothing changed" bash -c '[ '"$rc"' -eq 3 ] && [ ! -s "$1" ]' _ "$d/rec/cmds"
 done
-t "signer: plan prints the scope it will write" bash -c 'grep -q "signer scope:    owners=tomas machines=hp-ubuntu pairs=dev-default:api|stub,e2e-default:stub" <<<"$1"' _ "$(CCSBX_OWNER=tomas "$inst" plan --machine hp-ubuntu 2>&1)"
+t "signer: plan prints the scope it will write" bash -c 'grep -q "signer scope:    owners=tomas machines=hp-ubuntu,future-two pairs=dev-default:api|stub,e2e-default:stub" <<<"$1"' _ "$(CCSBX_OWNER=tomas CCSBX_HUB_SECRET_FROM=/etc/hostname "$inst" plan --machine hp-ubuntu 2>&1)"
 # check asks the signer to sign one in-scope claim (a stub signer on a unix socket in the fake root)
 d="$(fx sgchk)"; mkdir -p "$d/root/run/ccsbx-signer"
 cat > "$tmp/fake-signer.py" <<'PY'
@@ -461,7 +462,40 @@ t "roots: a real directory is accepted (exit 0)" bash -c '[ '"$rc"' -eq 0 ] || {
 echo "# ccsbx-root's verbs: status (read-only, A's n1-a-h1-r67) is listed explicitly"
 d="$(fx verbs)"; ins "$d" install --yes >/dev/null 2>&1
 t "verbs: the installed ccsbx-root.toml lists status explicitly, next to stop" bash -c 'grep -q "^verbs = \\[.*\"stop\", \"status\"" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
-t "verbs: it lists exactly run stop status renew gc attach exec-token (no verb is added by accident)" bash -c 'v="$(sed -n "s/^verbs = \\[\\(.*\\)\\]\$/\\1/p" "$1" | tr -d "\" " | tr "," "\\n" | sort | tr "\\n" " ")"; [ "$v" = "attach exec-token gc renew run status stop " ]' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+t "verbs: it lists exactly the seven docker verbs and the five pod and relay verbs (no verb is added by accident)" bash -c 'v="$(sed -n "s/^verbs = \\[\\(.*\\)\\]\$/\\1/p" "$1" | tr -d "\" " | tr "," "\\n" | sort | tr "\\n" " ")"; [ "$v" = "attach exec-token gc pod-create pod-load pod-status pod-stop relay-mint renew run status stop " ]' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+
+echo "# round 3: ccsbx-launch, ccsbx-term, the hub secret, the keys peer (n1-a-relay b14eeb2)"
+d="$(fx r3)"; ins "$d" install --yes >"$d/out" 2>"$d/err"; rc=$?; c="$d/rec/cmds"; toml="$d/root/etc/ccsbx/ccsbx-root.toml"
+t "r3: the install succeeds" test "$rc" -eq 0
+t "r3: ccsbx-launch is a system user with its own 0700 home, and the signer's user is not it" bash -c 'grep -q "^useradd --system --home-dir /var/lib/ccsbx-launch --create-home --shell /usr/sbin/nologin ccsbx-launch" "$1" && grep -q "^chown ccsbx-launch:ccsbx-launch /var/lib/ccsbx-launch" "$1" && grep -q "^chmod 0700 /var/lib/ccsbx-launch" "$1"' _ "$c"
+t "r3: ccsbx-term has no home (/nonexistent, no create-home) and no shell, and is in no group but its own" bash -c 'l="$(grep "ccsbx-term$" "$1" | grep ^useradd)"; grep -q -- "--no-create-home" <<<"$l" && grep -q -- "--home-dir /nonexistent" <<<"$l" && grep -q -- "--shell /usr/sbin/nologin" <<<"$l" && ! grep -q -- "--groups\|-G " <<<"$l" && ! grep -q "gpasswd -a ccsbx-term\|usermod.*ccsbx-term" "$1"' _ "$c"
+t "r3: the signer's unit names the keys peer ccsbx-launch for future-two only" bash -c 'grep -q -- "--keys-peer-user ccsbx-launch --keys-peer-machines future-two" "$1/root/etc/systemd/system/ccsbx-signer.service"' _ "$d"
+t "r3: the signer's scope allows future-two as well (else the launcher's token is out of scope)" bash -c 'grep -- "--write-scope" "$1" | grep -q -- "--machines [a-z0-9.-]*.,future-two"' _ "$c"
+t "r3: ccsbx-root.toml names launch_user, term_user, signer_user, the kubeconfig under ccsbx-launch, k8s_machine, the hub" bash -c 'for k in "launch_user = \"ccsbx-launch\"" "term_user = \"ccsbx-term\"" "signer_user = \"ccsbx-keys\"" "kubeconfig = \"/var/lib/ccsbx-launch/launcher.kubeconfig\"" "k8s_machine = \"future-two\"" "hub_url = \"http://127.0.0.1:4011\"" "hub_secret = \"/etc/ccsbx/hub-admin.secret\""; do grep -qF "$k" "$1" || { echo "missing $k"; exit 1; }; done' _ "$toml"
+t "r3: the pod and relay verbs are on" bash -c 'grep "^verbs" "$1" | grep -q "pod-create.*pod-load.*pod-stop.*pod-status.*relay-mint"' _ "$toml"
+t "r3: hub-admin.secret is root:root 0600 and holds the secret without a newline's worth of extras" bash -c 'grep -q "^chown root:root /etc/ccsbx/hub-admin.secret" "$1/rec/cmds" && [ "$(stat -c %a "$1/root/etc/ccsbx/hub-admin.secret")" = 600 ] && [ "$(cat "$1/root/etc/ccsbx/hub-admin.secret")" = hub-secret-value-not-printed ]' _ "$d"
+printf 'first-line-secret\nsecond line must not be copied\n' > "$d/hubsecret2"; d2="$(fx r3two)"; HUBSRC="$d/hubsecret2" ins "$d2" install --yes >/dev/null 2>&1
+t "r3: only the FIRST LINE of the owner's secret file is copied" bash -c '[ "$(cat "$1/root/etc/ccsbx/hub-admin.secret")" = first-line-secret ]' _ "$d2"
+out="$(CCSBX_OWNER=tomas "$inst" plan 2>&1)"
+t "r3: with no option the source is ~owner/.config/session-bus/secret" bash -c 'grep -q "/.config/session-bus/secret" <<<"$1"' _ "$out"
+t "r3: the secret is never printed by the install" bash -c '! grep -q hub-secret-value-not-printed "$1" "$2"' _ "$d/out" "$d/err"
+t "r3: the sudoers rule is unchanged: one rule for ccsbx-root covers the pod verbs for the owner and hostd" bash -c 'f="$1/root/etc/sudoers.d/.90-ccsbx-root.new"; [ "$(grep -c "^[a-z][a-z0-9_-]* ALL=(root) NOPASSWD: /usr/local/sbin/ccsbx-root\$" "$f")" = 2 ] && ! grep -q ccsbx-launch "$f"' _ "$d"
+plan="$(ins "$d" plan -v 2>&1)"
+t "r3: plan -v does not print the secret either" bash -c '! grep -q hub-secret-value-not-printed <<<"$1"' _ "$plan"
+for bad in "/nonexistent-hub-secret"; do
+  d="$(fx r3b)"; HUBSRC="$bad" ins "$d" install --yes >/dev/null 2>"$d/err"; rc=$?
+  t "r3: hub secret source '${bad:-unset}' is refused (exit 3), nothing changed" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/rec/cmds" ] && [ ! -e "$2/root/etc/ccsbx" ]' _ "$rc" "$d"
+done
+d="$(fx r3c)"; : > "$d/empty"; HUBSRC="$d/empty" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "r3: an empty secret file is refused (exit 3)" test "$rc" -eq 3
+d="$(fx r3d)"; ln -s "$d/hubsecret" "$d/hublink"; HUBSRC="$d/hublink" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "r3: a symlink as the secret source is refused (exit 3)" test "$rc" -eq 3
+d="$(fx r3e)"; ins "$d" install --yes --k8s-machine "$(hostname -s | tr A-Z a-z)" >/dev/null 2>&1; rc=$?
+t "r3: a k8s machine equal to this machine is refused (exit 3)" test "$rc" -eq 3
+d="$(fx r3h)"; ins "$d" install --yes >/dev/null 2>&1
+out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
+t "r3: check looks at ccsbx-launch, ccsbx-term, their uids, the launch dir and the hub secret" bash -c 'for k in "user ccsbx-launch exists" "user ccsbx-term exists" "five different uids\|share uid" "/var/lib/ccsbx-launch is" "hub-admin.secret is"; do grep -q "$k" <<<"$1" || { echo "no check: $k"; exit 1; }; done' _ "$out"
+t "r3: the hub secret is listed as absent in the first backup, so uninstall removes it" grep -qx /etc/ccsbx/hub-admin.secret "$d/root/var/backups/ccsbx-install/original/ABSENT"
 
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"

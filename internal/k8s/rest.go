@@ -2,7 +2,7 @@
 // namespace), over net/http with a bearer token and the cluster CA. It exists because client-go is a
 // third-party module; the API surface we need is four calls. It reads a small JSON file, not a
 // kubeconfig (that is YAML): {"server": "https://...", "ca_file": "...", "token_file": "..."}, which
-// the installer derives from the launcher kubeconfig that lives under ccsbx-keys. The token is read
+// the installer derives from the launcher kubeconfig that lives under ccsbx-launch. The token is read
 // on every request, so a renewal (the launcher token is short-lived) needs no restart.
 package k8s
 

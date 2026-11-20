@@ -20,7 +20,7 @@ type Backend struct {
 	X          Execer
 	Cfg        Config
 	Kubectl    string // absolute path, for AttachArgv
-	Kubeconfig string // the launcher kubeconfig under ccsbx-keys, for AttachArgv
+	Kubeconfig string // the launcher kubeconfig under ccsbx-launch, for AttachArgv
 	Server     string // https://host[:port], from ConnConfig, for AttachArgv
 	CAFile     string // CA file, from ConnConfig, for AttachArgv
 }
@@ -240,9 +240,13 @@ func (b *Backend) Exec(ctx context.Context, ref Ref, container string, cmd []str
 	return b.X.Exec(ctx, ref.Namespace, ref.Name, container, cmd, io)
 }
 
+// AttachTerm is the TERM the in-pod tmux is attached with: kubectl exec does not forward the caller's
+// TERM and the fence sets none, so tmux would find no terminal; a fixed, ubiquitous name works.
+const AttachTerm = "xterm-256color"
+
 // AttachArgv is the command line that attaches a terminal to the fence's tmux (F5): kubectl exec -it
 // into the fence container, by exact pod name derived here from the sid and generation (a caller
-// names the session, never the pod), with the kubeconfig under ccsbx-keys. The caller execs it as the
+// names the session, never the pod), with the kubeconfig under ccsbx-launch. The caller execs it as the
 // user that holds the kubeconfig; nothing here runs it. It refuses while kubectl or the kubeconfig is
 // not an absolute path, because kubectl without a kubeconfig talks to localhost.
 func (b *Backend) AttachArgv(sid string, gen int) ([]string, error) {
@@ -260,5 +264,5 @@ func (b *Backend) AttachArgv(sid string, gen int) ([]string, error) {
 	}
 	a := append([]string{b.Kubectl}, connArgs(b.Kubeconfig, b.Server, b.CAFile)...)
 	return append(a, "-n", ref.Namespace, "exec", "-it", "-c", "fence", ref.Name, "--",
-		"tmux", "attach-session", "-t", "="+sid+":"), nil
+		"env", "TERM="+AttachTerm, "tmux", "attach-session", "-t", "="+sid+":"), nil
 }

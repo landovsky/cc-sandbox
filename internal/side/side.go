@@ -33,6 +33,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -383,25 +384,48 @@ func Load(control string, in io.Reader) error {
 	}
 	c, err := net.DialTimeout("unix", control, 5*time.Second)
 	if err != nil {
-		return fmt.Errorf("side load: %w", err)
+		return fmt.Errorf("side load: %w: %w", ErrNoSocket, err)
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := c.Write(b); err != nil {
-		return err
-	}
-	if uc, ok := c.(*net.UnixConn); ok {
+	// A server that refuses the peer answers and closes at once, so the write can fail with a broken pipe
+	// while the answer is already waiting: the answer is read either way.
+	_, werr := c.Write(b)
+	if uc, ok := c.(*net.UnixConn); ok && werr == nil {
 		uc.CloseWrite() // the server reads exactly one JSON object and then wants to see the end
 	}
 	var r reply
 	if err := json.NewDecoder(c).Decode(&r); err != nil {
+		if werr != nil {
+			return werr
+		}
 		return fmt.Errorf("side load: no answer: %w", err)
 	}
 	if !r.OK {
+		if strings.HasPrefix(r.Error, "already loaded") {
+			return fmt.Errorf("side load: refused: %s: %w", r.Error, ErrAlreadyLoaded)
+		}
 		return fmt.Errorf("side load: refused: %s", r.Error)
 	}
 	return nil
 }
+
+// Exit codes of `ccsbx side load`, so the launcher can tell what happened without reading text: 1 is a
+// refusal (a bad payload, an expired token), 3 is that nothing was listening (the sidecar is not up yet:
+// safe to try again), 4 is that this sidecar already holds a load (the launcher's earlier try got through,
+// or somebody else's did). kubectl's own failures also exit 1, so 3 and 4 only ever come from here.
+const (
+	ExitNoSocket      = 3
+	ExitAlreadyLoaded = 4
+)
+
+// ErrNoSocket and ErrAlreadyLoaded are what Load returns for those two cases.
+var (
+	ErrNoSocket      = errors.New("no control socket")
+	ErrAlreadyLoaded = errors.New("already loaded")
+	// ErrRefused is what LoadInto returns when the sidecar's command exited 1: a refusal of the payload.
+	ErrRefused = errors.New("refused")
+)
 
 // appendFailures rate-limits the log line for a failing journal: once the store is broken (journal.ErrBroken)
 // every append fails, and a line per decision would flood the sidecar's log. The first failure is logged,

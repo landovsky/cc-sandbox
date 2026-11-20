@@ -58,6 +58,14 @@ Flags: (each also CCSBX_SIGNER_<NAME>, e.g. CCSBX_SIGNER_KEYS; a value that does
   --max-ttl D         longest token lifetime, at most 12h                          (default 12h)
   --allow-user U      user name or numeric uid allowed to ask: the exact uid, not group membership (default ccsbx)
   --allow-group G     optional: the caller's primary gid must ALSO be this group (name or gid)  (default: not checked)
+  --keys-peer-user U  a second allowed caller (name or uid): the pod launcher, ccsbx-launch (never the signer's own user, which can read the machine key; refused). It may sign ONLY for
+                      --keys-peer-machines and only tokens with a cnf (a generation key it holds itself, so
+                      hostd never sees a pod session's token and key). Those machines are then closed to
+                      --allow-user. Off by default; needs --keys-peer-machines, and a uid other than --allow-user.
+  --keys-peer-socket PATH    the keys peer's OWN socket (mode 0660, created here; under systemd the second socket,
+                      LISTEN_FDS=2, with SocketGroup=ccsbx-launch): hostd's socket is group ccsbx and the launch
+                      user is not in it, so it needs a socket it can reach; each socket takes its own class only
+  --keys-peer-machines M,N   the machines only the pod launcher may sign for, e.g. future-two
   --max-request N     largest request in bytes                                     (default 8192)
   --timeout D         per-connection read and write deadline                       (default 5s)
 
@@ -145,6 +153,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	ttl := fs.Duration("max-ttl", ee.dur("MAX_TTL", token.MaxLifetime), "")
 	user_ := fs.String("allow-user", envOr("ALLOW_USER", "ccsbx"), "")
 	group := fs.String("allow-group", envOr("ALLOW_GROUP", ""), "")
+	ksock := fs.String("keys-peer-socket", envOr("KEYS_PEER_SOCKET", ""), "")
+	kuser := fs.String("keys-peer-user", envOr("KEYS_PEER_USER", ""), "")
+	kmach := fs.String("keys-peer-machines", envOr("KEYS_PEER_MACHINES", ""), "")
 	maxReq := fs.Int("max-request", ee.integer("MAX_REQUEST", 8192), "")
 	timeout := fs.Duration("timeout", ee.dur("TIMEOUT", 5*time.Second), "")
 	if len(ee.errs) > 0 {
@@ -216,25 +227,63 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		}
 		gid = &g
 	}
+	var keysUID *uint32
+	if *kuser != "" {
+		u, err := userID(*kuser)
+		if err != nil {
+			fmt.Fprintln(stderr, "ccsbx-signer:", err)
+			return 2
+		}
+		keysUID = &u
+	}
 	logf := func(f string, a ...any) { fmt.Fprintf(stderr, f+"\n", a...) }
-	srv, err := New(Config{Key: k, Scope: sc, Audiences: splitCSV(*auds), MaxTTL: *ttl, AllowUID: uid, AllowGID: gid,
+	srv, err := New(Config{Key: k, Scope: sc, Audiences: splitCSV(*auds), MaxTTL: *ttl, AllowUID: uid, AllowGID: gid, KeysUID: keysUID, KeysMachines: splitCSV(*kmach),
 		MaxRequest: *maxReq, ReadTimeout: *timeout, Logf: logf})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	var l net.Listener
-	if *sysd {
+	if keysUID == nil && *ksock != "" {
+		fmt.Fprintln(stderr, "ccsbx-signer: --keys-peer-socket without --keys-peer-user")
+		return 2
+	}
+	if keysUID != nil && !*sysd && *ksock == "" {
+		fmt.Fprintln(stderr, "ccsbx-signer: --keys-peer-user needs its own socket: --keys-peer-socket PATH, or a second socket from systemd (LISTEN_FDS=2)")
+		return 2
+	}
+	var l, kl net.Listener // kl: the keys peer's own socket (group ccsbx-launch), never the main one
+	switch {
+	case *sysd && keysUID != nil:
+		var ls []net.Listener
+		if ls, err = SystemdListeners(os.Getenv, os.Getpid(), 3, []string{SocketNameHostd, SocketNameKeys}); err == nil {
+			l, kl = ls[0], ls[1]
+		}
+	case *sysd:
 		l, err = SystemdListener(os.Getenv, os.Getpid(), 3)
-	} else {
-		l, err = listenUnix(*sock)
+	default:
+		if l, err = listenUnix(*sock); err == nil && keysUID != nil {
+			if kl, err = listenUnix(*ksock); err != nil {
+				l.Close()
+			}
+		}
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "ccsbx-signer:", err)
 		return 2
 	}
-	srv.logJSON("signer", "serving", "kid", k.KID, "allow_uid", uid)
-	if err := srv.Serve(l); err != nil {
+	srv.logJSON("signer", "serving", "kid", k.KID, "allow_uid", uid, "keys_peer_socket", kl != nil)
+	if kl == nil {
+		if err := srv.Serve(l); err != nil {
+			fmt.Fprintln(stderr, "ccsbx-signer:", err)
+			return 1
+		}
+		return 0
+	}
+	// two sockets, one rule: hostd's socket takes hostd only, the keys peer's takes the keys peer only
+	errc := make(chan error, 2)
+	go func() { errc <- srv.ServeHostd(l) }()
+	go func() { errc <- srv.ServeKeysPeer(kl) }()
+	if err := <-errc; err != nil {
 		fmt.Fprintln(stderr, "ccsbx-signer:", err)
 		return 1
 	}
@@ -245,23 +294,77 @@ func Main(args []string, stdout, stderr io.Writer) int {
 // exactly 1, the socket being the fd at first (3 under systemd). Anything else is refused, so a
 // stray environment can't make the signer serve on an fd it didn't get from its parent.
 func SystemdListener(env func(string) string, pid, first int) (net.Listener, error) {
+	ls, err := SystemdListeners(env, pid, first, []string{""})
+	if err != nil {
+		return nil, err
+	}
+	return ls[0], nil
+}
+
+// Names of the two systemd sockets (FileDescriptorName= in the .socket units): which fd is which is
+// decided by name, never by order, so units that start in another order cannot swap the classes.
+const (
+	SocketNameHostd = "main"
+	SocketNameKeys  = "launch"
+)
+
+// SystemdListeners is SystemdListener for exactly the named sockets, taken from the fds at first.. by
+// LISTEN_FDNAMES, and returned in the order of names. Exactly len(names) fds must be passed, each name
+// once, and nothing else.
+func SystemdListeners(env func(string) string, pid, first int, names []string) ([]net.Listener, error) {
+	n := len(names)
 	if p, err := strconv.Atoi(env("LISTEN_PID")); err != nil || p != pid {
 		return nil, fmt.Errorf("LISTEN_PID %q is not this process (%d): not started by systemd socket activation", env("LISTEN_PID"), pid)
 	}
-	if n, err := strconv.Atoi(env("LISTEN_FDS")); err != nil || n != 1 {
-		return nil, fmt.Errorf("LISTEN_FDS is %q, want exactly 1 socket", env("LISTEN_FDS"))
+	if got, err := strconv.Atoi(env("LISTEN_FDS")); err != nil || got != n {
+		return nil, fmt.Errorf("LISTEN_FDS is %q, want exactly %d socket(s)", env("LISTEN_FDS"), n)
 	}
-	f := os.NewFile(uintptr(first), "systemd-socket")
-	defer f.Close()
-	l, err := net.FileListener(f)
-	if err != nil {
-		return nil, fmt.Errorf("fd %d is not a listening socket: %w", first, err)
+	fd := make([]int, n)
+	if n == 1 {
+		fd[0] = first
+	} else {
+		have := strings.Split(env("LISTEN_FDNAMES"), ":")
+		if len(have) != n {
+			return nil, fmt.Errorf("LISTEN_FDNAMES is %q, want the %d names %v (set FileDescriptorName= on the socket units)", env("LISTEN_FDNAMES"), n, names)
+		}
+		for i, want := range names {
+			idx := -1
+			for j, h := range have {
+				if h == want {
+					if idx >= 0 {
+						return nil, fmt.Errorf("LISTEN_FDNAMES names %q twice", want)
+					}
+					idx = j
+				}
+			}
+			if idx < 0 {
+				return nil, fmt.Errorf("LISTEN_FDNAMES %q has no socket named %q", env("LISTEN_FDNAMES"), want)
+			}
+			fd[i] = first + idx
+		}
 	}
-	if _, ok := l.(*net.UnixListener); !ok {
-		l.Close()
-		return nil, fmt.Errorf("fd %d is not a unix socket", first)
+	var out []net.Listener
+	closeAll := func() {
+		for _, o := range out {
+			o.Close()
+		}
 	}
-	return l, nil
+	for _, d := range fd {
+		f := os.NewFile(uintptr(d), "systemd-socket")
+		l, err := net.FileListener(f)
+		f.Close()
+		if err != nil {
+			closeAll()
+			return nil, fmt.Errorf("fd %d is not a listening socket: %w", d, err)
+		}
+		if _, ok := l.(*net.UnixListener); !ok {
+			l.Close()
+			closeAll()
+			return nil, fmt.Errorf("fd %d is not a unix socket", d)
+		}
+		out = append(out, l)
+	}
+	return out, nil
 }
 
 // listenUnix creates the socket itself (not under systemd). It refuses a path that exists.

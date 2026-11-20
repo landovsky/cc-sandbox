@@ -17,7 +17,7 @@
 //	func (b *Backend) Delete(ctx, sid string, gen int) error    // by exact name, grace <= 60 s; absent = ok
 //	func (b *Backend) List(ctx) ([]Status, error)               // role=session pods of this namespace
 //	func (b *Backend) Exec(ctx, ref Ref, container string, cmd []string, io IO) (exit int, err error)  // live pod UID must equal ref.UID, checked just before the exec
-//	func (b *Backend) AttachArgv(sid string, gen int) ([]string, error) // kubectl exec -it -c fence ... tmux attach; derives the pod, refuses non-absolute kubectl/kubeconfig
+//	func (b *Backend) AttachArgv(sid string, gen int) ([]string, error) // kubectl exec -it -c fence ... tmux attach (TERM=xterm-256color); derives the pod, refuses non-absolute kubectl/kubeconfig
 //	func NewKubectl(bin, kubeconfig, server, ca string) (Kubectl, error) // the production Execer; absolute paths, kubeconfig and CA must exist, server https; server+CA are passed on the command line
 //	func PodFor(Spec) (*Pod, error)                             // pure; the contract is checked here
 //

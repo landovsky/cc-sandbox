@@ -1,6 +1,6 @@
 {
   "name": "dev-default",
-  "machines": ["hp-ubuntu"],
+  "machines": ["hp-ubuntu", "future-two"],
   "billing": ["api", "stub"],
   "memory_mb": 4096,
   "pids": 512,

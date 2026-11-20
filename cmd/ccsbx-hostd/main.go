@@ -76,6 +76,10 @@ func app() *cli.App {
 				f.String("pins", "/etc/ccsbx/pins.toml", "production pins file for session starts (digests that may run under any profile); the same file ccsbx-root reads")
 				f.Int("min-uid", 1000, "session starts: a caller with a uid below this, root, or hostd's own uid is refused (ccsbx-root refuses them anyway; a start must not hold a label and a slot first)")
 				f.String("worktree-root", home, "session starts: comma-separated absolute directories (the syntax and meaning of ccsbx-root.toml allowed_roots, e.g. /home/u/git,/home/u/wt): a workdir must be strictly inside one of them after symlinks are resolved; a bad entry stops every start; hidden dirs of the home are refused when a root is the home")
+				f.String("pod-machines", "", "session starts: comma-separated machine names whose sessions run as pods (e.g. future-two): a spec for one is started through `sudo -n ccsbx-root pod-create` then `pod-load` (helper mode only); hostd holds no kubeconfig and never sees the pod's token or key. Empty: no pod placement")
+				f.Duration("pod-ttl", 8*time.Hour, "pod sessions: a pod session older than this is stopped by the sweep (the pod deleted by UID); keep it at the root config's k8s_token_hours")
+				f.Duration("pod-sweep", time.Minute, "pod sessions: how often the sweep looks for expired pods and pods the owner already stopped (0 turns it off)")
+				f.Duration("pod-load-wait", 0, "pod sessions: how long hostd waits for `ccsbx-root pod-load` (0: its worst case, 600 s ready deadline plus load and API time, plus 30 s)")
 				f.String("cc-version", "", "Claude Code version recorded in a started session's pin")
 				f.Int("max-live", 8, "session starts: machine_full above this many live sessions")
 				f.String("known-machines", "", "comma-separated machines of this deployment (hub machine ids): a session start whose msg_scope puts its manager or a peer on any other machine is refused (bad_spec) before anything is published. Empty: only the shape is checked")
@@ -120,6 +124,7 @@ func app() *cli.App {
 func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	get := func(n string) string { return f.Lookup(n).Value.String() }
 	num := func(n string) int { var v int; fmt.Sscanf(get(n), "%d", &v); return v }
+	dur := func(n string) time.Duration { d, _ := time.ParseDuration(get(n)); return d }
 	iv, err := time.ParseDuration(get("interval"))
 	if err != nil || iv <= 0 {
 		fmt.Fprintf(stderr, "ccsbx-hostd: --interval %q is not a positive duration\n", get("interval"))
@@ -217,6 +222,28 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	}
 	sd := &start.Daemon{StateDir: abs(get("state")), RunDir: runDir, ProfileLoader: profiles.Load, Machine: get("machine"), Root: mode, Exe: exe, Backend: "docker", Runtime: runtimeFor(mode),
 		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Helper: mode == "helper", Env: paneEnv(abs(get("state")), get("machine"), get("image"), mode)}}
+	if pm := get("pod-machines"); pm != "" {
+		if mode != "helper" {
+			fmt.Fprintln(os.Stderr, "ccsbx-hostd: --pod-machines needs helper mode (--root helper): the pod verbs are ccsbx-root's")
+			return cli.ExitFail
+		}
+		sd.Placements = map[string]string{}
+		for _, m := range strings.Split(pm, ",") {
+			if m = strings.TrimSpace(m); m != "" && m != get("machine") {
+				sd.Placements[m] = "k8s"
+			}
+		}
+		sd.PodRoot = start.SudoPodRoot{LoadWait: dur("pod-load-wait")}
+		sd.Logf = lg.Printf
+		if every := dur("pod-sweep"); every > 0 {
+			ttl := dur("pod-ttl")
+			go func() {
+				for range time.Tick(every) {
+					sd.SweepPods(ttl)
+				}
+			}()
+		}
+	}
 	var servers []*http.Server
 	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
 	srv.Replace = func(sid, brief string) (int, error) {

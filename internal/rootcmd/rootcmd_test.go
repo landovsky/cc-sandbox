@@ -135,6 +135,9 @@ type fx struct {
 	execs             []execCall
 	dropped           [][2]int
 	dropErr           error
+	sessions          []AttachSpec
+	sessionCode       int
+	sessionErr        error
 }
 
 // vtmp is a directory under /var/tmp: /tmp is a fixed mount point of the fence, so a worktree
@@ -649,7 +652,7 @@ func TestAttachAllow(t *testing.T) {
 	}
 	// the environment is rebuilt: no PATH, HOME or TMUX of the caller
 	want := "PATH=/usr/bin:/bin HOME=/nonexistent LANG=C.UTF-8 TERM=screen-256color"
-	hard := "tmux -S /run/ccsbx/tmux.sock -f /dev/null set-option -g prefix None ; set-option -g prefix2 None ; set-option -g mouse off ; unbind-key -a ; unbind-key -a -T root ; attach -t =" + sid + ":"
+	hard := "tmux -S /run/ccsbx/tmux.sock -f /dev/null set-option -g prefix None ; set-option -g prefix2 None ; set-option -g mouse off ; set-option -g set-clipboard off ; set-option -g allow-passthrough off ; unbind-key -a ; unbind-key -a -T root ; attach -t =" + sid + ":"
 	if strings.Join(e.argv, " ") != hard {
 		t.Errorf("attach does not harden the server itself: %v", e.argv)
 	}

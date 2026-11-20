@@ -3,9 +3,11 @@ package side
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/k8s"
 )
@@ -73,5 +75,50 @@ func TestLoadIntoRefusesOversizedSecrets(t *testing.T) {
 	f := &fakeX{}
 	if err := LoadInto(context.Background(), f, k8s.Ref{UID: "u"}, bytes.Repeat([]byte("a"), MaxSecrets+1)); err == nil || f.stdin != "" || f.cont != "" {
 		t.Fatalf("oversized secrets: %v (exec called: %q)", err, f.cont)
+	}
+}
+
+// context "the launcher must tell 'not up yet' and 'already loaded' from a refusal by the exit code the
+// sidecar's own command returns, not by words in its stderr": text that merely contains those words is
+// still a refusal.
+func TestLoadIntoClassifiesByExitCode(t *testing.T) {
+	for _, c := range []struct {
+		code     int
+		msg      string
+		noSocket bool
+		already  bool
+	}{
+		{ExitNoSocket, "side load: dial unix x: no such file", true, false},
+		{ExitAlreadyLoaded, "side load: refused: already loaded", false, true},
+		{1, "side load: refused: no such file or directory in the token", false, false},
+		{1, "side load: refused: already loaded (so it says)", false, false},
+	} {
+		f := &fakeX{code: c.code, msg: c.msg}
+		err := LoadInto(context.Background(), f, k8s.Ref{UID: "uid-1"}, []byte(`{"token":"T","key":"K"}`))
+		if err == nil || errors.Is(err, ErrNoSocket) != c.noSocket || errors.Is(err, ErrAlreadyLoaded) != c.already {
+			t.Errorf("exit %d %q: %v", c.code, c.msg, err)
+		}
+	}
+}
+
+// context "the real command's exit codes": nothing listening exits 3; a second load into a loaded
+// sidecar exits 4; a bad payload exits 1.
+func TestSideLoadExitCodes(t *testing.T) {
+	r := newRig(t, nil)
+	var out, errb bytes.Buffer
+	if c := Main([]string{"load", "--control", r.ctl + ".nope"}, strings.NewReader(`{}`), &out, &errb); c != ExitNoSocket {
+		t.Errorf("no socket: exit %d (%s)", c, errb.String())
+	}
+	_, in := r.secrets(time.Hour)
+	if c := Main([]string{"load", "--control", r.ctl}, in, &out, &errb); c != 0 {
+		t.Fatalf("first load: exit %d (%s)", c, errb.String())
+	}
+	_, in2 := r.secrets(time.Hour)
+	if c := Main([]string{"load", "--control", r.ctl}, in2, &out, &errb); c != ExitAlreadyLoaded {
+		t.Errorf("second load: exit %d", c)
+	}
+	r2 := newRig(t, nil)
+	if c := Main([]string{"load", "--control", r2.ctl}, strings.NewReader(`{"token":"x","key":"y"}`), &out, &errb); c != 1 {
+		t.Errorf("a bad payload: exit %d", c)
 	}
 }

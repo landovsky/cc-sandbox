@@ -196,7 +196,9 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	}
 	stage := func(s backend.Spec) (func(), error) { return e.stage(s, wpin, gpin) }
 	files := rec.FenceFiles(e.cfg.Machine, res.Settings, res.MCP)
-	return e.d.NewBackend(docker, e.d.Mounter).Run(spec, files, stage, e.d.Stdin, stdout, stderr)
+	code, err := e.d.NewBackend(docker, e.d.Mounter).Run(spec, files, stage, e.d.Stdin, stdout, stderr)
+	e.revokeRelay(rec.Sid, rec.Gen) // the generation is over: its relay credential goes with it
+	return code, err
 }
 
 // stage makes the two mountpoints under the generation directory and binds the pinned
@@ -270,6 +272,14 @@ func (e *env) stopCmd() *cli.Command {
 			if err != nil {
 				return fail(stderr, "stop", err)
 			}
+			// a pod session is stopped by deleting its pod (by name and UID): the same as pod-stop, which
+			// the owner may run; docker's mount-namespace rule does not apply to it
+			if prec, perr := e.sessionAny(w, sid); perr == nil && prec.Backend == "k8s" {
+				if err := e.podStop(sid, stdout); err != nil {
+					return fail(stderr, "stop", err)
+				}
+				return cli.ExitOK
+			}
 			if err := e.hostNS(); err != nil {
 				return fail(stderr, "stop", err)
 			}
@@ -285,6 +295,7 @@ func (e *env) stopCmd() *cli.Command {
 				return fail(stderr, "stop", err)
 			}
 			fmt.Fprintf(stdout, "stopped %s g%d\n", rec.Sid, rec.Gen)
+			e.revokeRelay(rec.Sid, rec.Gen)
 			if err := e.stripSession(rec); err != nil {
 				fmt.Fprintf(stderr, "ccsbx-root stop: the container is gone, but the workdir was not cleaned of setid bits: %v\n", err)
 				return cli.ExitFail
@@ -397,6 +408,13 @@ func (e *env) gcCmd() *cli.Command {
 				return fail(stderr, "gc", err)
 			}
 			fmt.Fprintf(stdout, "removed %d orphan(s)\n", len(orphans))
+			revoked := map[string]bool{}
+			for _, o := range orphans {
+				if k := fmt.Sprintf("%s/%d", o.Sid, o.Gen); !revoked[k] && o.Gen >= 1 {
+					revoked[k] = true
+					e.revokeRelay(o.Sid, o.Gen)
+				}
+			}
 			failed := false
 			seen := map[string]bool{}
 			for _, o := range orphans {
@@ -406,6 +424,9 @@ func (e *env) gcCmd() *cli.Command {
 				seen[o.Sid] = true
 				w, _ := e.prelude("gc")
 				rec, err := loadRecord(e.cfg.StateDir, o.Sid, w.service, e.cfg.TrustedUID)
+				if err == nil && rec.Backend == "k8s" {
+					continue // a pod session has no host worktree: nothing here is root's to clean
+				}
 				if err == nil {
 					err = e.stripSession(rec)
 				}

@@ -175,7 +175,7 @@ func TestAttachArgv(t *testing.T) {
 	os.WriteFile(ca, []byte("x"), 0o600)
 	b.Kubectl, b.Kubeconfig, b.Server, b.CAFile = "/usr/local/bin/kubectl", "/var/lib/ccsbx-keys/launcher.kubeconfig", "https://10.0.0.1:6443", ca
 	got, err := b.AttachArgv("s0abcdefgh", 3)
-	want := "/usr/local/bin/kubectl --kubeconfig /var/lib/ccsbx-keys/launcher.kubeconfig --server https://10.0.0.1:6443 --certificate-authority " + ca + " --insecure-skip-tls-verify=false -n cc-sandbox exec -it -c fence ccsbx-s-s0abcdefgh-g3 -- tmux attach-session -t =s0abcdefgh:"
+	want := "/usr/local/bin/kubectl --kubeconfig /var/lib/ccsbx-keys/launcher.kubeconfig --server https://10.0.0.1:6443 --certificate-authority " + ca + " --insecure-skip-tls-verify=false -n cc-sandbox exec -it -c fence ccsbx-s-s0abcdefgh-g3 -- env TERM=xterm-256color tmux attach-session -t =s0abcdefgh:"
 	if err != nil || strings.Join(got, " ") != want {
 		t.Errorf("%v %v", got, err)
 	}

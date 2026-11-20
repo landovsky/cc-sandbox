@@ -178,7 +178,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 					{Name: "worktree", MountPath: "/work"}, {Name: "out", MountPath: "/run/ccsbx/out", ReadOnly: true},
 					{Name: "in", MountPath: "/run/ccsbx/in"}, {Name: "managed", MountPath: "/etc/claude-code"},
 					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "relay-cred", MountPath: "/run/ccsbx/relay"},
-					{Name: "side-tmp", MountPath: "/tmp"},
+					{Name: "side-tmp", MountPath: "/tmp"}, {Name: "journal", MountPath: "/run/ccsbx/journal"},
 				},
 			}},
 			Containers: []Container{{
@@ -193,7 +193,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			}},
 			Volumes: []Volume{
 				vol("worktree", s.WorktreeMB, false), vol("out", 64, false), vol("in", 16, false), vol("managed", 8, false),
-				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("relay-cred", 1, true),
+				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("relay-cred", 1, true), vol("journal", 16, false),
 			},
 		},
 	}
@@ -315,7 +315,7 @@ const (
 // place for the process that holds the token.
 var volumeOwner = map[string]string{
 	"worktree": "both", "out": "both", "in": "both", "managed": "both",
-	"side-state": "side", "relay-cred": "side", "side-tmp": "side",
+	"side-state": "side", "relay-cred": "side", "side-tmp": "side", "journal": "side",
 	"home": "fence", "tmp": "fence",
 }
 

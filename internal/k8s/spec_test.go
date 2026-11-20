@@ -185,6 +185,9 @@ func contractCases() []contractCase {
 		{"the fence mounting the sidecar's state", func(p *Pod) {
 			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "side-state", MountPath: "/s"})
 		}, "alone"},
+		{"the fence mounting the sidecar's journal", func(p *Pod) {
+			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "journal", MountPath: "/j"})
+		}, "alone"},
 		{"the fence mounting the relay credential", func(p *Pod) {
 			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "relay-cred", MountPath: "/r"})
 		}, "alone"},
@@ -340,5 +343,36 @@ func TestConfigValuesAreNotConstants(t *testing.T) {
 func TestPodNameFitsAlways(t *testing.T) {
 	if n := PodName("s"+strings.Repeat("z", 16), 9999); len(n) > 40 || !podNameRe.MatchString(n) {
 		t.Errorf("%q", n)
+	}
+}
+
+// B's journal (up to 20000 records of ~300 B, about 6 MB) lives in a volume of its own, apart from the
+// 8Mi side-state that holds the ledger: sidecar only, disk-backed (it must survive a container restart),
+// 16Mi, mounted at /run/ccsbx/journal and nowhere else.
+func TestThePodHasASidecarOnlyJournalVolume(t *testing.T) {
+	p := goodPod(t)
+	var vol *Volume
+	for i := range p.Spec.Volumes {
+		if p.Spec.Volumes[i].Name == "journal" {
+			vol = &p.Spec.Volumes[i]
+		}
+	}
+	if vol == nil || vol.EmptyDir == nil || vol.EmptyDir.SizeLimit != "16Mi" || vol.EmptyDir.Medium != "" {
+		t.Fatalf("journal volume: %+v", vol)
+	}
+	for _, c := range append(append([]Container{}, p.Spec.InitContainers...), p.Spec.Containers...) {
+		for _, m := range c.VolumeMounts {
+			if m.Name == "journal" && (c.Name != "side" || m.MountPath != "/run/ccsbx/journal" || m.ReadOnly) {
+				t.Errorf("%s mounts the journal at %s", c.Name, m.MountPath)
+			}
+		}
+	}
+	for _, v := range p.Spec.Volumes {
+		if v.Name == "side-state" && v.EmptyDir.SizeLimit != "8Mi" {
+			t.Errorf("side-state is %s: the ledger's 8Mi stays separate", v.EmptyDir.SizeLimit)
+		}
+	}
+	if volumeOwner["journal"] != "side" {
+		t.Error("the journal is not in the sidecar-only allow-list")
 	}
 }

@@ -1,10 +1,19 @@
 {
   "name": "dev-default",
-  "machines": ["hp-ubuntu", "future-two"],
-  "billing": ["api", "stub"],
+  "machines": [
+    "hp-ubuntu",
+    "future-two"
+  ],
+  "billing": [
+    "api",
+    "stub"
+  ],
   "memory_mb": 4096,
   "pids": 512,
   "deny": [],
   "mode": "bypassPermissions",
-  "e2e": false
+  "e2e": false,
+  "harness_args": [
+    "--model"
+  ]
 }

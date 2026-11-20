@@ -16,9 +16,13 @@ hooks/config/fsmonitor off, `--end-of-options`); it has no clone or `worktree ad
 R-WT therefore builds the docker half and exports the rules both halves must follow; it does not touch the pod's volume or token handling.
 
 ## Docker half
-- **Where clones live:** one bare clone per repo under `<worktree-root>/.ccsbx-clones/<owner>/<repo>.git` (mode 0700, owned by the owner user), fetched not re-cloned;
-  each session gets `git worktree add` at `<worktree-root>/<label-slug>` on branch `refs/heads/<branch>` created from the resolved base. The directory is under the root, so the
-  M2c/C6 workdir check applies unchanged. A `workdir.path` start is not affected.
+- **Where clones live (DECIDED by the M2c review): the owner's STATE directory, never under `--worktree-root`.** One bare clone per repo at
+  `<state>/clones/<owner>/<repo>.git` (0700, owner-owned, outside every root), fetched not re-cloned. A cache under a root would be mountable by a
+  start naming it as `workdir.path` (a root that is not `$HOME` does not refuse hidden names): the fence would get refs, objects, config and hooks that
+  the daemon later fetches into and every other session checks out from (cross-session poisoning). Each session gets `git worktree add` at
+  `<worktree-root>/<label-slug>` on `refs/heads/<branch>` from the resolved base; only that worktree's own gitdir is ever mounted, read-only. If helper mode's
+  gitdir rule (`CheckGitDirLexical`: the gitdir under a root) ever forces the cache under a root, the name is RESERVED: CheckWorkdir and ccsbx-root refuse it
+  at any depth under any root. The location is pinned now because moving it later means re-pointing every worktree's `.git` file.
 - **argv rules (contract C5):** every value is one argv element, after `--end-of-options`; `git check-ref-format --branch` on top of the charset; branch always `refs/heads/<branch>`;
   base resolved with `rev-parse --verify --end-of-options <base>^{commit}`; never a shell; run through `internal/gitroute.Runner` (hardened env), not bare `git`.
 - **Auth (no token in the fence):** the fetch runs in the daemon as the owner user with that user's own credential helper/ssh agent; the fence never sees it. Private repos work iff the owner's

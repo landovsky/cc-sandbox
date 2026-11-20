@@ -167,11 +167,19 @@ func TestStart(t *testing.T) {
 		d, _ := newDaemon(t)
 		d.MaxLive = 2
 		for i, l := range []string{"a", "b"} {
-			if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = l; s.RequestID = "r" + string(rune('0'+i)); s.Workdir.Path = sub(t, spec(nil).Workdir.Path, l) })); err != nil {
+			if _, err := d.Start(spec(func(s *LaunchSpec) {
+				s.Label = l
+				s.RequestID = "r" + string(rune('0'+i))
+				s.Workdir.Path = sub(t, spec(nil).Workdir.Path, l)
+			})); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "c"; s.RequestID = "r9"; s.Workdir.Path = sub(t, spec(nil).Workdir.Path, "c") })); code(err) != MachineFull {
+		if _, err := d.Start(spec(func(s *LaunchSpec) {
+			s.Label = "c"
+			s.RequestID = "r9"
+			s.Workdir.Path = sub(t, spec(nil).Workdir.Path, "c")
+		})); code(err) != MachineFull {
 			t.Fatal(err)
 		}
 	})
@@ -182,7 +190,11 @@ func TestStart(t *testing.T) {
 		now := time.Now()
 		d.Now = func() time.Time { return now }
 		for i, l := range []string{"a", "b"} {
-			d.Start(spec(func(s *LaunchSpec) { s.Label = l; s.RequestID = "r" + string(rune('0'+i)); s.Workdir.Path = sub(t, spec(nil).Workdir.Path, l) }))
+			d.Start(spec(func(s *LaunchSpec) {
+				s.Label = l
+				s.RequestID = "r" + string(rune('0'+i))
+				s.Workdir.Path = sub(t, spec(nil).Workdir.Path, l)
+			}))
 		}
 		for sid := range fl.alive {
 			fl.alive[sid] = false

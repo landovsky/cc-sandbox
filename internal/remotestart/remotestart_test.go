@@ -387,3 +387,64 @@ func TestALabelLiveOnThisMachineIsAlreadyRunningWithItsSid(t *testing.T) {
 		t.Fatal("message")
 	}
 }
+
+// context (M2, review): the label check must fail CLOSED. One unreadable session file made hp answer "nothing live"
+// for every label, so the Mac launched a second generation. "Could not tell" is an error, never "free".
+func TestACheckThatCannotReadTheRecordsAnswersAnErrorNeverFree(t *testing.T) {
+	r := newRig(t)
+	r.liveErr = errors.New("bad record file")
+	if _, err := r.s.Answer("cc-sandbox:w1"); err == nil {
+		t.Fatal("an unreadable record answered a label as free")
+	}
+	if _, ref := r.s.Start(context.Background(), by, spec(nil)); ref == nil || ref.Code != Internal || r.starts.Load() != 0 {
+		t.Fatalf("a start went ahead while the local records could not be read: %v", ref)
+	}
+}
+
+// context (S2, review): a renewal that runs late (a sleeping laptop, a clock step) must not end the renewals: a
+// launch in flight stays reserved, answered from memory, whatever the stored timestamp says.
+func TestALaunchInFlightStaysReservedEvenWhenTheStampLooksOld(t *testing.T) {
+	r := newRig(t)
+	gate, started := make(chan struct{}), make(chan struct{})
+	r.startFn = func() (*start.StartReply, error) {
+		close(started)
+		<-gate
+		return &start.StartReply{V: 1, Sid: "s0abc123"}, nil
+	}
+	done := make(chan struct{})
+	go func() { r.s.Start(context.Background(), by, spec(nil)); close(done) }()
+	<-started
+	r.advance(10 * time.Minute) // the laptop slept: every stored stamp is now "dead"
+	if a := answerOf(r.s, "cc-sandbox:w1"); a.Reserved == nil {
+		t.Fatal("the reservation lapsed during a launch because the clock jumped")
+	}
+	close(gate)
+	<-done
+}
+
+// context (S1, review): a request_id is the CALLER's: another caller sending the same id for another label must not be
+// handed the first caller's reply, nor share its reservation.
+func TestAnotherCallersSameRequestIDGetsItsOwnStart(t *testing.T) {
+	r := newRig(t)
+	first, _ := r.s.Start(context.Background(), by, spec(nil))
+	other := Caller{StartedBy: "owner:tomas@example.com@phone", Machine: "phone"}
+	r.startFn = func() (*start.StartReply, error) { return &start.StartReply{V: 1, Sid: "s0second"}, nil }
+	rep, ref := r.s.Start(context.Background(), other, spec(map[string]any{"label": "cc-sandbox:other"}))
+	if ref != nil || rep.Sid != "s0second" || rep.Sid == first.Sid {
+		t.Fatalf("%v %v", rep, ref)
+	}
+}
+
+// context (S4, review): a refused retry must never delete the stored reply of the start that happened.
+func TestARefusedRetryNeverDeletesTheStoredReply(t *testing.T) {
+	r := newRig(t)
+	first, _ := r.s.Start(context.Background(), by, spec(nil))
+	r.live = []View{{Machine: "hp-ubuntu", Sid: first.Sid, State: "running"}}
+	if _, ref := r.s.Start(context.Background(), by, spec(map[string]any{"profile": "dev-default", "billing": "stub"})); code(ref) != start.RequestIDReused {
+		t.Fatalf("%v", ref)
+	}
+	again, ref := r.s.Start(context.Background(), by, spec(nil))
+	if ref != nil || again.Sid != first.Sid {
+		t.Fatalf("the stored reply was lost: %v %v", again, ref)
+	}
+}

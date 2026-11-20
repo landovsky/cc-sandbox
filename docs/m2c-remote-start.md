@@ -98,7 +98,10 @@ the sessions run as; cc-tree sends the caller's `$USER`, so the two accounts mus
 `bad_spec`).
 A remote `workdir.path` is NOT checked by shape only: before any record is written it must pass the same
 `--worktree-root` check a local start applies (strictly inside a configured root, symlinks resolved, no hidden
-home directories) and be an existing git worktree; else `bad_spec`. Nothing can point the fence at `~/.ssh`,
+home directories) and be a git WORKTREE ROOT (its own `.git` at exactly that path: not a parent of repos, not a
+subdirectory of one, not a plain directory); else `bad_spec` with a fixed message (no path or OS text). It must not equal,
+contain or sit inside another live session's workdir. In HELPER mode hostd cannot look inside the owner's home, so a remote
+start is refused `not_built` until ccsbx-root can make that check; direct mode needs `--remote-start-direct` and `--owner-user` = the user hostd runs as. Nothing can point the fence at `~/.ssh`,
 `~` or another repo. A remote start has no gitdir (git verbs are unavailable to it until H1 resolves one).
 
 ## (5) `request_id` idempotency (C7)

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -655,4 +656,48 @@ func bothMachines(name string) (*profile.Profile, error) {
 		p.Machines = append(p.Machines, "mac-tomas")
 	}
 	return p, err
+}
+
+// context (M2, review): one unreadable file in the session records must make the label check say "cannot tell", not
+// "nothing live"; a record that merely vanished between the listing and the read (a failed launch rolls back) must not.
+func TestAnUnreadableSessionRecordIsAnErrorNotAFreeLabel(t *testing.T) {
+	sd, _ := policyFor(t, "tomas")
+	sd.Launcher = aliveLauncher{}
+	os.MkdirAll(filepath.Join(sd.StateDir, "sessions"), 0o700)
+	if _, err := sd.LiveByLabel("cc-sandbox:x"); err != nil {
+		t.Fatalf("no sessions at all is an empty answer: %v", err)
+	}
+	os.WriteFile(filepath.Join(sd.StateDir, "sessions", "junk.json"), []byte("{not json"), 0o600)
+	if _, err := sd.LiveByLabel("cc-sandbox:x"); err == nil {
+		t.Fatal("a bad record file was read as 'nothing live'")
+	}
+}
+
+// context (S5, review): in direct mode a remote start is an explicit opt-in and its owner is the user hostd runs as;
+// in helper mode it is someone else. A misconfiguration is a usage error at startup, never a surprise at the first start.
+func TestRemoteStartOwnerUserRulesAreCheckedAtStartup(t *testing.T) {
+	me, _ := user.Current()
+	other := "root"
+	if me.Username == "root" {
+		other = "nobody"
+	}
+	for name, c := range map[string]struct {
+		root, owner, direct string
+		ok                  bool
+	}{
+		"direct, the hostd user, opted in":  {"direct", me.Username, "true", true},
+		"direct, the hostd user, no opt-in": {"direct", me.Username, "false", false},
+		"direct, another user":              {"direct", other, "true", false},
+		"helper, the hostd user":            {"helper", me.Username, "false", false},
+	} {
+		sd, p := policyFor(t, "tomas")
+		sd.Root = c.root
+		get := func(k string) string {
+			return map[string]string{"owner-user": c.owner, "peers": "", "machine": "hp-ubuntu", "state": t.TempDir(), "peer-ask-timeout": "3s", "remote-start-direct": c.direct}[k]
+		}
+		_, rc := remoteService(get, func(string) int { return 0 }, sd, p, io.Discard)
+		if (rc == 0) != c.ok {
+			t.Errorf("%s: exit %d, want ok=%v", name, rc, c.ok)
+		}
+	}
 }

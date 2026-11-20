@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# units/hub-probe — Gate M step 8c: does /etc/ccsbx/hub-admin.secret match the live hub? (run as root)
+# Why: ccsbx-root mints relays with that secret, so a stale or wrong copy must show at the gate, not at the first pod start.
+# It makes one admin call (POST a throwaway relay principal) and one DELETE of that exact id, and prints only the status codes.
+#   sudo units/hub-probe --owner USER        prints "POST 201", "DELETE 200", then "hub secret OK"; exit 0
+#   exit 1: the hub answered something else (401/403 = the secret does not match: STOP); exit 2: usage or refused
+# The Bearer never appears in an argument list (any local uid could read /proc/<pid>/cmdline): curl takes its header from stdin
+# (printf is a builtin). Before the secret leaves, the process that LISTENS on :4011 must belong to --owner (the owner's hub); a
+# port bound by anyone else is refused, as ccsbx-root's own listener check does.
+# Flags: --owner USER (required)   --hub URL (default http://127.0.0.1:4011, loopback only)   --secret FILE (default /etc/ccsbx/hub-admin.secret)
+# Test hooks: none. Reads: the secret file, /proc, ss. Writes: one principal on the hub, deleted again.
+set -uo pipefail
+umask 077
+case "${1:-}" in -h|--help|"") sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; esac
+OWNER=""; HUB="http://127.0.0.1:4011"; SECRET_FILE=/etc/ccsbx/hub-admin.secret
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --owner) OWNER="${2:?--owner USER}"; shift ;;
+    --hub) HUB="${2:?--hub URL}"; shift ;;
+    --secret) SECRET_FILE="${2:?--secret FILE}"; shift ;;
+    -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "hub-probe: unknown option '$1' (--help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+[ "$(id -u)" = 0 ] || { echo "hub-probe: run as root (the secret file is root-only)" >&2; exit 2; }
+[ -n "$OWNER" ] && id -u "$OWNER" >/dev/null 2>&1 || { echo "hub-probe: --owner must be an existing user" >&2; exit 2; }
+[[ "$HUB" =~ ^http://(127\.0\.0\.1|localhost):([0-9]{1,5})$ ]] || { echo "hub-probe: --hub must be http://127.0.0.1:PORT (loopback only)" >&2; exit 2; }
+PORT="${BASH_REMATCH[2]}"
+[ -f "$SECRET_FILE" ] && [ ! -L "$SECRET_FILE" ] && [ "$(stat -c '%U:%a' "$SECRET_FILE")" = root:600 ] || { echo "hub-probe: $SECRET_FILE is not a root-owned 0600 regular file" >&2; exit 2; }
+# the listener on the port must be the owner's
+pid="$(ss -ltnpH "sport = :$PORT" 2>/dev/null | grep -o 'pid=[0-9]*' | head -1 | cut -d= -f2)"
+[ -n "$pid" ] || { echo "hub-probe: nothing listens on 127.0.0.1:$PORT (is the hub up?)" >&2; exit 2; }
+[ "$(stat -c %u "/proc/$pid" 2>/dev/null)" = "$(id -u "$OWNER")" ] || { echo "hub-probe: the listener on :$PORT is not $OWNER's: the secret is NOT sent" >&2; exit 2; }
+S="$(head -n1 "$SECRET_FILE" | tr -d '\r')"
+body='{"role":"relay","sid":"gatem-probe","gen":"1","pub":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","may_reach":[]}'
+call() {   # call METHOD PATH [BODY] -> prints the status code only; the header comes from stdin
+  local m="$1" p="$2" b="${3:-}"
+  printf 'header = "Authorization: Bearer %s"\n' "$S" | curl -K - -sS -o /dev/null -w '%{http_code}' --max-time 10 --noproxy '*' -X "$m" \
+    ${b:+-H "Content-Type: application/json" --data-binary "$b"} "$HUB$p"
+}
+post="$(call POST /v1/principals "$body")"; echo "POST $post"
+del="$(call DELETE '/v1/principals/relay%3Agatem-probe%2F1')"; echo "DELETE $del"
+if [ "$post" = 201 ] && [ "$del" = 200 ]; then echo "hub secret OK"; exit 0; fi
+case "$post" in 401|403) echo "hub-probe: the hub REFUSED the secret ($post): it does not match. STOP: units/install-linux.sh uninstall --yes, fix ~/.config/session-bus/secret, install again" >&2;; esac
+exit 1

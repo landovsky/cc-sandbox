@@ -38,6 +38,7 @@
 #                         <repo>/profiles/*.json that list this machine, e.g. dev-default:api|stub,e2e-default:stub)
 #   --side-image REF      the sidecar image of pod sessions, BY DIGEST: ghcr.io/landovsky/ccsbx@sha256:<64 hex> (CCSBX_SIDE_IMAGE, required;
 #                         written to ccsbx-root.toml as k8s_side_image). A tag is refused. The digest comes from the side-image Actions run (#3wsr)
+#   (rotating SB_SECRET: re-run `install --yes`: it copies the new first line again; the other steps are idempotent)
 #   --hub-secret-from F   the owner's file holding the hub's shared secret (the hub's SB_SECRET), (CCSBX_HUB_SECRET_FROM, default
 #                         ~owner/.config/session-bus/secret). Its FIRST LINE is copied to /etc/ccsbx/hub-admin.secret, root 0600, for
 #                         ccsbx-root's relay mint; never printed. Must be a regular file (no symlink). Verify it at Gate M (night-1-morning.md, 8c)
@@ -114,8 +115,6 @@ SCOPE_ERRORS=()
 [[ "$K8S_MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] && [ "$K8S_MACHINE" != "$MACHINE" ] || SCOPE_ERRORS+=("k8s machine '$K8S_MACHINE' must be a plain host name other than this machine (--k8s-machine)")
 SCOPE_MACHINES="$MACHINE,$K8S_MACHINE"
 [ -n "$HUB_SECRET_FROM" ] || HUB_SECRET_FROM="$OWNER_HOME/.config/session-bus/secret"
-if [ ! -f "$HUB_SECRET_FROM" ] || [ -L "$HUB_SECRET_FROM" ]; then SCOPE_ERRORS+=("hub secret file $HUB_SECRET_FROM is not a regular file (no symlink); pass --hub-secret-from FILE: ccsbx-root's relay mint needs the hub's secret")
-elif [ -z "$(head -n1 "$HUB_SECRET_FROM" | tr -d '\r\n ')" ]; then SCOPE_ERRORS+=("hub secret file $HUB_SECRET_FROM has an empty first line"); fi
 [[ "$MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || SCOPE_ERRORS+=("machine name '$MACHINE' is not a plain host name (--machine)")
 _b='(api|subscription|stub)'
 [[ "$PAIRS" =~ ^[A-Za-z0-9._-]+:$_b(\|$_b)*(,[A-Za-z0-9._-]+:$_b(\|$_b)*)*$ ]] || SCOPE_ERRORS+=("pairs '$PAIRS' is empty or not name:billing|billing,... (--pairs; default: profiles/*.json that list machine $MACHINE)")
@@ -156,6 +155,30 @@ export OWNER MACHINE PAIRS IMAGE SIDE_IMAGE WORKTREE_ROOT BIN_DIR UNITS_DIR ALLO
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()
 gate() { GATE_MSGS+=("$1"); }                                  # an unmet gate
+# The hub secret is read ONCE, AS THE OWNER (so a root-only file is unreadable even through a swapped link), with O_NOFOLLOW on the
+# last component, regular files only, at most 4 KiB, and a first line ccsbx-root's own rule accepts (1..512 printable, no space).
+# That one buffer is validated and later written; root never opens the owner's path. A link in a parent directory is the owner's
+# to make and can only lead to what the owner can already read. In record mode the call is recorded and made as the current user.
+hub_secret_py='import os, re, stat, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except OSError as e:
+    sys.stderr.write("cannot open it (a link in the last component is refused): %s\n" % e.strerror); sys.exit(3)
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode): sys.stderr.write("not a regular file\n"); sys.exit(3)
+if st.st_size > 4096: sys.stderr.write("larger than 4 KiB\n"); sys.exit(3)
+b = os.read(fd, 4097).split(b"\n", 1)[0].rstrip(b"\r")
+if not re.fullmatch(rb"[\x21-\x7e]{1,512}", b): sys.stderr.write("the first line is empty, longer than 512 bytes, or has a space or control character\n"); sys.exit(3)
+sys.stdout.write(b.decode("ascii"))'
+HUB_SECRET=""
+load_hub_secret() {
+  local out rc err
+  err="$(mktemp)" || die "cannot create a temp file"
+  out="$(as_owner python3 -I -c "$hub_secret_py" "$HUB_SECRET_FROM" 2>"$err")"; rc=$?
+  if [ "$rc" -ne 0 ]; then gate "hub secret file $HUB_SECRET_FROM: $(head -1 "$err") (pass --hub-secret-from FILE; ccsbx-root's relay mint needs the hub's secret)"; HUB_SECRET=""
+  else HUB_SECRET="$out"; fi
+  rm -f "$err"
+}
 as_owner() {                                                   # run a user-level command as the owner
   if [ "$(id -u)" = 0 ] && [ "$OWNER" != root ]; then runuser -u "$OWNER" -- env "XDG_RUNTIME_DIR=/run/user/$(id -u "$OWNER")" "$@"
   else "$@"; fi
@@ -176,6 +199,8 @@ P15_FILE="${CCSBX_P15_FILE:-$OWNER_HOME/cc-tree/cc-sandbox/nodes/4vwb/p15-status
 default_p15() { as_owner env CCSBX_P15_FILE="$P15_FILE" "$UNITS_DIR/p15" check; }
 eval_gates() {
   local m f missing="" e unlisted
+  load_hub_secret
+  local sp; while IFS= read -r sp; do [ -z "$sp" ] || gate "$sp"; done < <(svc_users_check)
   if [ -z "$PREFIX" ] && [ -n "${CCSBX_B9_CMD:-}${CCSBX_P15_CMD:-}" ]; then
     refuse "CCSBX_B9_CMD / CCSBX_P15_CMD are test overrides and are set: unset them (sudo -E would pass them to root)"
   fi
@@ -240,12 +265,12 @@ EOT
 post_install_check() {
   step "post-install check: hostd and the signer must be up before DONE"
   local i ready=1
-  if [ "$MODE" = plan ]; then note "waits up to 10 s for ccsbx-hostd and ccsbx-signer.socket to be active and their sockets to exist; otherwise install stops, no DONE"; return 0; fi
+  if [ "$MODE" = plan ]; then note "waits up to 10 s for ccsbx-hostd, ccsbx-signer.socket and ccsbx-signer-launch.socket to be active and their sockets to exist; otherwise install stops, no DONE"; return 0; fi
   if [ "${EXEC%%:*}" = record ]; then rec post-install-check; ready="${CCSBX_TEST_POSTCHECK_RC:-0}"
   else
     for i in 1 2 3 4 5 6 7 8 9 10; do
       if systemctl is-active --quiet ccsbx-tmux.service && systemctl is-active --quiet ccsbx-hostd.service && systemctl is-active --quiet ccsbx-signer.socket \
-         && [ -S "$SIGNER_SOCK" ] && [ -S "$HOSTD_SOCK" ]; then ready=0; break; fi
+         && systemctl is-active --quiet ccsbx-signer-launch.socket && [ -S "$SIGNER_SOCK" ] && [ -S "$LAUNCH_SOCK" ] && [ -S "$HOSTD_SOCK" ]; then ready=0; break; fi
       sleep 1
     done
   fi
@@ -260,6 +285,8 @@ post_install_check() {
 }
 steps_install() {
   if [ "$MODE" = install ]; then step "back up every file the install replaces (once; never overwritten)"; backup_originals; fi
+  # the read happened in eval_gates (as the owner); in record mode it is logged here, once the gates and the backup have passed, so a refusal records nothing
+  if [ "$MODE" = install ] && [ "${EXEC%%:*}" = record ]; then rec runuser -u "$OWNER" -- python3 -I -c "$hub_secret_py" "$HUB_SECRET_FROM"; fi
   # everything that can fail for a machine-specific reason comes BEFORE sudoers is changed
   u0b_users; u0_binaries; u0b_keys; u0b_signer; u0_hostd
   if [ "$WITH_DEPLOY" = 1 ]; then u0_deploy_rule; fi

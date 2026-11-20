@@ -473,11 +473,11 @@ t "r3: the signer's unit names the keys peer ccsbx-launch for future-two only" b
 t "r3: the signer's scope allows future-two as well (else the launcher's token is out of scope)" bash -c 'grep -- "--write-scope" "$1" | grep -q -- "--machines [a-z0-9.-]*.,future-two"' _ "$c"
 t "r3: ccsbx-root.toml names launch_user, term_user, signer_user, the kubeconfig under ccsbx-launch, k8s_machine, the hub" bash -c 'for k in "launch_user = \"ccsbx-launch\"" "term_user = \"ccsbx-term\"" "signer_user = \"ccsbx-keys\"" "kubeconfig = \"/var/lib/ccsbx-launch/launcher.kubeconfig\"" "k8s_machine = \"future-two\"" "hub_url = \"http://127.0.0.1:4011\"" "hub_secret = \"/etc/ccsbx/hub-admin.secret\""; do grep -qF "$k" "$1" || { echo "missing $k"; exit 1; }; done' _ "$toml"
 t "r3: the pod and relay verbs are on" bash -c 'grep "^verbs" "$1" | grep -q "pod-create.*pod-load.*pod-stop.*pod-status.*relay-mint"' _ "$toml"
-t "r3: hub-admin.secret is root:root 0600 and holds the secret without a newline's worth of extras" bash -c 'grep -q "^chown root:root /etc/ccsbx/hub-admin.secret" "$1/rec/cmds" && [ "$(stat -c %a "$1/root/etc/ccsbx/hub-admin.secret")" = 600 ] && [ "$(cat "$1/root/etc/ccsbx/hub-admin.secret")" = hub-secret-value-not-printed ]' _ "$d"
+t "r3: hub-admin.secret is root:root 0600 and holds exactly the secret" bash -c 'grep -q "^chown root:root /etc/ccsbx/hub-admin.secret" "$1/rec/cmds" && [ "$(stat -c %a "$1/root/etc/ccsbx/hub-admin.secret")" = 600 ] && [ "$(cat "$1/root/etc/ccsbx/hub-admin.secret")" = hub-secret-value-not-printed ]' _ "$d"
 printf 'first-line-secret\nsecond line must not be copied\n' > "$d/hubsecret2"; d2="$(fx r3two)"; HUBSRC="$d/hubsecret2" ins "$d2" install --yes >/dev/null 2>&1
 t "r3: only the FIRST LINE of the owner's secret file is copied" bash -c '[ "$(cat "$1/root/etc/ccsbx/hub-admin.secret")" = first-line-secret ]' _ "$d2"
-out="$(CCSBX_OWNER=tomas "$inst" plan 2>&1)"
-t "r3: with no option the source is ~owner/.config/session-bus/secret" bash -c 'grep -q "/.config/session-bus/secret" <<<"$1"' _ "$out"
+out="$("$inst" --help 2>&1)"
+t "r3: with no option the source is ~owner/.config/session-bus/secret (the suite never reads the host's real secret)" bash -c 'grep -q "~owner/.config/session-bus/secret" <<<"$1"' _ "$out"
 t "r3: the secret is never printed by the install" bash -c '! grep -q hub-secret-value-not-printed "$1" "$2"' _ "$d/out" "$d/err"
 t "r3: the sudoers rule is unchanged: one rule for ccsbx-root covers the pod verbs for the owner and hostd" bash -c 'f="$1/root/etc/sudoers.d/.90-ccsbx-root.new"; [ "$(grep -c "^[a-z][a-z0-9_-]* ALL=(root) NOPASSWD: /usr/local/sbin/ccsbx-root\$" "$f")" = 2 ] && ! grep -q ccsbx-launch "$f"' _ "$d"
 plan="$(ins "$d" plan -v 2>&1)"
@@ -494,7 +494,7 @@ d="$(fx r3e)"; ins "$d" install --yes --k8s-machine "$(hostname -s | tr A-Z a-z)
 t "r3: a k8s machine equal to this machine is refused (exit 3)" test "$rc" -eq 3
 d="$(fx r3h)"; ins "$d" install --yes >/dev/null 2>&1
 out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
-t "r3: check looks at ccsbx-launch, ccsbx-term, their uids, the launch dir and the hub secret" bash -c 'for k in "user ccsbx-launch exists" "user ccsbx-term exists" "five different uids\|share uid" "/var/lib/ccsbx-launch is" "hub-admin.secret is"; do grep -q "$k" <<<"$1" || { echo "no check: $k"; exit 1; }; done' _ "$out"
+t "r3: check looks at ccsbx-launch, ccsbx-term, whether their uids differ, the launch dir and the hub secret" bash -c 'for k in "user ccsbx-launch exists" "user ccsbx-term exists" "five different uids\|share uid" "/var/lib/ccsbx-launch is" "hub-admin.secret is"; do grep -q "$k" <<<"$1" || { echo "no check: $k"; exit 1; }; done' _ "$out"
 t "r3: the hub secret is listed as absent in the first backup, so uninstall removes it" grep -qx /etc/ccsbx/hub-admin.secret "$d/root/var/backups/ccsbx-install/original/ABSENT"
 
 echo "# the sidecar image (#3wsr): by digest, from our repo, fail closed"
@@ -510,13 +510,64 @@ t "side: the --side-image option overrides the environment" grep -q 'sha256:c\{6
 echo "# the signer's second socket and hub_user (A's names, n1-a-relay cffe472)"
 d="$(fx sock)"; ins "$d" install --yes >/dev/null 2>&1; u="$d/root/etc/systemd/system"
 t "sock2: the launch socket is ccsbx-keys:ccsbx-launch 0660 at /run/ccsbx-signer/launch.sock" bash -c 'grep -qx "ListenStream=/run/ccsbx-signer/launch.sock" "$1" && grep -qx "SocketUser=ccsbx-keys" "$1" && grep -qx "SocketGroup=ccsbx-launch" "$1" && grep -qx "SocketMode=0660" "$1"' _ "$u/ccsbx-signer-launch.socket"
-t "sock2: the service Requires both sockets and the main socket stays FIRST (fd 3)" bash -c 'grep -qx "Requires=ccsbx-signer.socket ccsbx-signer-launch.socket" "$1"' _ "$u/ccsbx-signer.service"
+t "sock2: the service Requires both sockets (the signer matches the fds by name, not position)" bash -c 'grep -qx "Requires=ccsbx-signer.socket ccsbx-signer-launch.socket" "$1"' _ "$u/ccsbx-signer.service"
 t "sock2: the sockets carry names so the order can be checked (main, launch)" bash -c 'grep -qx "FileDescriptorName=main" "$1" && grep -qx "FileDescriptorName=launch" "$2"' _ "$u/ccsbx-signer.socket" "$u/ccsbx-signer-launch.socket"
-t "sock2: the launch socket is enabled before the main one and is stopped on undo" bash -c 'a="$(grep -n "enable --now ccsbx-signer-launch.socket" "$1" | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-signer.socket" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
+t "sock2: the launch socket is enabled before the main one" bash -c 'a="$(grep -n "enable --now ccsbx-signer-launch.socket" "$1" | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-signer.socket" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
 t "sock2: ccsbx-root.toml has signer_socket = launch.sock and hub_user = the owner" bash -c 'grep -qx "signer_socket = \"/run/ccsbx-signer/launch.sock\"" "$1" && grep -qx "hub_user = \"tomas\"" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
 t "sock2: the launch socket unit is a managed path (backed up as absent, removed by undo)" grep -qx /etc/systemd/system/ccsbx-signer-launch.socket "$d/root/var/backups/ccsbx-install/original/ABSENT"
 d="$(fx sockun)"; ins "$d" install --yes >/dev/null 2>&1; : > "$d/rec/cmds"; ins "$d" uninstall --yes >/dev/null 2>&1
 t "sock2: undo disables the launch socket before any unit file is removed, then removes it" bash -c 'c="$1"; a="$(grep -n "disable --now ccsbx-signer-launch.socket" "$c" | head -1 | cut -d: -f1)"; r="$(grep -n "^rm -f /etc/systemd/system/ccsbx-signer-launch.socket" "$c" | head -1 | cut -d: -f1)"; [ -n "$a" ] && [ -n "$r" ] && [ "$a" -lt "$r" ]' _ "$d/rec/cmds"
+
+echo "# review of cbaa62e: M1 secret read once as the owner, S1 one machine source, S3 undo, S4 users"
+d="$(fx m1)"; ins "$d" install --yes >/dev/null 2>&1
+t "M1: the secret is read as the OWNER, once, before anything changes (recorded runuser -u tomas)" bash -c 'n="$(grep -c "^runuser -u tomas -- python3 -I -c .* /.*hubsecret$" "$1/rec/cmds")"; [ "$n" = 1 ] && [ "$(grep -n "^runuser -u tomas -- python3" "$1/rec/cmds" | cut -d: -f1)" -lt "$(grep -n "^useradd" "$1/rec/cmds" | head -1 | cut -d: -f1)" ]' _ "$d"
+t "M1: root never opens the owner's path itself (no head/cat/cp of the source in the installer)" bash -c '! grep -nE "(head|cat|cp|tr) [^|]*HUB_SECRET_FROM" "$1" "$2"' _ "$inst" "$here/units/lib/u0.sh"
+d="$(fx m1fifo)"; mkfifo "$d/fifo"
+CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/rec/cmds" CCSBX_BIN_DIR="$d/dist" CCSBX_P15_FILE="$d/p15.tsv" CCSBX_SIDE_IMAGE=ghcr.io/landovsky/ccsbx@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb CCSBX_HUB_SECRET_FROM="$d/fifo" CCSBX_OWNER=tomas CCSBX_B9_CMD=true CCSBX_IMAGE=ghcr.io/landovsky/ccsbx-fence@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa timeout 20 "$inst" install --yes >/dev/null 2>&1; rc=$?
+t "M1: a FIFO as the source is refused (exit 3), it does not hang the installer" test "$rc" -eq 3
+d="$(fx m1big)"; head -c 5000 /dev/zero | tr '\0' 'a' > "$d/big"; HUBSRC="$d/big" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "M1: a source larger than 4 KiB is refused (exit 3)" test "$rc" -eq 3
+d="$(fx m1sp)"; printf 'has a space\n' > "$d/sp"; HUBSRC="$d/sp" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "M1: a first line with a space is refused (exit 3), as ccsbx-root would refuse it at mint" test "$rc" -eq 3
+d="$(fx m1long)"; head -c 513 /dev/zero | tr '\0' 'a' > "$d/l"; HUBSRC="$d/l" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "M1: a first line over 512 bytes is refused (exit 3)" test "$rc" -eq 3
+d="$(fx m1dir)"; mkdir "$d/adir"; HUBSRC="$d/adir" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "M1: a directory as the source is refused (exit 3)" test "$rc" -eq 3
+d="$(fx m1swap)"; echo "machine-key-line" > "$d/key"; ln -s "$d/key" "$d/swapped"; HUBSRC="$d/swapped" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "M1: the link swap (the source became a link to another file) is refused, and that file is never copied" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/root/etc/ccsbx/hub-admin.secret" ]' _ "$rc" "$d"
+d="$(fx s1)"; ins "$d" install --yes --k8s-machine other-box >/dev/null 2>&1
+t "S1: --k8s-machine is the one source: the signer unit's keys-peer machines, the scope and ccsbx-root.toml agree" bash -c 'u="$1/root/etc/systemd/system/ccsbx-signer.service"; grep "^ExecStart=" "$u" | grep -q -- "--keys-peer-machines other-box " && ! grep "^ExecStart=" "$u" | grep -q future-two && grep -- "--write-scope" "$1/rec/cmds" | grep -q "other-box" && grep -qx "k8s_machine = \"other-box\"" "$1/root/etc/ccsbx/ccsbx-root.toml"' _ "$d"
+d="$(fx s3)"; ins "$d" install --yes >/dev/null 2>&1; ab="$d/root/var/backups/ccsbx-install/original/ABSENT"
+grep -vx -e /etc/ccsbx/hub-admin.secret -e /etc/systemd/system/ccsbx-signer-launch.socket "$ab" > "$ab.new"; mv "$ab.new" "$ab"
+: > "$d/rec/cmds"; ins "$d" uninstall --yes >/dev/null 2>&1
+t "S3: a first backup from an older installer: undo still removes the hub secret and the launch socket unit" bash -c 'grep -qx "rm -f /etc/ccsbx/hub-admin.secret" "$1" && grep -qx "rm -f /etc/systemd/system/ccsbx-signer-launch.socket" "$1"' _ "$d/rec/cmds"
+d="$(fx s3p)"; ins "$d" install --yes >/dev/null 2>&1; : > "$d/rec/cmds"; out="$(ins "$d" uninstall --yes --purge-keys 2>&1)"
+t "S3: --purge-keys also removes ccsbx-launch (its home holds the kubeconfig and token) and says to revoke the launcher token" bash -c 'grep -q "^userdel -r ccsbx-launch" "$1/rec/cmds" && grep -qi "revoke the launcher token" <<<"$2"' _ "$d" "$out"
+d="$(fx s3k)"; ins "$d" install --yes >/dev/null 2>&1; out="$(ins "$d" uninstall --yes 2>&1)"
+t "S3: without --purge-keys it still says the launcher token must be revoked if the directory is discarded" grep -qi "revoke the launcher token" <<<"$out"
+mkdir -p "$tmp/idstub"; cat > "$tmp/idstub/id" <<'EOS'
+#!/bin/sh
+# a stand-in for id(1): STUB_UIDS="name=uid ..." makes those users exist with those uids; anything else is the real id
+last=""; for a; do last="$a"; done
+m=""; for kv in $STUB_UIDS; do [ "${kv%%=*}" = "$last" ] && m="${kv#*=}"; done
+if [ -n "$m" ]; then case "$1" in -u) echo "$m";; -nG) echo "$last";; *) echo "uid=$m($last)";; esac; exit 0; fi
+exec /usr/bin/id "$@"
+EOS
+chmod +x "$tmp/idstub/id"
+me="$(/usr/bin/id -u)"
+for pair in "ccsbx-term=$me" "ccsbx-launch=0" "ccsbx-term=4242 ccsbx-launch=4242" "ccsbx-keys=$me"; do
+  d="$(fx s4)"; STUB_UIDS="$pair" PATH="$tmp/idstub:$PATH" ins "$d" install --yes >/dev/null 2>"$d/err"; rc=$?
+  t "S4: existing users with colliding or zero uids ($pair) are refused at the gate (exit 3), nothing changed" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/rec/cmds" ]' _ "$rc" "$d"
+done
+d="$(fx s4ok)"; STUB_UIDS="ccsbx-term=4243 ccsbx-launch=4244" PATH="$tmp/idstub:$PATH" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "S4: distinct non-zero uids pass" test "$rc" -eq 0
+t "N11: the post-install check waits for the launch socket too" grep -q "ccsbx-signer-launch.socket" <(sed -n '/^post_install_check/,/^}/p' "$inst")
+echo "# units/hub-probe (step 8c)"
+hp="$here/units/hub-probe"
+t "8c: hub-probe --help exits 0 and runs nothing" bash -c '"$1" --help >/dev/null' _ "$hp"
+t "8c: hub-probe never puts the Bearer in an argument list (the header comes from stdin: curl -K -)" bash -c 'grep -q "curl -K -" "$1" && ! grep -nE "curl[^|]*Bearer|-H \"Authorization" "$1"' _ "$hp"
+t "8c: hub-probe refuses to run as a non-root user (exit 2)" bash -c '[ "$(id -u)" = 0 ] || { "$1" --owner tomas >/dev/null 2>&1; [ $? -eq 2 ]; }' _ "$hp"
+t "8c: hub-probe checks the :4011 listener is the owner's before the secret leaves" grep -q "is not .*'s: the secret is NOT sent" "$hp"
 
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"

@@ -56,7 +56,7 @@ where = "hp"
 
 [[rule]]
 id = "image-no-secret"
-title = "the fence image holds no credential, token or key: not in its config, build history, files or any layer (a deleted file is still in its layer)"
+title = "the fence image holds no credential, token or key: not in its config, build history, files, or any layer of the final image (a deleted or overwritten file is still in its layer); every check is shown to go red on a bad image"
 suite = "fence"
 allow = "tests/image-test.sh image-no-secret allow"
 block = "tests/image-test.sh image-no-secret block"
@@ -75,8 +75,18 @@ backends = ["docker"]
 where = "hp"
 
 [[rule]]
+id = "image-hardening"
+title = "the image has no setuid/setgid file, no sudo, an empty /opt/ccf the fence uid cannot write, an explicit PATH, and the shim as the only git on it"
+suite = "fence"
+allow = "tests/image-test.sh image-hardening allow"
+block = "tests/image-test.sh image-hardening block"
+invariants = [3, 26]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
 id = "image-git-shim"
-title = "in the fence, git reads pass through, commit and push become outbox requests, every other write verb and push flags are refused"
+title = "in the fence, git reads pass through (with -C/-c/--git-dir), commit and push become outbox requests; force/delete refspecs, URL remotes, main, other write verbs, --output are refused"
 suite = "fence"
 allow = "tests/image-test.sh image-git-shim allow"
 block = "tests/image-test.sh image-git-shim block"

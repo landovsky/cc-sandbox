@@ -2,81 +2,129 @@
 # image/git-shim: the `git` a fenced agent runs (plan §3 U1a). It exists because the fence has no
 # credentials and cannot write the git dir (mounted read-only): a commit or push is not done here but
 # ASKED for, as a request file in the outbox (/run/ccsbx/out/requests), which the host daemon reads,
-# judges and performs; the answer comes back in /run/ccsbx/in/replies. Read verbs go to the real git.
-# This is convenience, not a boundary: the real git is still /usr/bin/git, and what keeps the fence
-# from writing history is the read-only git dir and the missing credentials, not this script.
+# judges and performs; the answer comes back in /run/ccsbx/in/replies. Read verbs go to the real git
+# (/usr/lib/git-core/git; it is not on PATH, so only this script calls it by name).
+# This is convenience, not a boundary: the fence can still run the real binary by path, and what
+# keeps it from writing history is the read-only git dir and the missing credentials. The host must
+# re-check every request it gets (remote, refspec, message size), exactly as if this shim did not exist.
 #
-#   git status|log|diff|show|...   passed to /usr/bin/git unchanged (the read list below)
+#   git [-C P] [-c K=V] [--git-dir P] [--work-tree P] [--no-pager] ... VERB   global options are parsed:
+#                                  the verb is the first word after them, not an option's value
+#   git status|log|diff|show|...   passed to the real git unchanged (the read list below);
+#                                  --output*, -O*, --open-files-in-pager and `reflog expire|delete` refused
 #   git commit -m MSG [-a]         request {"type":"git.commit","message":MSG,"all":bool}
-#   git push [REMOTE [REFSPEC]]    request {"type":"git.push","remote":..,"refspec":..}
+#   git push [REMOTE [REFSPEC]]    request {"type":"git.push","remote":..,"refspec":..}; REMOTE must be a
+#                                  configured remote NAME (never a URL), REFSPEC SRC or SRC:DST of plain
+#                                  ref characters: no '+' (force), no empty source (delete), no flags,
+#                                  and never main/master as the destination
 #   anything else                  refused with exit 1 and a message
 # Recipes: CCSBX_OUT / CCSBX_IN override the outbox/inbox (tests); CCSBX_GIT_TIMEOUT seconds to wait
-# for the answer (default 120). The request format is the shim's side of the contract; the daemon's
-# handler for git.* is built in the git route (not in this image).
+# for the answer (default 120). A reply must appear whole (the host writes a temp file and renames
+# it). The request format is the shim's side of the contract; the daemon's handler for git.* is built
+# in the git route (not in this image).
 set -u
-REAL=/usr/bin/git
+REAL=/usr/lib/git-core/git
 OUT=${CCSBX_OUT:-/run/ccsbx/out}
 IN=${CCSBX_IN:-/run/ccsbx/in}
 WAIT=${CCSBX_GIT_TIMEOUT:-120}
+refuse() { echo "git: $*" >&2; exit 1; }
 
-verb=""
-for a in "$@"; do
-  case "$a" in -*) ;; *) verb=$a; break;; esac
-done
+# find_verb ARGS...: sets VERB (empty if none) and NSKIP (how many words come before it).
+find_verb() {
+  VERB=""; NSKIP=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -C|-c|--git-dir|--work-tree|--namespace) [ $# -ge 2 ] || refuse "option $1 needs a value"; NSKIP=$((NSKIP + 2)); shift 2;;
+      --git-dir=*|--work-tree=*|--namespace=*|--no-pager|-P|--no-optional-locks|--no-replace-objects|--literal-pathspecs|--no-lazy-fetch) NSKIP=$((NSKIP + 1)); shift;;
+      --version|--help|-h|-v) VERB=""; return 0;;
+      -*) refuse "option '$1' before the verb is not supported in the fence";;
+      *) VERB=$1; return 0;;
+    esac
+  done
+}
+find_verb "$@"
 [ $# -eq 0 ] && exec "$REAL"
+if [ -z "$VERB" ]; then
+  # Only `git --version` / `git --help` style, with nothing else after.
+  case "$*" in "--version"|"--help"|"-h"|"-v") exec "$REAL" "$@";; esac
+  refuse "no verb"
+fi
 
-case "$verb" in
-  "") exec "$REAL" "$@" ;;   # git --version, git --help
+# A word after the verb that makes a read verb write a file or run a program.
+check_read_args() {
+  skip=$NSKIP
+  for a in "$@"; do
+    if [ "$skip" -gt 0 ]; then skip=$((skip - 1)); continue; fi
+    case "$a" in
+      --output|--output=*|-O*|--open-files-in-pager*|--ext-diff) refuse "$a is not allowed in the fence (it writes a file or runs a program)";;
+    esac
+  done
+}
+# The word right after the verb (for `reflog <sub>`).
+sub_after_verb() { shift "$NSKIP"; shift; echo "${1:-}"; }
+
+case "$VERB" in
   status|log|diff|show|blame|rev-parse|rev-list|ls-files|ls-tree|cat-file|grep|describe|shortlog|\
   name-rev|merge-base|diff-tree|diff-files|diff-index|show-ref|for-each-ref|check-ignore|help|version|\
-  whatchanged|count-objects|var|cherry|range-diff|reflog)
-    exec "$REAL" "$@" ;;
-  commit|push) ;;
-  *) echo "git $verb: not available in the fence; reads, 'git commit' and 'git push' are. (The host does the writing: see $0.)" >&2; exit 1 ;;
+  whatchanged|count-objects|var|cherry|range-diff)
+    check_read_args "$@"; exec "$REAL" "$@" ;;
+  reflog)
+    case "$(sub_after_verb "$@")" in ""|show|list|exists) check_read_args "$@"; exec "$REAL" "$@";; *) refuse "reflog $(sub_after_verb "$@") is not allowed in the fence";; esac ;;
+  commit|push)
+    [ "$NSKIP" -eq 0 ] || refuse "$VERB takes no global options in the fence"
+    ;;
+  *) refuse "$VERB is not available in the fence; reads, 'git commit' and 'git push' are. (The host does the writing.)" ;;
 esac
 
 # --- build the request -------------------------------------------------------------------------
-case "$verb" in
+shift   # past the verb
+case "$VERB" in
   commit)
-    msg=""; all=false
-    while [ $# -gt 0 ] && [ "$1" != commit ]; do shift; done
-    shift
+    msg=""; have=0; all=false
     while [ $# -gt 0 ]; do
       case "$1" in
-        -m) msg=${2:-}; shift 2 || { echo "git commit: -m needs a message" >&2; exit 1; };;
+        -m) [ $# -ge 2 ] || refuse "commit: -m needs a message"; [ "$have" = 0 ] || refuse "commit: only one -m (the host writes the message as given)"; msg=$2; have=1; shift 2;;
         -a|--all) all=true; shift;;
-        -am) all=true; msg=${2:-}; shift 2 || exit 1;;
-        *) echo "git commit: only -m MESSAGE and -a are supported in the fence (got '$1')" >&2; exit 1;;
+        -am) [ $# -ge 2 ] || refuse "commit: -am needs a message"; [ "$have" = 0 ] || refuse "commit: only one -m"; all=true; msg=$2; have=1; shift 2;;
+        *) refuse "commit: only -m MESSAGE and -a are supported in the fence (got '$1')";;
       esac
     done
-    [ -n "$msg" ] || { echo "git commit: -m MESSAGE is required" >&2; exit 1; }
-    body=$(jq -cn --arg m "$msg" --argjson a "$all" '{type:"git.commit",message:$m,all:$a}') ;;
+    [ -n "$msg" ] || refuse "commit: -m MESSAGE is required"
+    body=$(jq -cn --arg m "$msg" --argjson a "$all" '{type:"git.commit",message:$m,all:$a}') || refuse "commit: cannot encode the message" ;;
   push)
-    while [ $# -gt 0 ] && [ "$1" != push ]; do shift; done
-    shift
     remote=""; refspec=""
     for a in "$@"; do
-      case "$a" in
-        -*) echo "git push: no flags in the fence (got '$a'); the host decides how it pushes" >&2; exit 1;;
-        *) if [ -z "$remote" ]; then remote=$a; elif [ -z "$refspec" ]; then refspec=$a; else echo "git push: too many arguments" >&2; exit 1; fi;;
-      esac
+      if [ -z "$remote" ]; then remote=$a
+      elif [ -z "$refspec" ]; then refspec=$a
+      else refuse "push: too many arguments"; fi
     done
+    if [ -n "$remote" ]; then
+      printf '%s' "$remote" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || refuse "push: '$remote' is not a remote name (a URL or a flag is not allowed)"
+      "$REAL" remote 2>/dev/null | grep -Fxq -- "$remote" || refuse "push: '$remote' is not a configured remote"
+    fi
+    if [ -n "$refspec" ]; then
+      printf '%s' "$refspec" | grep -Eq '^[A-Za-z0-9._/][A-Za-z0-9._/-]*(:[A-Za-z0-9._/][A-Za-z0-9._/-]*)?$' \
+        || refuse "push: refspec '$refspec' is not allowed (no '+' force, no ':ref' delete, no flags; SRC or SRC:DST)"
+      dst=${refspec#*:}
+      case "${dst#refs/heads/}" in main|master) refuse "push: pushing to ${dst} is not allowed from the fence";; esac
+    fi
+    [ -z "$refspec" ] || [ -n "$remote" ] || refuse "push: a refspec needs a remote"
     body=$(jq -cn --arg r "$remote" --arg s "$refspec" '{type:"git.push",remote:$r,refspec:$s}') ;;
 esac
 
 # --- send it and wait for the answer -------------------------------------------------------------
 rid="git-$(date +%s%N)-$$"          # time-ordered, matches the daemon's name rule [A-Za-z0-9_-]{1,64}
 dir="$OUT/requests"
-[ -d "$dir" ] || { echo "git $verb: no outbox at $dir (is this a ccsbx fence?)" >&2; exit 1; }
+[ -d "$dir" ] || refuse "$VERB: no outbox at $dir (is this a ccsbx fence?)"
 printf '%s\n' "$body" > "$dir/.$rid.tmp" && mv "$dir/.$rid.tmp" "$dir/$rid.json" \
-  || { echo "git $verb: cannot write the request" >&2; exit 1; }
+  || refuse "$VERB: cannot write the request"
 reply="$IN/replies/$rid.json"
 i=0
 while [ ! -s "$reply" ]; do
   i=$((i + 1))
-  [ "$i" -gt $((WAIT * 4)) ] && { echo "git $verb: no answer from the host within ${WAIT}s (request $rid)" >&2; exit 1; }
+  [ "$i" -gt $((WAIT * 4)) ] && refuse "$VERB: no answer from the host within ${WAIT}s (request $rid)"
   sleep 0.25
 done
-status=$(jq -r '.status // "error"' "$reply")
-echo "git $verb: $(jq -c '.result // {}' "$reply")"
-case "$status" in ok|queued) exit 0;; *) echo "git $verb: refused by the host ($status)" >&2; exit 1;; esac
+status=$(jq -r '.status // "error"' "$reply" 2>/dev/null) || refuse "$VERB: the host's reply is not valid JSON"
+echo "git $VERB: $(jq -c '.result // {}' "$reply")"
+case "$status" in ok|queued) exit 0;; *) refuse "$VERB: refused by the host ($status)";; esac

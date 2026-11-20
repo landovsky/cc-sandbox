@@ -54,10 +54,14 @@ sudo -n /usr/local/sbin/ccsbx-root relay-mint -- <sid> <gen> <pub>
 - Hub address: `hub_url` in `ccsbx-root.toml` (default `http://127.0.0.1:4011`, loopback only; a non-loopback
   host is refused at config load). No redirects followed. Timeout 10 s.
 - Request: `POST <hub_url>/v1/principals` with `Authorization: Bearer <admin secret>` and body
-  `{"role":"relay","sid":"<sid>","gen":"<gen>","pub":"<pub>","may_reach":[<nodes>]}`.
+  `{"role":"relay","sid":"<sid>","gen":"<gen>","pub":"<pub>","may_reach":["<machine>/<node>",...]}`.
 - **`may_reach` is derived by root, never supplied.** For now it is the session's MANAGER node only
-  (`msg_scope.manager.node`), read by root from the SAME record it just validated, matching
-  `[A-Za-z0-9._#:/-]{1,128}`. Peers are not in it: whether a relay may type into an UNFENCED peer is Tomas's
+  (`msg_scope.manager.node`) together with the MACHINE the record binds it to (`msg_scope.manager.machine`, written
+  from the owner's start spec, never from the fence), as the one entry `<machine>/<node>`, read by root from the
+  SAME record it just validated: machine `[A-Za-z0-9._-]{1,64}`, node `[A-Za-z0-9._#:/-]{1,128}`. A record that
+  names no manager machine yields an EMPTY list (reaches fenced sessions only): a node belongs to the machine its
+  record names, so an owner token of any other machine that publishes the same node is never reachable by the
+  relay, and the hub matches machine AND node (a bare node is refused at mint, 422). Peers are not in it: whether a relay may type into an UNFENCED peer is Tomas's
   open question (#3cy2); peers that are fenced stay reachable over the signed fenced path. The hub's list
   format already holds up to 32 nodes, so adding peers later is a change to this one derivation. The verb has no argument for it: a `--may-reach` option, or
   any argument other than `--after-401` and `-- <sid> <gen> <pub>`, is refused with exit 2 before anything is
@@ -84,7 +88,7 @@ result. Never the token, never the secret.
 | 3 | the hub or the secret: unreachable, 401/403, no secret, secret not trusted |
 
 ## Tests this needs
-(plus: `may_reach` equals the manager node from the record (and nothing else); a caller-supplied `--may-reach` or
+(plus: `may_reach` equals `<manager machine>/<manager node>` from the record (and nothing else; empty when the record has no manager machine); a caller-supplied `--may-reach` or
 extra argument is refused and no hub call is made.)
 Each refusal above; the secret never appears in stdout, stderr, the audit line or a child process's
 arguments; a symlinked or group-readable secret is refused; a fake hub that answers 201 / 401 / 500 / hangs;

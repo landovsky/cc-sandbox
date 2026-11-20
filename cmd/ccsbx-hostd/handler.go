@@ -295,8 +295,23 @@ func fencedEntries(machine string, all []msg.Session, idleSince func(sid string,
 		if _, idle := idleSince(s.Sid, s.Gen); idle {
 			state = "waiting"
 		}
-		out = append(out, map[string]any{"key": "ccsbx:" + s.Sid, "uid": s.Sid, "label": s.Label, "node": s.Label, "machine": machine,
-			"fenced": true, "downlink": "spoke:" + machine + "/ccsbx", "attach": "ccsbx:" + s.Sid, "state": state})
+		e := map[string]any{"key": "ccsbx:" + s.Sid, "uid": s.Sid, "label": s.Label, "node": s.Label, "machine": machine,
+			"fenced": true, "downlink": "spoke:" + machine + "/ccsbx", "attach": "ccsbx:" + s.Sid, "state": state}
+		// where this session's manager and peers live, from its record (the owner's start spec): the hub holds
+		// those nodes for those machines, so another machine's owner token cannot squat an absent manager's node
+		binds := map[string]string{}
+		if n, m := s.Scope.Manager.Node, s.Scope.Manager.Machine; n != "" && m != "" {
+			binds[n] = m
+		}
+		for _, p := range s.Scope.Peers {
+			if m := s.Scope.PeerMachines[p]; p != "" && m != "" && len(binds) < 16 {
+				binds[p] = m
+			}
+		}
+		if len(binds) > 0 {
+			e["binds"] = binds
+		}
+		out = append(out, e)
 	}
 	return out
 }

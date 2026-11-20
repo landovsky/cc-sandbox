@@ -459,6 +459,21 @@ hostd's rights (tracking a fenced identity, reading hostd's frames), and the rev
   real manager's node ambiguous. Owner sessions route only to `spoke:<machine>` (no named downlink), and an
   owner spoke's focus/rename/drop/read reach unfenced sessions of its own machine only; hostd's principal
   gets none of those four.
+- **A node belongs to a machine** (round 5). A session's record carries the machine of its manager and peers
+  (`msg_scope.manager.machine`, `msg_scope.peer_machines`: from the owner's start spec, cc-tree sends the tree
+  record's Host), never from the fence. hostd hears an UNFENCED manager or peer only from that machine, and
+  sends to it only if the hub's entry for the node is on that machine (otherwise `msg.dropped`; another
+  machine's entry for the same node is a squatter's and neither receives a report nor makes the real one
+  ambiguous); a scope that names no machine for an unfenced node reaches nobody unfenced. The relay's
+  `may_reach` is `<machine>/<node>` and the hub matches both. The hub keeps a durable claim node→machine (first
+  publisher, or hostd's `binds` for its session's manager/peers, which take over a claim): another machine's
+  entry for a claimed node is refused (409), so the real manager is never locked out; `GET /v1/nodes` (admin)
+  lists claims, `DELETE /v1/nodes/<url-encoded node>` clears one when a node moves machines on purpose, and an
+  unrefreshed claim ends after 30 days (`SB_NODE_CLAIMS_FILE` keeps them across a hub restart). The shared secret
+  is conflict-checked too (a node a fenced entry or a principal holds cannot be re-published with it). Known
+  window: a squat BEFORE any worker bound to that node has started is accepted (nobody has said whose it is) and
+  is overridden when the worker's hostd tracks; two tracks of one node at the very same moment can both pass the
+  presence check (hostd's checks catch the result: a refused message, not an impersonation).
 - **Fenced to unfenced.** A relay reaches an unfenced target only if (a) that target's node is in the relay's
   `may_reach`, fixed at mint by root from the session's record (the MANAGER only for now: Tomas's open
   question #3cy2 decides peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held

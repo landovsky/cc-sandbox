@@ -321,8 +321,15 @@ func (h *hubRemote) vetUnfenced(d hubc.Deliver, entries []map[string]any) (rs ms
 	// refuses that now, but this is checked here, not believed), or a session record of this machine does,
 	// which of them is the sender is not for us to guess. Impersonation, and the real channel cut, is what a
 	// duplicate would otherwise be.
-	if hubc.CountNode(entries, node) != 1 {
-		return rs, "", "the sender's node is held by more than one hub entry (a fenced session's, or another principal's): not heard"
+	for _, x := range entries {
+		if x["id"] == id || hubc.CountNode([]map[string]any{x}, node) == 0 {
+			continue
+		}
+		if xm, _ := x["machine"].(string); x["fenced"] == true || xm == machine {
+			return rs, "", "the sender's node is also held by a fenced session or by another session of its machine: not heard"
+		}
+		// held also by an unfenced entry of ANOTHER machine: not ours to weigh here; the target's record binds
+		// the node to one machine (remoteInScope), so a squatter elsewhere is never heard and cannot cut this one
 	}
 	if h.rt != nil && h.rt.Dir != nil {
 		if ss, err := h.rt.Dir.Sessions(); err == nil {
@@ -380,15 +387,41 @@ func (h *hubRemote) SendRemote(sender msg.Session, node, kind, text string) (boo
 	if err != nil {
 		return false, "", err
 	}
-	if n := hubc.CountNode(entries, node); n > 1 {
+	// A node belongs to the machine the sender's record binds it to (scope.manager.machine, from the owner's
+	// start spec): an entry for it on another machine is a squatter's (any machine's owner token can publish an
+	// unclaimed node) and gets nothing, however it is tracked; and it cannot make the real one ambiguous.
+	want := sender.Scope.MachineOf(node)
+	var held []map[string]any
+	for _, x := range entries {
+		if hubc.CountNode([]map[string]any{x}, node) > 0 {
+			held = append(held, x)
+		}
+	}
+	if want != "" {
+		var on []map[string]any
+		for _, x := range held {
+			if m, _ := x["machine"].(string); m == want {
+				on = append(on, x)
+			}
+		}
+		if len(on) == 0 && len(held) > 0 {
+			return false, "", msg.ErrWrongMachine
+		}
+		held = on
+	}
+	if len(held) > 1 {
 		return false, "", msg.ErrAmbiguousNode // two sessions hold the node: which one is the manager is not for us to guess
 	}
-	e := hubc.FindNode(entries, node)
-	if e == nil {
+	if len(held) == 0 {
 		return false, "", msg.ErrUnknownNode
 	}
-	if m, _ := e["machine"].(string); m == h.machine {
+	e := held[0]
+	m, _ := e["machine"].(string)
+	if m == h.machine {
 		return false, "", msg.ErrLocalNode
+	}
+	if want == "" && e["fenced"] != true {
+		return false, "", msg.ErrWrongMachine // an unfenced node the scope does not place: not guessed
 	}
 	to, _ := e["id"].(string)
 	toSid, _ := e["uid"].(string)

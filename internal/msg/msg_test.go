@@ -57,7 +57,12 @@ var t0 = time.Date(2026, 11, 20, 1, 0, 0, 0, time.UTC)
 func sess(sid, label string, live bool, mgr string, peers ...string) Session {
 	s := Session{Sid: sid, Label: label, BusID: "ccsbx:" + sid, Realm: "production", Gen: 1, Live: live, Started: t0}
 	s.Scope.Manager.Node = mgr
+	s.Scope.Manager.Machine = "mac"
 	s.Scope.Peers = peers
+	s.Scope.PeerMachines = map[string]string{}
+	for _, p := range peers {
+		s.Scope.PeerMachines[p] = "mac"
+	}
 	s.Scope.ReplyWindowS = 3600
 	return s
 }
@@ -751,6 +756,32 @@ func TestRemoteMessageIsScopedByTheTargetsRecordAllow(t *testing.T) {
 	res = w.r.DeliverRemote(RemoteSender{Node: "cc-sandbox:peer", Sid: "s0x", Machine: "mac"}, "sT", "hi")
 	if res.Status != "ok" || !strings.Contains(w.out.lines["sT"][1], "unfenced (hub)") {
 		t.Fatalf("an unverified sender is labelled unfenced: %+v %q", res, w.out.lines["sT"])
+	}
+}
+
+// context (round 5): an UNFENCED sender is only a node name the hub's presence vouches for, and any machine's
+// owner token can publish an unclaimed node. The target's record binds the node to a machine; the same node
+// from another machine, or from a record that names no machine, is refused. A fenced sender is signed: it
+// needs no machine.
+func TestAnUnfencedNodeCountsOnlyOnTheMachineTheRecordBindsItToBlock(t *testing.T) {
+	for name, c := range map[string]struct {
+		rs   RemoteSender
+		mach string
+		code string
+	}{
+		"the bound machine":                  {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "mac"}, "mac", ""},
+		"the same node from another machine": {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "x4"}, "mac", "scope"},
+		"no machine named by the record":     {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "mac"}, "", "scope"},
+		"no machine named by the hub":        {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a"}, "mac", "scope"},
+		"a fenced sender needs no machine":   {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "x4", Fenced: true}, "mac", ""},
+	} {
+		w := newWorld(t, sess("sT", "cc-sandbox:worker", true, "cc-sandbox:mgr"))
+		w.dir.s[0].Scope.Manager.Machine = c.mach
+		w.stop("sT")
+		w.now = w.now.Add(time.Second)
+		if res := w.r.DeliverRemote(c.rs, "sT", "x"); res.Code != c.code && !(c.code == "" && res.Status == "ok") {
+			t.Errorf("%s: %+v", name, res)
+		}
 	}
 }
 

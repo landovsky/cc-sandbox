@@ -66,8 +66,8 @@ func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s 
 		// may_reach is the session's MANAGER only, as root derives it (Tomas's open question #3cy2: peers stay
 		// reachable only when they are fenced, over the signed path)
 		var reach []string
-		if s.Scope.Manager.Node != "" {
-			reach = append(reach, s.Scope.Manager.Node)
+		if s.Scope.Manager.Node != "" && s.Scope.Manager.Machine != "" {
+			reach = append(reach, s.Scope.Manager.Machine+"/"+s.Scope.Manager.Node)
 		}
 		m := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": sid, "gen": fmt.Sprint(gen), "pub": pub, "may_reach": reach})
 		return m["token"].(string), nil
@@ -237,6 +237,7 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	defer cancel()
 	worker := msg.Session{Sid: "s0worker02", Label: "cc-sandbox:worker2", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
 	worker.Scope.Manager.Node = "cc-sandbox:umgr"
+	worker.Scope.Manager.Machine = "mac3"
 	worker.Scope.ReplyWindowS = 3600
 	hp := startMachine(t, ctx, url, admin, "hp2", worker)
 
@@ -397,17 +398,75 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		t.Fatalf("a relay reached an unfenced node outside its may_reach: %v", err)
 	}
 
-	// 7. two entries hold the manager's node (the shared secret re-tracked it elsewhere): the worker's next
-	// report goes to NEITHER (ambiguous), and is journaled as dropped.
-	if _, err := owner.Track(ctx, []map[string]any{{"key": "ws/evil", "label": "evil", "node": "cc-sandbox:umgr", "uid": "eeeeeeee-0000-4000-8000-0000000000a4", "machine": "mac9", "pane": "%1", "state": "waiting", "downlink": "spoke:mac9/evil"}}, 120); err != nil {
-		t.Fatal(err)
+	// 7. the shared secret (every owner session on every machine holds it) is conflict-checked too: it cannot
+	// re-track the manager's node elsewhere to make it ambiguous and cut the worker's channel (the hub refuses,
+	// 409; hostd's own handling of a node held twice is covered by the unit tests).
+	if _, err := owner.Track(ctx, []map[string]any{{"key": "ws/evil", "label": "evil", "node": "cc-sandbox:umgr", "uid": "eeeeeeee-0000-4000-8000-0000000000a4", "machine": "mac9", "pane": "%1", "state": "waiting"}}, 120); !hubc.IsConflict(err) {
+		t.Fatalf("the shared secret re-tracking a held node: want 409, got %v", err)
+	}
+
+	// 9. (round 5) squatting an ABSENT manager's node. The worker's manager umgr5 is an unfenced session on mac3
+	// that is not tracked right now (a restart, a closed laptop). An owner token of a third machine, x4, publishes
+	// its node; then the worker starts (its record binds umgr5 to mac3, written from the owner's start spec).
+	w3 := msg.Session{Sid: "s0worker03", Label: "cc-sandbox:worker3", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	w3.Scope.Manager.Node, w3.Scope.Manager.Machine, w3.Scope.ReplyWindowS = "cc-sandbox:umgr5", "mac3", 3600
+	squatEntry := map[string]any{"key": "x4/%1", "label": "squat", "node": "cc-sandbox:umgr5", "uid": "eeeeeeee-0000-4000-8000-0000000000b1", "machine": "x4", "pane": "%1", "state": "waiting"}
+	x4Client := &hubc.Client{URL: url, Token: func() (string, error) { return x4Tok, nil }}
+	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 120); err != nil {
+		t.Fatalf("a squat with no worker bound to the node yet is accepted (nobody has said whose it is): %v", err)
+	}
+	hp3 := startMachine(t, ctx, url, admin, "hp3", w3)
+	var w3ID, squatID string
+	for i := 0; i < 100 && (w3ID == "" || squatID == ""); i++ {
+		es, _ := owner.Sessions(ctx)
+		if e := hubc.FindSid(es, w3.Sid); e != nil {
+			w3ID, _ = e["id"].(string)
+		}
+		if e := hubc.FindSid(es, "eeeeeeee-0000-4000-8000-0000000000b1"); e != nil {
+			squatID, _ = e["id"].(string)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if w3ID == "" {
+		t.Fatal("worker3 is not on the hub")
+	}
+	// the squatter, bound correctly by its own spoke and the only holder, speaks as the manager: not heard
+	x4Client.Send(ctx, hubc.SendReq{To: w3ID, Text: "squatter speaking as your manager", From: map[string]string{"id": squatID, "machine": "x4"}})
+	time.Sleep(600 * time.Millisecond)
+	hp3.out.mu.Lock()
+	for _, l := range hp3.out.lines {
+		if strings.Contains(l, "squatter speaking") {
+			t.Fatalf("the squatter was heard as the absent manager: %q", l)
+		}
+	}
+	hp3.out.mu.Unlock()
+	// the squatter cannot renew (the hub holds the node for mac3 now), and the REAL manager is not locked out
+	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 120); !hubc.IsConflict(err) {
+		t.Errorf("the squatter's re-track after the worker bound the node: want 409, got %v", err)
+	}
+	if _, err := mac.Track(ctx, []map[string]any{
+		entry("umgr", "cc-sandbox:umgr", "eeeeeeee-0000-4000-8000-0000000000a1", ""),
+		entry("uother", "cc-sandbox:uother", "eeeeeeee-0000-4000-8000-0000000000a2", ""),
+		entry("umgr5", "cc-sandbox:umgr5", "eeeeeeee-0000-4000-8000-0000000000b2", ""),
+	}, 120); err != nil {
+		t.Fatalf("the real manager coming back is locked out by the squatter: %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
-	res2 := hp.hr.rt.Send(worker, []byte(`{"type":"msg.send","to":{"node":"cc-sandbox:umgr"},"kind":"report","text":"secret report"}`))
-	if res2.Code != "dropped" {
-		t.Fatalf("a node held by two entries was sent to: %+v", res2)
+	// the worker's report goes to the REAL manager (mac3), never to the squatter
+	if ok, err := sendVia(hp3, w3, "cc-sandbox:umgr5", "report", "secret report"); !ok || err != nil {
+		t.Fatalf("worker3 -> its real manager: %v %v", ok, err)
 	}
-	// 8. and the manager's node being held twice, the correctly bound unfenced manager is not heard either:
-	// hostd does not guess which of the two is the sender.
-	refused("a sender whose node is held twice", "dup-node", mac, map[string]string{"id": umgrID, "machine": "mac3"})
+	select {
+	case f := <-got:
+		var d hubc.Deliver
+		json.Unmarshal(f.Payload, &d)
+		if !strings.Contains(d.Text, "secret report") {
+			t.Fatalf("what mac3 got: %+v", d)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the real manager got nothing")
+	}
+	if fs, _, err := x4Client.Poll(ctx, "spoke:x4", 0, time.Second); err == nil && len(fs) != 0 {
+		t.Fatalf("the squatter's downlink got the worker's report: %v", fs)
+	}
 }

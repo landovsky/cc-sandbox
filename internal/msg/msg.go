@@ -54,9 +54,31 @@ const MaxText = 4000
 type Scope struct {
 	Manager struct {
 		Node string `json:"node"`
+		// Machine is the hub machine id of the tree record's Host (never from the fence): a node belongs to
+		// the machine its record names, so an UNFENCED manager is heard, and sent to, only there. Empty =
+		// unknown: an unfenced node without a machine reaches nobody (a fenced one is verified by signature).
+		Machine string `json:"machine"`
 	} `json:"manager"`
-	Peers        []string `json:"peers"`
-	ReplyWindowS int      `json:"reply_window_s"`
+	Peers        []string          `json:"peers"`
+	PeerMachines map[string]string `json:"peer_machines"` // peer node -> its machine, as Manager.Machine
+	ReplyWindowS int               `json:"reply_window_s"`
+}
+
+// MachineOf is the machine the scope says a node (the manager or a peer) belongs to, "" if it says none.
+func (s Scope) MachineOf(node string) string {
+	node = strings.Replace(node, ":#", ":", 1)
+	if node == "" {
+		return ""
+	}
+	if node == strings.Replace(s.Manager.Node, ":#", ":", 1) {
+		return s.Manager.Machine
+	}
+	for p, m := range s.PeerMachines {
+		if strings.Replace(p, ":#", ":", 1) == node {
+			return m
+		}
+	}
+	return ""
 }
 
 // Session is what the router knows of one session.
@@ -225,6 +247,9 @@ func (r *Router) SendWith(from Session, body []byte, o Origin) Result {
 				case errors.Is(err, ErrAmbiguousNode):
 					r.dropped(sender, b.To.Node, "more than one session holds that node")
 					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "dropped"})
+				case errors.Is(err, ErrWrongMachine):
+					r.dropped(sender, b.To.Node, "no session of that node on the machine the scope binds it to")
+					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "dropped"})
 				case errors.Is(err, ErrUnknownNode) && r.Hub == nil:
 					r.dropped(sender, b.To.Node, "no session on the hub holds that node")
 					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "dropped"})
@@ -292,6 +317,9 @@ var (
 	ErrUnknownNode = errors.New("the hub holds no session for that node")
 	// ErrAmbiguousNode: more than one live session holds the node, so a message must not guess.
 	ErrAmbiguousNode = errors.New("more than one session holds that node")
+	// ErrWrongMachine: the scope binds the node to a machine and the hub's entry for it is on another (or the
+	// scope names no machine for an unfenced node): a session squatting on the node must not receive a report.
+	ErrWrongMachine = errors.New("the node's session is not on the machine the scope binds it to")
 )
 
 // dropped tells whoever journals (Dropped hook) that a message ended as dropped.
@@ -355,7 +383,10 @@ func (r *Router) DeliverRemote(rs RemoteSender, targetSid, text string) Result {
 // remoteInScope: the sender's node is in the target's own scope, or the target messaged it lately.
 func (r *Router) remoteInScope(rs RemoteSender, target Session) bool {
 	if nodeInScope(target, rs.Node) {
-		return true
+		// An UNFENCED sender is only a node name the hub's presence list vouches for, and any machine's owner
+		// token can publish any unclaimed node: so it counts only on the machine the target's record binds the
+		// node to. A fenced sender's signature identifies it, wherever it is.
+		return rs.Fenced || (rs.Machine != "" && target.Scope.MachineOf(rs.Node) == rs.Machine)
 	}
 	win := time.Duration(target.Scope.ReplyWindowS) * time.Second
 	if win <= 0 {

@@ -138,6 +138,7 @@ func newRig(t *testing.T, mint minter) *rig {
 	worker := msg.Session{Sid: targetSid, Label: "cc-sandbox:worker", BusID: "ccsbx:" + targetSid, Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
 	worker.Scope.Manager.Node = "cc-sandbox:mgr"
 	worker.Scope.Peers = []string{"cc-sandbox:peer"}
+	worker.Scope.PeerMachines = map[string]string{"cc-sandbox:peer": "mac"}
 	worker.Scope.ReplyWindowS = 3600
 	out, j := &xOut{}, &xJ{}
 	rt := &msg.Router{Dir: &xDir{[]msg.Session{worker}}, Out: out, Idle: xIdle{}, StateDir: t.TempDir()}
@@ -290,12 +291,44 @@ func TestUnfencedSenderWhoseNodeAnythingElseHoldsIsNotHeardBlock(t *testing.T) {
 			t.Errorf("%s: heard (%v)", name, r.out.lines)
 		}
 	}
-	// two unfenced entries on one node (the owner of mac and a squatter of x4): neither is heard
-	r := newRig(t, nil)
-	e, from := squat("cc-sandbox:peer")
-	r.hub.sessions = append(r.hub.sessions, e)
-	if r.recv(unfenced("spoke:mac", true, macUnfencedMgr, map[string]string{"id": "um1", "machine": "mac"})) || r.recv(unfenced("spoke:x4", true, e, from)) {
-		t.Error("a node held by two unfenced entries was heard")
+}
+
+// context (round 5): a node belongs to the machine the TARGET's record binds it to (scope.manager.machine, from
+// the owner's start spec). A squatter on a third machine publishing the absent manager's node is bound
+// correctly by its own spoke and is the only holder: it must still not be heard as the manager, must not be
+// sent the worker's reports, and must not cut the real manager's channel once that comes back.
+func TestASquatterOnAnotherMachineIsNeitherHeardNorSentToBlock(t *testing.T) {
+	calls := 0
+	r := newRig(t, fixedMint("sbp1.relay-token-0001", &calls))
+	r.hub.relayToken = "sbp1.relay-token-0001"
+	// the real unfenced manager (um1, node cc-sandbox:peer on mac) is away; x4's owner token squats its node
+	r.hub.sessions = r.hub.sessions[:2]
+	r.hub.sessions = append(r.hub.sessions, map[string]any{"id": "sq1", "key": "x4/%1", "uid": "u-squat", "label": "squat", "node": "cc-sandbox:peer", "machine": "x4", "tracked_by": "spoke:x4"})
+	e, from := r.hub.sessions[2], map[string]string{"id": "sq1", "machine": "x4"}
+	if r.recv(unfenced("spoke:x4", true, e, from)) || len(r.out.lines) != 0 {
+		t.Fatalf("the squatter was heard as the manager: %v", r.out.lines)
+	}
+	if ok, _, err := r.hr.SendRemote(worker(), "cc-sandbox:peer", "report", "secret"); ok || !errors.Is(err, msg.ErrWrongMachine) || len(r.hub.got) != 0 {
+		t.Fatalf("the worker's report reached the squatter: %v %v (%d sends)", ok, err, len(r.hub.got))
+	}
+	// the real manager comes back: both hold the node, yet the real one (on its bound machine) is heard and
+	// sent to, and the squatter is still refused
+	r.hub.sessions = append(r.hub.sessions, map[string]any{"id": "um1", "key": "mac/%2", "uid": "u-peer", "label": "plain", "node": "cc-sandbox:peer", "machine": "mac", "tracked_by": "spoke:mac"})
+	if !r.recv(unfenced("spoke:mac", true, macUnfencedMgr, map[string]string{"id": "um1", "machine": "mac"})) {
+		t.Fatalf("the real manager was cut off by a squatter's duplicate: %v", r.logs)
+	}
+	if r.recv(unfenced("spoke:x4", true, e, from)) {
+		t.Fatal("the squatter was heard once the real manager was back")
+	}
+	if ok, toSid, err := r.hr.SendRemote(worker(), "cc-sandbox:peer", "report", "x"); !ok || err != nil || toSid != "u-peer" {
+		t.Fatalf("the report did not reach the real manager: %v %q %v", ok, toSid, err)
+	}
+	// a scope that names no machine for an unfenced node reaches nobody unfenced (refused, not guessed)
+	w := worker()
+	w.Scope.PeerMachines = nil
+	n := len(r.hub.got)
+	if ok, _, err := r.hr.SendRemote(w, "cc-sandbox:peer", "report", "x"); ok || err == nil || len(r.hub.got) != n {
+		t.Fatalf("an unplaced unfenced node was sent to: %v %v", ok, err)
 	}
 }
 
@@ -359,7 +392,7 @@ func TestClaimingAFencedIdentityWithoutARelaySignatureIsRefusedBlock(t *testing.
 func TestANodeHeldByTwoEntriesIsNotSentToEither(t *testing.T) {
 	calls := 0
 	r := newRig(t, fixedMint("sbp1.relay-token-0001", &calls))
-	r.hub.sessions = append(r.hub.sessions, map[string]any{"id": "m9", "uid": "s0mac99999", "label": "ghost", "node": "cc-sandbox:mgr", "machine": "mac5", "fenced": true})
+	r.hub.sessions = append(r.hub.sessions, map[string]any{"id": "m9", "uid": "s0mac99999", "label": "ghost", "node": "cc-sandbox:mgr", "machine": "mac", "fenced": true})
 	if _, _, err := r.hr.SendRemote(worker(), "cc-sandbox:mgr", "report", "secret"); !errors.Is(err, msg.ErrAmbiguousNode) || calls != 0 || len(r.hub.got) != 0 {
 		t.Fatalf("%v minted %d sent %d", err, calls, len(r.hub.got))
 	}
@@ -453,7 +486,10 @@ func fixedMint(token string, calls *int) minter {
 }
 
 func worker() msg.Session {
-	return msg.Session{Sid: targetSid, Label: "cc-sandbox:worker", Realm: "production", Gen: 1}
+	s := msg.Session{Sid: targetSid, Label: "cc-sandbox:worker", Realm: "production", Gen: 1}
+	s.Scope.Manager.Node, s.Scope.Manager.Machine = "cc-sandbox:mgr", "mac"
+	s.Scope.Peers, s.Scope.PeerMachines = []string{"cc-sandbox:peer"}, map[string]string{"cc-sandbox:peer": "mac"}
+	return s
 }
 
 func TestSendRemoteSignsWithTheGenerationKeyAndReportsDelivery(t *testing.T) {

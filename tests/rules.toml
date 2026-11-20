@@ -1550,3 +1550,13 @@ block = "tests/twin-go.sh ./internal/start TestStoppedProofAsksTheRuntime && tes
 invariants = [11, 24]
 backends = ["unit"]
 where = "hp"
+
+[[rule]]
+id = "k8s-pod-contract"
+title = "the session pod is built to the live k3s contract (name ccsbx-s-, role=session, node and toleration, priority class from config, uids 10001/10002, hardened, Guaranteed, emptyDir with sizeLimit, no token, no Secret, sidecar-only volumes, digest images from our repos) and every violation is refused; a fake API server stands in for the cluster (the cluster dry-run is Gate M)"
+suite = "fence"
+allow = "tests/twin-go.sh ./internal/k8s TestPodForMakesAContractPod && tests/twin-go.sh ./internal/k8s TestCreateGetListDeleteAgainstTheFakeAPI"
+block = "tests/twin-go.sh ./internal/k8s TestCheckContractRefusesEachViolation && tests/twin-go.sh ./internal/k8s TestPodForRefusesBadSpecs && tests/twin-go.sh ./internal/k8s TestCreateNeverSendsAPodTheContractRefuses && tests/twin-go.sh ./internal/k8s TestBackendRefusesBadNamesAndForeignPods && tests/twin-go.sh ./internal/k8s TestBackendExecChecksBeforeRunning && tests/twin-go.sh ./internal/k8s TestKubectlExecArgvEnvAndExitCode && tests/twin-go.sh ./internal/k8s TestConfigValuesAreNotConstants"
+invariants = [1, 12]
+backends = ["k8s"]
+where = "hp"

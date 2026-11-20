@@ -75,6 +75,10 @@ Step 8 in detail (changed after the PR #2 review):
 - `install` prints `DONE` only after hostd and the signer are really up (it waits up to 10 s). A
   crash-looping hostd gives `NOT DONE` and the undo hint, not a false DONE;
 - known limit after the gate: hostd has no `--ccmsg-bin` (uid `ccsbx` cannot use the owner's bus sockets), so fenced to unfenced-manager messages wait for the hub spoke (B10/B11/M2b);
+- the signer will not start without its scope file; the install writes `/var/lib/ccsbx-keys/signer.scope`
+  (one line: owners = the owner, machines = `hostname -s`, profiles = the names in `profiles/*.json`, billings =
+  `api,subscription`; override with `--machine`, `--profiles`, `--billings`; `plan` prints it). `check` asks the
+  signer for a token for one in-scope test claim, so it needs root (the caller must be in group `ccsbx`);
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
@@ -138,7 +142,7 @@ After the group change only password sudo can start them (`sudo docker start <na
   The installer parses it as root and refuses if a NOPASSWD line isn't one of docker, apt-get,
   dokku, sops (it won't guess).
 
-## `units/install-linux.sh plan` as of 2026-11-20 (owner tomas, after the PR #2 re-check)
+## `units/install-linux.sh plan` as of 2026-11-20 (owner tomas, after the signer alignment)
 
 ```
 install-linux plan  (owner=tomas, bin-dir=<repo>/dist)
@@ -151,11 +155,13 @@ GATES (install refuses while any is unmet)
   note: sudoers.d/README not readable without root: verified at install
   P15 status file: /home/tomas/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv
   allowed roots:   "/home/tomas/git", "/home/tomas/wt"
+  signer scope:    owners=tomas machines=hp-ubuntu profiles=dev-default,e2e-default billings=api,subscription
 
 [01] U0b users and directories: ccsbx (hostd), ccsbx-keys (keys), group ccsbx-clients
      # ccsbx-keys may already exist (R10b creates it and the age key during the day): reused, never recreated
      # user ccsbx-keys exists
-     $ useradd --system --home-dir /var/lib/ccsbx --create-home --shell /usr/sbin/nologin ccsbx
+     $ groupadd --system ccsbx
+     $ useradd --system --gid ccsbx --home-dir /var/lib/ccsbx --create-home --shell /usr/sbin/nologin ccsbx
      $ groupadd --system ccsbx-clients
      # ccsbx-clients may talk to hostd's local socket; it grants no root path
      $ gpasswd -a tomas ccsbx-clients
@@ -185,6 +191,9 @@ GATES (install refuses while any is unmet)
      $ chmod 0600 /var/lib/ccsbx-keys/age.key
      # machine key: made by the signer itself (--init), so no other process ever sees it
      $ runuser -u ccsbx-keys -- /usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --init
+     # the signer will not serve without its scope: ONE keyring line (owners, machines, profiles, billings), written by
+     #   'ccsbx token pubkey' as ccsbx-keys, 0600, from the install's own values; rewritten on every run so it matches the options
+     $ runuser -u ccsbx-keys -- sh -c f=\$1\;\ shift\;\ umask\ 077\;\ \"\$@\"\ \>\ \"\$f.tmp\"\ \&\&\ mv\ \"\$f.tmp\"\ \"\$f\" sh /var/lib/ccsbx-keys/signer.scope /usr/local/bin/ccsbx token pubkey --key-file /var/lib/ccsbx-keys/machine.key --owners tomas --machines hp-ubuntu --profiles dev-default\,e2e-default --billings api\,subscription
      # the printed PUBLIC key goes into config/machines/<machine>.json (M9); nothing secret is printed
      # the K8 kubeconfig arrives SOPS-encrypted to the age key; it is decrypted only by ccsbx-keys
 
@@ -195,7 +204,7 @@ GATES (install refuses while any is unmet)
      $ systemctl enable --now ccsbx-signer.socket
 
 [05] U0 hostd unit
-     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 52 lines)
+     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 54 lines)
      # the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced
      $ runuser -u ccsbx -- sh -c umask\ 077\;\ head\ -c\ 32\ /dev/urandom\ \|\ base64\ \>\ /var/lib/ccsbx/listen.token
      $ systemctl daemon-reload

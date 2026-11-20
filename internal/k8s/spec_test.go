@@ -21,7 +21,7 @@ func goodSpec() Spec {
 		panic(err)
 	}
 	return Spec{Sid: "s0abcdefgh", Gen: 2, Label: "cc-sandbox:x", OwnerUID: 1000, FenceImage: fenceImg, SideImage: sideImg, SideCmd: cmd,
-		MemoryMB: 4096, CPU: 2, EphemeralMB: 20480, WorktreeMB: 10240}
+		MemoryMB: 4096, CPU: 2, EphemeralMB: 32768, WorktreeMB: 10240}
 }
 
 func goodPod(t *testing.T) *Pod {
@@ -57,7 +57,7 @@ func TestPodForMakesAContractPod(t *testing.T) {
 			t.Errorf("%s has env %v", c.Name, c.Env)
 		}
 	}
-	if q := p.Spec.Containers[0].Resources; q.Limits["memory"] != "4Gi" || q.Requests["cpu"] != "2" || q.Limits["ephemeral-storage"] != "20Gi" {
+	if q := p.Spec.Containers[0].Resources; q.Limits["memory"] != "4Gi" || q.Requests["cpu"] != "2" || q.Limits["ephemeral-storage"] != "32Gi" {
 		t.Errorf("%+v", q)
 	}
 	if h := p.Spec.HostUsers; h != nil {

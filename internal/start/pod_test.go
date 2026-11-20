@@ -23,6 +23,7 @@ type fakeRoot struct {
 	stopEr          error
 	uidOnDiskAtLoad string
 	gone            bool
+	stopGens        []int
 	goneEr          error
 }
 
@@ -37,7 +38,10 @@ func (f *fakeRoot) Load(sid string) error {
 	}
 	return f.loadEr
 }
-func (f *fakeRoot) Stop(sid string) error { f.calls = append(f.calls, "stop"); return f.stopEr }
+func (f *fakeRoot) Stop(sid string, gen int) error {
+	f.calls, f.stopGens = append(f.calls, "stop"), append(f.stopGens, gen)
+	return f.stopEr
+}
 func (f *fakeRoot) Gone(sid string) (bool, error) {
 	f.calls = append(f.calls, "gone")
 	return f.gone, f.goneEr
@@ -510,6 +514,9 @@ func TestAFailedResumeNeverGivesTheGenerationNumberBack(t *testing.T) {
 		t.Fatalf("%v calls %v", err, fr.calls)
 	}
 	rec, _ := d.Load(first.Sid)
+	if rec.Reply.Gen != 2 || !strings.HasSuffix(rec.Reply.ID, "/g2") {
+		t.Errorf("the failed generation's full id names another generation: %d %s", rec.Reply.Gen, rec.Reply.ID)
+	}
 	if rec.Gen != 2 || rec.Ended == nil || rec.PodUID != "" || rec.Starting || rec.RequestID != "rid-1" {
 		t.Errorf("the failed generation is kept as generation 2, ended, its pod gone, its request not answered as a success: %+v", rec)
 	}
@@ -777,5 +784,120 @@ func TestAPodStartNeedsAGoodRepositoryAndBranch(t *testing.T) {
 		if _, err := d.Start(podSpec(mod)); code(err) != BadSpec || len(fr.calls) != 0 || len(d.recordFiles(t)) != 0 {
 			t.Errorf("%s: %v calls %v", why, err, fr.calls)
 		}
+	}
+}
+
+// the limit on a start in flight follows what the verbs may take (hostd sets it from --pod-load-wait), not a constant
+func TestTheStartingLimitIsConfigurable(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	first, _ := d.Start(podSpec(nil))
+	rec, _ := d.Load(first.Sid)
+	rec.Starting = true
+	rec.Started = time.Now().Add(-5 * time.Minute) // in flight for five minutes
+	d.save(rec)
+	fr.calls = nil
+	if _, err := d.Start(resumeSpec(first.Sid, nil)); code(err) != SessionBusy {
+		t.Errorf("under the default 15 minutes a five-minute-old start is still in flight: %v", err)
+	}
+	d.StartLimit = 3 * time.Minute // the verbs may take three minutes at most: five means it is stuck
+	if _, err := d.Start(resumeSpec(first.Sid, nil)); err != nil {
+		t.Errorf("past the configured limit the resume must go ahead: %v", err)
+	}
+	d.StartLimit = 20 * time.Minute
+	r2, _ := d.Load(first.Sid)
+	r2.Starting, r2.Started, r2.Ended = true, time.Now().Add(-16*time.Minute), nil
+	d.save(r2)
+	if _, err := d.Start(resumeSpec(first.Sid, func(s *LaunchSpec) { s.RequestID = "rid-late" })); code(err) != SessionBusy {
+		t.Errorf("a longer limit keeps a 16-minute-old start in flight: %v", err)
+	}
+}
+
+// the delete of a failed start's pod does not hold the daemon's lock: another start goes through meanwhile
+func TestTheCleanupOfAFailedStartDoesNotHoldTheDaemonsLockWhileDeleting(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	fr.loadEr = errors.New("side load refused: bad key")
+	answered := make(chan error, 1)
+	d.PodRoot = &stopHook{fakeRoot: fr, during: func() {
+		go func() {
+			_, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID, s.Label = "rid-9", "cc-sandbox:other" }))
+			answered <- err
+		}()
+		select {
+		case err := <-answered:
+			if err != nil {
+				t.Errorf("the other start: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Error("another start waited for a pod's delete (the lock is held through it)")
+			// (that goroutine stays blocked on the lock for good; the test must not wait for it)
+		}
+	}}
+	d.Start(podSpec(nil))
+}
+
+type stopHook struct {
+	*fakeRoot
+	during func()
+}
+
+func (s *stopHook) Stop(sid string, gen int) error { s.during(); return s.fakeRoot.Stop(sid, gen) }
+
+// Gate M: pods are far heavier than docker sessions, so they have a cap of their own
+func TestPodSessionsHaveACapOfTheirOwn(t *testing.T) {
+	d, _, _ := podDaemon(t)
+	d.PodMaxLive = 2
+	for i := 0; i < 2; i++ {
+		if _, err := d.Start(podSpec(func(s *LaunchSpec) {
+			s.RequestID, s.Label = "rid-p"+string(rune('a'+i)), "cc-sandbox:p"+string(rune('a'+i))
+		})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.Start(podSpec(func(s *LaunchSpec) { s.RequestID, s.Label = "rid-pz", "cc-sandbox:pz" })); code(err) != MachineFull {
+		t.Errorf("a third pod: %v", err)
+	}
+	// docker sessions are not held to it
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID, s.Label = "rid-d", "cc-sandbox:docker" })); err != nil {
+		t.Errorf("a docker session: %v", err)
+	}
+}
+
+// N6: the unlocked cleanup tells pod-stop which generation it means: every pod-stop of a start names its own
+func TestEveryPodStopNamesItsGeneration(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	fr.loadEr = ErrPodNotReady
+	d.Start(podSpec(nil))
+	if len(fr.stopGens) != 1 || fr.stopGens[0] != 1 {
+		t.Errorf("the cleanup's pod-stop named generations %v", fr.stopGens)
+	}
+	d2, fr2, _ := podDaemon(t)
+	first, _ := d2.Start(podSpec(nil))
+	fr2.stopGens = nil
+	fr2.uid = "pod-uid-2"
+	d2.Start(resumeSpec(first.Sid, nil))
+	d2.StopPod(first.Sid)
+	if len(fr2.stopGens) != 2 || fr2.stopGens[0] != 1 || fr2.stopGens[1] != 2 {
+		t.Errorf("a resume stops generation 1, a stop generation 2: %v", fr2.stopGens)
+	}
+}
+
+// root refused because the session moved on (another_generation): the cleanup touches nothing
+func TestACleanupRefusedBecauseTheSessionMovedOnChangesNothing(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	l := logs(d)
+	fr.loadEr = errors.New("side load refused: bad key")
+	fr.stopEr = fmt.Errorf("%w: refused", ErrPodStale)
+	if _, err := d.Start(podSpec(nil)); err == nil {
+		t.Fatal("the start should fail")
+	}
+	files := d.recordFiles(t)
+	if len(files) != 1 {
+		t.Fatalf("records %v", files)
+	}
+	if rec, _ := d.Load(strings.TrimSuffix(files[0], ".json")); rec.Ended != nil || !rec.Starting {
+		t.Errorf("the record was changed by a cleanup that root refused as stale: %+v", rec)
+	}
+	if !strings.Contains(strings.Join(*l, "\n"), "moved on") {
+		t.Errorf("not said: %v", *l)
 	}
 }

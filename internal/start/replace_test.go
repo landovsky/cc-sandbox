@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -109,8 +110,10 @@ func TestReplaceWhoseLaunchFailsMarksTheSessionEnded(t *testing.T) {
 		t.Fatal("expected failure")
 	}
 	rec, _ := d.Load(sid)
-	if rec.Gen != 1 || rec.Ended == nil {
-		t.Fatalf("record after a failed replace: gen %d ended %v", rec.Gen, rec.Ended)
+	// the number is not given back (the doors refuse every token at or below a revoked generation), and the
+	// record's full id names the generation it is at
+	if rec.Gen != 2 || rec.Ended == nil || rec.Reply.Gen != 2 || !strings.HasSuffix(rec.Reply.ID, "/g2") {
+		t.Fatalf("record after a failed replace: gen %d ended %v reply %d %s", rec.Gen, rec.Ended, rec.Reply.Gen, rec.Reply.ID)
 	}
 }
 

@@ -658,7 +658,7 @@ func TestPodCreateBuildsTheSidecarCommandFromTheRecordAndConfig(t *testing.T) {
 	want := "/usr/local/bin/ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
 		"--out /run/ccsbx/out --in /run/ccsbx/in --fence-uid 10001 --sid " + sid + " --gen 2 --label cc-sandbox:x --full-id tomas/future-two/" + sid + "/g2 --machine future-two " +
 		`--scope {"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":["p1"],"peer_machines":{"p1":"mac"}} ` +
-		"--git-repo landovsky/cc-sandbox --git-url http://127.0.0.1:8080/egress/git --git-base main --git-branch work/" + sid + " --git-dir /run/ccsbx/side/git/g " +
+		"--git-repo landovsky/cc-sandbox --git-url http://127.0.0.1:8080/egress/git --git-base main --git-branch work/" + sid + " --git-dir /run/ccsbx/side/git/g --git-max-bytes 9663676416 " +
 		"--hub-url http://hub-egress.cc-sandbox.svc:4011 --door model=http://ccsp-model.cc-sandbox-doors.svc:8080"
 	if got != want {
 		t.Errorf("got  %s\nwant %s", got, want)
@@ -783,5 +783,45 @@ func TestRevokeDoorsAreChecked(t *testing.T) {
 	put(t, p, base+"revoke_doors = [\"http://100.64.0.9:8091\", \"https://doors.example:8091\"]\n", 0o644)
 	if c, err := LoadConfig(p, os.Getuid()); err != nil || len(c.RevokeDoors) != 2 {
 		t.Errorf("good doors: %v", err)
+	}
+}
+
+func TestTheEphemeralBudgetIsCheckedAtConfigLoad(t *testing.T) {
+	f := newFx(t)
+	p := f.dir + "/etc/c.toml"
+	base := "allowed_roots = [\"" + f.roots + "\"]\nmachine = \"m\"\n"
+	put(t, p, base+"k8s_ephemeral_mb = 20480\n", 0o644) // the old default: three worktree-sized volumes no longer fit
+	if _, err := LoadConfig(p, os.Getuid()); err == nil || !strings.Contains(err.Error(), "evicted") {
+		t.Errorf("a budget that cannot hold the volumes was accepted: %v", err)
+	}
+	put(t, p, base+"k8s_ephemeral_mb = 20480\nk8s_worktree_mb = 4096\n", 0o644)
+	if _, err := LoadConfig(p, os.Getuid()); err != nil {
+		t.Errorf("a smaller worktree fits the smaller budget: %v", err)
+	}
+	if Defaults().K8sEphemeralMB+k8s.SideEphemeralMB < k8s.DiskVolumesMB(Defaults().K8sWorktreeMB) {
+		t.Error("the defaults do not fit each other")
+	}
+}
+
+// N6: pod-stop with a generation refuses, touching nothing, when the session is at another one
+func TestPodStopWithAGenerationRefusesAStaleOne(t *testing.T) {
+	pf := newPodFx(t)
+	code, out := pf.call("pod-stop", sid, "1") // the record is at generation 2
+	if code != 2 || !strings.Contains(out, "another_generation") || len(pf.pod.deleted) != 0 || len(pf.hub) != 0 || len(pf.revoked) != 0 || len(pf.dropped) != 0 {
+		t.Errorf("exit %d deleted=%d hub=%d revoked=%d dropped=%d: %s", code, len(pf.pod.deleted), len(pf.hub), len(pf.revoked), len(pf.dropped), out)
+	}
+	pf = newPodFx(t)
+	if code, out := pf.call("pod-stop", sid, "2"); code != 0 || len(pf.pod.deleted) != 1 {
+		t.Errorf("the right generation: %d %s", code, out)
+	}
+	for _, bad := range []string{"0", "x", "02", "-1", "99999"} {
+		pf = newPodFx(t)
+		if code, _ := pf.call("pod-stop", sid, bad); code == 0 || len(pf.pod.deleted) != 0 {
+			t.Errorf("generation %q was taken", bad)
+		}
+	}
+	pf = newPodFx(t)
+	if code, _ := pf.call("pod-stop", sid, "2", "3"); code == 0 || len(pf.pod.deleted) != 0 {
+		t.Error("a third argument was taken")
 	}
 }

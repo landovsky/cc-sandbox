@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -29,7 +30,7 @@ type PodRoot interface {
 	// Load waits for the pod and loads the sidecar; ErrPodNotReady if the pod never came up (nothing was minted).
 	Load(sid string) error
 	// Stop deletes the pod by name and the recorded UID; an absent pod is fine.
-	Stop(sid string) error
+	Stop(sid string, gen int) error
 	// Gone says whether the generation's pod no longer exists (read-only; the owner's own `stop` leaves
 	// the record to be reconciled by the sweep).
 	Gone(sid string) (bool, error)
@@ -41,7 +42,13 @@ var (
 	ErrPodConflict = errors.New("pod_conflict")
 	// ErrPodRefused: the verb refused by policy (exit 2) before anything was created.
 	ErrPodRefused = errors.New("pod_refused")
+	// ErrPodStale: pod-stop was told a generation and the session has moved on: nothing was stopped.
+	ErrPodStale = errors.New("another_generation")
 )
+
+// DefaultLoadWait is how long hostd waits for pod-load by default: the verb's own worst case (a 600 s ready
+// deadline, 30 s of load retries, 90 s of API) plus 30 s.
+const DefaultLoadWait = 12*time.Minute + 30*time.Second
 
 // SudoPodRoot asks `sudo -n ccsbx-root pod-<verb> -- <sid>`.
 type SudoPodRoot struct {
@@ -50,13 +57,13 @@ type SudoPodRoot struct {
 	LoadWait time.Duration
 }
 
-func (r SudoPodRoot) run(verb, sid string, wait time.Duration) ([]byte, error) {
+func (r SudoPodRoot) run(verb, sid string, wait time.Duration, extra ...string) ([]byte, error) {
 	if !ValidSid(sid) {
 		return nil, fmt.Errorf("%q is not a session id", sid)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), wait)
 	defer cancel()
-	c := exec.CommandContext(ctx, SudoBin, "-n", RootBin, verb, "--", sid)
+	c := exec.CommandContext(ctx, SudoBin, append([]string{"-n", RootBin, verb, "--", sid}, extra...)...)
 	c.WaitDelay = time.Second
 	// a timeout must reach the verb: SIGKILL to sudo cannot be passed on (the verb would go on, and
 	// might still mint), SIGTERM is relayed
@@ -77,6 +84,8 @@ func (r SudoPodRoot) run(verb, sid string, wait time.Duration) ([]byte, error) {
 		switch {
 		case ee.ExitCode() == 4:
 			return nil, fmt.Errorf("%w: %s", ErrPodNotReady, msg)
+		case ee.ExitCode() == 2 && strings.Contains(msg, "another_generation"):
+			return nil, fmt.Errorf("%w: %s", ErrPodStale, msg)
 		case ee.ExitCode() == 2 && strings.Contains(msg, "pod_conflict"):
 			return nil, fmt.Errorf("%w: %s", ErrPodConflict, msg)
 		case ee.ExitCode() == 2:
@@ -101,7 +110,7 @@ func (r SudoPodRoot) Create(sid string) (string, error) {
 func (r SudoPodRoot) Load(sid string) error {
 	w := r.LoadWait
 	if w <= 0 {
-		w = 12*time.Minute + 30*time.Second
+		w = DefaultLoadWait
 	}
 	_, err := r.run("pod-load", sid, w)
 	return err
@@ -121,8 +130,12 @@ func (r SudoPodRoot) Gone(sid string) (bool, error) {
 	return false, fmt.Errorf("pod-status: unexpected answer %q", strings.TrimSpace(string(out)))
 }
 
-func (r SudoPodRoot) Stop(sid string) error {
-	_, err := r.run("pod-stop", sid, 90*time.Second)
+func (r SudoPodRoot) Stop(sid string, gen int) error {
+	var extra []string
+	if gen > 0 {
+		extra = []string{strconv.Itoa(gen)}
+	}
+	_, err := r.run("pod-stop", sid, 90*time.Second, extra...)
 	return err
 }
 
@@ -186,7 +199,7 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 			return nil, refuse(BadSpec, "resume: the repository must be the same (%s)", old.Spec.Workdir.Repo)
 		case old.Gen >= 9999:
 			return nil, refuse(BadSpec, "resume: session %s is at its last generation", old.Sid)
-		case (old.Starting || (old.Ended == nil && old.PodUID == "")) && d.now().Sub(old.Started) < abandonedAfter:
+		case (old.Starting || (old.Ended == nil && old.PodUID == "")) && d.now().Sub(old.Started) < d.startingLimit():
 			return nil, refuse(SessionBusy, "resume: a start of session %s (generation %d) is still in progress", old.Sid, old.Gen)
 		}
 	}
@@ -207,6 +220,9 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 	if d.MaxLive > 0 && live >= d.MaxLive {
 		return nil, refuse(MachineFull, "%d live sessions (cap %d)", live, d.MaxLive)
 	}
+	if d.PodMaxLive > 0 && live >= d.PodMaxLive {
+		return nil, refuse(MachineFull, "%d live pod sessions (cap %d: each holds up to 32 GiB of the node's ephemeral storage)", live, d.PodMaxLive)
+	}
 	var rec *Record
 	now := d.now().UTC()
 	if old != nil {
@@ -214,7 +230,7 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 		// ended (an ended record may still name a pod that could not be deleted): its token and relay are dealt
 		// with by the verb. If that fails the resume is refused and nothing has changed.
 		if old.PodUID != "" {
-			if err := d.PodRoot.Stop(old.Sid); err != nil {
+			if err := d.PodRoot.Stop(old.Sid, old.Gen); err != nil {
 				return nil, refuse(SessionBusy, "resume: the previous generation's pod could not be deleted: %v", err)
 			}
 		}
@@ -255,16 +271,32 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 		if err != nil {
 			return nil, refuse(code, "%v", cause)
 		}
-		defer unlock()
-		if !d.owns(rec) {
+		mine := d.owns(rec)
+		unlock()
+		if !mine {
 			d.logf("start of %s generation %d failed (%v) but the session record is no longer that generation's: nothing was deleted", sid, rec.Gen, cause)
 			return nil, refuse(code, "%v", cause)
 		}
+		// The pod is deleted WITHOUT the daemon's lock (a delete can take a minute and every other start waits
+		// for it): the record still says Starting, so nothing else acts on this session meanwhile.
 		var stopErr error
 		if rec.PodUID != "" {
-			stopErr = d.PodRoot.Stop(sid)
+			stopErr = d.PodRoot.Stop(sid, rec.Gen)
 		}
-		d.finishFailed(rec, old, stopErr != nil)
+		if errors.Is(stopErr, ErrPodStale) {
+			// the session moved on while the delete was asked for: root refused and touched nothing, and the record is no
+			// longer this generation's: leave it alone
+			d.logf("start of %s generation %d failed (%v) and the session moved on before its pod could be deleted: nothing was deleted or changed", sid, rec.Gen, cause)
+			return nil, refuse(code, "%v", cause)
+		}
+		unlock, err = d.lock()
+		if err != nil {
+			return nil, refuse(code, "%v", cause)
+		}
+		if d.owns(rec) {
+			d.finishFailed(rec, old, stopErr != nil)
+		}
+		unlock()
 		if stopErr != nil {
 			return nil, fmt.Errorf("%s: %v (and the pod could not be deleted: %v; it is recorded as ended, retry `ccsbx-root pod-stop %s`)", code, cause, stopErr, sid)
 		}
@@ -310,7 +342,7 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 		}
 	}
 	if err != nil {
-		d.logf("pod %s is loaded but its record could not be marked started (%v): the sweep will treat it as stuck after %s; stop and start again", PodName(sid, rec.Gen), err, abandonedAfter)
+		d.logf("pod %s is loaded but its record could not be marked started (%v): the sweep will treat it as stuck after %s; stop and start again", PodName(sid, rec.Gen), err, d.startingLimit())
 	}
 	rep := rec.Reply
 	return &rep, nil
@@ -392,13 +424,14 @@ func (d *Daemon) finishFailed(rec, old *Record, keep bool) {
 		rec.Ended, rec.Starting = &now, false
 		_ = d.save(rec)
 	default:
-		failed := *old
-		failed.Gen, failed.Ended, failed.Starting, failed.Starts = rec.Gen, &now, false, rec.Starts
-		failed.PodUID = ""
+		failed := failedGeneration(old, rec.Gen, now)
+		failed.Starts = rec.Starts
 		if keep {
 			failed.PodUID = rec.PodUID // a pod that could not be deleted stays named, for a later pod-stop
+		} else {
+			failed.PodUID = ""
 		}
-		_ = d.save(&failed)
+		_ = d.save(failed)
 	}
 }
 
@@ -421,7 +454,7 @@ func (d *Daemon) StopPod(sid string) error {
 		return fmt.Errorf("session %s is not a pod session", sid)
 	}
 	if rec.PodUID != "" {
-		if err := d.PodRoot.Stop(sid); err != nil {
+		if err := d.PodRoot.Stop(sid, rec.Gen); err != nil {
 			return err
 		}
 	}
@@ -456,6 +489,16 @@ func (d *Daemon) logf(format string, a ...any) {
 	}
 }
 
+// startingLimit is how long a start may be in flight before a resume stops being refused and the sweep gives up
+// on it: what the verbs may take (hostd sets StartLimit from --pod-load-wait plus the create and a margin),
+// abandonedAfter when it has not been set.
+func (d *Daemon) startingLimit() time.Duration {
+	if d.StartLimit > 0 {
+		return d.StartLimit
+	}
+	return abandonedAfter
+}
+
 // abandonedAfter is how long a pod record may sit with no UID before the sweep gives up on it: a start
 // that died between its first save and its create.
 const abandonedAfter = 15 * time.Minute
@@ -481,11 +524,11 @@ func (d *Daemon) SweepPods(ttl time.Duration) {
 		age := now.Sub(r.Started)
 		switch {
 		case r.PodUID == "":
-			if age > abandonedAfter {
+			if age > d.startingLimit() {
 				d.logf("pod session %s never recorded a pod UID: pod %s may exist, delete exactly that pod by hand; the record is ended", r.Sid, PodName(r.Sid, r.Gen))
 				d.endRecord(r.Sid)
 			}
-		case age > ttl || (r.Starting && age > abandonedAfter):
+		case age > ttl || (r.Starting && age > d.startingLimit()):
 			// expired, or a start that never finished (hostd died in the middle of it): the pod is deleted
 			if err := d.StopPod(r.Sid); err != nil {
 				d.logf("pod sweep: stopping %s: %v", r.Sid, err)
@@ -498,7 +541,7 @@ func (d *Daemon) SweepPods(ttl time.Duration) {
 			} else if gone {
 				// a pod that vanished outside pod-stop (evicted, OOM-killed, deleted by hand): pod-stop revokes
 				// its token and relay (an absent pod is fine to it), then the record ends. Only then.
-				if err := d.PodRoot.Stop(r.Sid); err != nil {
+				if err := d.PodRoot.Stop(r.Sid, r.Gen); err != nil {
 					d.logf("pod sweep: %s is gone but its token could not be revoked (%v): revoke sid %s gen %d by hand", r.Sid, err, r.Sid, r.Gen)
 				} else {
 					d.endRecord(r.Sid)

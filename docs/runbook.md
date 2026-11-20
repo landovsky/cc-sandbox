@@ -767,3 +767,27 @@ only a directory of its own). Repository, branch and base are checked by `intern
 uses (branch required, at most 100 characters, never main, master, HEAD or trunk). Disk: the worktree, snapshot and git volumes are
 each as large as the worktree: size the pod's ephemeral storage for their sum plus home, out and journal (a node eviction
 comes before any one limit).
+
+**worktree-check (R-H).** `sudo -n ccsbx-root worktree-check -- <path>` is what hostd asks, read-only, before it records a REMOTE
+start's workdir in helper mode (spec: docs/m2c-remote-start.md (4b)). Exit 0 and two lines (the resolved absolute path, then the gitdir derived through the pinned descriptor; hostd records line 2 as GitDir) when
+the path is a git worktree root run would accept: strictly inside an allowed root, no symlink in it, a login user's own
+directory (never root's or a system user's), no hidden home directory, its own `.git` (a directory, or a linked worktree's
+file naming a host-owned gitdir inside a root whose back-reference names this worktree), and no overlap with a live session's
+workdir (equal, containing or inside). Exit 2: refused, with one fixed line on stderr (never the path or OS text). Exit 3: could
+not tell (a read error, an unreadable record, a config that cannot be believed). Only the service user (hostd) and root may ask;
+it writes nothing and takes no lock. Lexical and hidden-component checks come before any stat, and every answer that depends on what exists collapses to one refusal line, so the verb is not an existence oracle. The path must lie under its owner's home (owner a login uid, never the service user or nobody), and an empty `.git` directory (no HEAD) is refused. Not covered by a test (it needs root): a `.git` owned by another user, refused through the
+pinned descriptor's owner check.
+
+**F2x round 2 NITs.** `--git-max-bytes` is 90% of the snapshot volume (`SnapshotLimitBytes`), so a commit cannot overflow it and get the pod
+evicted. The containers' ephemeral-storage limits must cover every disk-backed volume together (worktree, snapshot and git
+directory are each worktree-sized, plus home, out, in, managed, journal): the pod contract and root's config check it
+(`k8s_ephemeral_mb` + 1024 for the sidecar >= `k8s.DiskVolumesMB(k8s_worktree_mb)`), so `k8s_ephemeral_mb` now defaults to
+32768. A failed resume (pod or docker) keeps the failed generation's number AND full id, ended. How long a pod start may be
+in flight follows `--pod-load-wait` (plus the create and 2 minutes): a resume is refused until then and the sweep stops what is
+left after it. A failed start's pod is deleted without holding the daemon's lock.
+
+**Pod cap and disk (R-H).** Every pod stop, including the unlocked cleanup of a failed start, names its generation
+(`pod-stop <sid> <gen>`); a mismatch is refused as another_generation and the cleanup leaves the newer record alone. 32 GiB
+ephemeral per pod is about 264 GiB at 8 live sessions (Gate M note): `--pod-max-live` (env `CCSBX_POD_MAX_LIVE`, default 4)
+caps live pod sessions separately from `--max-live`; set it to what the node's disk fits. No-hub installs: relay-mint refuses
+because `hub-admin.secret` is absent (checked before any connect); the installer removes a stale one.

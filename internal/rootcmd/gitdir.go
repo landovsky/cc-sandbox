@@ -21,18 +21,27 @@ import (
 //	                        `gitdir` file points back at this worktree's .git (a linked worktree)
 //	no .git              -> none
 func (e *env) deriveGitDir(rec *start.Record, wd string, wpin *pinned, home string) (string, *pinned, error) {
+	derived, p, err := e.gitdirOf(rec.Uid, wd, wpin, home)
+	if err != nil {
+		return "", nil, err
+	}
+	if rec.GitDir != derived {
+		p.close()
+		return "", nil, refuse("the record's gitdir %q does not match the one derived from %s/.git (%q)", rec.GitDir, wd, derived)
+	}
+	return derived, p, nil
+}
+
+// gitdirOf derives the gitdir of a worktree from its own .git, through the pinned descriptor, for a worktree
+// whose owner is uid; "" and nil when it has no .git. It compares nothing with a record: deriveGitDir does,
+// and worktree-check (which has no record) asks only whether there is one.
+func (e *env) gitdirOf(uid int, wd string, wpin *pinned, home string) (string, *pinned, error) {
 	kind, content, child, err := dotGit(wpin.f)
 	if err != nil {
 		return "", nil, refuse("%s/.git: %v", wd, err)
 	}
-	mismatch := func(derived string) error {
-		return refuse("the record's gitdir %q does not match the one derived from %s/.git (%q)", rec.GitDir, wd, derived)
-	}
 	switch kind {
 	case "none":
-		if rec.GitDir != "" {
-			return "", nil, mismatch("")
-		}
 		return "", nil, nil
 	case "dir":
 		defer func() {
@@ -41,10 +50,10 @@ func (e *env) deriveGitDir(rec *start.Record, wd string, wpin *pinned, home stri
 			}
 		}()
 		derived := filepath.Join(wd, ".git")
-		if rec.GitDir != derived {
-			return "", nil, mismatch(derived)
+		if !hasRegularChild(child, "HEAD") {
+			return "", nil, refuse("%s is not a git directory (no HEAD)", derived)
 		}
-		p, err := pinFile(child, derived, rec.Uid)
+		p, err := pinFile(child, derived, uid)
 		if err != nil {
 			return "", nil, err
 		}
@@ -63,14 +72,14 @@ func (e *env) deriveGitDir(rec *start.Record, wd string, wpin *pinned, home stri
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(wd, target)
 	}
-	derived, err := e.cfg.gitdir(filepath.Clean(target), rec.Uid, home)
+	// (a linked worktree's gitdir also has a `commondir` file naming the main repository's directory; it is
+	// deliberately NOT followed or mounted: only this worktree's own gitdir is, read-only, so it cannot widen
+	// the fence. Do not "fix" that into a second mount.)
+	derived, err := e.cfg.gitdir(filepath.Clean(target), uid, home)
 	if err != nil {
 		return "", nil, err
 	}
-	if rec.GitDir != derived {
-		return "", nil, mismatch(derived)
-	}
-	gp, err := pin(e.d.OpenDir, derived, rec.Uid)
+	gp, err := pin(e.d.OpenDir, derived, uid)
 	if err != nil {
 		return "", nil, err
 	}

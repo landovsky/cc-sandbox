@@ -107,6 +107,10 @@
      installer's one rule for `ccsbx-root` already covers that verb, so no separate attach line is added.
      hostd's API socket is `/run/ccsbx-api/hostd.sock`, `ccsbx:ccsbx-clients` 0660, in a 0755 directory.
      `check` (as root) confirms `ccsbx-tmux`'s mount namespace equals PID 1's and that the socket is `ccsbx:600`.
+     **Known cost:** any process running as uid `ccsbx`, hostd included, can open a tmux window on
+     `/run/ccsbx/tmux.sock` (`tmux -S ... new-window CMD`) and run `CMD` outside hostd's sandbox, so that
+     sandbox does not contain a compromised hostd. It already has `sudo ccsbx-root` and the signer socket; the
+     sandbox limits accidents. Moving the hostd-to-tmux edge behind `ccsbx-root` would close it.
      **Known limit after Gate M:** hostd runs as uid `ccsbx` (no `--ccmsg-bin`), so it cannot use the
      owner's bus sockets. Messages from a fenced session to an unfenced manager wait for the hub
      spoke over :4011 (B10/B11/M2b). Until then only ccsbx sessions are reachable by hostd.
@@ -129,17 +133,12 @@
   refuses to start a fence unless `/etc/ccsbx/seccomp.json` is root-owned and verified. It is Docker's
   default profile with `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `open`, `openat`, `creat`, `mknod`
   and `mknodat` allowed only when the mode has no setuid or setgid bit (a setid mode falls to the
-  profile's EPERM default) and `openat2` and `io_uring_*` refused. Nobody can fetch the base on the night; at the gate:
-  ```
-  V=$(docker version --format '{{.Server.Version}}')
-  curl -fsSL -o default.json https://raw.githubusercontent.com/moby/moby/v$V/profiles/seccomp/default.json
-  ccsbx seccomp-profile --base default.json --out /tmp/seccomp.json
-  sudo install -o root -g root -m 0644 /tmp/seccomp.json /etc/ccsbx/seccomp.json
-  ccsbx seccomp-profile --verify /etc/ccsbx/seccomp.json
-  tests/seccomp-setuid-test.sh --base default.json --image <pinned fence image>     # needs docker
-  ```
-  The base must be the file of the installed engine's version tag (the URL above). The last command
-  is the docker twin: it tries `chmod 4755`, `2755`, `u+s` and creating a file with mode 4755 inside
+  profile's EPERM default) and `openat2` and `io_uring_*` refused. Nobody can fetch the base on the night; the commands are Gate M **step 8b** in
+  `docs/night-1-morning.md`, between the install (step 8, which creates `/etc/ccsbx`) and the reboot (after which
+  tomas has no docker). The docker twin uses the candidate fence image `ccsbx-fence:dev`, since there is no
+  production pin yet.
+  The base must be the file of the installed engine's version tag (the URL in step 8b). The last command of
+  step 8b is the docker twin: it tries `chmod 4755`, `2755`, `u+s` and creating a file with mode 4755 inside
   a fence, and checks that `chmod 755` still works; it is not part of `make test`.
 - **Which mode runs (U1c).** `ccsbx` and `ccsbx-hostd` take `--root auto|direct|helper` (env `CCSBX_ROOT`).
   `auto`, the default: helper if `/usr/local/sbin/ccsbx-root` exists, is a regular file owned by root and
@@ -147,7 +146,7 @@
   `/usr/bin/sudo -n /usr/local/sbin/ccsbx-root <verb> <sid>`; a sudo refusal (password needed, not
   permitted, helper missing) is reported as that with exit 2 and there is no fallback to direct. Direct
   mode refuses with a clear error when docker's socket is unreachable (it is, after Gate M).
-- **Real bind-mount test (Gate M).** `sudo unshare -m go test -tags rootmount -run TestRealMounter ./internal/rootcmd`.
+- **Real bind-mount test (Gate M).** `sudo unshare -m env GOTOOLCHAIN=local /home/tomas/.local/go/bin/go test -tags rootmount -run TestRealMounter ./internal/rootcmd` (go is not on sudo's PATH; step 7b has the `go version` precheck).
 - **Known: orphaned direct-mode homes.** The node home is now keyed by owner, class and label, so
   homes made by direct mode before this change are not found again: `--resume` of such a session
   starts without its old transcript. Nothing important lives there yet; they can be deleted by hand.

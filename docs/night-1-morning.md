@@ -29,19 +29,26 @@
 
 ## Gate M, step by step (exact commands)
 
-Run on hp in `~/git/cc-sandbox` unless a step says otherwise. Order matters: the reboot is step 9.
+Run on hp in `~/git/cc-sandbox` unless a step says otherwise. Order matters: the reboot is step 9. **Gate M is
+2026-11-22.**
+
+**Prerequisite: U1c (the helper-mode client, built by stream A) must be merged first.** Until it lands nothing
+on hp can start a fence after the gate: hostd and `ccsbx start` only know `--root direct`, which needs the docker
+group this install removes. Merge U1c before step 8, or accept that window explicitly and make U1c the first
+night-2 piece.
 
 | # | Step | Command |
 |---|---|---|
-| 1 | Read the install PR and the plan | `gh pr view 2 --web`, then `units/install-linux.sh plan` (as of the morning; this file's copy is from last night) |
+| 1 | Read the install PR and the plan | `gh pr view 2 --web`, then run `plan` **from the PR branch** (`git switch n1-d-root`, then back to `main`) or after step 3: on `main` the `units/` directory is empty until the PR is merged. This file's copy is from last night |
 | 2 | Push main (builders never push it; it is ahead of origin) | `git -C ~/git/cc-sandbox push origin main` |
 | 3 | Merge the install PR, then get its files | `gh pr merge 2 --squash` (or review in the browser), then `git pull --ff-only` in `~/git/cc-sandbox` |
 | 4 | P15: decide, then close the rows | `units/p15 status`; decisions are in #4vwb's Outcome; `units/p15 mark ID done\|dropped "note"`; `units/p15 check` must exit 0 |
 | 5 | Keep the restart=no containers (table above) | `docker update --restart unless-stopped messaging-hub-db-1` (and any other you want kept) |
 | 6 | B9: the hub is native | stream C's release is live and `systemctl --user is-active session-bus-hub.service` says `active` (unit name assumed; `CCSBX_B9_UNIT` overrides). The install refuses otherwise |
-| 7 | Build the binaries the installer wants | `ccsbx-root`, `ccsbx-hostd`, `ccsbx-signer`, `ccsbx` for linux/amd64 in `dist/` with a `SHA256SUMS` (`make dist` does not yet produce them: `_GAP:_` stream A) |
-| 7b | Root-only test of `ccsbx-root`'s bind mount (**PR #8 must be merged first**) | from `~/git/cc-sandbox`: `sudo unshare -m go test -tags rootmount -run TestRealMounter ./internal/rootcmd`. It must **PASS**; if it does not, stop here |
+| 7 | Build the binaries the installer wants | `make dist-linux GO=$HOME/.local/go/bin/go` builds `ccsbx-root`, `ccsbx-hostd`, `ccsbx-signer`, `ccsbx` for linux/amd64 into `dist/` with a `SHA256SUMS` that lists exactly them. Compare the checksums with a build you trust (CI or a second machine) before step 8: the file sits next to the binaries |
+| 7b | Root-only test of `ccsbx-root`'s bind mount (**PR #8 must be merged first**) | from `~/git/cc-sandbox`: `~/.local/go/bin/go version` first (go is not on sudo's PATH, so the full path is used and `GOTOOLCHAIN=local` stops it fetching a toolchain), then `sudo unshare -m env GOTOOLCHAIN=local /home/tomas/.local/go/bin/go test -tags rootmount -run TestRealMounter ./internal/rootcmd`. It must **PASS**; if it does not, stop here |
 | 8 | The root install (sudo, password) | `sudo units/install-linux.sh install --yes` (add `--with-deploy` only if Q12 = yes) |
+| 8b | Seccomp profile for `ccsbx-root run` (**before the reboot**: it needs `/etc/ccsbx` from step 8 and docker, which the old session still has) | from `~/git/cc-sandbox`, in this order: `V=$(docker version --format '{{.Server.Version}}')`; `curl -fsSL -o default.json https://raw.githubusercontent.com/moby/moby/v$V/profiles/seccomp/default.json`; `ccsbx seccomp-profile --base default.json --out /tmp/seccomp.json`; `sudo install -o root -g root -m 0644 /tmp/seccomp.json /etc/ccsbx/seccomp.json`; `ccsbx seccomp-profile --verify /etc/ccsbx/seccomp.json`; `tests/seccomp-setuid-test.sh --base default.json --image ccsbx-fence:dev` (docker; the candidate image, since there is no production pin yet). The verify and the docker test must both pass. `check` verifies the profile again |
 | 9 | Reboot | `sudo reboot`, then open tmux again |
 | 10 | The install is complete | `units/install-linux.sh check` (exit 0) |
 | 11 | k3s launcher check 5: hp only, as `ccsbx-keys`, launcher-scoped | the block below, verbatim from the k3s side |
@@ -49,7 +56,7 @@ Run on hp in `~/git/cc-sandbox` unless a step says otherwise. Order matters: the
 | 13 | Everything green | `bin/ccsbx-preflight --morning --post-M1` (set `CCSBX_DOORS_MODEL_URL` and `CCSBX_DOORS_EGRESS_URL` first) |
 | 14 | The report | `bin/ccsbx-night-report --dry-run`, then `--send` |
 
-If a step fails: runbook §2 (rollback), and `sudo units/install-linux.sh uninstall --yes` undoes steps 8 to 9.
+If a step fails: runbook §2 (rollback), and `sudo units/install-linux.sh uninstall --yes` undoes steps 8 to 9 (the seccomp file in step 8b stays: it is harmless).
 
 **Right before step 8, by hand (the installer does not check these; the PR #2 review accepted them as manual steps):**
 1. **S5, binaries:** build `dist/` immediately before the install, with no agents running, so nothing
@@ -84,6 +91,7 @@ Step 8 in detail (changed after the PR #2 review):
   test claim (api + dev-default), so it needs root;
 - `ccsbx-root` runs with a clean environment: the sudoers file has `Defaults!/usr/local/sbin/ccsbx-root env_reset,!setenv`, so `sudo -E` and `VAR=x` do not reach it;
 - the ccsbx tmux server is its own unit, `ccsbx-tmux.service` (uid `ccsbx`, no sandbox, host mount namespace), started before hostd; hostd only connects to `/run/ccsbx/tmux.sock`. `check` (as root) confirms the namespace and that the socket is `ccsbx:600`;
+- `install` prints DONE only after the signer has signed a test claim, not only after its socket exists;
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
@@ -210,8 +218,8 @@ GATES (install refuses while any is unmet)
 
 [05] U0 hostd unit
      # the tmux server is its own unit (no sandbox: its panes run sudo ccsbx-root and need the host mount namespace); hostd only connects
-     write /etc/systemd/system/ccsbx-tmux.service  (mode 0644, root:root, 31 lines)
-     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 53 lines)
+     write /etc/systemd/system/ccsbx-tmux.service  (mode 0644, root:root, 35 lines)
+     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 55 lines)
      # the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced
      $ runuser -u ccsbx -- sh -c umask\ 077\;\ head\ -c\ 32\ /dev/urandom\ \|\ base64\ \>\ /var/lib/ccsbx/listen.token
      $ systemctl daemon-reload

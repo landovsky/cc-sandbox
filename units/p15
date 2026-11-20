@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# p15 — the P15 checklist: replacements for hp's docker and sudo users (from the P14 inventory).
+# Why: U0 removes tomas from docker; this list proves each thing that used it has a replacement before the install is allowed.
+#
+#   units/p15 status              every row: id, state, what (counts at the end); exit 0
+#   units/p15 check               exit 0 only when EVERY row is done or dropped; else names the open rows (exit 1)
+#   units/p15 mark ID STATE [NOTE…]   STATE = done | dropped | open. Edits the file; one row at a time
+#   units/p15 --help              this text (every subcommand takes --help and runs nothing)
+#
+# install-linux.sh refuses to install while `check` fails: the install removes the owner from the
+# docker group, so every user of that group must have a replacement, or be dropped, first.
+#
+# The file is TSV: id <TAB> state <TAB> what <TAB> action/replacement, in the tree repo (the inventory
+# is private; this tool is not):  $CCSBX_P15_FILE  (default ~/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv)
+# Rows come from the P14 inventory (cc-sandbox:#4rcv). done = works without the owner's docker group
+# (or needs no change); dropped = removed or retired on purpose; open = a replacement or a decision is missing.
+# Recipes:
+#   units/p15 mark B-redis-zl-review dropped "docker rm done 2026-11-20"
+#   units/p15 mark A5 done "runners moved to ghrunner uid"
+# Exit: 0 ok, 1 open rows (check) / not found, 2 usage.
+set -euo pipefail
+if [ -n "${CCSBX_P15_FILE:-}" ]; then F="$CCSBX_P15_FILE"
+else   # under sudo $HOME is /root: use the invoking user's home from the passwd database
+  _u="${SUDO_USER:-$(id -un)}"; _h="$(getent passwd "$_u" 2>/dev/null | cut -d: -f6)"
+  F="${_h:-$HOME}/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv"
+fi
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
+sub="${1:-status}"; [ $# -gt 0 ] && shift
+for a in "$@"; do case "$a" in -h|--help) usage; exit 0;; esac; done
+case "$sub" in -h|--help|help) usage; exit 0;; esac
+[ -f "$F" ] || { echo "p15: no status file at $F (CCSBX_P15_FILE)" >&2; exit 1; }
+# a truncated or headerless file must not pass as "every row is done": need the header and a data row
+[ "$(head -1 "$F")" = "$(printf 'id\tstate\twhat\taction')" ] || { echo "p15: $F has no header line 'id<TAB>state<TAB>what<TAB>action'" >&2; exit 1; }
+[ "$(awk -F'\t' 'NR>1 && $1!=""' "$F" | wc -l)" -ge 1 ] || { echo "p15: $F has no rows" >&2; exit 1; }
+case "$sub" in
+  status)
+    awk -F'\t' 'NR>1 && $1!="" { printf "%-22s %-8s %s\n", $1, $2, $3; n[$2]++ } END { printf "-- done %d, dropped %d, open %d\n", n["done"], n["dropped"], n["open"] }' "$F" ;;
+  check)
+    open="$(awk -F'\t' 'NR>1 && $1!="" && $2!="done" && $2!="dropped" {print $1}' "$F")"
+    if [ -z "$open" ]; then echo "p15: every row is done or dropped"; exit 0; fi
+    printf '%d row(s) not done or dropped: %s\n' "$(wc -l <<<"$open")" "$(head -5 <<<"$open" | tr '\n' ' ')$([ "$(wc -l <<<"$open")" -gt 5 ] && echo …)"
+    exit 1 ;;
+  mark)
+    id="${1:-}"; st="${2:-}"; shift 2 2>/dev/null || true; note="$*"
+    [ -n "$id" ] && [[ "$st" =~ ^(done|dropped|open)$ ]] || { echo "usage: p15 mark ID done|dropped|open [NOTE…]" >&2; exit 2; }
+    awk -F'\t' -v id="$id" '$1==id{f=1} END{exit !f}' "$F" || { echo "p15: no row '$id' in $F" >&2; exit 1; }
+    tmp="$(mktemp "$F.XXXXXX")"
+    NOTE="$note" awk -F'\t' -v OFS='\t' -v id="$id" -v st="$st" '$1==id { $2=st; if (ENVIRON["NOTE"]!="") $4=$4 " [" ENVIRON["NOTE"] "]" } { print }' "$F" > "$tmp"
+    chmod --reference="$F" "$tmp"; mv "$tmp" "$F"; echo "p15: $id -> $st" ;;
+  *) echo "p15: unknown command '$sub' (status|check|mark; --help)" >&2; exit 2 ;;
+esac

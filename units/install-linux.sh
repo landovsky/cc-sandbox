@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+# install-linux.sh — the root installer for Tom's Linux machines (I0, U0, U0b). plan | install | check | uninstall.
+# Why: U0 takes root paths away from tomas, so the morning install must be one reviewed, refusable, restorable script, not hand-typed sudo.
+#
+#   units/install-linux.sh plan                prints every step and the gate results; changes NOTHING; needs no root
+#   (as root) units/install-linux.sh install --yes   does it (the morning gate, R10). Refuses unless every gate is met
+#   units/install-linux.sh check               read-only: ok/FAIL per step; exit 0 only when the install is complete (after the reboot)
+#   (as root) units/install-linux.sh uninstall --yes  restores from the FIRST backup (/var/backups/ccsbx-install/original)
+#
+# What it does (the same code prints it in `plan` and runs it in `install`):
+#   U0b  users ccsbx + ccsbx-keys, the 0700 key directory, the machine and age keys, the signer unit
+#   U0   ccsbx-root (fixed verbs) as the only NOPASSWD sudo grant; the NOPASSWD grants for docker, apt-get,
+#        dokku and sops removed; sops root-owned; hostd unit (loopback only, no firewall rule);
+#        the accidental lxd snap and its installer socket removed; the owner out of lxd and, LAST, docker
+#   then: reboot. A fresh tmux has the new groups; the old one keeps docker.
+#
+# GATES. `install` REFUSES (exit 3) while any is unmet; `plan` shows which are:
+#   B9   the hub is a native release under a systemd user unit (not the docker container `session-bus`),
+#        because leaving the docker group would otherwise orphan the live hub
+#   P15  every row of the P14 inventory is done or dropped (units/p15 check)
+#   bins ccsbx-root, ccsbx-hostd, ccsbx-signer, ccsbx exist in --bin-dir and match its SHA256SUMS
+#   sudoers  every sudoers.d NOPASSWD line parses (units/lib/sudoers_strip.py), so nothing is guessed
+#   tools    visudo, python3, runuser (and age-keygen when there is no age key yet) are installed
+#   owner    a plain login name with uid >= 1000, not root; --allowed-roots are absolute, existing, not /
+#   probes   sops is not a symlink (chown would hit its target)
+#
+# Options (each also a CCSBX_* env var):
+#   --yes                 really do it (install and uninstall)
+#   --bin-dir DIR         built binaries + SHA256SUMS            (CCSBX_BIN_DIR, default <repo>/dist)
+#   --owner USER          the human who keeps access            (CCSBX_OWNER, default the invoking user)
+#   --allowed-roots A,B   ccsbx-root's workdir roots            (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt)
+#   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
+#   --pairs P             what the signer may sign: exact profile:billing|billing,... (CCSBX_PAIRS; default: built from
+#                         <repo>/profiles/*.json that list this machine, e.g. dev-default:api|stub,e2e-default:stub)
+#   --with-deploy         also the ccsbx-deploy sudoers rule (Q12 = yes, R10c)  (CCSBX_WITH_DEPLOY=1)
+#   --backup DIR          uninstall from this backup (must be under /var/backups/ccsbx-install), not the first one
+#   --purge-keys          uninstall also deletes the keys and the ccsbx-keys user (rotate M9 first!)
+#   -v, --verbose         plan prints the files it would write
+# Gate overrides, for tests only: CCSBX_B9_CMD, CCSBX_P15_CMD (a command; exit 0 = met). They are honoured
+# only together with the test hook CCSBX_ROOT_PREFIX; set alone, the installer refuses (they would be eval'd as root).
+# P15's status file: CCSBX_P15_FILE, else <owner's home>/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv (never root's $HOME).
+# Exit: 0 ok, 1 a step failed / check failed, 2 usage, 3 refused (a gate is unmet).
+set -uo pipefail
+umask 077                 # nothing the installer writes is ever briefly world-readable
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UNITS_DIR="$HERE"; REPO_DIR="$(dirname "$HERE")"
+
+usage() { sed -n '2,/^set -uo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
+case "${1:-}" in
+  plan|install|check|uninstall) MODE="$1"; shift ;;
+  -h|--help|help|"") usage; exit 0 ;;
+  *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
+esac
+YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
+MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"
+ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;                       # on every subcommand; runs nothing
+    --yes) YES=1 ;;
+    --bin-dir) BIN_DIR="${2:?--bin-dir DIR}"; shift ;;
+    --owner) CCSBX_OWNER="${2:?--owner USER}"; shift ;;
+    --allowed-roots) ALLOWED_ROOTS="${2:?--allowed-roots A,B}"; shift ;;
+    --machine) MACHINE="${2:?--machine NAME}"; shift ;;
+    --pairs) PAIRS="${2:?--pairs P}"; shift ;;
+    --with-deploy) WITH_DEPLOY=1 ;;
+    --backup) RESTORE_OVERRIDE="${2:?--backup DIR}"; shift ;;
+    --purge-keys) PURGE_KEYS=1 ;;
+    -v|--verbose) VERBOSE=1 ;;
+    *) echo "install-linux: unknown option '$1' (--help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+export CCSBX_OWNER VERBOSE PURGE_KEYS MODE
+# shellcheck source=lib/common.sh
+. "$HERE/lib/common.sh"; . "$HERE/lib/u0b.sh"; . "$HERE/lib/u0.sh"
+
+OWNER="$(real_user)"; OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"; OWNER_HOME="${OWNER_HOME:-/home/$OWNER}"
+[ -n "$ALLOWED_ROOTS" ] || ALLOWED_ROOTS="$OWNER_HOME/git,$OWNER_HOME/wt"
+# the signer's scope (what the machine key may sign): owner, machine, profiles, billings
+[ -n "$MACHINE" ] || MACHINE="$(hostname -s 2>/dev/null)"
+# the pairs come from the profiles themselves: each profile that lists this machine, with ITS billings (a flat
+# profiles x billings product would let a profile be signed with a billing it does not allow)
+if [ -z "$PAIRS" ] && compgen -G "$REPO_DIR/profiles/*.json" >/dev/null; then
+  PAIRS="$(python3 -I - "$MACHINE" "$REPO_DIR"/profiles/*.json <<'PY' 2>/dev/null
+import json, sys
+machine, out = sys.argv[1], []
+for f in sys.argv[2:]:
+    p = json.load(open(f))
+    if machine in p.get("machines", []) and p.get("billing"):
+        out.append(p["name"] + ":" + "|".join(p["billing"]))
+print(",".join(out))
+PY
+)"
+fi
+SCOPE_ERRORS=()
+[[ "$MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || SCOPE_ERRORS+=("machine name '$MACHINE' is not a plain host name (--machine)")
+_b='(api|subscription|stub)'
+[[ "$PAIRS" =~ ^[A-Za-z0-9._-]+:$_b(\|$_b)*(,[A-Za-z0-9._-]+:$_b(\|$_b)*)*$ ]] || SCOPE_ERRORS+=("pairs '$PAIRS' is empty or not name:billing|billing,... (--pairs; default: profiles/*.json that list machine $MACHINE)")
+# split on commas only (no globbing, no word splitting); each root must be a plain absolute path
+ROOT_ERRORS=(); ALLOWED_ROOTS_TOML=""
+IFS=, read -r -a _roots <<<"$ALLOWED_ROOTS"
+for _r in "${_roots[@]}"; do
+  if [[ "$_r" =~ ^/[A-Za-z0-9._@+/-]+$ ]] && [ "$_r" != / ] && [[ "$_r" != *..* ]]; then
+    [ -n "$PREFIX" ] || [ -d "$_r" ] || ROOT_ERRORS+=("allowed root $_r does not exist")
+    ALLOWED_ROOTS_TOML+="\"$_r\", "
+  else ROOT_ERRORS+=("allowed root '$_r' is not a plain absolute path (no /, .., quotes, globs or spaces)"); fi
+done
+ALLOWED_ROOTS_TOML="${ALLOWED_ROOTS_TOML%, }"
+RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
+export OWNER MACHINE PAIRS BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+
+# ---------------------------------------------------------------- gates (read-only)
+GATE_MSGS=(); NOTES=()
+gate() { GATE_MSGS+=("$1"); }                                  # an unmet gate
+as_owner() {                                                   # run a user-level command as the owner
+  if [ "$(id -u)" = 0 ] && [ "$OWNER" != root ]; then runuser -u "$OWNER" -- env "XDG_RUNTIME_DIR=/run/user/$(id -u "$OWNER")" "$@"
+  else "$@"; fi
+}
+default_b9() {
+  local unit="${CCSBX_B9_UNIT:-session-bus-hub.service}" exec
+  as_owner systemctl --user is-active --quiet "$unit" 2>/dev/null || { echo "user unit $unit is not active"; return 1; }
+  exec="$(as_owner systemctl --user show -p ExecStart --value "$unit" 2>/dev/null)"
+  case "$exec" in *docker*) echo "$unit still starts docker"; return 1;; esac
+  if command -v docker >/dev/null 2>&1; then
+    local ps
+    ps="$(as_owner docker ps --filter name='^session-bus$' -q 2>&1)" || { echo "cannot ask docker whether session-bus runs (docker ps failed): $(head -1 <<<"$ps")"; return 1; }
+    [ -z "$ps" ] || { echo "docker container session-bus is still running"; return 1; }
+  fi
+  return 0
+}
+P15_FILE="${CCSBX_P15_FILE:-$OWNER_HOME/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv}"   # never $HOME: under sudo that is /root
+default_p15() { as_owner env CCSBX_P15_FILE="$P15_FILE" "$UNITS_DIR/p15" check; }
+eval_gates() {
+  local m f missing="" e unlisted
+  if [ -z "$PREFIX" ] && [ -n "${CCSBX_B9_CMD:-}${CCSBX_P15_CMD:-}" ]; then
+    refuse "CCSBX_B9_CMD / CCSBX_P15_CMD are test overrides and are set: unset them (sudo -E would pass them to root)"
+  fi
+  # the owner keeps access, so it must be a real login: root, ALL or a typo would put the rule on the wrong account
+  case "$OWNER" in ""|root|ALL|*[!a-z0-9_-]*|[!a-z_]*) gate "owner '$OWNER' is not a plain login name (run as sudo from the owner's shell, or --owner USER)";; esac
+  if [ -z "$PREFIX" ]; then
+    if ! id -u "$OWNER" >/dev/null 2>&1; then gate "owner '$OWNER' does not exist"
+    elif [ "$(id -u "$OWNER")" -lt 1000 ]; then gate "owner '$OWNER' is a system account (uid < 1000)"; fi
+  fi
+  for e in "${ROOT_ERRORS[@]}" "${SCOPE_ERRORS[@]}"; do gate "$e"; done
+  if [ -n "${CCSBX_B9_CMD:-}" ]; then m="$(eval "$CCSBX_B9_CMD" 2>&1)" || gate "B9 missing: ${m:-$CCSBX_B9_CMD failed}"
+  else m="$(default_b9)" || gate "B9 missing: $m (the native hub release, stream C)"; fi
+  if [ -n "${CCSBX_P15_CMD:-}" ]; then m="$(eval "$CCSBX_P15_CMD" 2>&1)" || gate "P15 open: ${m:-$CCSBX_P15_CMD failed}"
+  else m="$(default_p15 2>&1)" || gate "P15 open: $(head -1 <<<"$m") (run units/p15 status)"; fi
+  for f in ccsbx-root ccsbx-hostd ccsbx-signer ccsbx; do [ -f "$BIN_DIR/$f" ] || missing+=" $f"; done
+  [ -z "$missing" ] || gate "binaries missing in $BIN_DIR:$missing (a linux build of each + SHA256SUMS in --bin-dir; see --help)"
+  if [ -z "$missing" ]; then
+    if [ ! -f "$BIN_DIR/SHA256SUMS" ]; then gate "no $BIN_DIR/SHA256SUMS"
+    elif unlisted="$(for f in ccsbx-root ccsbx-hostd ccsbx-signer ccsbx; do grep -Eq "^[0-9a-f]{64} [ *]${f}\$" "$BIN_DIR/SHA256SUMS" || printf ' %s' "$f"; done)"; [ -n "$unlisted" ]; then
+      gate "SHA256SUMS does not list:$unlisted (an unlisted file would pass unchecked)"
+    elif ! (cd "$BIN_DIR" && sha256sum --quiet -c SHA256SUMS >/dev/null 2>&1); then gate "binaries do not match SHA256SUMS"; fi
+  fi
+  local tools="visudo python3 runuser"; [ -e "$(pth /var/lib/ccsbx-keys/age.key)" ] || tools+=" age-keygen"
+  for f in $tools; do command -v "$f" >/dev/null 2>&1 || [ -n "$PREFIX" ] || gate "tool not installed: $f"; done
+  if [ -L "$(pth /usr/local/bin/sops)" ]; then gate "/usr/local/bin/sops is a symlink: chown would change its target; replace it with the real file first"; fi
+  if [ "$WITH_DEPLOY" = 1 ]; then
+    [ -f "$BIN_DIR/ccsbx-deploy" ] && grep -Eq "^[0-9a-f]{64} [ *]ccsbx-deploy\$" "$BIN_DIR/SHA256SUMS" 2>/dev/null && (cd "$BIN_DIR" && grep -E " [ *]ccsbx-deploy\$" SHA256SUMS | sha256sum --quiet -c - >/dev/null 2>&1) \
+      || gate "--with-deploy: ccsbx-deploy is missing in $BIN_DIR, not listed in SHA256SUMS, or does not match it"
+  fi
+  # sudoers: nothing may be unparseable (a dry run of the stripper; root only, the files are 0440)
+  if compgen -G "$(pth /etc/sudoers.d)/*" >/dev/null; then
+    for f in "$(pth /etc/sudoers.d)"/*; do
+      if [ ! -r "$f" ]; then
+        [ "$(id -u)" = 0 ] && gate "cannot read $f" || NOTES+=("sudoers.d/$(basename "$f") not readable without root: verified at install")
+        continue
+      fi
+      grep -q NOPASSWD "$f" 2>/dev/null || continue
+      m="$(python3 -I "$UNITS_DIR/lib/sudoers_strip.py" "$f" 2>&1 >/dev/null)" || gate "sudoers $(basename "$f"): $m"
+    done
+  fi
+}
+print_gates() {
+  echo "GATES (install refuses while any is unmet)"
+  if [ "${#GATE_MSGS[@]}" -eq 0 ]; then echo "  all met"; else printf '  UNMET: %s\n' "${GATE_MSGS[@]}"; fi
+  [ "${#NOTES[@]}" -eq 0 ] || printf '  note: %s\n' "${NOTES[@]}"
+}
+
+# ---------------------------------------------------------------- steps
+u0_deploy_rule() {
+  step "ccsbx-deploy sudoers rule (Q12 = yes, R10c): one binary, nothing else"
+  put /etc/sudoers.d/.91-ccsbx-deploy.new 0440 root:root <<EOT
+# ccsbx-deploy (NB5): installs only artifacts built from main by Actions, digest-pinned.
+# It never installs ccsbx-root, the signer, itself, or anything that talks to ccsbx-keys.
+$OWNER ALL=(root) NOPASSWD: /usr/local/sbin/ccsbx-deploy
+EOT
+  cmd visudo -cf /etc/sudoers.d/.91-ccsbx-deploy.new
+  cmd mv -f /etc/sudoers.d/.91-ccsbx-deploy.new /etc/sudoers.d/91-ccsbx-deploy
+  if [ -f "$BIN_DIR/ccsbx-deploy" ] || [ "$MODE" = plan ]; then cmd install -o root -g root -m 0755 "$BIN_DIR/ccsbx-deploy" /usr/local/sbin/ccsbx-deploy; fi
+}
+# DONE only when the services really came up: `enable --now` of a Type=simple unit returns 0 even for a
+# crash-looping daemon (review R1). In record mode CCSBX_TEST_POSTCHECK_RC stands in for the answer.
+post_install_check() {
+  step "post-install check: hostd and the signer must be up before DONE"
+  local i ready=1
+  if [ "$MODE" = plan ]; then note "waits up to 10 s for ccsbx-hostd and ccsbx-signer.socket to be active and their sockets to exist; otherwise install stops, no DONE"; return 0; fi
+  if [ "${EXEC%%:*}" = record ]; then rec post-install-check; ready="${CCSBX_TEST_POSTCHECK_RC:-0}"
+  else
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      if systemctl is-active --quiet ccsbx-tmux.service && systemctl is-active --quiet ccsbx-hostd.service && systemctl is-active --quiet ccsbx-signer.socket \
+         && [ -S "$SIGNER_SOCK" ] && [ -S "$HOSTD_SOCK" ]; then ready=0; break; fi
+      sleep 1
+    done
+  fi
+  [ "$ready" = 0 ] || die "ccsbx-hostd or the signer is not up (a crash loop?): see 'journalctl -u ccsbx-hostd -u ccsbx-signer'. NOT DONE"
+  # the signer is socket-activated: the socket file exists even if the service exits 2 on a bad scope, so ask it to sign
+  if [ "${EXEC%%:*}" = record ]; then rec sign-probe; [ "${CCSBX_TEST_SIGN_RC:-0}" = 0 ] || die "the signer did not sign the in-scope test claim (bad scope or key?): see 'journalctl -u ccsbx-signer'. NOT DONE"
+  else
+    CHECK_FAIL=0; sign_check
+    [ "$CHECK_FAIL" -eq 0 ] || die "the signer did not sign the in-scope test claim (see above; 'journalctl -u ccsbx-signer'). NOT DONE"
+  fi
+  note "up, and the signer signs"
+}
+steps_install() {
+  if [ "$MODE" = install ]; then step "back up every file the install replaces (once; never overwritten)"; backup_originals; fi
+  # everything that can fail for a machine-specific reason comes BEFORE sudoers is changed
+  u0b_users; u0_binaries; u0b_keys; u0b_signer; u0_hostd
+  if [ "$WITH_DEPLOY" = 1 ]; then u0_deploy_rule; fi
+  u0_sops; u0_lxd
+  u0_sudoers; u0_groups
+  post_install_check
+  if [ "$MODE" = install ]; then step "mark the install complete"; backup_state complete || die "cannot mark the backup complete"; fi
+}
+
+case "$MODE" in
+  plan)
+    echo "install-linux plan  ($(date '+%F %T'), owner=$OWNER, bin-dir=$BIN_DIR)"
+    echo "Nothing below is run by 'plan'. The same steps run under 'install --yes' as root."
+    eval_gates; print_gates
+    echo "  P15 status file: $P15_FILE"; echo "  allowed roots:   ${ALLOWED_ROOTS_TOML:-(none)}"
+    echo "  signer scope:    owners=$OWNER machines=$MACHINE pairs=$PAIRS"
+    steps_install
+    echo; echo "AFTER: reboot, then units/install-linux.sh check  and  bin/ccsbx-preflight --morning --post-M1"
+    echo "UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the first backup, $BACKUP_DIR; a failed install is undone the same way)"
+    ;;
+  install)
+    [ "$YES" = 1 ] || refuse "install changes the system. Read 'plan', then run it as root with --yes"
+    [ "$(id -u)" = 0 ] || [ -n "$PREFIX" ] || refuse "install must run as root"
+    [ "$(uname -s)" = Linux ] || refuse "this is the Linux installer (Mac: install-mac.sh)"
+    eval_gates
+    if [ "${#GATE_MSGS[@]}" -gt 0 ]; then print_gates >&2; refuse "${#GATE_MSGS[@]} gate(s) unmet; nothing was changed"; fi
+    echo "install-linux: all gates met; the first backup goes to $BACKUP_DIR"
+    steps_install
+    echo; echo "DONE. NOW: reboot. Then: units/install-linux.sh check"
+    ;;
+  check)
+    u0b_check; u0_check
+    echo
+    if [ "$CHECK_FAIL" -eq 0 ]; then echo "install-linux check: complete"; exit 0; fi
+    echo "install-linux check: $CHECK_FAIL FAIL"; exit 1
+    ;;
+  uninstall)
+    [ "$YES" = 1 ] || refuse "uninstall changes the system: add --yes"
+    [ "$(id -u)" = 0 ] || [ -n "$PREFIX" ] || refuse "uninstall must run as root"
+    restore_dir_ok "$RESTORE_DIR"
+    u0_uninstall; u0b_uninstall
+    echo; echo "DONE. docker/lxd were not reinstalled or re-granted: that is deliberate."
+    ;;
+esac

@@ -50,3 +50,15 @@ func TestSteeringCheckRefusesFencedWorktreeFallback(t *testing.T) {
 		t.Fatalf("an unrelated checkout was refused: %s", errb.String())
 	}
 }
+
+// context: the ccsbx tmux server belongs to the service uid (socket 0600). Without ccsbx-root the
+// owner cannot attach, and `ccsbx attach` must say exactly which command is the way in and exit 2,
+// not exec tmux against a socket it cannot reach.
+func TestAttachToAnUnreachableServiceSocketNamesTheCommandAndExits2(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // no ccsbx-root, no tmux
+	var out, errb bytes.Buffer
+	code := app().Main([]string{"attach", "--tmux-socket", "/nonexistent/ccsbx/tmux.sock", "s0abcd1"}, &out, &errb)
+	if code != 2 || !strings.Contains(errb.String(), "ccsbx-root attach s0abcd1") {
+		t.Fatalf("exit %d: %s", code, errb.String())
+	}
+}

@@ -1,10 +1,16 @@
-// Test for the tmux launcher. It guards against the hardening (empty config, no prefix, no status line)
-// being applied in a second call, which would leave a window in which the server runs with defaults.
+// Tests of the tmux pane launcher. Why: the pane of a fenced agent is the owner's way in, so its
+// server must be hardened, and when it lives on a shared socket path that path must be reachable by
+// the group and by no one else.
 
 package start
 
 import (
+	"time"
+
+	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -29,5 +35,46 @@ func TestTmuxHardeningIsInTheSameInvocation(t *testing.T) {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %q in %s", want, line)
 		}
+	}
+}
+
+// context: hostd runs as a service uid and its tmux server lives on a shared socket PATH
+// (--tmux-socket /run/ccsbx/tmux.sock). The server must be addressed with -S, and the socket must
+// stay 0600: a group-writable tmux socket would let any process of a group member type into fenced
+// panes and run commands as the service uid. The owner gets in through `ccsbx-root attach`.
+func TestAbsoluteTmuxSocketIsUsedWithSAndStaysPrivate(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("no tmux")
+	}
+	dir, _ := os.MkdirTemp("/tmp", "tmx")
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "t.sock")
+	exe := filepath.Join(dir, "pane.sh")
+	os.WriteFile(exe, []byte("#!/bin/sh\nsleep 30\n"), 0o755)
+	tl := &TmuxLauncher{Exe: exe, Socket: sock}
+	defer exec.Command("tmux", "-S", sock, "kill-server").Run()
+	rec := &Record{Sid: "sabc123", Gen: 1}
+	rec.Spec.Workdir.Path = dir
+	if err := tl.Launch(rec); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(sock)
+	if err != nil || st.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("socket %v err %v: must not be open to group or others", st, err)
+	}
+	if !tl.Alive("sabc123") {
+		t.Fatal("the session is not on the -S server")
+	}
+}
+
+// context: a wedged tmux server must not stall the daemon: the launcher's calls are bounded too.
+func TestLauncherTmuxCallsTimeOut(t *testing.T) {
+	old := tmuxsock.Timeout
+	tmuxsock.Timeout = 200 * time.Millisecond
+	defer func() { tmuxsock.Timeout = old }()
+	tl := &TmuxLauncher{Exe: "x", Socket: "x", Command: func(string, ...string) *exec.Cmd { return exec.Command("sleep", "30") }}
+	t0 := time.Now()
+	if tl.Alive("s1") || time.Since(t0) > 3*time.Second {
+		t.Fatalf("alive or slow: %s", time.Since(t0))
 	}
 }

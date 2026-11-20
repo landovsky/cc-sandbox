@@ -77,7 +77,7 @@ Step 8 in detail (changed after the PR #2 review):
 - known limit after the gate: hostd has no `--ccmsg-bin` (uid `ccsbx` cannot use the owner's bus sockets), so fenced to unfenced-manager messages wait for the hub spoke (B10/B11/M2b);
 - the signer will not start without its scope file; the install writes `/var/lib/ccsbx-keys/signer.scope`
   (one line: owners = the owner, machines = `hostname -s`, profiles = the names in `profiles/*.json`, billings =
-  `api,subscription`; override with `--machine`, `--profiles`, `--billings`; `plan` prints it). `check` asks the
+  `api,subscription,stub`; override with `--machine`, `--profiles`, `--billings`; `plan` prints it). `check` asks the
   signer for a token for one in-scope test claim, so it needs root (the caller must be in group `ccsbx`);
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
@@ -155,7 +155,7 @@ GATES (install refuses while any is unmet)
   note: sudoers.d/README not readable without root: verified at install
   P15 status file: /home/tomas/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv
   allowed roots:   "/home/tomas/git", "/home/tomas/wt"
-  signer scope:    owners=tomas machines=hp-ubuntu profiles=dev-default,e2e-default billings=api,subscription
+  signer scope:    owners=tomas machines=hp-ubuntu profiles=dev-default,e2e-default billings=api,subscription,stub
 
 [01] U0b users and directories: ccsbx (hostd), ccsbx-keys (keys), group ccsbx-clients
      # ccsbx-keys may already exist (R10b creates it and the age key during the day): reused, never recreated
@@ -193,7 +193,7 @@ GATES (install refuses while any is unmet)
      $ runuser -u ccsbx-keys -- /usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --init
      # the signer will not serve without its scope: ONE keyring line (owners, machines, profiles, billings), written by
      #   'ccsbx token pubkey' as ccsbx-keys, 0600, from the install's own values; rewritten on every run so it matches the options
-     $ runuser -u ccsbx-keys -- sh -c f=\$1\;\ shift\;\ umask\ 077\;\ \"\$@\"\ \>\ \"\$f.tmp\"\ \&\&\ mv\ \"\$f.tmp\"\ \"\$f\" sh /var/lib/ccsbx-keys/signer.scope /usr/local/bin/ccsbx token pubkey --key-file /var/lib/ccsbx-keys/machine.key --owners tomas --machines hp-ubuntu --profiles dev-default\,e2e-default --billings api\,subscription
+     $ runuser -u ccsbx-keys -- sh -c f=\$1\;\ shift\;\ umask\ 077\;\ \"\$@\"\ \>\ \"\$f.tmp\"\ \&\&\ mv\ \"\$f.tmp\"\ \"\$f\" sh /var/lib/ccsbx-keys/signer.scope /usr/local/bin/ccsbx token pubkey --key-file /var/lib/ccsbx-keys/machine.key --owners tomas --machines hp-ubuntu --profiles dev-default\,e2e-default --billings api\,subscription\,stub
      # the printed PUBLIC key goes into config/machines/<machine>.json (M9); nothing secret is printed
      # the K8 kubeconfig arrives SOPS-encrypted to the age key; it is decrypted only by ccsbx-keys
 

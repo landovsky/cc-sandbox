@@ -8,6 +8,7 @@ import (
 	"encoding/base32"
 	"encoding/json"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
 	"os"
 	"path/filepath"
 	"strings"
@@ -62,6 +63,7 @@ type Daemon struct {
 	Socket       string // tmux -L name for the attach command; default ccsbx
 	Root         string // "direct" tonight
 	Launcher     Launcher
+	ReplaceWait  time.Duration // how long Replace waits for the old fence to shut down (default 15s)
 	Now          func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
 	Exe string
@@ -204,7 +206,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	rec.Reply = StartReply{
 		V: 1, Sid: sid, Gen: rec.Gen, ID: fmt.Sprintf("%s/%s/%s/g%d", s.Owner, d.Machine, sid, rec.Gen), Backend: d.Backend,
 		Pin:     Pin{CC: orUnpinned(d.CCVersion), Image: orUnpinned(d.Image), Channel: channel},
-		Attach:  Attach{Local: []string{"tmux", "-L", orDefault(d.Socket, "ccsbx"), "attach", "-t", sid}, Remote: []string{"ssh", "-t", d.Machine, "ccsbx", "attach", sid}},
+		Attach:  Attach{Local: append(append([]string{"tmux"}, tmuxsock.Args(orDefault(d.Socket, "ccsbx"))...), "attach", "-t", sid), Remote: []string{"ssh", "-t", d.Machine, "ccsbx", "attach", sid}},
 		Journal: Journal{Epoch: d.epoch(), Seq: len(recs)},
 		NotEv:   d.Root != "helper",
 	}
@@ -269,6 +271,9 @@ func (d *Daemon) lock() (func(), error) {
 
 func (d *Daemon) records() ([]*Record, error) {
 	ents, err := os.ReadDir(d.path("sessions"))
+	if os.IsNotExist(err) {
+		return nil, nil // nothing was ever started here: an empty list, not an error
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -332,4 +337,72 @@ func orDefault(s, def string) string {
 		return def
 	}
 	return s
+}
+
+// Records lists every session record, for the daemon's resolvers (message delivery, journal).
+func (d *Daemon) Records() ([]*Record, error) { return d.records() }
+
+// Stopper is a Launcher that can end a pane (TmuxLauncher).
+type Stopper interface{ Stop(sid string) error }
+
+// Replace is session.replace (C9b): generation+1 of a running session with a new brief. The
+// caller has already checked the turn is over. Order matters, so that a failure at any step
+// leaves a consistent record:
+//
+//  1. end the old pane (a failure here changes nothing);
+//  2. wait until the old `ccsbx run` has torn its container down (its CLOSED marker), so two
+//     containers never hold the same workdir and per-node home read-write at once; if it does not
+//     in time, nothing new is started and the record stays as it was (the dead pane makes the next
+//     start mark it ended);
+//  3. only then save generation+1 (same sid, label, workdir, profile; a fresh Started, so
+//     "in this generation" checks don't accept messages sent to the previous one) and launch it; a
+//     failed launch restores the previous record and marks it ended, since its pane is gone.
+func (d *Daemon) Replace(sid, brief string) (*Record, error) {
+	unlock, err := d.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	rec, err := d.Load(sid)
+	if err != nil {
+		return nil, err
+	}
+	if rec.Ended != nil || !d.Launcher.Alive(sid) {
+		return nil, refuse(NotRunning, "%s is not running", sid)
+	}
+	st, ok := d.Launcher.(Stopper)
+	if !ok {
+		return nil, refuse(NotBuilt, "this launcher cannot end a pane")
+	}
+	prev := *rec
+	if err := st.Stop(sid); err != nil {
+		return nil, fmt.Errorf("end the old pane: %w", err)
+	}
+	closed := d.path("s", sid, fmt.Sprintf("g%d", prev.Gen), "CLOSED")
+	wait := d.ReplaceWait
+	if wait == 0 {
+		wait = 15 * time.Second
+	}
+	for deadline := time.Now().Add(wait); ; {
+		if _, err := os.Stat(closed); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("the old generation's fence did not shut down within %s; nothing was started", wait)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	rec.Gen++
+	rec.Started = d.now().UTC()
+	rec.Spec.Brief = &Brief{Text: brief}
+	rec.Reply.Gen = rec.Gen
+	rec.Reply.ID = fmt.Sprintf("%s/%s/%s/g%d", rec.Spec.Owner, d.Machine, sid, rec.Gen)
+	if err := d.save(rec); err != nil {
+		return nil, err
+	}
+	if err := d.Launcher.Launch(rec); err != nil {
+		d.markEnded(&prev)
+		return nil, fmt.Errorf("launch generation %d: %w", rec.Gen, err)
+	}
+	return rec, nil
 }

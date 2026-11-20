@@ -5,6 +5,8 @@ package start
 
 import (
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
+	"os"
 	"os/exec"
 	"strconv"
 )
@@ -20,7 +22,8 @@ type TmuxLauncher struct {
 
 // base is the fixed start of every tmux call: this server's socket and an empty config file, so
 // nothing from the user's ~/.tmux.conf (bindings, plugins, run-shell lines) runs in the ccsbx server.
-func (t *TmuxLauncher) base() []string { return []string{"-L", t.Socket, "-f", "/dev/null"} }
+// An absolute socket is a shared path (-S), a bare name is a per-user server (-L): see tmuxsock.
+func (t *TmuxLauncher) base() []string { return append(tmuxsock.Args(t.Socket), "-f", "/dev/null") }
 
 func (t *TmuxLauncher) cmd(args ...string) *exec.Cmd {
 	if t.Command != nil {
@@ -40,13 +43,30 @@ func (t *TmuxLauncher) Launch(r *Record) error {
 		// A pane is a window onto a fence, not a tmux session to drive: no status line, no prefix
 		// key (so a keystroke never reaches tmux's own command mode), no escape delay.
 		";", "set-option", "-g", "status", "off", ";", "set-option", "-g", "prefix", "None", ";", "set-option", "-g", "escape-time", "0")
-	if out, err := t.cmd(args...).CombinedOutput(); err != nil {
+	if out, err := tmuxsock.Run(t.cmd(args...)); err != nil {
 		return fmt.Errorf("tmux new-session: %v: %s", err, out)
+	}
+	// The socket stays as tmux made it: 0600, owned by this uid. It is NOT opened to a group: a
+	// group-writable tmux socket would let any process of a group member type into fenced panes
+	// and run commands as this uid, undoing the privilege split. The owner reaches a pane
+	// through `ccsbx-root attach <sid>` instead.
+	if tmuxsock.IsPath(t.Socket) {
+		if st, err := os.Stat(t.Socket); err != nil || st.Mode().Perm()&0o077 != 0 {
+			_ = t.Stop(r.Sid)
+			return fmt.Errorf("tmux socket %s is missing or readable by others (session ended): %v", t.Socket, err)
+		}
 	}
 	return nil
 }
 
+// Stop ends the session's pane (and so its fence run: `ccsbx run` cleans its container up).
+func (t *TmuxLauncher) Stop(sid string) error {
+	_, err := tmuxsock.Run(t.cmd("kill-session", "-t", "="+sid))
+	return err
+}
+
 // Alive reports whether the session's tmux session exists.
 func (t *TmuxLauncher) Alive(sid string) bool {
-	return t.cmd("has-session", "-t", "="+sid).Run() == nil
+	_, err := tmuxsock.Run(t.cmd("has-session", "-t", "="+sid))
+	return err == nil
 }

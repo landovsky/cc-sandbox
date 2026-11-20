@@ -1,4 +1,5 @@
-# ccsbx-preflight config (plan §7.2). Every value can be overridden: --config FILE or
+# ccsbx-preflight config (plan §7.2). Why: the ids, paths and URLs the checks read live here,
+# not in the code, so the next agent changes them without editing it. Every value can be overridden: --config FILE or
 # CCSBX_PREFLIGHT_CONFIG=FILE. Paths may start with ~.
 
 [tree]

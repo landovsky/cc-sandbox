@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# night-report-test.sh — tests for bin/ccsbx-night-report (NB3). Hermetic: a fixture tree.md and a
+# night-report-test.sh — tests for bin/ccsbx-night-report (NB3). Why: the report is the only
+# thing Tomas reads in the morning, so its table must stay right. Hermetic: a fixture tree.md and a
 # fixture --limits string, a stub notify-tomas-telegram on a private PATH, nothing real is read.
 # Usage: tests/night-report-test.sh [--help]
 set -uo pipefail

@@ -927,3 +927,53 @@ block = "pending"
 invariants = [5]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "gitdir-from-record"
+title = "the gitdir a fence sees is decided once at first start and kept in the session record; the agent-writable .git file is never trusted for a later generation"
+suite = "fence"
+allow = "tests/twin-go.sh ./internal/backend TestGitDirFromRecordAllow"
+block = "tests/twin-go.sh ./internal/backend TestGitDirFromRecordBlock"
+invariants = [2, 4, 10]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "workdir-inside-root"
+title = "a worktree must resolve inside the operator-set worktree root: not the home, the state dir, a symlink out, or a hidden home directory"
+suite = "fence"
+allow = "tests/twin-go.sh ./internal/backend TestCheckWorkdir"
+block = "tests/twin-go.sh ./internal/backend TestWorkdirNotInHiddenHomeDirs"
+invariants = [2]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "home-steering-not-carried"
+title = "agent-written steering files in the per-node home (CLAUDE.md, commands, hooks, shell rc) are moved to a host-side quarantine before the next generation; the transcript store stays so resume works"
+suite = "fence"
+allow = "tests/resume-test.sh allow"
+block = "tests/resume-test.sh block"
+invariants = [25]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "orphan-reaped"
+title = "after a SIGKILL of 'ccsbx run' its container and network are removed by 'ccsbx gc', and a live run is never touched"
+suite = "fence"
+allow = "tests/gc-test.sh allow"
+block = "tests/gc-test.sh block"
+invariants = [11]
+backends = ["docker"]
+where = "hp"
+
+[[rule]]
+id = "leaves-0777-direct-only"
+title = "world-writable generation leaves exist only in direct mode; helper mode refuses until ccsbx-root makes 10001-owned 0700 leaves"
+suite = "fence"
+allow = "tests/twin-go.sh ./internal/backend TestOneOutboxPerGeneration"
+block = "tests/twin-go.sh ./internal/backend TestWorldWritableLeavesAreDirectModeOnly"
+invariants = [11, 14]
+backends = ["unit"]
+where = "any"

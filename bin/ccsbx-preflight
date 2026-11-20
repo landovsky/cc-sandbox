@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """ccsbx-preflight: one check per prerequisite of the nightly build (plan §7.2, NB1).
 
+Why it exists: the night runs unattended, so a missing prerequisite (R1–R22) must stop it, or
+park only the pieces that need it, BEFORE it starts, not surface as a mystery failure at 3am.
+
 Every check has an id (C-R<n> after the R-step it proves), the gates it belongs to
 (evening, morning, post-M1) and what a failure does: abort (the night doesn't start), skip
 (only the dependent pieces are parked and listed) or warn.  Checks only READ.  `--help` and

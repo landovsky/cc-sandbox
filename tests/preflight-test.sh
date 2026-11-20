@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# preflight-test.sh — tests for bin/ccsbx-preflight (NB1). Hermetic: every external command the
+# preflight-test.sh — tests for bin/ccsbx-preflight (NB1). Why: the evening gate must never
+# touch anything real or install anything, so that is proven here. Hermetic: every external command the
 # preflight may call is a stub on a private PATH, so nothing real (kubectl, sudo, gh, tailscale,
 # a Telegram) is touched, and a stub for sudo/snap/lxc/apt records any call so we can prove
 # the evening gate never makes one.

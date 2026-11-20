@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -35,6 +36,9 @@ func (r *Runner) Run(s Spec) (int, error) {
 	if err := s.Prepare(); err != nil {
 		return -1, err
 	}
+	if err := s.writePID(); err != nil {
+		return -1, err
+	}
 	for name, b := range r.Files {
 		p := filepath.Join(s.GenDir(), name)
 		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
@@ -45,6 +49,13 @@ func (r *Runner) Run(s Spec) (int, error) {
 		}
 	}
 	defer s.Close()
+
+	// Fail closed: if the home can't be swept, the generation doesn't start.
+	if out, err := exec.Command(r.docker(), s.SweepArgs()...).CombinedOutput(); err != nil {
+		return -1, fmt.Errorf("sweep home: %v: %s", err, out)
+	} else if m := moved(string(out)); len(m) > 0 && r.Stderr != nil {
+		fmt.Fprintf(r.Stderr, "ccsbx run: moved %d steering file(s) out of the home to %s: %s\n", len(m), s.QuarantineDir(), strings.Join(m, " "))
+	}
 
 	if out, err := exec.Command(r.docker(), s.NetworkArgs()...).CombinedOutput(); err != nil {
 		return -1, fmt.Errorf("docker network create: %v: %s", err, out)

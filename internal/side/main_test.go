@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -373,4 +374,82 @@ func (s slowShed) Append(e journal.Event) (journal.Record, error) {
 		time.Sleep(300 * time.Millisecond)
 	}
 	return s.Appender.Append(e)
+}
+
+// context "a launcher passes --state /work/s, the commonest mistake": through the real flag parser, with the
+// DEFAULT fence-writable list (nothing injected), serve exits 2 and says why, before it creates anything.
+func TestMainRefusesStateUnderWorkWithTheDefaultList(t *testing.T) {
+	ctl := filepath.Join(t.TempDir(), "ctl", "ctl.sock")
+	for _, flag := range []string{"--state", "--journal-dir"} {
+		var errb bytes.Buffer
+		args := []string{"serve", "--control", ctl, "--door", "model=http://127.0.0.1:1", "--sid", "s", "--gen", "1", flag, "/work/s"}
+		if code := Main(args, nil, io.Discard, &errb); code != 2 || !strings.Contains(errb.String(), "fence can write") {
+			t.Errorf("%s /work/s: exit %d (%s)", flag, code, errb.String())
+		}
+	}
+	if _, err := os.Stat("/work/s"); err == nil {
+		t.Error("serve created /work/s")
+	}
+}
+
+// context "a path with a '..' or a symlink in it is a different place by the time it is used": each of the five
+// paths must already be absolute and clean with no link in it, or serve refuses to start.
+func TestServeRefusesAPathThatIsNotCleanOrHasALinkInIt(t *testing.T) {
+	root := t.TempDir()
+	real := filepath.Join(root, "real")
+	os.Mkdir(real, 0o700)
+	link := filepath.Join(root, "link")
+	os.Symlink(real, link)
+	file := filepath.Join(real, "f")
+	os.WriteFile(file, []byte("[]"), 0o600)
+	paths := map[string]func(o *ServeOptions, p string){
+		"--control":     func(o *ServeOptions, p string) { o.Config.Control = p + "/ctl/ctl.sock" },
+		"--state":       func(o *ServeOptions, p string) { o.State = p + "/state" },
+		"--journal-dir": func(o *ServeOptions, p string) { o.JournalDir = p + "/j"; o.Sid, o.Gen = "s", 1 },
+		"--routes":      func(o *ServeOptions, p string) { o.RoutesFile = p + "/f" },
+		"--ca-file":     func(o *ServeOptions, p string) { o.Config.CAFile = p + "/f" },
+	}
+	for name, set := range paths {
+		for kind, dir := range map[string]string{"symlink": link, "dotdot": real + "/../real", "relative": "rel"} {
+			o := serveBase(t)
+			o.FenceWritable = []string{filepath.Join(root, "elsewhere")}
+			set(&o, dir)
+			if code, msg := serveCode(o); code != 2 || !strings.Contains(msg, "clean") && kind != "relative" {
+				t.Errorf("%s via %s: exit %d (%s)", name, kind, code, msg)
+			}
+		}
+	}
+}
+
+// context "the routes allowlist and the CA decide what the fence may reach": they must be real files that only
+// their owner can write, owned by the sidecar's uid or root.
+func TestTrustedFileChecksTypeModeAndOwner(t *testing.T) {
+	d := t.TempDir()
+	me := os.Getuid()
+	good := filepath.Join(d, "good")
+	os.WriteFile(good, []byte("x"), 0o640)
+	if err := trustedFile(good, me); err != nil {
+		t.Fatalf("a plain file of ours: %v", err)
+	}
+	dir := filepath.Join(d, "dir")
+	os.Mkdir(dir, 0o700)
+	link := filepath.Join(d, "link")
+	os.Symlink(good, link)
+	gw := filepath.Join(d, "gw")
+	os.WriteFile(gw, []byte("x"), 0o600)
+	os.Chmod(gw, 0o620)
+	ow := filepath.Join(d, "ow")
+	os.WriteFile(ow, []byte("x"), 0o600)
+	os.Chmod(ow, 0o602)
+	fifo := filepath.Join(d, "fifo")
+	syscall.Mkfifo(fifo, 0o600)
+	for name, p := range map[string]string{"a directory": dir, "a symlink": link, "group-writable": gw, "other-writable": ow, "a fifo": fifo, "missing": filepath.Join(d, "nope")} {
+		if err := trustedFile(p, me); err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	// the owner check: this file is ours, so asked for as another uid's (and not root's) it is refused
+	if err := trustedFile(good, me+4242); err == nil {
+		t.Error("a file owned by neither the sidecar's uid nor root accepted")
+	}
 }

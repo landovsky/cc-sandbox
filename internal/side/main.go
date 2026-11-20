@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -207,6 +208,14 @@ func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 		"--routes": o.RoutesFile, "--ca-file": o.Config.CAFile} {
 		if r, bad := underAny(p, o.FenceWritable); p != "" && bad {
 			return fail("%s %s is under %s, which the fence can write", name, p, r)
+		}
+	}
+	// Each path must already be what it says: absolute, clean (no "." or ".."), and with no symlink in it, so the
+	// check above and the files opened below are about the same place and a link cannot be swapped in.
+	for name, p := range map[string]string{"--control": o.Config.Control, "--state": o.State, "--journal-dir": o.JournalDir,
+		"--routes": o.RoutesFile, "--ca-file": o.Config.CAFile} {
+		if p != "" && (!filepath.IsAbs(p) || filepath.Clean(p) != p || resolve(p) != p) {
+			return fail("%s %q must be an absolute, clean path with no symlink in it", name, p)
 		}
 	}
 	for name, p := range map[string]string{"--state": o.State, "--journal-dir": o.JournalDir} {

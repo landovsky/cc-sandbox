@@ -38,3 +38,23 @@ func TestACallToAHubThatNeverAnswersEndsAtItsDeadline(t *testing.T) {
 		t.Fatalf("ack: %v after %s", err, time.Since(t0))
 	}
 }
+
+func TestFindNodeResolvesATreeAddressLikeCcmsg(t *testing.T) {
+	es := []map[string]any{
+		{"id": "a1", "node": "cc-sandbox:3cvt", "updated_at": float64(10)},
+		{"id": "a2", "node": "cc-sandbox:3cvt", "updated_at": float64(20)}, // a roll in progress: the newer wins
+		{"id": "b1", "node": "cc-sandbox:other"},
+		{"id": "c1"}, // no node
+	}
+	for _, addr := range []string{"cc-sandbox:3cvt", "cc-sandbox:#3cvt"} {
+		if e := FindNode(es, addr); e == nil || e["id"] != "a2" {
+			t.Errorf("%s -> %v", addr, e)
+		}
+	}
+	if FindNode(es, "cc-sandbox:nobody") != nil || FindNode(es, "") != nil {
+		t.Error("a node nobody holds was found")
+	}
+	if e := FindSid([]map[string]any{{"uid": "s1", "node": "n"}}, "s1"); e == nil || e["node"] != "n" {
+		t.Error("FindSid")
+	}
+}

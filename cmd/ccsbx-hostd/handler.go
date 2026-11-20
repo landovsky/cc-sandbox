@@ -238,9 +238,8 @@ func startHandler(sd *start.Daemon, p startPolicy) func(uid int, spec []byte) (*
 }
 
 // startHubSpoke puts hostd on the session bus (B1): its live fenced sessions are tracked on the hub,
-// and deliveries to spoke:<machine>/ccsbx are received. For now a delivery is journaled
-// (host/hub.frame) and acked as NOT delivered: the receive path that verifies the sender, re-checks
-// scope and types into the pane is M2b. It returns the function that stops it.
+// and deliveries to spoke:<machine>/ccsbx are received (hubRemote.onDeliver verifies and scopes them).
+// It returns the function that stops it.
 func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router, j appender, lg *log.Logger, url string) func() {
 	tokFile := get("hub-token-file")
 	token := func() (string, error) {
@@ -250,8 +249,11 @@ func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router
 		return readHubToken(tokFile)
 	}
 	machine := get("machine")
+	client := &hubc.Client{URL: url, Token: token}
+	hr := newHubRemote(client, url, machine, rt, j, lg.Printf, rootMinter())
+	rt.Uplink = hr // a message to a node of another machine goes through the hub, signed
 	sp := hubspoke.New(hubspoke.Config{
-		Client:  &hubc.Client{URL: url, Token: token},
+		Client:  client,
 		Machine: machine, Name: "ccsbx", TTL: num("hub-ttl"),
 		Logf: lg.Printf,
 		Entries: func() []map[string]any {
@@ -274,12 +276,8 @@ func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router
 			}
 			return out
 		},
-		OnDeliver: func(_ context.Context, f hubc.Frame, d hubc.Deliver) hubspoke.Result {
-			data, _ := json.Marshal(map[string]any{"seq": f.Seq, "uid": d.UID, "bytes": len(d.Text)})
-			if _, err := j.Append(journal.Event{Src: "host", Type: "hub.frame", Realm: "production", Data: data}); err != nil {
-				lg.Printf("hub: frame %d could not be journaled: %v", f.Seq, err)
-			}
-			return hubspoke.Result{OK: false} // not delivered: the receive path is M2b
+		OnDeliver: func(ctx context.Context, f hubc.Frame, d hubc.Deliver) hubspoke.Result {
+			return hr.onDeliver(ctx, f, d)
 		},
 	})
 	ctx, cancel := context.WithCancel(context.Background())

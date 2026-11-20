@@ -240,3 +240,46 @@ func (c *Client) Send(ctx context.Context, r SendReq) (*SendResult, error) {
 	}
 	return &out, nil
 }
+
+// Sessions reads the hub's presence list (GET /sessions): every tracked session as the hub knows it.
+func (c *Client) Sessions(ctx context.Context) ([]map[string]any, error) {
+	b, err := c.do(ctx, "GET", "/sessions", nil, nil, callTimeout)
+	if err != nil {
+		return nil, err
+	}
+	var out []map[string]any
+	if err := json.Unmarshal(b, &out); err != nil {
+		return nil, fmt.Errorf("hub's sessions answer: %w", err)
+	}
+	return out, nil
+}
+
+// FindNode resolves a tree address to the hub's entry for it, the way ccmsg does: an entry whose
+// `node` equals the address, with "tree:#id" and "tree:id" meaning the same. When several match
+// (a roll in progress) the most recently updated wins. nil: nobody on the hub has that node.
+func FindNode(entries []map[string]any, node string) map[string]any {
+	want := strings.Replace(node, ":#", ":", 1)
+	var best map[string]any
+	var bestAt float64 = -1
+	for _, e := range entries {
+		n, _ := e["node"].(string)
+		if n == "" || (n != node && n != want) {
+			continue
+		}
+		at, _ := e["updated_at"].(float64)
+		if best == nil || at > bestAt {
+			best, bestAt = e, at
+		}
+	}
+	return best
+}
+
+// FindSid is the entry the hub holds for a session id (its `uid`), or nil.
+func FindSid(entries []map[string]any, sid string) map[string]any {
+	for _, e := range entries {
+		if u, _ := e["uid"].(string); u == sid {
+			return e
+		}
+	}
+	return nil
+}

@@ -1316,16 +1316,6 @@ backends = ["unit"]
 where = "hp"
 
 [[rule]]
-id = "relay-reader-uses-relayed-entry"
-title = "the hub downlink reader delivers only through DeliverRelayed (B10/B11/M2b: not built)"
-suite = "msg"
-allow = "pending"
-block = "pending"
-invariants = [13]
-backends = ["unit"]
-where = "any"
-
-[[rule]]
 id = "signer-caps-lifetime"
 title = "the signer refuses a token lifetime over its cap"
 suite = "keys"
@@ -1569,6 +1559,48 @@ title = "a hub delivery is handled once even when its ack fails and the hub send
 suite = "msg"
 allow = "tests/twin-go.sh ./internal/hubspoke TestReceivesATestFrameAndAcksTheResult"
 block = "tests/twin-go.sh ./internal/hubspoke TestAFrameWhoseAckFailedIsNotHandledTwice"
+invariants = [13]
+backends = ["unit"]
+where = "hp"
+
+# ---- M2b: messages across machines through the hub (n1-g-m2b). Direct mode: not evidence. ----
+
+[[rule]]
+id = "xmachine-forged-from"
+title = "a cross-machine message with a forged sender, edited body or kind, replayed stamp, a stamp for another target, or a sender outside the target's scope is refused (at the hub, and again by the receiving hostd) and nothing is typed"
+suite = "msg"
+allow = "tests/twin-go.sh ./cmd/ccsbx-hostd TestFencedMessageFromTheManagerIsVerifiedScopedAndTypedAllow"
+block = "tests/twin-go.sh ./cmd/ccsbx-hostd TestForgedFromIsRefusedAndTypesNothingBlock"
+invariants = [6, 13, 22]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "xmachine-real-hub"
+title = "on the real hub (two logical machines): a signed message crosses machines and is typed once; forged ones are refused at the hub and by the receiver; an unknown node is dropped and journaled"
+suite = "msg"
+allow = "tests/hub-spoke-test.sh"
+block = "tests/twin-go.sh ./cmd/ccsbx-hostd TestUnreachableTargetsAreDroppedAndJournaledNeverSuccess"
+invariants = [13]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "xmachine-msg"
+title = "a fenced hp worker messages a Mac manager through the hub with cc-tree stopped on both (needs the Mac: skipped until then)"
+suite = "msg"
+allow = "tests/xmachine-mac-test.sh"
+block = "tests/twin-go.sh ./cmd/ccsbx-hostd TestAGenuineStampFromOutOfScopeOrNodelessSenderIsRefused"
+invariants = [13]
+backends = ["unit"]
+where = "mac"
+
+[[rule]]
+id = "relay-reader-uses-relayed-entry"
+title = "the hub downlink reader delivers only through DeliverRemote (scope re-checked from the target's record, never the owner path)"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestRemoteMessageIsScopedByTheTargetsRecordAllow"
+block = "tests/twin-go.sh ./internal/msg TestRemoteMessageFromAStrangerIsRefusedBlock"
 invariants = [13]
 backends = ["unit"]
 where = "hp"

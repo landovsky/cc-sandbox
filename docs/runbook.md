@@ -422,3 +422,29 @@
   section's five fields). `make procedures` is the same command once P1's Makefile exists.
   `~/git/k3s/scripts/gitops-inventory.sh` lists cc-sandbox as compliant.
 - **Rollback:** a doc: revert the commit.
+
+
+## Messages across machines through the hub (M2b)
+
+hostd is a client of the session-bus hub over HTTP (`--hub-url`, `--hub-token-file`: a spoke credential for
+THIS machine, minted once by the hub's admin; hostd never holds the admin secret and never touches the
+owner's bus sockets). It tracks its fenced sessions there (with their tree `node`, taken from the session
+record, never from the fence) and polls `spoke:<machine>/ccsbx`.
+
+- **Receiving.** A delivery that claims `fenced` is verified by hostd itself: the Ed25519 stamp (domain
+  `ccsbx-stamp-v1`, 120 s skew, 10-minute nonce cache), the `to` it names must be THIS target, the sender's
+  node comes from the hub's presence entry for its sid, and scope is re-checked against the target's own
+  record (manager, peers, reply-to-sender). An unfenced sender is delivered as `unfenced (hub)` under the same
+  scope. The typed text is the verified body, never the hub's rebuilt line.
+- **Known limit: the public key is supplied by the hub.** hostd verifies the stamp against the `pub` the hub
+  sends with the message, so it trusts the hub's routing and its key bookkeeping (a compromised hub could
+  substitute a key and forge a stamp for any sender whose node the hub can also fake). Scope still bounds the
+  damage to messages a target would accept from that node. The end-to-end chain (the hp-signed token carrying
+  the sender's key, checked by the receiver) comes with U5/M9.
+- **Sending.** A fenced session's message to a node that is not on this machine is signed by hostd with a
+  per-generation key (in memory only); `ccsbx-root relay-mint` registers its public half as a relay principal
+  (spec: docs/relay-mint-spec.md; until it exists, sending fails with "no relay credential" and is reported as
+  `undeliverable`). A target the hub does not hold, or that did not take the message, is `dropped`: the sender's
+  reply says `error/dropped` and the journal records `msg.dropped` (reason and node, never the text).
+- **Not wired in the unit until:** the hub has B10/B11 and the downlink payload change (dotfiles `n1-g-hub`, a
+  merge that is Tomas's), the spoke credential file exists, and `relay-mint` is installed.

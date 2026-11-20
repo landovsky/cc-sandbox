@@ -521,10 +521,8 @@ func ParsePairs(s string) (map[string][]string, error) {
 		if !ok || name == "" || bs == "" {
 			return nil, fmt.Errorf("pairs: %q is not profile:billing|billing", item)
 		}
-		for _, r := range name {
-			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
-				return nil, fmt.Errorf("pairs: profile name %q has a character outside [A-Za-z0-9._-]", name)
-			}
+		if !ValidName(name) {
+			return nil, fmt.Errorf("pairs: profile name %q has a character outside [A-Za-z0-9._-]", name)
 		}
 		if _, dup := out[name]; dup {
 			return nil, fmt.Errorf("pairs: profile %q listed twice", name)
@@ -544,7 +542,9 @@ func ParsePairs(s string) (map[string][]string, error) {
 
 // KeyringLineWithPairs is the scope line the signer writes for its own key: owners, machines and
 // the exact profile→billings pairs. profiles= and billings= are derived (the names, and the union of
-// their billings) so a door that reads the line with the older fields sees the same limits.
+// their billings) for readers that look at those fields. A door built before pairs= existed rejects
+// the line as having an unknown field; only doors from this change on read it, so they must be
+// updated before they are given a signer's scope.
 func (k *Key) KeyringLineWithPairs(owners, machines []string, pairs string) (string, error) {
 	p, err := ParsePairs(pairs)
 	if err != nil {
@@ -564,3 +564,17 @@ func (k *Key) KeyringLineWithPairs(owners, machines []string, pairs string) (str
 }
 
 func validGlob(pat string) bool { _, err := path.Match(pat, ""); return err == nil }
+
+// ValidName is the one rule for names in a scope (profiles, owners, machines): letters, digits,
+// '.', '_' and '-', so no glob, separator, space or '=' can hide in one.
+func ValidName(n string) bool {
+	if n == "" {
+		return false
+	}
+	for _, r := range n {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}

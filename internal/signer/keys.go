@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -180,10 +181,19 @@ func readScope(path string) ([]byte, error) {
 	if err := trusted(fi, path); err != nil {
 		return nil, err
 	}
-	b := make([]byte, 64<<10)
-	n, _ := f.Read(b)
-	return b[:n], nil
+	// One byte over the cap is enough to refuse: a scope cut short could drop its last lines.
+	b, err := io.ReadAll(io.LimitReader(f, maxScope+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(b) > maxScope {
+		return nil, fmt.Errorf("signer: %s is over %d bytes; refusing a scope that would be cut short", path, maxScope)
+	}
+	return b, nil
 }
+
+// maxScope is the largest scope file the signer reads.
+const maxScope = 64 << 10
 
 // load reads the existing key (never creates one) and the scope the signer is bound to. The scope
 // must carry profile→billing pairs, hold exactly one line, and be for this key.
@@ -229,6 +239,11 @@ func WriteScope(dir, scopePath string, owners, machines []string, pairs string) 
 	}
 	if len(owners) == 0 || len(machines) == 0 {
 		return "", errors.New("signer: --owners and --machines are required")
+	}
+	for _, n := range append(append([]string{}, owners...), machines...) {
+		if !token.ValidName(n) {
+			return "", fmt.Errorf("signer: %q is not a valid owner or machine name (letters, digits, '.', '_', '-')", n)
+		}
 	}
 	line, err := k.KeyringLineWithPairs(owners, machines, pairs)
 	if err != nil {

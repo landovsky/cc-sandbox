@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -44,7 +45,8 @@ Flags: (each also CCSBX_SIGNER_<NAME>, e.g. CCSBX_SIGNER_KEYS; a value that does
   --init              create machine.key if absent (0600), refuse a wrong owner, mode or symlink, print
                       "kid <kid>" and "public <base64>" and exit
   --write-scope       write the scope file for this key (atomic, 0600) and print its line; needs --owners,
-                      --machines and --pairs. Only this binary ever opens machine.key.
+                      --machines and --pairs (names: letters, digits . _ -). Only this binary ever opens
+                      machine.key. A destination outside KEYS must be given as --scope on the command line.
   --owners A,B        owners the key may sign for                                  (with --write-scope)
   --machines X,Y      machines the key may sign for                                (with --write-scope)
   --pairs P           exact profile→billing pairs: dev-default:api|stub,e2e-default:stub   (with --write-scope)
@@ -171,6 +173,18 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if *writeScope {
+		// A destination outside KEYS must be named on the command line. A value that came from the
+		// environment (a stray CCSBX_SIGNER_SCOPE) never counts, or the old scope could stay in force.
+		explicit := false
+		fs.Visit(func(f *flag.Flag) {
+			if f.Name == "scope" {
+				explicit = true
+			}
+		})
+		if *scope != "" && !explicit && filepath.Dir(filepath.Clean(*scope)) != filepath.Clean(*keys) {
+			fmt.Fprintf(stderr, "ccsbx-signer: --write-scope would write %s, outside %s, and that came from the environment; pass --scope on the command line to mean it\n", *scope, *keys)
+			return 2
+		}
 		line, err := WriteScope(*keys, *scope, splitCSV(*owners), splitCSV(*machines), *pairs)
 		if err != nil {
 			fmt.Fprintln(stderr, "ccsbx-signer:", err)

@@ -36,9 +36,20 @@ type Config struct {
 	AllowGID    *uint32       // when set, the caller's primary gid must be this too
 	MaxRequest  int           // bytes
 	ReadTimeout time.Duration
-	MaxConns    int // concurrent connections (default 64)
+	MaxConns    int           // concurrent connections (default 64)
+	AcceptPause time.Duration // wait after a failed Accept (default 100ms; tests shorten it)
 	Now         func() time.Time
 	Logf        func(format string, a ...any)
+}
+
+// maxAcceptFailures consecutive Accept errors end Serve (about two seconds at the default pause).
+const maxAcceptFailures = 20
+
+func (s *Server) acceptPause() time.Duration {
+	if s.cfg.AcceptPause > 0 {
+		return s.cfg.AcceptPause
+	}
+	return 100 * time.Millisecond
 }
 
 // Server answers signing requests.
@@ -97,16 +108,24 @@ func (s *Server) logJSON(kv ...any) {
 // MaxConns at a time. A failing Accept (for example no free descriptors) is retried after a pause
 // instead of ending the signer.
 func (s *Server) Serve(l net.Listener) error {
+	failures := 0
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			s.logJSON("signer", "accept-error", "err", err.Error())
-			time.Sleep(100 * time.Millisecond)
+			// A transient error (no free descriptors) clears; one that doesn't is permanent, and a
+			// signer that can't accept must exit so systemd restarts it, not log ten lines a second.
+			failures++
+			s.logJSON("signer", "accept-error", "err", err.Error(), "consecutive", failures)
+			if failures >= maxAcceptFailures {
+				return fmt.Errorf("accept failed %d times in a row: %w", failures, err)
+			}
+			time.Sleep(s.acceptPause())
 			continue
 		}
+		failures = 0
 		s.sem <- struct{}{}
 		go func() {
 			defer func() { <-s.sem }()
@@ -145,7 +164,8 @@ func (s *Server) handle(c net.Conn) {
 	// Read exactly one JSON value, at most MaxRequest bytes (one more is read to notice an excess).
 	cr := &countingReader{r: io.LimitReader(c, int64(s.cfg.MaxRequest)+1)}
 	var raw json.RawMessage
-	err = json.NewDecoder(cr).Decode(&raw)
+	dec := json.NewDecoder(cr)
+	err = dec.Decode(&raw)
 	if cr.n > s.cfg.MaxRequest {
 		s.logJSON("signer", "refused", "why", "request too large", "peer_uid", uid)
 		s.send(c, reply{Error: "request too large"})
@@ -161,6 +181,11 @@ func (s *Server) handle(c net.Conn) {
 		s.send(c, reply{Error: msg})
 		return
 	}
+	if s.trailingData(c, dec) {
+		s.logJSON("signer", "refused", "why", "data after the request", "peer_uid", uid)
+		s.send(c, reply{Error: "bad request"})
+		return
+	}
 	tok, cl, err := s.Sign(raw)
 	if err != nil {
 		s.logJSON("signer", "refused", "why", err.Error(), "peer_uid", uid, "sub", cl.Sub, "profile", cl.Profile, "billing", cl.Billing)
@@ -171,6 +196,20 @@ func (s *Server) handle(c net.Conn) {
 	s.logJSON("signer", "signed", "peer_uid", uid, "sub", cl.Sub, "label", cl.Label, "profile", cl.Profile,
 		"billing", cl.Billing, "aud", strings.Join(cl.Aud, ","), "exp", cl.Exp)
 	s.send(c, reply{Token: tok})
+}
+
+// trailingData reports whether anything but white space follows the first JSON value: what the
+// decoder already buffered, or what the peer has sent within the next few milliseconds. A client that
+// sends one value and waits (or half-closes) sees no delay beyond that short look.
+func (s *Server) trailingData(c net.Conn, dec *json.Decoder) bool {
+	rest, _ := io.ReadAll(dec.Buffered())
+	if len(strings.TrimSpace(string(rest))) > 0 {
+		return true
+	}
+	c.SetReadDeadline(time.Now().Add(20 * time.Millisecond))
+	buf := make([]byte, 64)
+	n, _ := c.Read(buf)
+	return len(strings.TrimSpace(string(buf[:n]))) > 0
 }
 
 func (s *Server) send(c net.Conn, r reply) {

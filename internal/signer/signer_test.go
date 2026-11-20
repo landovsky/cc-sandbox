@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -553,3 +554,123 @@ func dupFD(t *testing.T, fd int) int {
 // keyDir is a not-yet-existing key directory; Init makes it 0700 (t.TempDir() itself is 0775 under a
 // 002 umask, which the signer rightly refuses).
 func keyDir(t *testing.T) string { return filepath.Join(t.TempDir(), "keys") }
+
+// context "one request is one JSON value": anything after it, in the same write or just after, is a
+// refused request rather than silently ignored (a second object must not ride along unseen).
+func TestRefusesDataAfterTheRequest(t *testing.T) {
+	r := newRig(t, nil)
+	good := r.claims(nil)
+	if out := r.ask(t, append(append([]byte{}, good...), '\n', ' ')); out.Token == "" {
+		t.Fatalf("allow twin: trailing white space: %+v", out)
+	}
+	if out := r.ask(t, append(append([]byte{}, good...), []byte(`{"sub":"x"}`)...)); out.Token != "" || out.Error != "bad request" {
+		t.Fatalf("a second object in the same write was accepted: %+v", out)
+	}
+	c, err := net.Dial("unix", r.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+	c.Write(good)
+	time.Sleep(3 * time.Millisecond)
+	c.Write([]byte(`garbage`))
+	var out reply
+	json.NewDecoder(c).Decode(&out)
+	if out.Token != "" {
+		t.Fatalf("data sent just after the request was accepted: %+v", out)
+	}
+}
+
+type failListener struct{ calls int }
+
+func (f *failListener) Accept() (net.Conn, error) {
+	f.calls++
+	return nil, errors.New("too many open files")
+}
+func (f *failListener) Close() error   { return nil }
+func (f *failListener) Addr() net.Addr { return &net.UnixAddr{Name: "x", Net: "unix"} }
+
+// context "accept keeps failing (a permanent error)": Serve gives up and returns the error, so the
+// signer exits non-zero and systemd restarts it, instead of logging ten lines a second for ever.
+func TestPermanentAcceptErrorEndsServe(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.AcceptPause = time.Millisecond })
+	fl := &failListener{}
+	done := make(chan error, 1)
+	go func() { done <- r.srv.Serve(fl) }()
+	select {
+	case err := <-done:
+		if err == nil || fl.calls < maxAcceptFailures {
+			t.Fatalf("err=%v after %d calls", err, fl.calls)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve kept retrying a permanent accept error")
+	}
+}
+
+// context "a scope file is read whole or not at all": over 64 KiB is refused, since a scope cut short
+// could lose its last lines; one just under the cap still loads.
+func TestOversizedScopeIsRefused(t *testing.T) {
+	dir := keyDir(t)
+	Init(dir)
+	line, _ := WriteScope(dir, "", []string{"tomas"}, []string{"hp-ubuntu"}, testPairs)
+	sc := filepath.Join(dir, ScopeName)
+	pad := func(n int) []byte {
+		return []byte(line + "\n" + strings.Repeat("# padding\n", n/10)) // the policy comes first: a cut-short read would still parse
+	}
+	os.WriteFile(sc, pad(60<<10), 0o600)
+	if _, _, err := load(dir, ""); err != nil {
+		t.Fatalf("allow twin: %v", err)
+	}
+	os.WriteFile(sc, pad(70<<10), 0o600)
+	if _, _, err := load(dir, ""); err == nil {
+		t.Fatal("a scope over 64 KiB was accepted")
+	}
+}
+
+// context "owners and machines are names": a space, '=', a glob or a stray separator can't be written
+// into the scope, the same rule as profile names.
+func TestScopeNamesAreChecked(t *testing.T) {
+	dir := keyDir(t)
+	Init(dir)
+	if _, err := WriteScope(dir, "", []string{"tomas"}, []string{"hp-ubuntu"}, testPairs); err != nil {
+		t.Fatalf("allow twin: %v", err)
+	}
+	for _, bad := range []string{"to mas", "tomas=x", "to*", "a/b", "tom\tas", ""} {
+		if _, err := WriteScope(dir, "", []string{bad}, []string{"hp-ubuntu"}, testPairs); err == nil {
+			t.Fatalf("owner %q accepted", bad)
+		}
+		if _, err := WriteScope(dir, "", []string{"tomas"}, []string{bad}, testPairs); err == nil {
+			t.Fatalf("machine %q accepted", bad)
+		}
+	}
+}
+
+// context "a stray CCSBX_SIGNER_SCOPE": --write-scope must not quietly write somewhere else and leave
+// the old scope in force. A destination outside KEYS has to be named on the command line.
+func TestWriteScopeDestinationMustBeExplicit(t *testing.T) {
+	dir := keyDir(t)
+	var out, errb bytes.Buffer
+	Main([]string{"--keys", dir, "--init"}, &out, &errb)
+	elsewhere := filepath.Join(t.TempDir(), "scope")
+	args := []string{"--keys", dir, "--write-scope", "--owners", "tomas", "--machines", "hp-ubuntu", "--pairs", testPairs}
+	t.Setenv("CCSBX_SIGNER_SCOPE", elsewhere)
+	if Main(args, &out, &errb) != 2 {
+		t.Fatal("wrote a scope outside KEYS because of an environment variable")
+	}
+	if _, err := os.Stat(elsewhere); err == nil {
+		t.Fatal("the stray destination was written")
+	}
+	t.Setenv("CCSBX_SIGNER_SCOPE", "")
+	if Main(append(args, "--scope", elsewhere), &out, &errb) != 0 {
+		t.Fatalf("an explicit --scope was refused: %s", errb.String())
+	}
+	if _, err := os.Stat(elsewhere); err != nil {
+		t.Fatal("the explicit destination was not written")
+	}
+	// inside KEYS, even from the environment, is fine
+	t.Setenv("CCSBX_SIGNER_SCOPE", filepath.Join(dir, ScopeName))
+	if Main(args, &out, &errb) != 0 {
+		t.Fatalf("a destination inside KEYS was refused: %s", errb.String())
+	}
+}

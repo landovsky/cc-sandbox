@@ -86,6 +86,9 @@ func app() *cli.App {
 				f.String("listen-token-file", "", "file (mode 0600) holding the bearer token the --listen address requires")
 				f.Int("lease-ttl", 90, "cockpit lease TTL in seconds (one holder per realm)")
 				f.Int("queue-max", 10000, "pending cockpit requests per realm before refused: queue_full")
+				f.String("hub-url", "", "the session-bus hub's HTTP address, e.g. http://127.0.0.1:4011: hostd tracks its fenced sessions there and receives deliveries on spoke:<machine>/ccsbx (B1). Empty: no hub (logged)")
+				f.String("hub-token-file", "", "file (mode 0600/0640, owned by the daemon's user or group) holding this machine's hub credential for hostd, the spoke:<machine>/ccsbx principal (sbp1.…; the owner's spoke:<machine> token is refused for hostd's work); hostd never holds the hub's admin secret and never touches the owner's bus sockets. Re-read after a 401. Mint it once, as the hub admin, on the hub host: curl -X POST -H \"authorization: Bearer $ADMIN\" -d '{\"role\":\"spoke\",\"machine\":\"<this machine>\",\"name\":\"ccsbx\",\"trees\":[\"cc-sandbox\"]}' http://127.0.0.1:4011/v1/principals (without trees the hub drops every node and cross-machine messages cannot be scoped)")
+				f.Int("hub-ttl", 60, "lease, in seconds, of the sessions tracked on the hub (the hub allows 1..300); renewed every third of it")
 				f.String("ccmsg-bin", "", "ccmsg (session-bus) to reach an unfenced manager on this machine, e.g. ~/.dotfiles/session-bus/bin/ccmsg; empty: only ccsbx sessions are reachable")
 				f.Bool("hear", false, "C23 hear: tell a worker's manager by message when the worker needs a human decision (permission prompt, question dialog)")
 				f.String("ccsbx-bin", "", "the ccsbx binary a replaced session's pane runs (default: ccsbx next to this binary)")
@@ -121,6 +124,10 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	if mode == "helper" && get("run-dir") == "" {
 		fmt.Fprintln(stderr, "ccsbx-hostd: helper mode needs --run-dir (ccsbx-root's run dir, /var/lib/ccsbx-run): without it hostd would look for outboxes in the state dir and see none")
 		return cli.ExitRefused
+	}
+	if ttl := num("hub-ttl"); ttl < 1 || ttl > 300 {
+		fmt.Fprintf(stderr, "ccsbx-hostd: --hub-ttl %d is outside the hub's 1..300 seconds\n", ttl)
+		return cli.ExitUsage
 	}
 	d := &start.Daemon{StateDir: get("state")}
 	tm := &msg.Tmux{Socket: get("tmux-socket")}
@@ -172,6 +179,13 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "accepted=%d refused=%d shed=%d reasons=%v\n", st.Accepted, st.Refused, st.Shed, st.Reasons)
 		return cli.ExitOK
 	}
+	hubCancel := func() {}
+	if u := get("hub-url"); u != "" {
+		hubCancel = startHubSpoke(get, num, rt, j, lg, u)
+	} else {
+		lg.Printf("--hub-url is not set: hostd is not on the session bus (no cross-machine messages, no presence)")
+	}
+	defer hubCancel()
 	exe := get("ccsbx-bin")
 	if exe == "" {
 		if self, err := os.Executable(); err == nil {
@@ -258,6 +272,56 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		hs.Close()
 	}
 	return cli.ExitOK
+}
+
+// readHubToken reads the hub spoke credential: the installer (root) writes it, hostd reads it through
+// the group. It is opened without following a symlink and without blocking on a FIFO, judged on the
+// opened descriptor (a regular file, owned by root or by hostd's own uid, not writable by its group
+// nor reachable by others: 0640 or 0600), read through that descriptor and at most 4 KiB, and the
+// token must look like a principal token (sbp1.…).
+func readHubToken(path string) (string, error) { return readHubTokenAs(path, 0, os.Getuid()) }
+
+func readHubTokenAs(path string, okUIDs ...int) (string, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return "", &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", path)
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); !ok || !containsInt(okUIDs, int(sys.Uid)) {
+		return "", fmt.Errorf("%s is not owned by root or by the daemon's user", path)
+	}
+	if st.Mode().Perm()&0o037 != 0 {
+		return "", fmt.Errorf("%s is writable by its group or reachable by others (mode %o: want 0640 or 0600)", path, st.Mode().Perm())
+	}
+	b, err := io.ReadAll(io.LimitReader(f, 4097))
+	if err != nil {
+		return "", err
+	}
+	if len(b) > 4096 {
+		return "", fmt.Errorf("%s is larger than 4 KiB: not a token file", path)
+	}
+	t := strings.TrimSpace(string(b))
+	if !strings.HasPrefix(t, "sbp1.") || len(t) < 16 {
+		return "", fmt.Errorf("%s does not hold a hub principal token (sbp1.…)", path)
+	}
+	return t, nil
+}
+
+func containsInt(l []int, v int) bool {
+	for _, x := range l {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // checkSigner dials the signer's socket with a short timeout, so a signer that is not up is a

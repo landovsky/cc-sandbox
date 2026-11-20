@@ -57,7 +57,12 @@ var t0 = time.Date(2026, 11, 20, 1, 0, 0, 0, time.UTC)
 func sess(sid, label string, live bool, mgr string, peers ...string) Session {
 	s := Session{Sid: sid, Label: label, BusID: "ccsbx:" + sid, Realm: "production", Gen: 1, Live: live, Started: t0}
 	s.Scope.Manager.Node = mgr
+	s.Scope.Manager.Machine = "mac"
 	s.Scope.Peers = peers
+	s.Scope.PeerMachines = map[string]string{}
+	for _, p := range peers {
+		s.Scope.PeerMachines[p] = "mac"
+	}
 	s.Scope.ReplyWindowS = 3600
 	return s
 }
@@ -682,5 +687,158 @@ func TestDeliverWithNoTmuxServerSaysWhichUnitToStart(t *testing.T) {
 	}
 	if _, e := os.Stat(sock); e == nil {
 		t.Fatal("delivery started a tmux server")
+	}
+}
+
+// ---- M2b: messages across machines through the hub ----------------------------------------------
+
+type fakeUplink struct {
+	sent      []string
+	delivered bool
+	toSid     string // the session the hub resolved the node to
+	err       error
+}
+
+func (u *fakeUplink) SendRemote(s Session, node, kind, text string) (bool, string, error) {
+	u.sent = append(u.sent, s.Sid+">"+node+":"+kind+":"+text)
+	return u.delivered, u.toSid, u.err
+}
+
+// context: a fenced worker on this machine writes to its manager, who lives on the Mac. Not a session
+// of this machine, so it goes through the hub, signed; the answer is delivered, or `dropped`.
+func TestMessageToANodeOfAnotherMachineGoesThroughTheHubOrIsDropped(t *testing.T) {
+	w := newWorld(t, sess("sW", "cc-sandbox:w1", true, "cc-sandbox:mgr"))
+	up := &fakeUplink{delivered: true}
+	w.r.Uplink = up
+	if res := w.r.Send(w.dir.s[0], body("cc-sandbox:mgr", "report")); res.Status != "ok" || res.To != "hub:cc-sandbox:mgr" || len(up.sent) != 1 {
+		t.Fatalf("%+v %v", res, up.sent)
+	}
+	up.delivered = false
+	if res := w.r.Send(w.dir.s[0], body("cc-sandbox:mgr", "again")); res.Status != "error" || res.Code != "dropped" {
+		t.Fatalf("an unreachable target must be dropped, not a success: %+v", res)
+	}
+	up.err = os.ErrDeadlineExceeded
+	if res := w.r.Send(w.dir.s[0], body("cc-sandbox:mgr", "again2")); res.Code != "undeliverable" {
+		t.Fatalf("%+v", res)
+	}
+}
+
+// context: scope is checked BEFORE anything leaves the machine, so a fenced worker cannot use the hub to
+// reach a node outside its scope; and a node that a ccsbx record here holds is never sent to the hub.
+func TestUplinkNeverCarriesAnOutOfScopeOrLocalNode(t *testing.T) {
+	w := newWorld(t, sess("sW", "cc-sandbox:w1", true, "cc-sandbox:mgr"), sess("sL", "cc-sandbox:local", false, ""))
+	up := &fakeUplink{delivered: true}
+	w.r.Uplink = up
+	if res := w.r.Send(w.dir.s[0], body("other:stranger", "x")); res.Code != "scope" || len(up.sent) != 0 {
+		t.Fatalf("%+v %v", res, up.sent)
+	}
+	w.dir.s[0].Scope.Peers = []string{"cc-sandbox:local"}
+	if res := w.r.Send(w.dir.s[0], body("cc-sandbox:local", "x")); len(up.sent) != 0 {
+		t.Fatalf("a node a local record holds went to the hub: %+v", res)
+	}
+}
+
+// ---- receiving ----
+
+// context: the receiving daemon re-checks scope against the TARGET's own record. A node that is not its
+// manager or a peer is refused, whatever the hub or the signature said.
+func TestRemoteMessageIsScopedByTheTargetsRecordAllow(t *testing.T) {
+	w := newWorld(t, sess("sT", "cc-sandbox:worker", true, "cc-sandbox:mgr", "cc-sandbox:peer"))
+	w.stop("sT")
+	w.now = w.now.Add(time.Second)
+	res := w.r.DeliverRemote(RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0mac12345", Machine: "mac", Fenced: true}, "sT", "do the thing")
+	got := w.out.lines["sT"]
+	if res.Status != "ok" || len(got) != 1 || !strings.Contains(got[0], "· fenced ·") || !strings.Contains(got[0], "mac/s0mac12345") || !strings.Contains(got[0], "cc-sandbox:mgr") {
+		t.Fatalf("%+v %q", res, got)
+	}
+	w.now = w.now.Add(time.Second)
+	w.stop("sT")
+	res = w.r.DeliverRemote(RemoteSender{Node: "cc-sandbox:peer", Sid: "s0x", Machine: "mac"}, "sT", "hi")
+	if res.Status != "ok" || !strings.Contains(w.out.lines["sT"][1], "unfenced (hub)") {
+		t.Fatalf("an unverified sender is labelled unfenced: %+v %q", res, w.out.lines["sT"])
+	}
+}
+
+// context (round 5): an UNFENCED sender is only a node name the hub's presence vouches for, and any machine's
+// owner token can publish an unclaimed node. The target's record binds the node to a machine; the same node
+// from another machine, or from a record that names no machine, is refused. A fenced sender is signed: it
+// needs no machine.
+func TestAnUnfencedNodeCountsOnlyOnTheMachineTheRecordBindsItToBlock(t *testing.T) {
+	for name, c := range map[string]struct {
+		rs   RemoteSender
+		mach string
+		code string
+	}{
+		"the bound machine":                  {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "mac"}, "mac", ""},
+		"the same node from another machine": {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "x4"}, "mac", "scope"},
+		"no machine named by the record":     {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "mac"}, "", "scope"},
+		"no machine named by the hub":        {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a"}, "mac", "scope"},
+		"a fenced sender needs no machine":   {RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0a", Machine: "x4", Fenced: true}, "mac", ""},
+	} {
+		w := newWorld(t, sess("sT", "cc-sandbox:worker", true, "cc-sandbox:mgr"))
+		w.dir.s[0].Scope.Manager.Machine = c.mach
+		w.stop("sT")
+		w.now = w.now.Add(time.Second)
+		if res := w.r.DeliverRemote(c.rs, "sT", "x"); res.Code != c.code && !(c.code == "" && res.Status == "ok") {
+			t.Errorf("%s: %+v", name, res)
+		}
+	}
+}
+
+func TestRemoteMessageFromAStrangerIsRefusedBlock(t *testing.T) {
+	w := newWorld(t, sess("sT", "cc-sandbox:worker", true, "cc-sandbox:mgr"))
+	w.stop("sT")
+	w.now = w.now.Add(time.Second)
+	for _, node := range []string{"other:evil", "", "cc-sandbox:mgr2"} {
+		if res := w.r.DeliverRemote(RemoteSender{Node: node, Sid: "s0evil", Machine: "mac", Fenced: true}, "sT", "x"); res.Code != "scope" {
+			t.Errorf("node %q: %+v", node, res)
+		}
+	}
+	if len(w.out.lines["sT"]) != 0 {
+		t.Fatalf("something was typed into the pane: %v", w.out.lines)
+	}
+}
+
+// context: reply-to-sender across machines: the target wrote to that node (through the hub) lately, so
+// the node may answer even though it is not in the target's scope.
+func TestRemoteReplyToSenderWithinTheWindow(t *testing.T) {
+	w := newWorld(t, sess("sT", "cc-sandbox:worker", true, "cc-sandbox:mgr"))
+	up := &fakeUplink{delivered: true, toSid: "s0a"}
+	w.r.Uplink = up
+	w.dir.s[0].Scope.Peers = []string{"other:asked"}
+	if res := w.r.Send(w.dir.s[0], body("other:asked", "question")); res.Status != "ok" {
+		t.Fatalf("%+v", res)
+	}
+	w.dir.s[0].Scope.Peers = nil
+	w.stop("sT")
+	w.now = w.now.Add(time.Second)
+	if res := w.r.DeliverRemote(RemoteSender{Node: "other:asked", Sid: "s0a", Machine: "mac", Fenced: true}, "sT", "answer"); res.Status != "ok" {
+		t.Fatalf("a reply to a node we wrote to was refused: %+v", res)
+	}
+	if res := w.r.DeliverRemote(RemoteSender{Node: "other:never-asked", Sid: "s0b", Machine: "mac"}, "sT", "x"); res.Code != "scope" {
+		t.Fatalf("%+v", res)
+	}
+	// the window is bound to the SESSION the hub resolved the address to, not to the node name: another
+	// session (or a later generation) that publishes the same node does not inherit it
+	if res := w.r.DeliverRemote(RemoteSender{Node: "other:asked", Sid: "s0imposter", Machine: "evil", Fenced: true}, "sT", "x"); res.Code != "scope" {
+		t.Fatalf("a different session with the same node was heard: %+v", res)
+	}
+}
+
+// context: a busy target queues the remote message; when it reaches its prompt the scope is checked
+// again and the text is typed once. A pane that is a menu never gets it.
+func TestRemoteMessageToABusyPaneWaitsForThePrompt(t *testing.T) {
+	w := newWorld(t, sess("sT", "cc-sandbox:worker", true, "cc-sandbox:mgr"))
+	w.idle.busy["sT"] = true
+	res := w.r.DeliverRemote(RemoteSender{Node: "cc-sandbox:mgr", Sid: "s0m", Machine: "mac", Fenced: true}, "sT", "later")
+	if res.Status != "queued" || len(w.out.lines["sT"]) != 0 {
+		t.Fatalf("%+v", res)
+	}
+	w.now = w.now.Add(time.Second)
+	w.stop("sT")
+	w.now = w.now.Add(time.Second)
+	w.r.Pump(nil)
+	if len(w.out.lines["sT"]) != 1 || !strings.Contains(w.out.lines["sT"][0], "later") {
+		t.Fatalf("%v", w.out.lines)
 	}
 }

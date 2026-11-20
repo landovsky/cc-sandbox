@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/hostd"
+	"github.com/landovsky/cc-sandbox/internal/hubc"
+	"github.com/landovsky/cc-sandbox/internal/hubspoke"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
@@ -232,4 +235,83 @@ func startHandler(sd *start.Daemon, p startPolicy) func(uid int, spec []byte) (*
 		d.MaxLive, d.MaxPerHour = p.MaxLive, p.MaxPerHour
 		return d.Start(spec)
 	}
+}
+
+// startHubSpoke puts hostd on the session bus (B1): its live fenced sessions are tracked on the hub,
+// and deliveries to spoke:<machine>/ccsbx are received (hubRemote.onDeliver verifies and scopes them).
+// It returns the function that stops it.
+func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router, j appender, lg *log.Logger, url string) func() {
+	tokFile := get("hub-token-file")
+	token := func() (string, error) {
+		if tokFile == "" {
+			return "", fmt.Errorf("--hub-token-file is not set")
+		}
+		return readHubToken(tokFile)
+	}
+	machine := get("machine")
+	client := &hubc.Client{URL: url, Token: token}
+	hr := newHubRemote(client, url, machine, rt, j, lg.Printf, rootMinter(), get("state"))
+	rt.Uplink = hr // a message to a node of another machine goes through the hub, signed
+	sp := hubspoke.New(hubspoke.Config{
+		Client:  client,
+		Machine: machine, Name: "ccsbx", TTL: num("hub-ttl"),
+		Logf: lg.Printf,
+		Entries: func() []map[string]any {
+			all, err := rt.Dir.Sessions()
+			if err != nil {
+				return nil
+			}
+			hr.pruneKeys()
+			return fencedEntries(machine, all, rt.Idle.IdleSince)
+		},
+		OnDeliver: func(ctx context.Context, f hubc.Frame, d hubc.Deliver) hubspoke.Result {
+			return hr.onDeliver(ctx, f, d)
+		},
+		AfterTrack: func(ctx context.Context) {
+			if all, err := rt.Dir.Sessions(); err == nil {
+				hr.warnNodeless(ctx, fencedEntries(machine, all, rt.Idle.IdleSince))
+			}
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { sp.Run(ctx); close(done) }()
+	lg.Printf("hub: tracking fenced sessions on %s as spoke:%s/ccsbx", url, machine)
+	return func() { cancel(); <-done }
+}
+
+// fencedEntries is what hostd publishes on the hub for its live fenced sessions: facts the daemon knows,
+// never the session's last output line (B5). `node` is the session's tree node from hostd's OWN record
+// (the daemon's, never the fence's): without it no fenced sender could be scoped by a receiver and no
+// fenced target could be addressed by tree address with the cockpit down (M2b). The hub keeps it only
+// for a fenced entry from this machine's own spoke principal.
+func fencedEntries(machine string, all []msg.Session, idleSince func(sid string, gen int) (time.Time, bool)) []map[string]any {
+	var out []map[string]any
+	for _, s := range all {
+		if !s.Live {
+			continue
+		}
+		state := "working"
+		if _, idle := idleSince(s.Sid, s.Gen); idle {
+			state = "waiting"
+		}
+		e := map[string]any{"key": "ccsbx:" + s.Sid, "uid": s.Sid, "label": s.Label, "node": s.Label, "machine": machine,
+			"fenced": true, "downlink": "spoke:" + machine + "/ccsbx", "attach": "ccsbx:" + s.Sid, "state": state}
+		// where this session's manager and peers live, from its record (the owner's start spec): the hub holds
+		// those nodes for those machines, so another machine's owner token cannot squat an absent manager's node
+		binds := map[string]string{}
+		if n, m := s.Scope.Manager.Node, s.Scope.Manager.Machine; n != "" && m != "" {
+			binds[n] = m
+		}
+		for _, p := range s.Scope.Peers {
+			if m := s.Scope.PeerMachines[p]; p != "" && m != "" && len(binds) < 16 {
+				binds[p] = m
+			}
+		}
+		if len(binds) > 0 {
+			e["binds"] = binds
+		}
+		out = append(out, e)
+	}
+	return out
 }

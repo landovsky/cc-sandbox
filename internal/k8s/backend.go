@@ -152,6 +152,9 @@ func (b *Backend) Delete(ctx context.Context, sid string, gen int, uid string) e
 	if err != nil {
 		return err
 	}
+	if uid == "" {
+		return errors.New("delete refused: no pod UID recorded for this generation")
+	}
 	g := b.Cfg.GraceSeconds
 	if g < 0 || g > maxGrace {
 		g = maxGrace

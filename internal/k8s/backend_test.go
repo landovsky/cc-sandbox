@@ -784,7 +784,7 @@ func TestDeleteIsPreconditionedOnTheUID(t *testing.T) {
 		t.Errorf("another UID: %v (%d pods)", err, len(f.pods))
 	}
 	n := len(f.log)
-	if err := b.Delete(ctx, "s0abcdefgh", 2, ""); err == nil || len(f.log) != n {
+	if err := b.Delete(ctx, "s0abcdefgh", 2, ""); err == nil || errors.As(err, &ce) || !strings.Contains(err.Error(), "no pod UID recorded") || len(f.log) != n {
 		t.Errorf("no UID: %v (requests %d -> %d)", err, n, len(f.log))
 	}
 	if err := b.Delete(ctx, "s0abcdefgh", 2, ref.UID); err != nil || len(f.pods) != 0 {

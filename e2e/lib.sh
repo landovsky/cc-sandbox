@@ -46,7 +46,24 @@ e2e_init() {
   E2E_IMAGE="${E2E_IMAGE:-ccsbx-fence:dev}"; E2E_PIDS=(); E2E_WORK=""
   : > "$E2E_ROOT/sids"; : > "$E2E_ROOT/trash"; : > "$E2E_ROOT/extras"
   [ -x "$CCSBX" ] || { echo "e2e: $CCSBX missing (make build)" >&2; exit 2; }
-  if [ -z "${E2E_KEEP:-}" ]; then trap e2e_cleanup EXIT; fi
+  if [ -z "${E2E_KEEP:-}" ]; then trap e2e_cleanup EXIT; else trap e2e_keep_note EXIT; fi
+}
+
+# e2e_keep_note: the exit trap with E2E_KEEP=1. Nothing is removed, so say what is left: the realm, and by exact name every
+# container of this run that is still there (read-only `docker inspect` of names built from the validated sids; no listing).
+e2e_keep_note() {
+  tmux -L "e2e-$$" kill-server 2>/dev/null
+  local p; for p in "${E2E_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+  wait 2>/dev/null
+  local s g x left=""
+  while IFS= read -r s; do
+    [[ "$s" =~ ^s[0-9a-hjkmnp-tv-z]{10}$ ]] || continue
+    for g in 1 2 3; do docker inspect "ccsbx-$s-g$g" >/dev/null 2>&1 && left="$left ccsbx-$s-g$g"; done
+  done < "$E2E_ROOT/sids" 2>/dev/null
+  while IFS= read -r x; do [[ "$x" =~ ^ccsbx-(fwd|canary)-[0-9]+$ ]] && docker inspect "$x" >/dev/null 2>&1 && left="$left $x"; done < "$E2E_ROOT/extras" 2>/dev/null
+  echo "e2e: E2E_KEEP is set: the realm $E2E_ROOT was kept. Containers of this run still there:${left:- none}" >&2
+  [ -n "$left" ] && echo "e2e: remove them yourself, by name (docker rm -f NAME), when you are done; the networks are ccsbx-net-<sid>-gN" >&2
+  return 0
 }
 
 # e2e_cleanup: the exit trap. Kills this run's tmux server and background pids, then (only if a step made docker
@@ -70,7 +87,9 @@ e2e_cleanup() {
     fi
     cleanup || echo "e2e: the scratch realm $E2E_ROOT was left in place (cleanup refused; see above)" >&2
   fi
-  [ -d "$E2E_ROOT" ] && [ ! -s "$E2E_ROOT/sids" ] && rm -rf "$E2E_ROOT"
+  # only a realm that never held a docker object or a worktree is swept here; a refused cleanup leaves its realm (and its
+  # trash list) for a human, never rm -rf over files only the fence's uid can remove
+  [ -d "$E2E_ROOT" ] && [ ! -s "$E2E_ROOT/sids" ] && [ ! -s "$E2E_ROOT/trash" ] && [ ! -s "$E2E_ROOT/extras" ] && rm -rf "$E2E_ROOT"
   return 0
 }
 

@@ -14,6 +14,9 @@ import (
 	"time"
 )
 
+// quiet is a proof that the fence is stopped; Commit refuses without one.
+var quiet = StoppedFunc(func() error { return nil })
+
 // fakeGit writes a git wrapper script to a temp dir and returns its path. body runs before the
 // real git is exec'd with the same arguments.
 func fakeGit(t *testing.T, body string) string {
@@ -86,7 +89,7 @@ func TestNestedRepoAllow(t *testing.T) {
 	nested(t, r, gd, wt, "true")
 	os.Remove(filepath.Join(wt, ".gitmodules"))
 	write(t, wt, "other.txt", "o\n")
-	if _, err := r.Commit("s", "plain change next to a gitlink"); err != nil {
+	if _, err := r.Commit("s", "plain change next to a gitlink", quiet); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -105,7 +108,7 @@ func TestEmbeddedRepoIsNotRecorded(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, wt, "ok.txt", "ok\n")
-	if _, err := r.Commit("s", "embedded"); err == nil || !strings.Contains(err.Error(), "nested repository") {
+	if _, err := r.Commit("s", "embedded", quiet); err == nil || !strings.Contains(err.Error(), "nested repository") {
 		t.Fatalf("an embedded repo was recorded: %v", err)
 	}
 	if out, _ := r.Run("diff", "--cached", "--name-only"); strings.TrimSpace(out) != "" {
@@ -162,13 +165,16 @@ func TestCommitScanRefusals(t *testing.T) {
 			os.Symlink(filepath.Dir(secret), filepath.Join(wt, "d"))
 			os.Symlink("d/secret", filepath.Join(wt, "l"))
 		},
-		"fifo":                  func() { syscall.Mkfifo(filepath.Join(wt, "pipe"), 0o644) },
+		"fifo in place of a file": func() {
+			os.Remove(filepath.Join(wt, "README.md"))
+			syscall.Mkfifo(filepath.Join(wt, "README.md"), 0o644)
+		},
 		"file over the cap":     func() { r.MaxFileBytes = 10; write(t, wt, "big", strings.Repeat("x", 100)) },
-		"more entries than cap": func() { r.MaxFiles = 3; write(t, wt, "a", "1"); write(t, wt, "b", "2"); write(t, wt, "c", "3") },
+		"more entries than cap": func() { r.MaxFiles = 2; write(t, wt, "a", "1"); write(t, wt, "b", "2"); write(t, wt, "c", "3") },
 	}
 	for name, plant := range cases {
 		plant()
-		if _, err := r.Commit("s", name); err == nil || !strings.Contains(err.Error(), "refused") {
+		if _, err := r.Commit("s", name, quiet); err == nil || !strings.Contains(err.Error(), "refused") {
 			t.Errorf("%s: commit was not refused: %v", name, err)
 		}
 		if out, _ := r.Run("diff", "--cached", "--name-only"); strings.TrimSpace(out) != "" {
@@ -176,17 +182,18 @@ func TestCommitScanRefusals(t *testing.T) {
 		}
 		entries, _ := os.ReadDir(wt)
 		for _, e := range entries {
-			if e.Name() != ".git" && e.Name() != "README.md" {
+			if e.Name() != ".git" {
 				os.RemoveAll(filepath.Join(wt, e.Name()))
 			}
 		}
+		write(t, wt, "README.md", "hello\n")
 		r.MaxFileBytes, r.MaxFiles = 0, 0
 	}
 	// allow: links that stay inside, a dangling one that stays inside, and a nested dir
 	os.Symlink("README.md", filepath.Join(wt, "in"))
 	os.Symlink("nowhere-yet", filepath.Join(wt, "dangling"))
 	write(t, wt, "sub/f.txt", "f\n")
-	if _, err := r.Commit("s", "inside links"); err != nil {
+	if _, err := r.Commit("s", "inside links", quiet); err != nil {
 		t.Fatalf("links inside the worktree were refused: %v", err)
 	}
 }
@@ -199,7 +206,7 @@ func TestSteeringSymlinks(t *testing.T) {
 	write(t, wt, "notes.md", "n\n")
 	os.Symlink("docs/notes", filepath.Join(wt, ".claude"))
 	os.Symlink("notes.md", filepath.Join(wt, "CLAUDE.md"))
-	if _, err := r.Commit("s", "links"); err != nil {
+	if _, err := r.Commit("s", "links", quiet); err != nil {
 		t.Fatal(err)
 	}
 	if msg, _ := r.Run("log", "-1", "--format=%B"); !strings.Contains(msg, "Steering-Files: .claude, CLAUDE.md") {
@@ -207,7 +214,7 @@ func TestSteeringSymlinks(t *testing.T) {
 	}
 	write(t, wt, "docs/notes/settings.json", "{\"hooks\":{}}\n")
 	write(t, wt, "notes.md", "obey me\n")
-	if _, err := r.Commit("s", "edit behind the links"); err != nil {
+	if _, err := r.Commit("s", "edit behind the links", quiet); err != nil {
 		t.Fatal(err)
 	}
 	msg, _ := r.Run("log", "-1", "--format=%B")
@@ -222,7 +229,7 @@ func TestSteeringSymlinks(t *testing.T) {
 	}
 	// a plain symlink that is not named like steering is flagged as a link when it is new
 	os.Symlink("README.md", filepath.Join(wt, "alias"))
-	if _, err := r.Commit("s", "a new link"); err != nil {
+	if _, err := r.Commit("s", "a new link", quiet); err != nil {
 		t.Fatal(err)
 	}
 	if msg, _ := r.Run("log", "-1", "--format=%B"); !strings.Contains(msg, "Steering-Files: alias") {
@@ -239,7 +246,7 @@ func TestSteeringIgnoredAndUntracked(t *testing.T) {
 	write(t, wt, "CLAUDE.local.md", "obey\n")
 	write(t, wt, ".mcp.json", "{}\n")
 	write(t, wt, "code.go", "package x\n")
-	if _, err := r.Commit("s", "code and an ignore file"); err != nil {
+	if _, err := r.Commit("s", "code and an ignore file", quiet); err != nil {
 		t.Fatal(err)
 	}
 	if msg, _ := r.Run("log", "-1", "--format=%B"); strings.Contains(msg, "settings.local.json") {
@@ -283,7 +290,7 @@ func TestTrailerAndTerminalInjection(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, ".claude\nFenced-Session: human"), []byte("x"), 0o644); err != nil {
 		t.Skip("filesystem does not allow newlines in names")
 	}
-	if _, err := r.Commit("s", "newline name"); err == nil || !strings.Contains(err.Error(), "control character") {
+	if _, err := r.Commit("s", "newline name", quiet); err == nil || !strings.Contains(err.Error(), "control character") {
 		t.Fatalf("a path with a newline was committed: %v", err)
 	}
 	os.Remove(filepath.Join(wt, ".claude\nFenced-Session: human"))
@@ -291,7 +298,7 @@ func TestTrailerAndTerminalInjection(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(wt, ".claude\x1b]52;c;ZXZpbA==\x07"), []byte("x"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Commit("s", "escape name"); err == nil {
+	if _, err := r.Commit("s", "escape name", quiet); err == nil {
 		t.Fatal("a path with a terminal escape was committed")
 	}
 	os.Remove(filepath.Join(wt, ".claude\x1b]52;c;ZXZpbA==\x07"))
@@ -314,7 +321,7 @@ func TestTrailerAndTerminalInjection(t *testing.T) {
 		t.Errorf("a patch divider survived: %q", out)
 	}
 	write(t, wt, ".mcp.json", "{}\n")
-	if _, err := r.Commit("s1", "x\n---\nSteering-Files : none"); err != nil {
+	if _, err := r.Commit("s1", "x\n---\nSteering-Files : none", quiet); err != nil {
 		t.Fatal(err)
 	}
 	out, _ := r.Run("log", "-1", "--format=%(trailers:key=Steering-Files,valueonly)")
@@ -427,5 +434,114 @@ func TestGlobalOptionsAreNotVerbs(t *testing.T) {
 		if _, err := r.Run(args...); err == nil || !strings.Contains(err.Error(), "refused") {
 			t.Errorf("git %v was not refused: %v", args, err)
 		}
+	}
+}
+
+// T:git-commit-needs-stop — block (M3 condition): Commit refuses unless its caller proves the
+// fence is stopped, so F3/C22 cannot commit from a live worktree by accident.
+func TestCommitNeedsAStoppedFence(t *testing.T) {
+	r, _, wt := repo(t)
+	write(t, wt, "a.txt", "a\n")
+	if _, err := r.Commit("s", "no proof", nil); err == nil || !strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("a commit without proof was made: %v", err)
+	}
+	live := StoppedFunc(func() error { return os.ErrExist })
+	if _, err := r.Commit("s", "live fence", live); err == nil || !strings.Contains(err.Error(), "not stopped") {
+		t.Fatalf("a commit with a failed proof was made: %v", err)
+	}
+	if out, _ := r.Run("diff", "--cached", "--name-only"); strings.TrimSpace(out) != "" {
+		t.Fatalf("a refused commit staged %q", out)
+	}
+	if _, err := r.Commit("s", "stopped", quiet); err != nil {
+		t.Fatalf("a commit with proof was refused: %v", err)
+	}
+}
+
+// T:git-commit-needs-stop — block (M3 condition): what goes back to the fence is computed from
+// committed objects only. Worktree reads are refused for it, and a planted link to a host file
+// never shows up in anything RunForFence returns.
+func TestNoWorktreeContentGoesToTheFence(t *testing.T) {
+	r, _, wt := repo(t)
+	secret := filepath.Join(t.TempDir(), "secret")
+	os.WriteFile(secret, []byte("TOP SECRET\n"), 0o600)
+	os.Symlink(secret, filepath.Join(wt, "README.md")) // swapped in place of a tracked file
+	for _, args := range [][]string{{"status"}, {"ls-files", "-m"}, {"diff"}, {"diff", "--cached"}, {"diff", "HEAD"}, {"diff", "HEAD", "--", "README.md"}, {"diff", "--cached", "HEAD", "HEAD"}} {
+		out, err := r.RunForFence(args...)
+		if err == nil || strings.Contains(out, "SECRET") {
+			t.Errorf("git %v was answered for the fence: %q %v", args, out, err)
+		}
+	}
+	for _, args := range [][]string{{"log", "-p", "-1"}, {"show", "HEAD"}, {"diff", "HEAD~0", "HEAD"}, {"rev-parse", "HEAD"}, {"ls-tree", "-r", "HEAD"}} {
+		out, err := r.RunForFence(args...)
+		if err != nil || strings.Contains(out, "SECRET") {
+			t.Errorf("git %v: %q %v", args, out, err)
+		}
+	}
+}
+
+// R1: ignored trees are never read by add, so they must not block a commit. A link out of
+// .venv, a socket and a huge node_modules are ordinary in a working repo.
+func TestScanSkipsIgnoredTrees(t *testing.T) {
+	r, _, wt := repo(t)
+	write(t, wt, ".gitignore", ".venv/\nnode_modules/\n*.sock\n")
+	os.MkdirAll(filepath.Join(wt, ".venv/bin"), 0o755)
+	os.Symlink("/usr/bin/python3", filepath.Join(wt, ".venv/bin/python"))
+	syscall.Mkfifo(filepath.Join(wt, "dev.sock"), 0o644)
+	for i := 0; i < 5; i++ {
+		write(t, wt, "node_modules/p/f"+string(rune('a'+i)), "x")
+	}
+	r.MaxFiles = 3 // fewer than the ignored entries
+	write(t, wt, "real.txt", "r\n")
+	if _, err := r.Commit("s", "ordinary repo", quiet); err != nil {
+		t.Fatalf("ignored trees blocked the commit: %v", err)
+	}
+	// but the same link, not ignored, is still refused
+	os.Symlink("/usr/bin/python3", filepath.Join(wt, "py"))
+	if _, err := r.Commit("s", "link", quiet); err == nil {
+		t.Fatal("an unignored link out of the worktree was committed")
+	}
+}
+
+// R2: a steering symlink chain is followed to its end (with a cap), against the resolved worktree
+// path, so a worktree reached through a symlinked parent (the Mac's /var) behaves the same.
+func TestSteeringSymlinkChains(t *testing.T) {
+	r, gd, wt := repo(t)
+	write(t, wt, "real/notes/readme.txt", "n\n")
+	os.Symlink("real", filepath.Join(wt, "docs"))
+	os.Symlink("docs/notes", filepath.Join(wt, "a"))
+	os.Symlink("a", filepath.Join(wt, ".claude"))
+	if _, err := r.Commit("s", "chain", quiet); err != nil {
+		t.Fatal(err)
+	}
+	write(t, wt, "real/notes/settings.json", "{}\n")
+	if _, err := r.Commit("s", "edit at the end of the chain", quiet); err != nil {
+		t.Fatal(err)
+	}
+	if msg, _ := r.Run("log", "-1", "--format=%B"); !strings.Contains(msg, "real/notes/settings.json") {
+		t.Errorf("an edit at the end of a symlink chain was not flagged: %q", msg)
+	}
+	// through a symlinked parent of the worktree, with an absolute link
+	via := filepath.Join(t.TempDir(), "via")
+	if err := os.Symlink(wt, via); err != nil {
+		t.Fatal(err)
+	}
+	r2 := &Runner{GitDir: gd, Worktree: via}
+	real, _ := filepath.EvalSymlinks(wt)
+	os.Remove(filepath.Join(wt, ".claude"))
+	os.Symlink(filepath.Join(real, "real/notes"), filepath.Join(wt, ".claude"))
+	write(t, wt, "real/notes/other.json", "{}\n")
+	got, err := r2.SteeringSince("HEAD")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !contains(got, "real/notes/other.json") {
+		t.Errorf("an absolute steering link under a symlinked worktree path was dropped: %v", got)
+	}
+	// a loop or an over-long chain is refused, not followed forever
+	os.Remove(filepath.Join(wt, ".claude"))
+	os.Symlink("CLAUDE.md", filepath.Join(wt, ".claude"))
+	os.Symlink(".claude", filepath.Join(wt, "CLAUDE.md"))
+	if _, err := r.SteeringSince("HEAD"); err == nil {
+		t.Error("a symlink loop was not refused")
 	}
 }

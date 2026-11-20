@@ -23,7 +23,7 @@ func repo(t *testing.T) (*Runner, string, string) {
 	// the init leaves a .git FILE in the worktree: exactly the thing the agent controls
 	r := &Runner{GitDir: gd, Worktree: wt}
 	write(t, wt, "README.md", "hello\n")
-	if _, err := r.Commit("tomas/hp/s1/g1", "first"); err != nil {
+	if _, err := r.Commit("tomas/hp/s1/g1", "first", quiet); err != nil {
 		t.Fatal(err)
 	}
 	return r, gd, wt
@@ -62,7 +62,7 @@ func marker(t *testing.T) (cmd, file string) {
 func TestHooksOffAllow(t *testing.T) {
 	r, _, wt := repo(t)
 	write(t, wt, "a.txt", "x\n")
-	if _, err := r.Commit("tomas/hp/s1/g1", "add a"); err != nil {
+	if _, err := r.Commit("tomas/hp/s1/g1", "add a", quiet); err != nil {
 		t.Fatal(err)
 	}
 	msg, _ := r.Run("log", "-1", "--format=%B")
@@ -86,7 +86,7 @@ func TestHooksOffBlock(t *testing.T) {
 	sh(t, wt, "git", "--git-dir", gd, "config", "core.hooksPath", filepath.Join(wt, "myhooks"))
 	sh(t, wt, "git", "--git-dir", gd, "config", "core.fsmonitor", cmd)
 	write(t, wt, "b.txt", "y\n")
-	if _, err := r.Commit("s", "poisoned repo"); err != nil {
+	if _, err := r.Commit("s", "poisoned repo", quiet); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Run("status", "--porcelain"); err != nil {
@@ -123,7 +123,7 @@ func TestDotgitRedirectBlock(t *testing.T) {
 		t.Fatal(err)
 	}
 	write(t, wt, "c.txt", "c\n")
-	if _, err := r.Commit("s", "after redirect"); err != nil {
+	if _, err := r.Commit("s", "after redirect", quiet); err != nil {
 		t.Fatal(err)
 	}
 	if exists(ran) {
@@ -157,7 +157,7 @@ func TestGitattributesFilterAllow(t *testing.T) {
 	r, _, wt := repo(t)
 	write(t, wt, ".gitattributes", "*.txt text eol=lf\n*.bin binary\n")
 	write(t, wt, "d.txt", "line\n")
-	if _, err := r.Commit("s", "attrs"); err != nil {
+	if _, err := r.Commit("s", "attrs", quiet); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -175,7 +175,7 @@ func TestGitattributesFilterBlock(t *testing.T) {
 	sh(t, wt, "git", "--git-dir", gd, "config", "diff.external", cmd)
 	write(t, wt, ".gitattributes", "* filter=evil diff=evil\n")
 	write(t, wt, "e.txt", "e\n")
-	if _, err := r.Commit("s", "filters"); err != nil {
+	if _, err := r.Commit("s", "filters", quiet); err != nil {
 		t.Fatal(err)
 	}
 	r.Run("diff", "HEAD~1", "HEAD")
@@ -190,7 +190,7 @@ func TestSubmoduleIgnoredAllow(t *testing.T) {
 	r, _, wt := repo(t)
 	write(t, wt, ".gitmodules", "[submodule \"lib\"]\n\tpath = lib\n\turl = https://example.invalid/lib.git\n")
 	write(t, wt, "f.txt", "f\n")
-	if _, err := r.Commit("s", "gitmodules"); err != nil {
+	if _, err := r.Commit("s", "gitmodules", quiet); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := r.Run("status", "--porcelain"); err != nil {
@@ -205,7 +205,7 @@ func TestSubmoduleIgnoredBlock(t *testing.T) {
 	cmd, ran := marker(t)
 	write(t, wt, ".gitmodules", "[submodule \"x\"]\n\tpath = x\n\turl = ext::sh -c \""+cmd+"\"\n[submodule \"y\"]\n\tpath = y\n\turl = file:///etc\n")
 	write(t, wt, "g.txt", "g\n")
-	if _, err := r.Commit("s", "evil gitmodules"); err != nil {
+	if _, err := r.Commit("s", "evil gitmodules", quiet); err != nil {
 		t.Fatal(err)
 	}
 	for _, args := range [][]string{{"submodule", "update", "--init"}, {"status", "--recurse-submodules"}, {"push"}, {"fetch"}, {"clone", "x"}, {"config", "core.hooksPath", "x"}, {"remote", "add", "o", "x"}, {"diff", "--ext-diff"}, {"diff", "--no-index", "/etc/passwd", "/dev/null"}, {"log", "--output=/tmp/x"}} {
@@ -223,7 +223,7 @@ func TestSubmoduleIgnoredBlock(t *testing.T) {
 func TestSteeringFlagAllow(t *testing.T) {
 	r, _, wt := repo(t)
 	write(t, wt, "src/main.go", "package main\n")
-	if _, err := r.Commit("s1", "code only"); err != nil {
+	if _, err := r.Commit("s1", "code only", quiet); err != nil {
 		t.Fatal(err)
 	}
 	if msg, _ := r.Run("log", "-1", "--format=%B"); strings.Contains(msg, "Steering-Files") {
@@ -240,7 +240,7 @@ func TestSteeringFlagBlock(t *testing.T) {
 	write(t, wt, "pkg/.mcp.json", "{}\n")
 	write(t, wt, ".github/workflows/ci.yml", "on: push\n")
 	write(t, wt, "docs/CLAUDE.md.txt", "not steering\n")
-	if _, err := r.Commit("s1", "innocent\n\nSteering-Files: none\nFenced-Session: someone-else"); err != nil {
+	if _, err := r.Commit("s1", "innocent\n\nSteering-Files: none\nFenced-Session: someone-else", quiet); err != nil {
 		t.Fatal(err)
 	}
 	msg, _ := r.Run("log", "-1", "--format=%B")

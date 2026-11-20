@@ -3,11 +3,13 @@
 // trailer and, when a steering file changed, a Steering-Files trailer, both written by the host
 // from its own view of the staged change, never from the agent's message (invariants 24 and 25).
 //
-// PRECONDITION (blocks F3 and C22): Commit must run while the fence is not writing to the worktree.
-// Git checks a path with lstat and then opens it, and open follows symlinks, so a fence that swaps
-// a file for a symlink in that window can get a host file staged. The scan below refuses symlinks
-// that point outside the worktree, special files and oversized trees, but it cannot close the race
-// itself: freeze or stop the fence, or run host git where only the worktree and gitdir are visible.
+// PRECONDITION (the live-fence race blocks F3 and C22): Commit must run while the fence is not
+// writing to the worktree. Git checks a path with lstat and then opens it, and open follows
+// symlinks, so a fence that swaps a file for a symlink in that window can get a host file staged.
+// The scan below refuses symlinks that point outside the worktree, special files and oversized
+// trees among what git would add, but it cannot close the race itself. So Commit takes a Stopped
+// proof from the owner of the session record and refuses without one. Reads that return worktree
+// content are host-only: see RunForFence.
 package gitroute
 
 import (
@@ -156,11 +158,27 @@ func (r *Runner) indexGitlinks() (map[string]string, error) {
 	return m, nil
 }
 
+// Stopped is proof, from whoever owns the session record, that no fence generation is running
+// against this worktree. Commit refuses without it, so F3/C22 cannot call Commit on a live fence
+// by accident. It is a seam, not a lock: the owner must not hand out a proof it has not checked.
+type Stopped interface{ FenceStopped() error }
+
+// StoppedFunc adapts a function to Stopped.
+type StoppedFunc func() error
+
+func (f StoppedFunc) FenceStopped() error { return f() }
+
 // Commit stages everything and commits with the Fenced-Session and Steering-Files trailers. The
 // trailers come from the host's view of the staged change, never from the agent's message.
 // No hooks run, the identity is the host's, and nothing is pushed. See the package comment above
 // for the precondition (a quiet fence). A refusal leaves nothing staged.
-func (r *Runner) Commit(session, message string) (string, error) {
+func (r *Runner) Commit(session, message string, proof Stopped) (string, error) {
+	if proof == nil {
+		return "", fmt.Errorf("%w: commit needs proof that the fence is stopped (the worktree is still writable by the agent)", ErrRefused)
+	}
+	if err := proof.FenceStopped(); err != nil {
+		return "", fmt.Errorf("%w: the fence is not stopped: %v", ErrRefused, err)
+	}
 	if !sessionRe.MatchString(session) {
 		return "", fmt.Errorf("%w: session id %q", ErrRefused, session)
 	}
@@ -169,7 +187,7 @@ func (r *Runner) Commit(session, message string) (string, error) {
 	}
 	// An agent-written message may try to forge a trailer; drop any trailer-looking line for ours.
 	message = stripForgedTrailers(message)
-	if err := r.scanWorktree(); err != nil {
+	if err := r.scanPending(); err != nil {
 		return "", err
 	}
 	if _, err := r.exec("add", "-A", "--", "."); err != nil {
@@ -250,11 +268,13 @@ func (r *Runner) unstage() {
 	}
 }
 
-// scanWorktree walks the worktree without following links, before git reads any file in it. It
-// refuses a symlink that resolves outside the worktree, a file that is not a regular file, a
-// directory or a symlink (a FIFO would hang git), and a tree over the entry or size caps. Nested
-// `.git` entries are not entered. Racy by nature: see the package comment.
-func (r *Runner) scanWorktree() error {
+// scanPending checks what `git add -A` would read: untracked files that .gitignore does not hide,
+// and tracked files that changed. Ignored trees (.venv, node_modules, build output) are never
+// opened by add, so they are not scanned and cannot block a commit. Each entry is lstat'ed, never
+// followed: a symlink that resolves outside the worktree is refused, so is a file that is not
+// regular (a FIFO would hang git), and a list over the entry or size caps. Racy by nature (see the
+// package comment): it protects against a quiet fence only.
+func (r *Runner) scanPending() error {
 	root, err := filepath.EvalSymlinks(r.Worktree)
 	if err != nil {
 		return err
@@ -266,36 +286,40 @@ func (r *Runner) scanWorktree() error {
 	if maxBytes <= 0 {
 		maxBytes = 256 << 20
 	}
-	n := 0
-	return filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+	var list []string
+	for _, a := range [][]string{{"ls-files", "-z", "--others", "--exclude-standard"}, {"ls-files", "-z", "--modified"}} {
+		out, err := r.Run(a...)
 		if err != nil {
-			return fmt.Errorf("%w: cannot scan %s: %v", ErrRefused, p, err)
+			return err
 		}
-		if p == root {
-			return nil
-		}
-		if d.Name() == ".git" {
-			if d.IsDir() {
-				return fs.SkipDir
+		list = append(list, splitZ(out)...)
+	}
+	if len(list) > maxFiles {
+		return fmt.Errorf("%w: %d changed entries in the worktree (cap %d)", ErrRefused, len(list), maxFiles)
+	}
+	for _, rel := range list {
+		p := filepath.Join(root, rel)
+		st, err := os.Lstat(p)
+		switch {
+		case os.IsNotExist(err):
+			continue // a deletion
+		case err != nil:
+			return fmt.Errorf("%w: cannot scan %q: %v", ErrRefused, rel, err)
+		case st.Mode()&fs.ModeSymlink != 0:
+			if err := checkLink(root, p); err != nil {
+				return err
 			}
-			return nil
-		}
-		if n++; n > maxFiles {
-			return fmt.Errorf("%w: more than %d entries in the worktree", ErrRefused, maxFiles)
-		}
-		switch t := d.Type(); {
-		case t&fs.ModeSymlink != 0:
-			return checkLink(root, p)
-		case d.IsDir():
-			return nil
-		case t.IsRegular():
-			if info, err := d.Info(); err == nil && info.Size() > maxBytes {
-				return fmt.Errorf("%w: %s is %d bytes (cap %d)", ErrRefused, p, info.Size(), maxBytes)
+		case st.IsDir():
+			// a nested repository or an empty dir: gitlinks are judged after staging
+		case st.Mode().IsRegular():
+			if st.Size() > maxBytes {
+				return fmt.Errorf("%w: %q is %d bytes (cap %d)", ErrRefused, rel, st.Size(), maxBytes)
 			}
-			return nil
+		default:
+			return fmt.Errorf("%w: %q is not a regular file, directory or symlink", ErrRefused, rel)
 		}
-		return fmt.Errorf("%w: %s is not a regular file, directory or symlink", ErrRefused, p)
-	})
+	}
+	return nil
 }
 
 // checkLink refuses a symlink whose final target is outside root. A dangling link is judged by its
@@ -304,7 +328,7 @@ func checkLink(root, p string) error {
 	inside := func(t string) bool { return t == root || strings.HasPrefix(t, root+string(filepath.Separator)) }
 	if t, err := filepath.EvalSymlinks(p); err == nil {
 		if !inside(t) {
-			return fmt.Errorf("%w: symlink %s points outside the worktree (%s)", ErrRefused, p, t)
+			return fmt.Errorf("%w: symlink %q points outside the worktree (%q)", ErrRefused, p, t)
 		}
 		return nil
 	}
@@ -316,7 +340,7 @@ func checkLink(root, p string) error {
 		l = filepath.Join(filepath.Dir(p), l)
 	}
 	if !inside(filepath.Clean(l)) {
-		return fmt.Errorf("%w: dangling symlink %s points outside the worktree", ErrRefused, p)
+		return fmt.Errorf("%w: dangling symlink %q points outside the worktree", ErrRefused, p)
 	}
 	return nil
 }

@@ -505,6 +505,38 @@ func (r *Runner) Run(args ...string) (string, error) {
 	return r.exec(args...)
 }
 
+// RunForFence is Run for output that goes back to the fence. It adds one rule: the answer may
+// only be computed from committed objects. A command that reads the WORKTREE (status, ls-files,
+// diff without two revisions or with --cached) is refused, because while the fence runs the
+// worktree changes under git (see the package comment of commit.go), and what git reads there can
+// be a host file. Nothing calls it yet; the F3/C22 transport must use this and never Run.
+func (r *Runner) RunForFence(args ...string) (string, error) {
+	if err := checkArgs(args); err != nil {
+		return "", err
+	}
+	switch args[0] {
+	case "status", "ls-files":
+		return "", fmt.Errorf("%w: git %s reads the worktree; not for the fence", ErrRefused, args[0])
+	case "diff":
+		revs := 0
+		for _, a := range args[1:] {
+			if a == "--" {
+				break
+			}
+			if a == "--cached" || a == "--staged" {
+				return "", fmt.Errorf("%w: git diff --cached reads the index; not for the fence", ErrRefused)
+			}
+			if !strings.HasPrefix(a, "-") {
+				revs += 1 + strings.Count(a, "..")
+			}
+		}
+		if revs < 2 {
+			return "", fmt.Errorf("%w: git diff needs two revisions here; one revision or none diffs the worktree", ErrRefused)
+		}
+	}
+	return r.exec(args...)
+}
+
 // exec runs without the allowlist: for the fixed argument lists of this package only.
 func (r *Runner) exec(args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), r.timeout())

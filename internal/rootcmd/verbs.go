@@ -166,6 +166,10 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	if !hasLayer { // a production pin without the label runs with no reporting: say so in root's log and to the caller, never silently
+		e.logf("run %s: image %s carries no client layer (no %s label): no hooks, statusLine or ccf MCP server in this session", sid, image, backend.LayerLabel)
+		fmt.Fprintf(stderr, "ccsbx-root run: image %s carries no client layer: this session has no hooks, statusLine or ccf MCP server\n", image)
+	}
 	res, err := settings.Compile(p, settings.Params{BaseURL: e.cfg.BaseURL, FetchURL: e.cfg.FetchURL, NoCCF: !hasLayer})
 	if err != nil {
 		return 0, err

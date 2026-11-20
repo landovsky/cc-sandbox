@@ -109,6 +109,12 @@ assert e["data"]=={"text":"e2e outcome"}, e["data"]
     grep -q PTH-RAN <<<"$plain" && grep -q JSON-SHADOW-RAN <<<"$plain" \
       && ok "control: started the plain way, the hook DOES run a planted .pth and a json.py on PYTHONPATH ($plain): the attack is real" || bad "control: the planted attack works against a plain python3" "ran: '$plain'"
     [ -z "$isolated" ] && ok "control: started as the settings start it (python3 -I) the same planted files run nothing: -I is what protects it" || bad "python3 -I ignores the planted .pth and PYTHONPATH" "ran: '$isolated'"
+    # the hostile project settings must have been LOADED, or "the hooks still report" would pass for the wrong reason: Claude Code's own
+    # debug log says it read the repository's env and kept it out of the managed (organization) hooks
+    timeout 100 docker exec "$c" claude -p "E2E:hi" --debug-file /tmp/dbg.log >/dev/null 2>&1
+    dbg="$(docker exec "$c" sh -c 'grep -i "without the repository settings. env" /tmp/dbg.log | head -2; rm -f /tmp/dbg.log' 2>&1)"
+    grep -q "repository settings' env of" <<<"$dbg" && ok "the hostile project .claude/settings.json WAS loaded: Claude Code's debug log says its managed hooks start without the repository settings' env (so the 'still reports' line below is not vacuous)" \
+      || bad "the hostile project settings were loaded" "debug log: '$dbg' (a Claude Code that stops saying this needs this check revisited)"
     pre="$(cnt hook.Stop <<<"$(events)")"
     say "E2E:hi" >/dev/null
     e2e_wait 15 bash -c "[ \$('$CCSBX' events --socket '$D/hostd.sock' --after 0 --json | python3 -c 'import json,sys;print(sum(1 for e in json.load(sys.stdin)[\"events\"] if e[\"type\"]==\"hook.Stop\"))') -gt $pre ]"

@@ -38,5 +38,15 @@ mk secret; printf '#!/usr/bin/python3 -I\n# ghp_%s\n' "$(head -c 40 /dev/zero | 
 mk wrongdig; pack wrongdig; expect wrongdig refuse --digest sha256:0000000000000000000000000000000000000000000000000000000000000000
 mk gooddig; pack gooddig; expect gooddig ok --digest "sha256:$(sha256sum "$W/gooddig.tar" | cut -d' ' -f1)"
 mk nohook; printf '#!/usr/bin/python3 -I\nimport sys\nsys.exit(3)\n' > "$W/nohook/ccf-hook"; pack nohook; expect nohook refuse
+# a refused rebuild under a tag that already names a checked candidate must leave that tag on the good image (build untagged, tag last)
+if [ "$mode" != allow ] || [ "$mode" = both ]; then n=$((n+1))
+  mk keep; pack keep; mk keepbad; printf '#!/usr/bin/python3 -I\n# ghp_%s\n' "$(head -c 40 /dev/zero | tr '\0' a)" > "$W/keepbad/ccf-hook"; pack keepbad
+  "$here/image/build-ccf.sh" --ccf-tar "$W/keep.tar" --base "$BASE" --tag "$(tag keep)" >/dev/null 2>&1; k0=$(docker image inspect -f '{{.Id}}' "$(tag keep)" 2>/dev/null)
+  out=$("$here/image/build-ccf.sh" --ccf-tar "$W/keepbad.tar" --base "$BASE" --tag "$(tag keep)" 2>&1); rc=$?
+  k1=$(docker image inspect -f '{{.Id}}' "$(tag keep)" 2>/dev/null)
+  { [ -n "$k0" ] && [ $rc -ne 0 ] && [ "$k0" = "$k1" ]; } && echo "  red as it must on: a refused rebuild under an existing tag (the tag still names the checked image)" \
+    || { echo "FAIL keep: rc=$rc before=$k0 after=$k1: $(echo "$out" | tail -1)"; fail=1; }
+  docker rmi "$(tag keep)" >/dev/null 2>&1
+fi
 for t in good gooddig; do docker rmi "$(tag $t)" >/dev/null 2>&1; done   # the images this test built, by exact tag
 [ $fail = 0 ] && echo "ok   build-ccf [$mode]: a layer with an extra file, a link, a missing file, a credential, a wrong pinned digest or a hook that fails is refused (and leaves no image); a good one is built" || exit 1

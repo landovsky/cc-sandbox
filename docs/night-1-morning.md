@@ -95,9 +95,9 @@ Step 8 in detail (changed after the PR #2 review):
 - helper mode: the install copies `profiles/*.json` to `/etc/ccsbx/profiles/` and `pins.toml` to `/etc/ccsbx/pins.toml`
   (root:root 0644, dir 0755). hostd (`--profiles`, `--pins`) and the signer's scope use THESE copies, never the
   owner-writable repo; `pins.toml` is empty today, so only e2e candidate images run. hostd also gets `--run-dir
-  /var/lib/ccsbx-run` (made here, root 0755), `--worktree-root` and `--image ccsbx-fence:dev`. **The default
-  allowed root is now `~/git` only** (it was `~/git,~/wt`): `ccsbx-root.toml`'s `allowed_roots` and hostd's
-  `--worktree-root` (its first entry) are one value; pass `--allowed-roots ~/git,~/wt` to keep `~/wt`;
+  /var/lib/ccsbx-run` (made here, root 0755), `--worktree-root` and `--image ccsbx-fence:dev`. The default
+  allowed roots stay `~/git,~/wt`: `ccsbx-root.toml`'s `allowed_roots` and hostd's `--worktree-root` are one value.
+  hostd gets only the first root (`~/git`) until its flag takes a comma list, then the whole list;
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
@@ -173,7 +173,7 @@ GATES (install refuses while any is unmet)
   note: sudoers.d/90-tomas-nopasswd not readable without root: verified at install
   note: sudoers.d/README not readable without root: verified at install
   P15 status file: /home/tomas/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv
-  allowed roots:   "/home/tomas/git"
+  allowed roots:   "/home/tomas/git", "/home/tomas/wt"
   signer scope:    owners=tomas machines=hp-ubuntu pairs=dev-default:api|stub,e2e-default:stub
 
 [01] U0b users and directories: ccsbx (hostd), ccsbx-keys (keys), group ccsbx-clients

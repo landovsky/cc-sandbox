@@ -28,8 +28,9 @@
 #   --yes                 really do it (install and uninstall)
 #   --bin-dir DIR         built binaries + SHA256SUMS            (CCSBX_BIN_DIR, default <repo>/dist)
 #   --owner USER          the human who keeps access            (CCSBX_OWNER, default the invoking user)
-#   --allowed-roots A,B   ccsbx-root's workdir roots AND hostd's --worktree-root (the first one): one source, written to both
-#                                                              (CCSBX_ALLOWED_ROOTS, default ~owner/git, the owner from SUDO_USER via getent)
+#   --allowed-roots A,B   ccsbx-root's workdir roots AND hostd's --worktree-root: one source, written to both (hostd gets only the
+#                         first root until its flag takes a comma list; then the whole list)
+#                                                              (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt, the owner from SUDO_USER via getent)
 #   --image REF           the fence image hostd passes to panes   (CCSBX_IMAGE, default ccsbx-fence:dev until a pin exists)
 #   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
 #   --pairs P             what the signer may sign: exact profile:billing|billing,... (CCSBX_PAIRS; default: built from
@@ -79,7 +80,7 @@ export CCSBX_OWNER VERBOSE PURGE_KEYS MODE
 . "$HERE/lib/common.sh"; . "$HERE/lib/u0b.sh"; . "$HERE/lib/u0.sh"
 
 OWNER="$(real_user)"; OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"; OWNER_HOME="${OWNER_HOME:-/home/$OWNER}"
-[ -n "$ALLOWED_ROOTS" ] || ALLOWED_ROOTS="$OWNER_HOME/git"
+[ -n "$ALLOWED_ROOTS" ] || ALLOWED_ROOTS="$OWNER_HOME/git,$OWNER_HOME/wt"
 # the signer's scope (what the machine key may sign): owner, machine, profiles, billings
 [ -n "$MACHINE" ] || MACHINE="$(hostname -s 2>/dev/null)"
 # the pairs come from the profiles themselves: each profile that lists this machine, with ITS billings (a flat

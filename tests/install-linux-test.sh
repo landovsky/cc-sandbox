@@ -422,7 +422,8 @@ t "helper: the copies are in the backup's ABSENT list, so uninstall removes them
 ins "$d" uninstall --yes >/dev/null 2>&1
 t "helper: uninstall removes the profile copies and pins" bash -c 'grep -qx "rm -f /etc/ccsbx/pins.toml" "$1" && grep -qx "rm -f /etc/ccsbx/profiles/dev-default.json" "$1"' _ "$d/rec/cmds"
 d="$(fx helper2)"; ins "$d" install --yes >/dev/null 2>&1
-t "helper: the default allowed root (and so the worktree root) is the owner's ~/git only" bash -c 'grep -q "^allowed_roots = \[\"[^\"]*/git\"\]\$" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+t "helper: the default allowed roots are the owner's ~/git and ~/wt (as before), written to ccsbx-root.toml" bash -c 'grep -q "^allowed_roots = \[\"[^\"]*/git\", \"[^\"]*/wt\"\]\$" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+t "helper: hostd's --worktree-root is the first of them until its flag takes a list" bash -c 'grep -q -- "--worktree-root [^ ]*/git " "$1"' _ "$d/root/etc/systemd/system/ccsbx-hostd.service"
 d="$(fx helper3)"; ins "$d" install --yes --image 'bad image;x' >/dev/null 2>"$d/err"; rc=$?
 t "helper: a bad --image is refused (exit 3), nothing changed" bash -c '[ '"$rc"' -eq 3 ] && [ ! -s "$1" ]' _ "$d/rec/cmds"
 out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"

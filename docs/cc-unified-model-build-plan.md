@@ -454,6 +454,31 @@ arrives. **Second batch:** Tomas confirmed it to the k3s side on 2026-11-19. The
 Secrets-encryption (Q13) is a separate k3s analysis task. Until it's done, only test keys go
 in.
 
+### 4.6a Git route of the egress door (F3c; for U15/U16 and the door owner)
+
+The pod's sidecar speaks git smart-HTTP to the egress door **through its forwarder** (the forwarder injects the
+token and the proof, so git sends no credentials). The sidecar defines this path scheme; U16 and the door owner
+adopt it when they build M1/U16. The forwarder's door prefix is `/egress`, so the door itself sees `/git/...`:
+
+| Method | Door path | What for |
+|---|---|---|
+| `GET` | `/git/<owner>/<repo>.git/info/refs?service=git-upload-pack` | ref advertisement for a fetch |
+| `POST` | `/git/<owner>/<repo>.git/git-upload-pack` | the fetch itself |
+| `GET` | `/git/<owner>/<repo>.git/info/refs?service=git-receive-pack` | ref advertisement for a push |
+| `POST` | `/git/<owner>/<repo>.git/git-receive-pack` | the push (U16: parse the pack's commands; refuse deletes, protected branches, refs outside the token's branch, ≥ 300 files, ≥ 250 commits) |
+
+- Nothing else of git's HTTP protocol is routed (no dumb-protocol paths such as `HEAD` or `objects/...`): the
+  forwarder's built-in rules answer 403 before the door is asked.
+- `<repo>.git` is one path segment; `<owner>` and `<repo>` are `[A-Za-z0-9._-]`, as the sidecar validates them.
+- Request bodies carry a `Content-Length` (the sidecar sets `http.postBuffer` above the forwarder's body cap), because
+  the proof is bound to the body's hash.
+- The sidecar pushes exactly one refspec, `refs/heads/<session branch>:refs/heads/<session branch>`, never with `+`;
+  the door must still refuse everything U16 lists, since the sidecar's own checks are the second lock.
+- The sidecar's git (`internal/side/gitops.go`) never takes the repo, base or branch from a request: they come from the
+  pod spec (`--git-repo --git-base --git-branch --git-url`). A commit is made from a **snapshot** of the worktree
+  (the "fence is stopped" proof H1 asks for), carries H1's `Fenced-Session` and `Steering-Files` trailers, and the
+  `git.committed` journal fact says `"proof":"snapshot"`.
+
 ## 5. Multi-machine and ops
 
 ### 5.1 Who reaches whom

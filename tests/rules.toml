@@ -1807,3 +1807,13 @@ block = "tests/go-test.sh ./internal/side 'TestServeRefusesAHalfWiredConfigurati
 invariants = [12]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "side-git-clone-commit-push"
+title = "a pod's sidecar clones the pod spec's repo into the empty worktree, commits from a snapshot of what the fence wrote (never following a link out of the tree), and pushes only the session branch through the forwarder: never main, a force, a +refspec or a ref the fence names, and never while a snapshot is made"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/side 'TestCloneCommitPushRoundTrip$'"
+block = "tests/go-test.sh ./internal/side 'TestARequestCannotNameTheBranchOrTheRemote$|TestTheSessionBranchAndRepoAreValidatedAtStart$|TestCloneRefusesAWorktreeTheFenceHasWritten$|TestAHostileWorktreeNeverBecomesACommit$|TestAGitFileInTheWorktreeNeverRedirectsOrRunsAnything$|TestPushAndCommitAreBusyWhileAnOperationRuns$|TestPushRefusesWhatTheDoorWouldAnyway$|TestAnAlreadyMovedBranchIsRejectedNotForced$|TestOnlyTheSmartGitRoutesAreOpen$|TestTheUmaskIsOnlyWidenedAroundTheCheckout$|TestTheSnapshotRefusesOnItsOwnWhatItShouldNotCopy$|TestTheSnapshotNeverReadsThroughALinkOutOfTheTree$|TestServeClonesThenCommitsAndPushesThroughItsOwnForwarder$|TestServeRefusesAHalfConfiguredGit$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"

@@ -37,6 +37,11 @@ var DefaultRules = []Rule{
 	{Door: "egress", Methods: []string{"GET"}, Path: "/github/**"},
 	{Door: "egress", Methods: []string{"POST"}, Path: "/github/repos/*/*/pulls"},
 	{Door: "egress", Methods: []string{"POST"}, Path: "/github/repos/*/*/issues/*/comments"},
+	// git over smart HTTP, owner/<repo>.git as two segments (F3c; the door's U16 rules decide what a push may do):
+	// the ref advertisement, a fetch, and a push. Nothing else of git's HTTP protocol (no dumb-protocol paths).
+	{Door: "egress", Methods: []string{"GET"}, Path: "/git/*/*/info/refs"},
+	{Door: "egress", Methods: []string{"POST"}, Path: "/git/*/*/git-upload-pack"},
+	{Door: "egress", Methods: []string{"POST"}, Path: "/git/*/*/git-receive-pack"},
 }
 
 // denySegments are path segments that make a route a decision, approval or

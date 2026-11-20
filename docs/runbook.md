@@ -538,7 +538,11 @@ the default until a machine opts in.
 ## The daemon on the tailnet (M2a)
 
 `ccsbx-hostd --tailnet-listen <this machine's tailnet ip>:7480 --tailnet-host <this node's MagicDNS name>
---owner-login <you> --owner-devices <FQDNs> [--peer-devices <FQDNs>] [--peer-tags tag:ccsbx-hostd]`. OFF by
+--owner-login <you> --owner-devices <FQDNs> --peer-devices <the other machines' FQDNs>`. For example on the Mac:
+`--owner-devices mac-tomas.<tailnet>.ts.net --peer-devices hp-ubuntu.<tailnet>.ts.net,future-two.<tailnet>.ts.net`
+(hp, the Mac and future-two are untagged devices of the owner's login; peers are listed DEVICES, not tags, for
+Night 2). `--peer-tags` is empty by default and stays so until F4 (Night 3), when an in-cluster hostd comes
+through a `tag:ccsbx-hostd` egress proxy; until then no cluster source gets :7480 at all. OFF by
 default, and not turned on in the unit until the tailnet ACL (R4) and `ufw allow in on tailscale0 to any port
 7480` exist. At start hostd refuses: an address that is not one of THIS node's own tailnet addresses (asked of
 tailscaled, so another VPN's 100.64/10 address does not pass), a short device name (use `host.<tailnet>.ts.net`),
@@ -547,9 +551,10 @@ that is not absolute or is writable by group/other, a `--whois-socket` that is n
 daemon's user.
 
 **Never `tag:ccsbx` as a peer tag.** It is the cluster operator proxies' tag, and a fenced pod can reach the
-egress proxy (NetPol is per pod): a peer from `tag:ccsbx` would be a fenced pod. Peers carry a tag only hostd's
-devices carry (`tag:ccsbx-hostd`, `tagOwners` = whoever deploys hostd); the ACL's 7480 grant (plan §5.2 grant 3,
-k3s-amendments A7: both still say `tag:ccsbx`, to change before they are applied) is for that tag only. An
+egress proxy (NetPol is per pod): a peer from `tag:ccsbx` would be a fenced pod (hostd refuses it at start). hp
+and the Mac stay untagged user devices; later (F4) only a `tag:ccsbx-hostd` egress proxy used by the in-cluster
+hostd gets :7480 (the ACL text for that is the k3s/D owners' to change: plan §5.2 grant 3 and k3s-amendments A7
+still say `tag:ccsbx`). An
 in-cluster hostd (F4) behind the operator's ingress would see the proxy pod's address, not the caller's, so
 WhoIs-by-address cannot classify callers there: F4 must not use this listener.
 
@@ -574,7 +579,12 @@ Answers: no cache for the LocalAPI; 5 s for the CLI, a failure remembered 2 s (s
 peer at a time, at most 8 at once. A stream or long poll on the tailnet ends after 60 s (the client reconnects
 and is classed again), at most 64 connections are open at once (`--tailnet-max-conns`), idle ones close after 2 minutes.
 
-**Owner authority is ambient** (SEC-20, accepted): any process on a LISTED owner device, whichever user runs it,
-acts as the owner there, with no secret (the loopback TCP port, by contrast, refuses deliver and steal even with
-its token). hostd warns at start when `--owner-devices` lists this machine. If that is not acceptable, keep
-deliver/prompt/replace/steal off the tailnet until M2d gives them a per-device secret: this is Tomas's decision.
+**Owner authority is ambient, so the tailnet gives the owner little** (SEC-20, ❓ cc-sandbox:#2dsc, the manager's
+default until Tomas answers): any process on a LISTED owner device, whichever user runs it, would act as the
+owner there with no secret (the loopback TCP port, by contrast, refuses deliver and steal even with its token).
+So over the tailnet the owner gets only `info`, `resolve`, the session list and (M2c) session start. **deliver,
+prompt, replace, the cockpit lease (steal) and the journal (events, streams, cursors, the cockpit's request queue)
+are local-only**: 403 `forbidden` on the tailnet even to the owner, still served on the unix socket. What that
+means for a cockpit on the OTHER machine: it cannot lease, stream events or type into this machine's panes over
+the tailnet; it runs against its own machine's socket until M2d gives these a per-device secret. (`attach` is
+tmux, not an API route.) hostd also warns at start when `--owner-devices` lists this machine.

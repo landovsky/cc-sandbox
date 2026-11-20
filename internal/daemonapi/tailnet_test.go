@@ -106,8 +106,8 @@ func TestOwnerAndPeerGetTheirClassAllow(t *testing.T) {
 	if code, body := tcall(h, "100.64.0.1", "GET", "/v1/info"); code != 200 || !strings.Contains(body, `"caller_class":"owner"`) {
 		t.Fatalf("owner: %d %s", code, body)
 	}
-	if code, body := tcall(h, "100.64.0.1", "GET", "/v1/events?after=0"); code != 200 {
-		t.Fatalf("owner events: %d %s", code, body)
+	if code, body := tcall(h, "100.64.0.1", "GET", "/v1/sessions"); code != 200 {
+		t.Fatalf("owner sessions: %d %s", code, body)
 	}
 	if code, body := tcall(h, "100.64.0.4", "GET", "/v1/info"); code != 200 || !strings.Contains(body, `"caller_class":"peer"`) {
 		t.Fatalf("peer: %d %s", code, body)
@@ -364,6 +364,41 @@ func TestListenAddressRule(t *testing.T) {
 	}
 	if !tailnetAddr(netip.MustParseAddr("100.127.255.254")) || tailnetAddr(netip.MustParseAddr("100.128.0.0")) || tailnetAddr(netip.MustParseAddr("127.0.0.1")) {
 		t.Error("the prefix rule")
+	}
+}
+
+// context (manager decision, SEC-20): the owner's authority on a listed device is ambient (no secret), so over
+// the tailnet even the owner gets only info, resolve and the session list (and, M2c, start). Everything that
+// types into a pane, steals the cockpit or reads the journal stays on the local socket: refused over the
+// tailnet, and still served locally.
+func TestOwnerOperationsStayLocalOnlyEvenForTheOwnerBlock(t *testing.T) {
+	h, _ := tailnetRig(t)
+	local := func(s *Server, method, path string) int {
+		req := httptest.NewRequest(method, path, strings.NewReader(`{"text":"x","from":"cc-tree:x"}`))
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, req)
+		return rec.Code
+	}
+	j, _ := journal.Open(t.TempDir(), "hp-ubuntu", 0)
+	q, _ := verbq.Open(t.TempDir())
+	defer j.Close()
+	defer q.Close()
+	dir := fakeDirT{[]msg.Session{{Sid: "sM", Label: "cc-sandbox:mgr", Realm: "production", Live: true, Gen: 1}}}
+	srv := &Server{J: j, Q: q, Msg: &msg.Router{Dir: dir, Out: &nopOut{}, Idle: idleT{true}, StateDir: t.TempDir()}, Dir: dir}
+	for _, c := range [][3]string{
+		{"POST", "/v1/sessions/sM/deliver", "deliver"}, {"POST", "/v1/sessions/sM/prompt", "prompt"}, {"POST", "/v1/sessions/sM/replace", "replace"},
+		{"POST", "/v1/cockpit/lease?realm=production", "steal the cockpit lease"}, {"GET", "/v1/cockpit/status?realm=production", "cockpit status"},
+		{"GET", "/v1/events?after=0", "the journal"}, {"GET", "/v1/events/stream", "the journal stream"}, {"GET", "/v1/cursors", "cursors"},
+		{"POST", "/v1/cursors/production", "a cursor"}, {"POST", "/v1/start", "start"},
+	} {
+		if code, _ := tcall(h, "100.64.0.1", c[0], c[1]); code != 403 {
+			t.Errorf("the OWNER over the tailnet, %s (%s %s): %d, want 403", c[2], c[0], c[1], code)
+		}
+	}
+	for _, c := range [][2]string{{"GET", "/v1/events?after=0"}, {"GET", "/v1/cursors"}, {"POST", "/v1/sessions/sM/deliver"}} {
+		if code := local(srv, c[0], c[1]); code == 403 || code == 404 && c[0] == "GET" {
+			t.Errorf("%s %s is no longer served on the local socket: %d", c[0], c[1], code)
+		}
 	}
 }
 

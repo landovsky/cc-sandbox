@@ -9,9 +9,9 @@
 //	none   anything else, and every failure to find out: 403
 //
 // What each class may call is an explicit (route, method) table (tailnetRoutes): a route added to the API
-// is closed on the tailnet until someone classifies it (a test walks the mux). An owner gets the owner
-// operations the local socket serves, except session start (it needs the caller's uid; M2c adds the remote
-// form); a peer gets only what another daemon needs (info, resolve, the session list). Nothing is served
+// is closed on the tailnet until someone classifies it (a test walks the mux). An owner gets info, resolve, the
+// session list and (M2c) the remote start; deliver, prompt, replace, steal and the journal stay on the local
+// socket (see tailnetRoutes). A peer gets only what another daemon needs (info, resolve, the session list). Nothing is served
 // unless hostd was told to listen (--tailnet-listen), and only on a tailnet address.
 //
 // Before WhoIs is even asked, a request must look like a daemon's, not a browser's or a local process's:
@@ -133,21 +133,28 @@ type routePolicy struct{ Owner, Peer []string }
 // tailnetRoutes classifies EVERY route of the API for the tailnet (patterns as registered in routes()).
 // TestEveryRouteIsClassifiedForTheTailnet walks the mux against it: a new route fails the build until it
 // has an entry here, and an entry with empty lists means "closed on the tailnet".
+//
+// DECISION (manager default, until Tomas answers ❓ cc-sandbox:#2dsc, SEC-20: owner authority on a listed device
+// is ambient, with no secret): over the tailnet the owner gets only info, resolve, the session list and (M2c)
+// session start. deliver, prompt, replace, the cockpit lease (steal) and the journal (events, streams, cursors,
+// the cockpit's request queue) are LOCAL-ONLY: `{}` here, refused with 403 even to the owner, and still served on
+// the unix socket. (attach is not an API route: it is tmux.) A cockpit on the other machine therefore cannot
+// lease, stream events or type into this machine's panes until M2d gives those a per-device secret.
 var tailnetRoutes = map[string]routePolicy{
 	"/v1/info":              {Owner: []string{"GET"}, Peer: []string{"GET"}},
 	"/v1/resolve":           {Owner: []string{"GET"}, Peer: []string{"GET"}},
-	"/v1/sessions":          {Owner: []string{"GET"}, Peer: []string{"GET"}},
-	"/v1/sessions/":         {Owner: []string{"POST"}}, // deliver, prompt, replace: the owner's
-	"/v1/start":             {},                        // needs the caller's uid: local socket only (M2c adds POST /v1/sessions)
-	"/v1/events":            {Owner: []string{"GET"}},
-	"/v1/events/stream":     {Owner: []string{"GET"}},
-	"/v1/cursors/":          {Owner: []string{"*"}},
-	"/v1/cursors":           {Owner: []string{"GET"}},
-	"/v1/cockpit/lease":     {Owner: []string{"*"}},
-	"/v1/cockpit/requests":  {Owner: []string{"*"}},
-	"/v1/cockpit/requests/": {Owner: []string{"*"}},
-	"/v1/cockpit/status":    {Owner: []string{"GET"}},
-	"/v1/cockpit/pending":   {Owner: []string{"GET"}},
+	"/v1/sessions":          {Owner: []string{"GET"}, Peer: []string{"GET"}}, // M2c adds POST here: remote start, owner only
+	"/v1/sessions/":         {},                                              // deliver, prompt, replace: local only
+	"/v1/start":             {},                                              // needs the caller's uid: local socket only
+	"/v1/events":            {},
+	"/v1/events/stream":     {},
+	"/v1/cursors/":          {},
+	"/v1/cursors":           {},
+	"/v1/cockpit/lease":     {}, // steal: local only
+	"/v1/cockpit/requests":  {},
+	"/v1/cockpit/requests/": {},
+	"/v1/cockpit/status":    {},
+	"/v1/cockpit/pending":   {},
 }
 
 // policyMux maps a request path to the pattern the real mux would pick (same matching rules).

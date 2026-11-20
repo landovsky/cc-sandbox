@@ -34,7 +34,7 @@ hub_user = "${OWNER}"
 kubeconfig = "/var/lib/ccsbx-launch/launcher.kubeconfig"
 k8s_machine = "${K8S_MACHINE}"
 k8s_side_image = "${SIDE_IMAGE}"
-hub_url = "http://127.0.0.1:4011"
+hub_url = "${HUB_URL}"
 hub_secret = "/etc/ccsbx/hub-admin.secret"
 EOT
   note "the hub's admin secret (the shared SB_SECRET), for ccsbx-root's relay mint: the first line of $HUB_SECRET_FROM, root 0600, never printed, never leaves hp"

@@ -35,7 +35,7 @@ fx() {                                   # fx NAME → a fresh fake root with su
 ins() {                                  # ins FXDIR ARGS… — run the installer inside the fake root, recording commands
   local d="$1"; shift
   CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/rec/cmds" CCSBX_BIN_DIR="$d/dist" CCSBX_P15_FILE="$d/p15.tsv" \
-  CCSBX_SIDE_IMAGE="${SIDEIMG-ghcr.io/landovsky/ccsbx@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" CCSBX_HUB_SECRET_FROM="${HUBSRC-$d/hubsecret}" CCSBX_OWNER=tomas CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" CCSBX_IMAGE="${IMG:-ghcr.io/landovsky/ccsbx-fence@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "$inst" "$@"
+  CCSBX_HUB_URL="${HUBURL-http://100.64.0.9:4011}" CCSBX_SIDE_IMAGE="${SIDEIMG-ghcr.io/landovsky/ccsbx@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" CCSBX_HUB_SECRET_FROM="${HUBSRC-$d/hubsecret}" CCSBX_OWNER=tomas CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" CCSBX_IMAGE="${IMG:-ghcr.io/landovsky/ccsbx-fence@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "$inst" "$@"
 }
 snapshot() { (cd "$1" && find root dist -type f -o -type l | sort | xargs -r sha256sum 2>/dev/null; cat rec/cmds 2>/dev/null); }
 
@@ -471,7 +471,7 @@ t "r3: ccsbx-launch is a system user with its own 0700 home, and the signer's us
 t "r3: ccsbx-term has no home (/nonexistent, no create-home) and no shell, and is in no group but its own" bash -c 'l="$(grep "ccsbx-term$" "$1" | grep ^useradd)"; grep -q -- "--no-create-home" <<<"$l" && grep -q -- "--home-dir /nonexistent" <<<"$l" && grep -q -- "--shell /usr/sbin/nologin" <<<"$l" && ! grep -q -- "--groups\|-G " <<<"$l" && ! grep -q "gpasswd -a ccsbx-term\|usermod.*ccsbx-term" "$1"' _ "$c"
 t "r3: the signer's unit names the keys peer ccsbx-launch for future-two only" bash -c 'grep -q -- "--keys-peer-user ccsbx-launch --keys-peer-machines future-two --keys-peer-socket /run/ccsbx-signer/launch.sock" "$1/root/etc/systemd/system/ccsbx-signer.service"' _ "$d"
 t "r3: the signer's scope allows future-two as well (else the launcher's token is out of scope)" bash -c 'grep -- "--write-scope" "$1" | grep -q -- "--machines [a-z0-9.-]*.,future-two"' _ "$c"
-t "r3: ccsbx-root.toml names launch_user, term_user, signer_user, the kubeconfig under ccsbx-launch, k8s_machine, the hub" bash -c 'for k in "launch_user = \"ccsbx-launch\"" "term_user = \"ccsbx-term\"" "signer_user = \"ccsbx-keys\"" "kubeconfig = \"/var/lib/ccsbx-launch/launcher.kubeconfig\"" "k8s_machine = \"future-two\"" "hub_url = \"http://127.0.0.1:4011\"" "hub_secret = \"/etc/ccsbx/hub-admin.secret\""; do grep -qF "$k" "$1" || { echo "missing $k"; exit 1; }; done' _ "$toml"
+t "r3: ccsbx-root.toml names launch_user, term_user, signer_user, the kubeconfig under ccsbx-launch, k8s_machine, the hub" bash -c 'for k in "launch_user = \"ccsbx-launch\"" "term_user = \"ccsbx-term\"" "signer_user = \"ccsbx-keys\"" "kubeconfig = \"/var/lib/ccsbx-launch/launcher.kubeconfig\"" "k8s_machine = \"future-two\"" "hub_url = \"http://100.64.0.9:4011\"" "hub_secret = \"/etc/ccsbx/hub-admin.secret\""; do grep -qF "$k" "$1" || { echo "missing $k"; exit 1; }; done' _ "$toml"
 t "r3: the pod and relay verbs are on" bash -c 'grep "^verbs" "$1" | grep -q "pod-create.*pod-load.*pod-stop.*pod-status.*relay-mint"' _ "$toml"
 t "r3: hub-admin.secret is root:root 0600 and holds exactly the secret" bash -c 'grep -q "^chown root:root /etc/ccsbx/hub-admin.secret" "$1/rec/cmds" && [ "$(stat -c %a "$1/root/etc/ccsbx/hub-admin.secret")" = 600 ] && [ "$(cat "$1/root/etc/ccsbx/hub-admin.secret")" = hub-secret-value-not-printed ]' _ "$d"
 printf 'first-line-secret\nsecond line must not be copied\n' > "$d/hubsecret2"; d2="$(fx r3two)"; HUBSRC="$d/hubsecret2" ins "$d2" install --yes >/dev/null 2>&1
@@ -534,7 +534,7 @@ t "M1: a first line over 512 bytes is refused (exit 3)" test "$rc" -eq 3
 d="$(fx m1dir)"; mkdir "$d/adir"; HUBSRC="$d/adir" ins "$d" install --yes >/dev/null 2>&1; rc=$?
 t "M1: a directory as the source is refused (exit 3)" test "$rc" -eq 3
 d="$(fx m1swap)"; echo "machine-key-line" > "$d/key"; ln -s "$d/key" "$d/swapped"; HUBSRC="$d/swapped" ins "$d" install --yes >/dev/null 2>&1; rc=$?
-t "M1: the link swap (the source became a link to another file) is refused, and that file is never copied" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/root/etc/ccsbx/hub-admin.secret" ]' _ "$rc" "$d"
+t "M1: a source that is a link to another file (the swap, as a static link) is refused, and that file is never copied" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/root/etc/ccsbx/hub-admin.secret" ]' _ "$rc" "$d"
 d="$(fx s1)"; ins "$d" install --yes --k8s-machine other-box >/dev/null 2>&1
 t "S1: --k8s-machine is the one source: the signer unit's keys-peer machines, the scope and ccsbx-root.toml agree" bash -c 'u="$1/root/etc/systemd/system/ccsbx-signer.service"; grep "^ExecStart=" "$u" | grep -q -- "--keys-peer-machines other-box " && ! grep "^ExecStart=" "$u" | grep -q future-two && grep -- "--write-scope" "$1/rec/cmds" | grep -q "other-box" && grep -qx "k8s_machine = \"other-box\"" "$1/root/etc/ccsbx/ccsbx-root.toml"' _ "$d"
 d="$(fx s3)"; ins "$d" install --yes >/dev/null 2>&1; ab="$d/root/var/backups/ccsbx-install/original/ABSENT"
@@ -567,7 +567,46 @@ hp="$here/units/hub-probe"
 t "8c: hub-probe --help exits 0 and runs nothing" bash -c '"$1" --help >/dev/null' _ "$hp"
 t "8c: hub-probe never puts the Bearer in an argument list (the header comes from stdin: curl -K -)" bash -c 'grep -q "curl -K -" "$1" && ! grep -nE "curl[^|]*Bearer|-H \"Authorization" "$1"' _ "$hp"
 t "8c: hub-probe refuses to run as a non-root user (exit 2)" bash -c '[ "$(id -u)" = 0 ] || { "$1" --owner tomas >/dev/null 2>&1; [ $? -eq 2 ]; }' _ "$hp"
-t "8c: hub-probe checks the :4011 listener is the owner's before the secret leaves" grep -q "is not .*'s: the secret is NOT sent" "$hp"
+t "8c: hub-probe asks the listener rule (hub_listen.py) before the secret leaves" grep -q "hub_listen.py" "$hp"
+
+echo "# R2-M1: the hub's listeners (units/lib/hub_listen.py), --hub-url"
+hl="$here/units/lib/hub_listen.py"; me="$(/usr/bin/id -u)"
+net() {   # net DIR FILE LINE… — a fake /proc/net/{tcp,tcp6}: net DIR tcp "ip:port uid" …
+  local dir="$1" f="$2"; shift 2; mkdir -p "$dir"
+  [ -s "$dir/$f" ] || echo "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode" > "$dir/$f"
+  local l n=0; for l in "$@"; do n=$((n+1)); printf '   %d: %s 00000000:0000 0A 00000000:00000000 00:00000000 00000000 %5d        0 %d 1 0\n' "$n" "${l% *}" "${l#* }" "$((9000+n))" >> "$dir/$f"; done
+}
+hl_run() { CCSBX_ROOT_PREFIX=/x python3 -I "$hl" "$1" "$me" --net-dir "$2" >"$tmp/hl.out" 2>&1; }
+# 100.101.219.96 = 0x60DB6564 (little-endian hex 60DB6564), 127.0.0.1 = 0100007F, port 4011 = 0FAB
+T1="60DB6564:0FAB"; LO="0100007F:0FAB"; ANY="00000000:0FAB"
+n="$tmp/n1"; net "$n" tcp "$T1 $me"; : > "$n/tcp6"; echo hdr > "$n/tcp6"
+t "R2-M1: the owner's hub on the tailnet address only, url = that address: allowed" hl_run http://100.101.219.96:4011 "$n"
+hl_run http://127.0.0.1:4011 "$n"; rc=$?
+t "R2-M1: …and a url at 127.0.0.1 is refused: no listener has that address (the hub is not on loopback)" bash -c '[ "$1" -eq 1 ] && grep -q "no listener" "$2"' _ "$rc" "$tmp/hl.out"
+n="$tmp/n2"; net "$n" tcp "$LO 4242" "$T1 $me"; echo hdr > "$n/tcp6"
+hl_run http://100.101.219.96:4011 "$n"; rc=$?; t "R2-M1: a squatter on loopback while the owner is on the tailnet address: refused, whatever the url" bash -c '[ "$1" -eq 1 ] && grep -q "uid 4242" "$2"' _ "$rc" "$tmp/hl.out"
+hl_run http://127.0.0.1:4011 "$n"; rc=$?; t "R2-M1: …also when the url is the squatted loopback address" test "$rc" -eq 1
+n="$tmp/n3"; net "$n" tcp "$T1 $me" "$LO 4242"; echo hdr > "$n/tcp6"; hl_run http://100.101.219.96:4011 "$n"; rc=$?
+t "R2-M1: a foreign listener listed LAST is refused as well as one listed first" test "$rc" -eq 1
+n="$tmp/n4"; net "$n" tcp "$ANY $me"; echo hdr > "$n/tcp6"
+t "R2-M1: an owner-only wildcard listener covers any address (loopback)" hl_run http://127.0.0.1:4011 "$n"
+n="$tmp/n5"; mkdir -p "$n"; echo hdr > "$n/tcp"; net "$n" tcp6 "00000000000000000000000000000000:0FAB 4242"
+hl_run http://100.101.219.96:4011 "$n"; rc=$?; t "R2-M1: a foreign listener on tcp6 ([::]) is refused (both tables are read)" test "$rc" -eq 1
+n="$tmp/n6"; mkdir -p "$n"; echo hdr > "$n/tcp"; echo hdr > "$n/tcp6"; hl_run http://100.101.219.96:4011 "$n"; rc=$?
+t "R2-M1: nothing listening is refused" bash -c '[ "$1" -eq 1 ] && grep -q "nothing listens" "$2"' _ "$rc" "$tmp/hl.out"
+n="$tmp/n7"; net "$n" tcp "00000000:1F90 4242" "$T1 $me"; echo hdr > "$n/tcp6"; hl_run http://100.101.219.96:4011 "$n"
+t "R2-M1: a foreign listener on ANOTHER port is not counted" test $? -eq 0
+for u in http://localhost:4011 http://hub.example:4011 https://100.101.219.96:4011 http://100.101.219.96 'http://100.101.219.96:4011/x'; do
+  hl_run "$u" "$tmp/n1"; rc=$?; t "R2-M1: url '$u' is refused (an IPv4 literal and a port only; no localhost)" test "$rc" -eq 1
+done
+t "R2-M1: --net-dir is refused outside the test hook (CCSBX_ROOT_PREFIX unset)" bash -c '! env -u CCSBX_ROOT_PREFIX python3 -I "$1" http://100.101.219.96:4011 1000 --net-dir "$2" >/dev/null 2>&1' _ "$hl" "$tmp/n1"
+d="$(fx hu)"; ins "$d" install --yes >/dev/null 2>&1
+t "R2-M1: ccsbx-root.toml gets the hub url that was passed (not a loopback default)" grep -qx 'hub_url = "http://100.64.0.9:4011"' "$d/root/etc/ccsbx/ccsbx-root.toml"
+for bad in "" "http://127.0.0.1:4011/" "http://localhost:4011" "https://100.64.0.9:4011" "http://100.64.0.9"; do
+  d="$(fx hub)"; HUBURL="$bad" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+  t "R2-M1: --hub-url '${bad:-unset}' is refused (exit 3), nothing changed" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/rec/cmds" ]' _ "$rc" "$d"
+done
+t "R2-M1: hub-probe has no 'localhost' and no ss: the listener rule is hub_listen.py" bash -c '! grep -nE "localhost|ss -ltn" "$1"' _ "$hp"
 
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"

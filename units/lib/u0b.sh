@@ -19,7 +19,7 @@ KEY_FILES="age.key machine.key"
 # ccsbx-term) must have five different uids, none of them 0; reused ccsbx-launch and ccsbx-term must have no login shell and no group but
 # their own; a group of either name without its user would make `useradd` fail halfway (after the backup).
 svc_users_check() {
-  local u uid seen="" g sh bad=0
+  local u uid seen="" g sh pw bad=0
   for u in ccsbx ccsbx-keys ccsbx-launch ccsbx-term "$(real_user)"; do
     have_user "$u" || continue
     uid="$(id -u "$u")"
@@ -30,8 +30,9 @@ svc_users_check() {
   for u in ccsbx-launch ccsbx-term; do
     if have_user "$u"; then
       g="$(id -nG "$u" 2>/dev/null)"; [ "$g" = "$u" ] || { echo "existing user $u is in groups '$g' (want only its own group)"; bad=1; }
-      sh="$(getent passwd "$u" 2>/dev/null | cut -d: -f7)"
-      case "$sh" in ""|*/nologin|*/false) ;; *) echo "existing user $u has the login shell $sh (want /usr/sbin/nologin)"; bad=1;; esac
+      pw="$(getent passwd "$u" 2>/dev/null)"; sh="$(cut -d: -f7 <<<"$pw")"
+      case "$sh" in */nologin|*/false) ;;
+      *) [ -z "$pw" ] || { echo "existing user $u has the login shell '${sh:-/bin/sh (empty field)}' (want /usr/sbin/nologin)"; bad=1; };; esac   # an empty field means /bin/sh
     elif have_group "$u"; then echo "group $u exists without the user $u: useradd would fail halfway; remove the group or create the user"; bad=1; fi
   done
   return "$bad"

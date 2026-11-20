@@ -39,6 +39,9 @@
 #   --side-image REF      the sidecar image of pod sessions, BY DIGEST: ghcr.io/landovsky/ccsbx@sha256:<64 hex> (CCSBX_SIDE_IMAGE, required;
 #                         written to ccsbx-root.toml as k8s_side_image). A tag is refused. The digest comes from the side-image Actions run (#3wsr)
 #   (rotating SB_SECRET: re-run `install --yes`: it copies the new first line again; the other steps are idempotent)
+#   --hub-url URL         where the hub is: http://A.B.C.D:PORT, an IPv4 literal (CCSBX_HUB_URL, REQUIRED; written to ccsbx-root.toml as hub_url). On hp
+#                         today the hub listens on the tailnet address only (http://100.101.219.96:4011), not on loopback. The B9 gate checks the url
+#                         against the live listeners: every listener on the port must be the owner's, and one must have that address
 #   --hub-secret-from F   the owner's file holding the hub's shared secret (the hub's SB_SECRET), (CCSBX_HUB_SECRET_FROM, default
 #                         ~owner/.config/session-bus/secret). Its FIRST LINE is copied to /etc/ccsbx/hub-admin.secret, root 0600, for
 #                         ccsbx-root's relay mint; never printed. Must be a regular file (no symlink). Verify it at Gate M (night-1-morning.md, 8c)
@@ -63,7 +66,7 @@ case "${1:-}" in
   *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
-MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"; SIDE_IMAGE="${CCSBX_SIDE_IMAGE:-}"
+MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"; SIDE_IMAGE="${CCSBX_SIDE_IMAGE:-}"; HUB_URL="${CCSBX_HUB_URL:-}"
 HUB_SECRET_FROM="${CCSBX_HUB_SECRET_FROM:-}"; K8S_MACHINE="${CCSBX_K8S_MACHINE:-future-two}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
@@ -77,6 +80,7 @@ while [ $# -gt 0 ]; do
     --pairs) PAIRS="${2:?--pairs P}"; shift ;;
     --image) IMAGE="${2:?--image REF}"; shift ;;
     --side-image) SIDE_IMAGE="${2:?--side-image REF}"; shift ;;
+    --hub-url) HUB_URL="${2:?--hub-url http://A.B.C.D:PORT}"; shift ;;
     --hub-secret-from) HUB_SECRET_FROM="${2:?--hub-secret-from FILE}"; shift ;;
     --k8s-machine) K8S_MACHINE="${2:?--k8s-machine NAME}"; shift ;;
     --with-deploy) WITH_DEPLOY=1 ;;
@@ -143,6 +147,8 @@ WORKTREE_ROOT="$(IFS=,; echo "${_roots[*]}")"
 if [ -z "$IMAGE" ]; then ROOT_ERRORS+=("no fence image: pass --image ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the CI-built candidate, U1a); a tag is refused")
 elif [[ "$IMAGE" != *@sha256:* ]]; then ROOT_ERRORS+=("image '$IMAGE' is a tag: hostd and ccsbx-root refuse every start of a tag (image_not_pinned); use ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex>")
 elif ! [[ "$IMAGE" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("image '$IMAGE' is not ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the only repo a candidate may come from)"); fi
+# the hub's address: an IPv4 literal, with a port (no host names: nothing to resolve or trick)
+[[ "$HUB_URL" =~ ^http://([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$ ]] || ROOT_ERRORS+=("no hub url: pass --hub-url http://A.B.C.D:PORT (an IPv4 literal; on hp today http://100.101.219.96:4011, the hub is on the tailnet address, not loopback); got '${HUB_URL}'")
 # the sidecar image: by digest from our own repo only; ccsbx-root's pod-create refuses a config without it
 if [ -z "$SIDE_IMAGE" ]; then ROOT_ERRORS+=("no sidecar image: pass --side-image ghcr.io/landovsky/ccsbx@sha256:<64 hex> (the digest of the side-image Actions run, #3wsr); a tag is refused")
 elif ! [[ "$SIDE_IMAGE" =~ ^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("sidecar image '$SIDE_IMAGE' is not ghcr.io/landovsky/ccsbx@sha256:<64 hex> (a tag, or another repo, is refused)"); fi
@@ -150,7 +156,7 @@ elif ! [[ "$SIDE_IMAGE" =~ ^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$ ]]; th
 MANAGED_PATHS+=(/etc/ccsbx/pins.toml)
 [ -f "$REPO_DIR/pins.toml" ] || ROOT_ERRORS+=("no $REPO_DIR/pins.toml to install as /etc/ccsbx/pins.toml")
 RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
-export OWNER MACHINE PAIRS IMAGE SIDE_IMAGE WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+export OWNER MACHINE PAIRS IMAGE SIDE_IMAGE HUB_URL WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()
@@ -192,6 +198,10 @@ default_b9() {
     local ps
     ps="$(as_owner docker ps --filter name='^session-bus$' -q 2>&1)" || { echo "cannot ask docker whether session-bus runs (docker ps failed): $(head -1 <<<"$ps")"; return 1; }
     [ -z "$ps" ] || { echo "docker container session-bus is still running"; return 1; }
+  fi
+  # the hub's address must be where the owner's hub really listens (every listener the owner's, one of them at HUB_URL's address)
+  if [[ "$HUB_URL" =~ ^http://([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$ ]]; then
+    local why; why="$(python3 -I "$UNITS_DIR/lib/hub_listen.py" "$HUB_URL" "$(id -u "$OWNER")")" || { echo "--hub-url $HUB_URL does not match the live hub: $why"; return 1; }
   fi
   return 0
 }

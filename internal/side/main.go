@@ -18,7 +18,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/landovsky/cc-sandbox/internal/fwd"
 	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
@@ -59,16 +58,23 @@ journal and the relay):
   --scope JSON      who this session may message: {"manager":{"node":"..","machine":".."},"peers":[".."],
                     "peer_machines":{"..":".."}}  (every node must be placed on a machine, or serve refuses)
 
-Session journal (plan F3; the pod mounts a sidecar-only volume at /run/ccsbx/journal):
+Session journal (plan F3; the pod mounts a sidecar-only volume at /run/ccsbx/journal, whose root is
+root-owned 0777, so the journal directory is one level below it and made here as 0700):
   --journal-dir D   records forwarder lifecycle (fwd.loaded/expired/denied) and every relay decision;
-                    empty = no journal. Needs --sid and --gen.
+                    empty = no journal. Needs --sid and --gen. Use /run/ccsbx/journal/s.
 
 Outbox relay (the fence's request files, read with the daemon's file checks):
   --out D           the fence's outbox (read-only mount); empty = no relay
   --in D            where replies go (in/replies is made here)       (required with --out)
-  --state D         the relay's ledger, in a sidecar-only volume      (required with --out)
+  --state D         the relay's ledger: a directory made 0700 under the sidecar-only volume
+                    (required with --out; use /run/ccsbx/side/state)
   --fence-uid N     the uid every request file must have              (default 10001)
   --relay-every DUR scan interval                                     (default 1s)
+
+Where state may live: --control, --state, --journal-dir, --routes and --ca-file must not be under a mount the
+fence can write (default: /work /run/ccsbx/out /home/agent; --fence-writable PATH adds more, repeatable,
+CCSBX_SIDE_FENCE_WRITABLE is a space-separated list). The directories must be ours and 0700; the files
+regular, not group/other-writable, owned by us or root. serve refuses to start otherwise.
 
 Bus relay (msg.send to a session on another machine, through the hub, signed with the generation key):
   --hub-url URL     the hub as the pod reaches it (the operator egress Service to hp:4011); needs --out,
@@ -76,7 +82,7 @@ Bus relay (msg.send to a session on another machine, through the hub, signed wit
 
 Recipes:
   bus relay on:       ccsbx side serve --control … --door model=URL --sid sX --gen 1 --label L --machine hp --scope '{…}' \
-                        --journal-dir /run/ccsbx/journal --out /run/ccsbx/out --in /run/ccsbx/in --state /run/ccsbx/side-state --hub-url http://hub:4011
+                        --journal-dir /run/ccsbx/journal/s --out /run/ccsbx/out --in /run/ccsbx/in --state /run/ccsbx/side/state --hub-url http://hub:4011
   from the launcher:  ccsbx token mint … --fwd-secrets | kubectl exec -i -c side POD -- ccsbx side load --control /run/ccsbx/side/ctl/ctl.sock
   what the fence sees: the forwarder port only; try  curl -s localhost:8080/model/health  (503 until loaded)
 Not built yet (F3c): git commit/push.
@@ -128,6 +134,8 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.IntVar(&o.FenceUID, "fence-uid", int(envInt("FENCE_UID", 10001)), "")
 	fs.DurationVar(&o.RelayEvery, "relay-every", envDur("RELAY_EVERY", time.Second), "")
 	fs.StringVar(&o.HubURL, "hub-url", envOr("HUB_URL", ""), "")
+	var fenceW multi
+	fs.Var(&fenceW, "fence-writable", "")
 	var doorFlags multi
 	fs.Var(&doorFlags, "door", "")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -157,18 +165,12 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 		}
 		doors[name] = u
 	}
-	var rules []fwd.Rule
-	if *routesFile != "" {
-		b, err := os.ReadFile(*routesFile)
-		if err == nil {
-			err = json.Unmarshal(b, &rules)
-		}
-		if err != nil {
-			fmt.Fprintln(stderr, "side:", err)
-			return 2
-		}
+	if len(fenceW) == 0 {
+		fenceW = strings.Fields(os.Getenv("CCSBX_SIDE_FENCE_WRITABLE"))
 	}
-	o.Config = Config{Listen: *listen, Control: *control, Doors: doors, Rules: rules, CAFile: *caFile,
+	o.FenceWritable = append(append([]string(nil), DefaultFenceWritable...), fenceW...)
+	o.RoutesFile = *routesFile
+	o.Config = Config{Listen: *listen, Control: *control, Doors: doors, CAFile: *caFile,
 		MaxBody: *maxBody, AllowUID: *allowUID, Logf: func(f string, a ...any) { fmt.Fprintf(stderr, f+"\n", a...) }}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
 	defer stop()
@@ -177,6 +179,10 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 // ServeOptions is everything `side serve` takes besides the secrets.
 type ServeOptions struct {
+	// wrapJournal is a test seam: it lets a test slow the relay\'s last journal write down to prove serve waits for it.
+	wrapJournal                        func(Appender) Appender
+	RoutesFile                         string
+	FenceWritable                      []string // mounts the fence can write; nothing of ours may live there
 	Config                             Config
 	Sid, Label, FullID, Machine, Scope string
 	Gen                                int
@@ -190,12 +196,53 @@ type ServeOptions struct {
 func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 	logf := o.Config.Logf
 	fail := func(format string, a ...any) int { fmt.Fprintf(stderr, "side: "+format+"\n", a...); return 2 }
+	uid := os.Getuid()
+	for name, p := range map[string]string{"--control": o.Config.Control, "--state": o.State, "--journal-dir": o.JournalDir,
+		"--routes": o.RoutesFile, "--ca-file": o.Config.CAFile} {
+		if r, bad := underAny(p, o.FenceWritable); p != "" && bad {
+			return fail("%s %s is under %s, which the fence can write", name, p, r)
+		}
+	}
+	for name, p := range map[string]string{"--state": o.State, "--journal-dir": o.JournalDir} {
+		if p != "" {
+			if err := ownDir(p, uid); err != nil {
+				return fail("%s: %v", name, err)
+			}
+		}
+	}
+	for name, p := range map[string]string{"--routes": o.RoutesFile, "--ca-file": o.Config.CAFile} {
+		if p != "" {
+			if err := trustedFile(p, uid); err != nil {
+				return fail("%s: %v", name, err)
+			}
+		}
+	}
+	if o.RoutesFile != "" {
+		b, err := os.ReadFile(o.RoutesFile)
+		if err == nil {
+			err = json.Unmarshal(b, &o.Config.Rules)
+		}
+		if err != nil {
+			return fail("--routes: %v", err)
+		}
+	}
+	if o.Out != "" && o.RelayEvery <= 0 {
+		return fail("--relay-every must be positive")
+	}
+	if o.HubURL != "" {
+		if u, err := url.Parse(o.HubURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.User != nil {
+			return fail("--hub-url must be an http(s) URL with a host and no credentials")
+		}
+	}
 	var scope msg.Scope
 	if o.HubURL != "" || o.Scope != "" {
 		var err error
 		if scope, err = parseScope(o.Scope); err != nil {
 			return fail("%v", err)
 		}
+	}
+	if o.HubURL != "" && o.Machine != "" && scope.Manager.Machine == o.Machine {
+		return fail("--scope places the manager on this pod's own machine (%s); the bus reaches other machines only", o.Machine)
 	}
 	if o.HubURL != "" && (o.Out == "" || o.Machine == "" || o.Sid == "") {
 		return fail("--hub-url needs --out, --machine and --sid")
@@ -221,19 +268,23 @@ func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
+	jr := journalOrNil(js)
+	if jr != nil && o.wrapJournal != nil {
+		jr = o.wrapJournal(jr)
+	}
 	var relay *Relay
 	if o.Out != "" {
 		fwdFn := func(context.Context, hostd.Request) hostd.Reply { return busReply("refused", "unsupported_in_pod") }
 		if o.HubURL != "" {
 			bus, err := NewBus(BusConfig{HubURL: o.HubURL, Machine: o.Machine, Sid: o.Sid, Label: o.Label, Scope: scope,
-				Cred: s.Relay, Journal: journalOrNil(js), Logf: logf})
+				Cred: s.Relay, Journal: jr, Logf: logf})
 			if err != nil {
 				return fail("%v", err)
 			}
 			fwdFn = bus.Forward
 		}
 		rc := RelayConfig{Out: o.Out, In: o.In, State: o.State, Sid: o.Sid, Gen: o.Gen, Label: o.Label, FullID: o.FullID,
-			FenceUID: o.FenceUID, Forward: fwdFn, Journal: journalOrNil(js), Logf: logf}
+			FenceUID: o.FenceUID, Forward: fwdFn, Journal: jr, Logf: logf}
 		if relay, err = NewRelay(rc); err != nil {
 			return fail("%v", err)
 		}

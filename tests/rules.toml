@@ -1780,10 +1780,10 @@ where = "any"
 
 [[rule]]
 id = "side-serve-wires-relay-journal-bus"
-title = "`ccsbx side serve` runs the forwarder, the session journal, the outbox relay and the bus sender together, and refuses a half-wired configuration or a scope with an unplaced node before anything listens"
+title = "`ccsbx side serve` runs the forwarder, the session journal, the outbox relay and the bus sender together, refuses a half-wired configuration, a scope with an unplaced node, state under a fence-writable mount or in a directory that is not ours and private, before anything listens, and waits for the relay's last journal write before it ends"
 suite = "keys"
 allow = "tests/go-test.sh ./internal/side 'TestServeRunsTheForwarderTheRelayTheBusAndTheJournalTogether$'"
-block = "tests/go-test.sh ./internal/side 'TestServeRefusesAHalfWiredConfiguration$|TestScopeMustPlaceEveryNode$|TestUsageNamesTheNewFlags$'"
+block = "tests/go-test.sh ./internal/side 'TestServeRefusesAHalfWiredConfiguration$|TestScopeMustPlaceEveryNode$|TestUsageNamesTheNewFlags$|TestServeRefusesStateWhereTheFenceCanWrite$|TestServeRequiresItsStateToBePrivate$|TestServeMakesItsStateDirectoriesUnderAnOpenVolumeRoot$|TestServeRefusesMisconfigurationsThatWouldFailSilently$|TestServeWritesTheRelaysFinalShedSummaryBeforeItEnds$'"
 invariants = [12]
 backends = ["unit"]
 where = "any"

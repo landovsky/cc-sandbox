@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -486,5 +487,28 @@ func TestParseSpecNormalisesTheRealm(t *testing.T) {
 	}
 	if _, err := ParseSpec([]byte(fmt.Sprintf(base, `,"realm":"Prod"`))); err == nil {
 		t.Fatal("a realm the queue would refuse was accepted")
+	}
+}
+
+// context: the owner is part of a session's id, which the journal and the session token trust. In
+// helper mode any process that reaches hostd's socket could otherwise start a session "as" another
+// user by writing that name in the spec. The owner is the socket peer's passwd name; a different one
+// is refused.
+func TestOwnerComesFromThePeerNotTheSpecAllow(t *testing.T) {
+	lookup := func(id string) (*user.User, error) { return &user.User{Uid: id, Username: "tomas"}, nil }
+	if err := CheckOwner(1000, "tomas", lookup); err != nil {
+		t.Fatalf("the caller's own name was refused: %v", err)
+	}
+}
+
+func TestSpecClaimingAnotherOwnerIsRefusedBlock(t *testing.T) {
+	lookup := func(id string) (*user.User, error) { return &user.User{Uid: id, Username: "tomas"}, nil }
+	err := CheckOwner(1000, "root", lookup)
+	if r, ok := err.(*Refusal); !ok || r.Code != BadSpec {
+		t.Fatalf("a spec under another owner's name was accepted: %v", err)
+	}
+	unknown := func(string) (*user.User, error) { return nil, os.ErrNotExist }
+	if err := CheckOwner(4242, "tomas", unknown); err == nil {
+		t.Fatal("a caller with no passwd entry was accepted: fail closed")
 	}
 }

@@ -9,7 +9,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"os/user"
 	"regexp"
+	"strconv"
 )
 
 // LaunchSpec is the request body (§4.1). Unknown fields are refused so a typo can't weaken it.
@@ -103,6 +105,21 @@ type Refusal struct {
 }
 
 func (r *Refusal) Error() string { return r.Code + ": " + r.Msg }
+
+// CheckOwner refuses a spec whose owner is not the user the caller really is. The owner names the
+// session in its id (the journal and token identity), so it comes from the socket peer's uid (through
+// the passwd entry), never from the spec: otherwise anyone who can reach the socket could start a
+// session under another owner's name. lookupID is user.LookupId in production.
+func CheckOwner(uid int, owner string, lookupID func(string) (*user.User, error)) error {
+	u, err := lookupID(strconv.Itoa(uid))
+	if err != nil || u.Username == "" {
+		return refuse(BadSpec, "cannot tell who uid %d is (no passwd entry): refusing to start a session for an unknown caller", uid)
+	}
+	if owner != u.Username {
+		return refuse(BadSpec, "owner %q is not the caller (%s): a session is started under the caller's own name", owner, u.Username)
+	}
+	return nil
+}
 
 func refuse(code, format string, a ...any) *Refusal {
 	return &Refusal{Code: code, Msg: fmt.Sprintf(format, a...)}

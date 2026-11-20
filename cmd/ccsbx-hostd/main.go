@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -187,6 +188,10 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	srv.Start = func(uid int, specJSON []byte) (*start.StartReply, error) {
 		spec, err := start.ParseSpec(specJSON)
 		if err != nil {
+			return nil, err
+		}
+		// The owner names the session in its id: it is the caller (socket peer), not what the spec says.
+		if err := start.CheckOwner(uid, spec.Owner, user.LookupId); err != nil {
 			return nil, err
 		}
 		d := *sd // a copy per call: Uid differs, everything else is hostd's configuration

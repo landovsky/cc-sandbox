@@ -62,6 +62,9 @@ type Deps struct {
 	// OpenDir opens a directory without following any symlink; Mounter stages it; HomeOf is a
 	// user's passwd home (for the hidden-directory rule, independent of HOME).
 	OpenDir func(path string) (*os.File, error)
+	// SameMountNS reports whether this process is in the host's mount namespace (pid 1's). The
+	// staging mounts and docker's own view of them only agree there.
+	SameMountNS func() (bool, error)
 	// Strip clears setuid/setgid bits a fence left in a worktree (backend.StripSetid).
 	Strip   func(root *os.File, owner int, logf func(string, ...any)) (int, error)
 	Mounter Mounter
@@ -170,7 +173,7 @@ func Real(getenv func(string) string) *Deps {
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
 		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
-		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS,
 	}
 }
 
@@ -193,4 +196,19 @@ func lookupUser(name string) (int, int, error) {
 		return 0, 0, fmt.Errorf("user %s has uid %q gid %q", name, u.Uid, u.Gid)
 	}
 	return uid, gid, nil
+}
+
+// sameMountNS compares this process's mount namespace with pid 1's.
+func sameMountNS() (bool, error) { return sameNS("/proc/self/ns/mnt", "/proc/1/ns/mnt") }
+
+func sameNS(a, b string) (bool, error) {
+	la, err := os.Readlink(a)
+	if err != nil {
+		return false, err
+	}
+	lb, err := os.Readlink(b)
+	if err != nil {
+		return false, err
+	}
+	return la == lb, nil
 }

@@ -24,6 +24,11 @@ const (
 // root's filesystem, and changes the mode on the opened file (not on a path that could be swapped
 // meanwhile). logf is told about each file changed. It returns how many.
 func StripSetid(root *os.File, owner int, logf func(format string, args ...any)) (int, error) {
+	return stripSetid(root, owner, FenceUID, logf)
+}
+
+// stripSetid is StripSetid with the fence's id as a parameter (tests cannot create files owned by 10001).
+func stripSetid(root *os.File, owner, fence int, logf func(format string, args ...any)) (int, error) {
 	var rst syscall.Stat_t
 	if err := syscall.Fstat(int(root.Fd()), &rst); err != nil {
 		return 0, err
@@ -33,12 +38,12 @@ func StripSetid(root *os.File, owner int, logf func(format string, args ...any))
 		return 0, fmt.Errorf("strip: %w", err)
 	}
 	n, seen := 0, 0
-	err = stripDir(dfd, "", 0, rst.Dev, owner, logf, &n, &seen)
+	err = stripDir(dfd, "", 0, rst.Dev, owner, fence, logf, &n, &seen)
 	return n, err
 }
 
 // stripDir takes ownership of dfd and closes it.
-func stripDir(dfd int, rel string, depth int, dev uint64, owner int, logf func(string, ...any), n, seen *int) error {
+func stripDir(dfd int, rel string, depth int, dev uint64, owner, fence int, logf func(string, ...any), n, seen *int) error {
 	d := os.NewFile(uintptr(dfd), rel)
 	defer d.Close()
 	if depth > maxStripDepth {
@@ -75,11 +80,14 @@ func stripDir(dfd int, rel string, depth int, dev uint64, owner int, logf func(s
 			if err != nil {
 				continue
 			}
-			if err := stripDir(sub, child, depth+1, dev, owner, logf, n, seen); err != nil {
+			if err := stripDir(sub, child, depth+1, dev, owner, fence, logf, n, seen); err != nil {
 				return err
 			}
 		case syscall.S_IFREG:
-			if st.Mode&(syscall.S_ISUID|syscall.S_ISGID) == 0 || int(st.Uid) == owner {
+			// Only what the fence could have made: owned by the fence's uid or gid. A hardlink in the
+			// worktree to some other setuid file (/usr/bin/sudo, with fs.protected_hardlinks=0) is the
+			// SAME inode, and clearing its bit would clear it everywhere.
+			if st.Mode&(syscall.S_ISUID|syscall.S_ISGID) == 0 || int(st.Uid) == owner || (int(st.Uid) != fence && int(st.Gid) != fence) {
 				continue
 			}
 			ffd, err := syscall.Openat(dfd, name, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)

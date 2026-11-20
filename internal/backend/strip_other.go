@@ -14,3 +14,7 @@ import (
 func StripSetid(*os.File, int, func(string, ...any)) (int, error) {
 	return 0, fmt.Errorf("the setid strip is linux only")
 }
+
+func stripSetid(*os.File, int, int, func(string, ...any)) (int, error) {
+	return 0, fmt.Errorf("the setid strip is linux only")
+}

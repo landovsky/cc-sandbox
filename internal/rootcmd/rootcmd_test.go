@@ -120,6 +120,8 @@ type fx struct {
 	rec               *start.Record
 	env               map[string]string
 	mounter           *fakeMounter
+	sameNS            bool
+	nsErr             error
 	strips            []stripCall
 	stripErr          error
 	execs             []execCall
@@ -175,6 +177,7 @@ func newFx(t *testing.T) *fx {
 	put(t, filepath.Join(f.dir, "bin", "docker"), "#!/bin/sh\n", 0o755)
 	put(t, filepath.Join(f.dir, "bin", "tmux"), "#!/bin/sh\n", 0o755)
 	put(t, filepath.Join(f.dir, "etc", "pins.toml"), "[[pin]]\nref = \""+goodImage+"\"\ncc = \"2.1.0\"\n", 0o644)
+	f.sameNS = true
 	f.writeConfig("")
 	f.rec = &start.Record{Sid: sid, Gen: 2, Label: "cc-sandbox:x", Uid: me, Spec: start.LaunchSpec{
 		Machine: "hp-ubuntu", Profile: "dev-default", Billing: "stub", Owner: "tomas", Workdir: start.Workdir{Path: f.wd},
@@ -203,7 +206,7 @@ func (f *fx) writeConfig(extra string) {
 			}
 			return svcUID, svcGID, nil
 		},
-		OpenDir: OpenDir, Mounter: f.mounter,
+		OpenDir: OpenDir, Mounter: f.mounter, SameMountNS: func() (bool, error) { return f.sameNS, f.nsErr },
 		Strip: func(root *os.File, owner int, _ func(string, ...any)) (int, error) {
 			st, _ := root.Stat()
 			f.strips = append(f.strips, stripCall{st.Sys().(*syscall.Stat_t).Ino, owner, len(f.mounter.binds)})
@@ -1001,5 +1004,28 @@ func TestStopAndGcStripSetidBits(t *testing.T) {
 	g.stripErr = fmt.Errorf("boom")
 	if c, _ := g.call("gc"); c != 1 {
 		t.Error("a failed strip at gc was reported as success")
+	}
+}
+
+// R1: in another mount namespace (hostd's sandboxed unit) the staging and docker would see
+// different trees, so run refuses rather than start a fence on an empty workdir.
+func TestRunRefusesOutsideTheHostMountNamespace(t *testing.T) {
+	f := newFx(t)
+	f.sameNS = false
+	f.wantRefusedMsg("another mount namespace", "mount namespace", "run", sid)
+	g := newFx(t)
+	g.nsErr = fmt.Errorf("permission denied")
+	g.wantRefusedMsg("an unreadable namespace", "cannot compare mount namespaces", "run", sid)
+}
+
+func TestSameNS(t *testing.T) {
+	if ok, err := sameNS("/proc/self/ns/mnt", "/proc/self/ns/mnt"); err != nil || !ok {
+		t.Errorf("a namespace differs from itself: %v %v", ok, err)
+	}
+	if ok, err := sameNS("/proc/self/ns/mnt", "/proc/self/ns/net"); err != nil || ok {
+		t.Errorf("a mount and a net namespace compared equal: %v %v", ok, err)
+	}
+	if _, err := sameNS("/proc/self/ns/mnt", "/nonexistent"); err == nil {
+		t.Error("an unreadable namespace was accepted")
 	}
 }

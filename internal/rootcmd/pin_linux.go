@@ -19,6 +19,9 @@ import (
 // oPath is O_PATH (not in package syscall).
 const oPath = 0x200000
 
+// umountNoFollow is UMOUNT_NOFOLLOW (not in package syscall): never unmount through a symlink.
+const umountNoFollow = 0x8
+
 // openDirNoFollow opens the absolute, clean path as an O_PATH directory fd, walking from "/" one
 // component at a time with O_NOFOLLOW. A symlink at any component fails the open (ELOOP).
 func openDirNoFollow(path string) (*os.File, error) {
@@ -57,14 +60,14 @@ func (realMounter) Bind(src *os.File, target string, readonly bool) error {
 		flags |= syscall.MS_RDONLY
 	}
 	if err := syscall.Mount("", target, "", flags, ""); err != nil {
-		syscall.Unmount(target, syscall.MNT_DETACH)
+		syscall.Unmount(target, syscall.MNT_DETACH|umountNoFollow)
 		return fmt.Errorf("remount %s: %w", target, err)
 	}
 	return nil
 }
 
 func (realMounter) Unmount(target string) error {
-	if err := syscall.Unmount(target, syscall.MNT_DETACH); err != nil && err != syscall.EINVAL && err != syscall.ENOENT {
+	if err := syscall.Unmount(target, syscall.MNT_DETACH|umountNoFollow); err != nil && err != syscall.EINVAL && err != syscall.ENOENT {
 		return err
 	}
 	return nil

@@ -859,7 +859,7 @@ func TestStripSetidClearsPlantedBits(t *testing.T) {
 	defer root.Close()
 	// "owner" is someone else, so every file of this test user counts as planted by the fence...
 	var logged []string
-	n, err := StripSetid(root, os.Getuid()+1, func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) })
+	n, err := stripSetid(root, os.Getuid()+1, os.Getuid(), func(f string, a ...any) { logged = append(logged, fmt.Sprintf(f, a...)) })
 	if err != nil || n != 4 { // x, a/y, a/b/z and mine
 		t.Fatalf("cleared %d: %v", n, err)
 	}
@@ -889,7 +889,7 @@ func TestStripSetidLeavesTheOwnersFiles(t *testing.T) {
 	os.Chmod(filepath.Join(d, "mine"), os.ModeSetuid|0o755)
 	root, _ := os.Open(d)
 	defer root.Close()
-	if n, err := StripSetid(root, os.Getuid(), nil); err != nil || n != 0 {
+	if n, err := stripSetid(root, os.Getuid(), os.Getuid(), nil); err != nil || n != 0 {
 		t.Fatalf("%d %v", n, err)
 	}
 	if st, _ := os.Stat(filepath.Join(d, "mine")); st.Mode()&os.ModeSetuid == 0 {
@@ -906,5 +906,31 @@ func TestRunArgsSeccomp(t *testing.T) {
 	s.Seccomp = "/etc/ccsbx/seccomp.json"
 	if !has(s.RunArgs(), "--security-opt", "seccomp=/etc/ccsbx/seccomp.json") {
 		t.Errorf("%v", s.RunArgs())
+	}
+}
+
+// R3: only what the fence owns is touched. A hardlink in the worktree to a setuid file of someone
+// else (with fs.protected_hardlinks=0, /usr/bin/sudo is one) is the same inode: clearing its bit
+// would clear it for the whole system.
+func TestStripSetidLeavesHardlinkedFilesOfOthers(t *testing.T) {
+	d, elsewhere := vt(t), vt(t)
+	target := filepath.Join(elsewhere, "sudo")
+	os.WriteFile(target, nil, 0o755)
+	os.Chmod(target, os.ModeSetuid|0o755)
+	if err := os.Link(target, filepath.Join(d, "innocent-name")); err != nil {
+		t.Skipf("no hardlinks here: %v", err)
+	}
+	root, _ := os.Open(d)
+	defer root.Close()
+	// the fence is "someone else" than the owner of this file, as uid 10001 is not root
+	n, err := stripSetid(root, os.Getuid()+1, os.Getuid()+2, nil)
+	if err != nil || n != 0 {
+		t.Fatalf("%d %v", n, err)
+	}
+	if st, _ := os.Stat(target); st.Mode()&os.ModeSetuid == 0 {
+		t.Error("a hardlinked setuid file of another owner lost its bit")
+	}
+	if FenceUID != 10001 {
+		t.Error("the production strip must be the fence's uid")
 	}
 }

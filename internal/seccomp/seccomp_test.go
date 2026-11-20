@@ -13,7 +13,7 @@ import (
 
 const base = `{"defaultAction":"SCMP_ACT_ERRNO","defaultErrnoRet":1,"architectures":["SCMP_ARCH_X86_64"],
  "syscalls":[
-  {"names":["read","write","chmod","fchmod","fchmodat","fchmodat2","open","openat","openat2","creat","mknod","mknodat"],"action":"SCMP_ACT_ALLOW"},
+  {"names":["read","write","io_uring_setup","chmod","fchmod","fchmodat","fchmodat2","open","openat","openat2","creat","mknod","mknodat"],"action":"SCMP_ACT_ALLOW"},
   {"names":["close","openat"],"action":"SCMP_ACT_ALLOW","includes":{"minKernel":"5.0"}},
   {"names":["clone"],"action":"SCMP_ACT_ALLOW","args":[{"index":0,"value":2114060288,"op":"SCMP_CMP_MASKED_EQ"}]},
   {"names":["mknodat"],"action":"SCMP_ACT_ALLOW","args":[{"index":2,"value":0,"op":"SCMP_CMP_EQ"}],"includes":{"caps":["CAP_MKNOD"]}},
@@ -107,6 +107,12 @@ func TestVerifyRefusesWeakenedProfiles(t *testing.T) {
 		"openat2 allowed": mutate(t, g, func(sys []any) []any {
 			return append(sys, map[string]any{"names": []any{"openat2"}, "action": "SCMP_ACT_ALLOW"})
 		}),
+		"io_uring_enter allowed": mutate(t, g, func(sys []any) []any {
+			return append(sys, map[string]any{"names": []any{"io_uring_enter"}, "action": "SCMP_ACT_ALLOW"})
+		}),
+		"io_uring_register allowed under a condition": mutate(t, g, func(sys []any) []any {
+			return append(sys, map[string]any{"names": []any{"io_uring_register"}, "action": "SCMP_ACT_ALLOW", "includes": map[string]any{"minKernel": "5.1"}})
+		}),
 		"openat2 not refused": mutate(t, g, func(sys []any) []any {
 			var out []any
 			for _, e := range sys {
@@ -160,4 +166,24 @@ func mutate(t *testing.T, profile string, f func([]any) []any) string {
 	p["syscalls"] = f(p["syscalls"].([]any))
 	b, _ := json.Marshal(p)
 	return string(b)
+}
+
+// A base that allows io_uring (which creates files without the filtered syscalls) has it removed
+// by Overlay, and Verify refuses a profile that allows it.
+func TestOverlayRemovesIoUringFromAllowEntries(t *testing.T) {
+	out, err := Overlay([]byte(base))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p struct {
+		Syscalls []entry `json:"syscalls"`
+	}
+	json.Unmarshal(out, &p)
+	for _, e := range p.Syscalls {
+		for _, n := range e.Names {
+			if strings.HasPrefix(n, "io_uring") && e.Action == "SCMP_ACT_ALLOW" {
+				t.Errorf("%s is still allowed", n)
+			}
+		}
+	}
 }

@@ -36,6 +36,11 @@ var refused = []string{"openat2"}
 
 const enosys = 38
 
+// denied must not be allowed by any entry: the profile's default (EPERM) then refuses them. io_uring
+// performs file operations (opens, creates with a mode) inside the kernel without going through the
+// syscalls above, so a filter on those is bypassed unless io_uring itself is off.
+var denied = []string{"io_uring_setup", "io_uring_enter", "io_uring_register"}
+
 func sortedNames() []string {
 	var n []string
 	for k := range guarded {
@@ -82,6 +87,9 @@ func Overlay(base []byte) ([]byte, error) {
 		return nil, err
 	}
 	drop := map[string]bool{"openat2": true}
+	for _, n := range denied {
+		drop[n] = true
+	}
 	for n := range guarded {
 		drop[n] = true
 	}
@@ -160,6 +168,11 @@ func Verify(profile []byte) error {
 	openat2Refused := false
 	for _, e := range p.Syscalls {
 		for _, n := range e.Names {
+			for _, d := range denied {
+				if n == d && !isDenial(e.Action) {
+					return fmt.Errorf("seccomp profile allows %s (io_uring performs file creation outside the filtered syscalls)", n)
+				}
+			}
 			if n == "openat2" {
 				if isDenial(e.Action) {
 					openat2Refused = true

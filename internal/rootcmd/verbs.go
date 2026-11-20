@@ -99,6 +99,14 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	// The staging mounts and docker's view of them agree only in the host's mount namespace. Inside
+	// a sandboxed unit (a private /home, say) the workdir would be missing or empty, and the fence
+	// would silently start on nothing: refuse instead.
+	if same, err := e.d.SameMountNS(); err != nil {
+		return 0, refuse("cannot compare mount namespaces: %v", err)
+	} else if !same {
+		return 0, refuse("this process is not in the host's mount namespace (a sandboxed unit?): the fence would get a different view of the workdir. Run ccsbx-root from the host's namespace")
+	}
 	rec, err := e.session(w, sid)
 	if err != nil {
 		return 0, err

@@ -126,7 +126,7 @@
   refuses to start a fence unless `/etc/ccsbx/seccomp.json` is root-owned and verified. It is Docker's
   default profile with `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `open`, `openat`, `creat`, `mknod`
   and `mknodat` allowed only when the mode has no setuid or setgid bit (a setid mode falls to the
-  profile's EPERM default) and `openat2` refused. Nobody can fetch the base on the night; at the gate:
+  profile's EPERM default) and `openat2` and `io_uring_*` refused. Nobody can fetch the base on the night; at the gate:
   ```
   V=$(docker version --format '{{.Server.Version}}')
   curl -fsSL -o default.json https://raw.githubusercontent.com/moby/moby/v$V/profiles/seccomp/default.json

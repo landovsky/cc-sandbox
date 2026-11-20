@@ -4,3 +4,4 @@ spike/results/*.log
 __pycache__/
 /bin/ccsbx
 /dist/
+/bin/ccsbx-hostd

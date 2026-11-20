@@ -4,6 +4,7 @@
 package start
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -450,5 +451,40 @@ func TestSessionForWorkdir(t *testing.T) {
 	}
 	if _, ok := SessionForWorkdir(t.TempDir(), wt); ok {
 		t.Fatal("matched in an empty state dir")
+	}
+}
+
+// context: cc-tree's LaunchSpec carries the node's Grants: line as "grants". The daemon refuses
+// unknown fields (a typo must not weaken a spec), so the field must be a known one.
+func TestSpecAcceptsGrantsFromCCTree(t *testing.T) {
+	b, _ := os.ReadFile("../../tests/specs/hello.json")
+	b = []byte(strings.Replace(string(b), `"billing":"stub",`, `"billing":"stub","grants":["g1","g2"],`, 1))
+	s, err := ParseSpec(b)
+	if err != nil || len(s.Grants) != 2 {
+		t.Fatalf("%v %+v", err, s)
+	}
+}
+
+// context: the cockpit asks `ccsbx ls` on a machine where nothing was ever started: an empty
+// list, not an error.
+func TestNoSessionsDirIsAnEmptyListNotAnError(t *testing.T) {
+	d := &Daemon{StateDir: t.TempDir()}
+	recs, err := d.Records()
+	if err != nil || len(recs) != 0 {
+		t.Fatalf("%v %v", recs, err)
+	}
+}
+
+// context: a spec without a realm (an older cc-tree, a stub) used to journal session.* events under
+// "" and ccf.* under "production", so a cockpit reading one realm missed half of a session. The
+// realm is normalised once, at parse time; one the verb queue would refuse is refused at start.
+func TestParseSpecNormalisesTheRealm(t *testing.T) {
+	base := `{"v":1,"request_id":"r","owner":"tomas","machine":"m","label":"l","harness":"claude","profile":"p"%s}`
+	s, err := ParseSpec([]byte(fmt.Sprintf(base, "")))
+	if err != nil || s.Realm != "production" {
+		t.Fatalf("%v %+v", err, s)
+	}
+	if _, err := ParseSpec([]byte(fmt.Sprintf(base, `,"realm":"Prod"`))); err == nil {
+		t.Fatal("a realm the queue would refuse was accepted")
 	}
 }

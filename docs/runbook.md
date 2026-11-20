@@ -102,7 +102,8 @@
      `pins.toml` is a candidate that only e2e profiles may run. `--machine` is the lowercased `hostname -s`, written to
      both hostd's unit and `ccsbx-root.toml`, so root never refuses a start over a mixed-case name. hostd's
      `--worktree-root` is the `--allowed-roots` value `ccsbx-root.toml` gets (default `~/git,~/wt`; the same comma list
-     for both, no spaces, no empty entry, no trailing slash); its `--run-dir` is `/var/lib/ccsbx-run`.
+     for both, no spaces, no empty entry, no trailing slash, and each a real path: `readlink -f` must give the root itself, because hostd checks
+     roots lexically and would refuse every start under a symlinked root); its `--run-dir` is `/var/lib/ccsbx-run`.
      **Signer scope:** before it enables the signer socket the install has `ccsbx-signer --write-scope` write
      `/var/lib/ccsbx-keys/signer.scope` (0600, `ccsbx-keys`); without it the signer exits 2. The scope lists the
      owner, the machine name and the exact profile:billing pairs from `profiles/*.json` (a profile is signed

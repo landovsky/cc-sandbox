@@ -445,6 +445,19 @@ for r in '/srv/a,' ',/srv/a' '/srv/a,,/srv/b' '/srv/a/' '/srv//a'; do
   t "helper: --allowed-roots '$r' (an empty entry or a trailing slash: hostd would refuse every start) is refused (exit 3)" test "$rc" -eq 3
 done
 
+echo "# allowed roots must be real paths: hostd checks them lexically, so a symlinked root refuses every start"
+d="$(fx real)"; mkdir -p "$d/root/srv/real"; ln -s real "$d/root/srv/link"
+ins "$d" install --yes --allowed-roots /srv/link >/dev/null 2>"$d/err"; rc=$?
+t "roots: a root that is a symlink is refused (exit 3), naming it, nothing changed" bash -c '[ '"$rc"' -eq 3 ] && grep -q "is not a real path" "$1" && grep -q "/srv/link" "$1" && [ ! -s "$2" ]' _ "$d/err" "$d/rec/cmds"
+mkdir -p "$d/root/srv/x"; ln -s ../x "$d/root/srv/real/inner"
+ins "$d" install --yes --allowed-roots /srv/real/inner >/dev/null 2>"$d/err"; rc=$?
+t "roots: a root with a symlink as its last component (relative target) is refused too" test "$rc" -eq 3
+ln -s real "$d/root/srv/viadir"; mkdir -p "$d/root/srv/real/sub"
+ins "$d" install --yes --allowed-roots /srv/viadir/sub >/dev/null 2>"$d/err"; rc=$?
+t "roots: a root reached THROUGH a symlinked directory (/srv/viadir/sub) is refused" test "$rc" -eq 3
+ins "$d" install --yes --allowed-roots /srv/real/sub >/dev/null 2>"$d/err"; rc=$?
+t "roots: a real directory is accepted (exit 0)" bash -c '[ '"$rc"' -eq 0 ] || { cat "$1" >&2; exit 1; }' _ "$d/err"
+
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"
 

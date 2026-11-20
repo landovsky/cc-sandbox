@@ -109,7 +109,15 @@ ROOT_ERRORS=(); ALLOWED_ROOTS_TOML=""
 IFS=, read -r -a _roots <<<"$ALLOWED_ROOTS"
 for _r in "${_roots[@]}"; do
   if [[ "$_r" =~ ^/[A-Za-z0-9._@+/-]+$ ]] && [ "$_r" != / ] && [[ "$_r" != *..* ]] && [[ "$_r" != */ ]] && [[ "$_r" != *//* ]]; then
-    [ -n "$PREFIX" ] || [ -d "$_r" ] || ROOT_ERRORS+=("allowed root $_r does not exist")
+    # a root must be a real directory whose realpath is itself: hostd checks roots lexically, so a symlinked root
+    # (or one with a symlink in its path) would make it refuse every start
+    _p="$(pth "$_r")"; _base=""; [ -z "$PREFIX" ] || _base="$(readlink -f "$PREFIX")"
+    if [ -z "$PREFIX" ] || [ -e "$_p" ]; then
+      if [ ! -d "$_p" ]; then ROOT_ERRORS+=("allowed root $_r does not exist")
+      elif [ "$(readlink -f "$_p")" != "$_base$_r" ]; then
+        ROOT_ERRORS+=("allowed root $_r is not a real path (readlink -f gives $(readlink -f "$_p")): a symlink, or a symlink in its path; give the real directory")
+      fi
+    fi
     ALLOWED_ROOTS_TOML+="\"$_r\", "
   else ROOT_ERRORS+=("allowed root '$_r' is not a plain absolute path (no /, .., quotes, globs or spaces)"); fi
 done

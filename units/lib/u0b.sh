@@ -8,13 +8,14 @@
 # shellcheck shell=bash
 
 KEYS_DIR=/var/lib/ccsbx-keys
+LAUNCH_DIR=/var/lib/ccsbx-launch               # ccsbx-launch: the launcher kubeconfig and token, 0700
 STATE_DIR=/var/lib/ccsbx
 SIGNER_SOCK=/run/ccsbx-signer/sign.sock       # systemd creates it (ccsbx-signer.socket): ccsbx-keys:ccsbx 0660
 HOSTD_SOCK=/run/ccsbx-api/hostd.sock          # hostd makes it: ccsbx:ccsbx-clients 0660 (dir 0755)
 KEY_FILES="age.key machine.key"
 
 u0b_users() {
-  step "U0b users and directories: ccsbx (hostd), ccsbx-keys (keys), group ccsbx-clients"
+  step "U0b users and directories: ccsbx (hostd), ccsbx-keys (signer only), ccsbx-launch (launcher credential), ccsbx-term (no credentials), group ccsbx-clients"
   note "ccsbx-keys may already exist (R10b creates it and the age key during the day): reused, never recreated"
   if ! have_user ccsbx-keys; then
     cmd useradd --system --home-dir "$KEYS_DIR" --create-home --shell /usr/sbin/nologin ccsbx-keys
@@ -24,11 +25,22 @@ u0b_users() {
   if ! have_user ccsbx; then
     cmd useradd --system --gid ccsbx --home-dir "$STATE_DIR" --create-home --shell /usr/sbin/nologin ccsbx
   else note "user ccsbx exists"; fi
+  if ! have_user ccsbx-launch; then
+    cmd useradd --system --home-dir "$LAUNCH_DIR" --create-home --shell /usr/sbin/nologin ccsbx-launch
+  else note "user ccsbx-launch exists"; fi
+  note "ccsbx-launch holds the launcher kubeconfig and token (launcher.kubeconfig, token: 0600) and runs kubectl for the pod verbs; it is the"
+  note "  signer's --keys-peer-user. It is not the signer's user (ccsbx-keys, the machine key), not hostd's (ccsbx) and not the owner"
+  if ! have_user ccsbx-term; then
+    cmd useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ccsbx-term
+  else note "user ccsbx-term exists"; fi
+  note "ccsbx-term has no credentials, no home, no shell and no group but its own: ccsbx-root attach drops to it to run the output filter"
   have_group ccsbx-clients || cmd groupadd --system ccsbx-clients
   note "ccsbx-clients may talk to hostd's local socket; it grants no root path"
   cmd gpasswd -a "$(real_user)" ccsbx-clients
   cmd chown ccsbx-keys:ccsbx-keys "$KEYS_DIR"
   cmd chmod 0700 "$KEYS_DIR"
+  cmd chown ccsbx-launch:ccsbx-launch "$LAUNCH_DIR"
+  cmd chmod 0700 "$LAUNCH_DIR"
   cmd chown ccsbx:ccsbx "$STATE_DIR"
   cmd chmod 0750 "$STATE_DIR"
   note "the signer's socket is made by systemd (ccsbx-signer.socket): ccsbx-keys:ccsbx 0660 in a 0755 dir,"
@@ -49,7 +61,7 @@ u0b_keys() {
   note "the signer will not serve without its scope (owners, machines, profile:billing pairs). The signer writes it itself"
   note "  (--write-scope: atomic, 0600): only that binary ever opens machine.key. Rewritten on every run to match the options"
   [ -n "$PAIRS" ] || { [ "$MODE" != install ] || die "no profile in the repo lists machine $MACHINE: the signer would have an empty scope"; }
-  cmd runuser -u ccsbx-keys -- "$LIBEXEC/ccsbx-signer" --keys "$KEYS_DIR" --write-scope --owners "$(real_user)" --machines "$MACHINE" --pairs "$PAIRS"
+  cmd runuser -u ccsbx-keys -- "$LIBEXEC/ccsbx-signer" --keys "$KEYS_DIR" --write-scope --owners "$(real_user)" --machines "$SCOPE_MACHINES" --pairs "$PAIRS"
   note "the printed PUBLIC key goes into config/machines/<machine>.json (M9); nothing secret is printed"
   note "the K8 kubeconfig arrives SOPS-encrypted to the age key; it is decrypted only by ccsbx-keys"
 }
@@ -109,6 +121,26 @@ u0b_check() {
   echo "-- U0b host keys"
   expect "user ccsbx-keys exists" have_user ccsbx-keys
   expect "user ccsbx exists" have_user ccsbx
+  expect "user ccsbx-launch exists" have_user ccsbx-launch
+  expect "user ccsbx-term exists" have_user ccsbx-term
+  local uids; uids="$(for u in ccsbx ccsbx-keys ccsbx-launch ccsbx-term "$(real_user)"; do id -u "$u" 2>/dev/null; done | sort | uniq -d)"
+  [ -z "$uids" ] && ok "the five users (owner, ccsbx, ccsbx-keys, ccsbx-launch, ccsbx-term) have five different uids" || bad "two of the users share uid $uids"
+  local lown; lown="$(stat -c '%U:%a' "$(pth $LAUNCH_DIR)" 2>/dev/null || echo missing)"
+  [ "$lown" = "ccsbx-launch:700" ] && ok "$LAUNCH_DIR is ccsbx-launch:700" || bad "$LAUNCH_DIR is $lown (want ccsbx-launch:700)"
+  local kf
+  for kf in launcher.kubeconfig token; do
+    if [ -e "$(pth $LAUNCH_DIR/$kf)" ]; then
+      lown="$(stat -c '%U:%a' "$(pth $LAUNCH_DIR/$kf)")"
+      [ "$lown" = "ccsbx-launch:600" ] && ok "$LAUNCH_DIR/$kf is ccsbx-launch:600" || bad "$LAUNCH_DIR/$kf is $lown (want ccsbx-launch:600)"
+    else note_check "$LAUNCH_DIR/$kf is not there yet (k3s launcher check 5 puts it there)"; fi
+  done
+  if have_user ccsbx-term && [ -z "$PREFIX" ]; then
+    local tg; tg="$(id -nG ccsbx-term)"
+    [ "$tg" = "ccsbx-term" ] && ok "ccsbx-term has no group but its own" || bad "ccsbx-term is in groups: $tg"
+    [ "$(getent passwd ccsbx-term | cut -d: -f7)" = /usr/sbin/nologin ] && ok "ccsbx-term has no shell" || bad "ccsbx-term has a shell"
+  fi
+  local hs; hs="$(stat -c '%U:%G %a' "$(pth /etc/ccsbx/hub-admin.secret)" 2>/dev/null || echo missing)"
+  [ "$hs" = "root:root 600" ] && ok "/etc/ccsbx/hub-admin.secret is root:root 600" || bad "/etc/ccsbx/hub-admin.secret is $hs (want root:root 600)"
   local own; own="$(stat -c '%U:%a' "$(pth $KEYS_DIR)" 2>/dev/null || echo missing)"
   [ "$own" = "ccsbx-keys:700" ] && ok "$KEYS_DIR is ccsbx-keys:700" || bad "$KEYS_DIR is $own (want ccsbx-keys:700)"
   local k

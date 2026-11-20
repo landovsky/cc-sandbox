@@ -52,7 +52,7 @@ func TestPodForMakesAContractPod(t *testing.T) {
 			t.Errorf("%s has env %v", c.Name, c.Env)
 		}
 	}
-	if q := p.Spec.Containers[0].Resources; q.Limits["memory"] != "4096Mi" || q.Requests["cpu"] != "2" || q.Limits["ephemeral-storage"] != "20480Mi" {
+	if q := p.Spec.Containers[0].Resources; q.Limits["memory"] != "4Gi" || q.Requests["cpu"] != "2" || q.Limits["ephemeral-storage"] != "20Gi" {
 		t.Errorf("%+v", q)
 	}
 	if h := p.Spec.HostUsers; h != nil {

@@ -74,6 +74,7 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			reply(409, map[string]string{"reason": "AlreadyExists", "message": "exists"})
 			return
 		}
+		canonicalise(p) // the server stores quantities in canonical form
 		p["status"] = map[string]any{"phase": "Pending"}
 		f.nextUID++
 		if !f.noUID {
@@ -670,5 +671,92 @@ func TestAnEmptyUIDNeverMatches(t *testing.T) {
 	ref, _ := b.ref("s0abcdefgh", 2)
 	if _, err := b.Exec(ctx, ref, "side", []string{"cat"}, IO{}); err == nil {
 		t.Error("exec into a pod with no UID, with a Ref with no UID")
+	}
+}
+
+// canonicalise does to quantities what the API server does: NMi with N a multiple of 1024 becomes
+// (N/1024)Gi, and a CPU "2000m" becomes "2". Every resources map and emptyDir sizeLimit is walked.
+func canonicalise(v any) {
+	canon := func(q string) string {
+		var n int
+		if _, err := fmt.Sscanf(q, "%dMi", &n); err == nil && fmt.Sprintf("%dMi", n) == q && n%1024 == 0 && n > 0 {
+			return fmt.Sprintf("%dGi", n/1024)
+		}
+		if _, err := fmt.Sscanf(q, "%dm", &n); err == nil && fmt.Sprintf("%dm", n) == q && n%1000 == 0 && n > 0 {
+			return fmt.Sprintf("%d", n/1000)
+		}
+		return q
+	}
+	switch x := v.(type) {
+	case map[string]any:
+		for k, e := range x {
+			if q, ok := e.(string); ok && (k == "memory" || k == "cpu" || k == "ephemeral-storage" || k == "sizeLimit") {
+				x[k] = canon(q)
+			} else {
+				canonicalise(e)
+			}
+		}
+	case []any:
+		for _, e := range x {
+			canonicalise(e)
+		}
+	}
+}
+
+// S8: the server hands back canonical quantities (1024Mi as 1Gi). A restart with the recorded UID must
+// still be recognised, so the pod we write has to be what the server stores.
+func TestARestartIsRecognisedAgainstACanonicalisingServer(t *testing.T) {
+	ctx := context.Background()
+	b, f := newBackend(t)
+	s := goodSpec()
+	s.MemoryMB, s.EphemeralMB, s.WorktreeMB = 4096, 20480, 1024 // all whole GiB: the server rewrites them
+	first, err := b.Create(ctx, s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dig(f.pods[PodName(s.Sid, s.Gen)], "spec", "volumes"); !strings.Contains(fmt.Sprint(got), "1Gi") {
+		t.Fatalf("the fake did not canonicalise: %v", got)
+	}
+	s.KnownUID = first.UID
+	if r, err := b.Create(ctx, s); err != nil || r.UID != first.UID {
+		t.Errorf("restart with the recorded UID against a canonicalising server: %+v %v", r, err)
+	}
+	for _, mb := range []int{0, 512, 1024, 1500, 4096, 20480, 40960} {
+		q := miQty(mb)
+		if q2 := miQty(mb); q != q2 || strings.HasSuffix(q, "Mi") && mb%1024 == 0 && mb > 0 {
+			t.Errorf("%d -> %s is not canonical", mb, q)
+		}
+	}
+}
+
+// Exec's live check also refuses a pod that is being deleted, or whose labels no longer say it is this
+// generation's, even with the right UID.
+func TestExecRefusesADyingOrRelabelledPodEvenWithTheRightUID(t *testing.T) {
+	ctx := context.Background()
+	b, f := newBackend(t)
+	fx := &fakeExecer{}
+	b.X = fx
+	ref, err := b.Create(ctx, goodSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := PodName("s0abcdefgh", 2)
+	for why, mod := range map[string]func(m map[string]any){
+		"being deleted": func(m map[string]any) {
+			dig(m, "metadata").(map[string]any)["deletionTimestamp"] = "2026-11-20T10:00:00Z"
+		},
+		"relabelled": func(m map[string]any) { dig(m, "metadata", "labels").(map[string]any)["ccsbx.gen"] = "9" },
+	} {
+		orig := f.pods[name]
+		raw, _ := json.Marshal(orig)
+		var cp map[string]any
+		json.Unmarshal(raw, &cp)
+		mod(cp)
+		f.pods[name] = cp
+		var ce *ConflictError
+		if _, err := b.Exec(ctx, *ref, "side", []string{"cat"}, IO{}); !errors.As(err, &ce) || fx.calls != 0 {
+			t.Errorf("%s: %v (calls %d)", why, err, fx.calls)
+		}
+		f.pods[name] = orig
 	}
 }

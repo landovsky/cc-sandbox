@@ -138,7 +138,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 		}
 	}
 	guaranteed := func(memMB, cpu, ephMB int) Resources {
-		m := map[string]string{"memory": fmt.Sprintf("%dMi", memMB), "cpu": strconv.Itoa(cpu), "ephemeral-storage": fmt.Sprintf("%dMi", ephMB)}
+		m := map[string]string{"memory": miQty(memMB), "cpu": strconv.Itoa(cpu), "ephemeral-storage": miQty(ephMB)}
 		r := map[string]string{}
 		for k, v := range m {
 			r[k] = v
@@ -146,7 +146,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 		return Resources{Requests: m, Limits: r}
 	}
 	vol := func(name string, mb int, mem bool) Volume {
-		v := Volume{Name: name, EmptyDir: &EmptyDir{SizeLimit: fmt.Sprintf("%dMi", mb)}}
+		v := Volume{Name: name, EmptyDir: &EmptyDir{SizeLimit: miQty(mb)}}
 		if mem {
 			v.EmptyDir.Medium = "Memory"
 		}
@@ -209,6 +209,16 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 	}
 	p.Metadata.Annotations = map[string]string{HashAnnotation: h}
 	return p, nil
+}
+
+// miQty writes a size the way the API server stores it: whole GiB as "NGi", anything else as "NMi".
+// The server canonicalises quantities (1024Mi comes back as 1Gi); a pod fetched after a restart is
+// compared with the pod as built (the spec hash), so what we write must already be canonical.
+func miQty(mb int) string {
+	if mb > 0 && mb%1024 == 0 {
+		return fmt.Sprintf("%dGi", mb/1024)
+	}
+	return fmt.Sprintf("%dMi", mb)
 }
 
 // specHash is the sha256 of the pod's canonical JSON without what the server or a person adds after

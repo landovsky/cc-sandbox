@@ -213,7 +213,7 @@ That's about 25 dev-days plus the gates. Parallel streams:
 | Id | Piece | Size | Owner | Needs | Acceptance test (where) |
 |---|---|---|---|---|---|
 | F1 | *Dropped* (it was doc 4's K1, docker beside k3s). Kept so old references resolve | — | — | — | — |
-| F2 | **k8s backend** (to the live contract in §4.6: label `cc-sandbox/role=session`, nodeSelector `kubernetes.io/hostname=future-two` + toleration `pool=shared:NoSchedule`, no SA token, no Secret refs, ≤ 4Gi / 4 CPU / 40Gi ephemeral per container, emptyDir worktree with `sizeLimit`): fence container + native sidecar; runAsNonRoot uid 10001, readOnlyRootFilesystem, drop ALL, seccomp RuntimeDefault, no SA token, Guaranteed QoS, `dnsPolicy: None`, `shareProcessNamespace: false`, nodeSelector + toleration, an emptyDir worktree, the image by digest; **COMING with k3s devops:#5dxt (see §4.6):** `priorityClassName: ccsbx-session`, no `runtimeClassName`, no finalizers, `terminationGracePeriodSeconds` ≤ 60. Created by hp's `ccsbx-root` (REST for create, `kubectl` for exec/attach; no ephemeral containers, so debugging and F5 use exec) | M | cs | U1b, U5, U0b, K2/K3/K8/K9/K11 | `ccsbx selftest --suites fence --backend k8s` green, `T:vap-rejects` (hp + Mac kubeconfig) |
+| F2 | **k8s backend** (to the live contract in §4.6: label `cc-sandbox/role=session`, nodeSelector `kubernetes.io/hostname=future-two` + toleration `pool=shared:NoSchedule`, no SA token, no Secret refs, ≤ 4Gi / 4 CPU / 40Gi ephemeral per container, emptyDir worktree with `sizeLimit`): fence container + native sidecar; runAsNonRoot uid 10001, readOnlyRootFilesystem, drop ALL, seccomp RuntimeDefault, no SA token, Guaranteed QoS, `dnsPolicy: None`, `shareProcessNamespace: false`, nodeSelector + toleration, an emptyDir worktree, the image by digest; **LIVE since k3s 1e76dc1 (devops:#5dxt, see §4.6):** `priorityClassName: ccsbx-session`, no `runtimeClassName`, no finalizers, `terminationGracePeriodSeconds` ≤ 60. Created by hp's `ccsbx-root` (REST for create, `kubectl` for exec/attach; no ephemeral containers, so debugging and F5 use exec) | M | cs | U1b, U5, U0b, K2/K3/K8/K9/K11 | `ccsbx selftest --suites fence --backend k8s` green, `T:vap-rejects` (hp + Mac kubeconfig) |
 | F3 | **Sidecar `ccsbx side`** (uid 10002). Forwarder: gets the token and per-generation key via `pods/exec` stdin; never in the pod spec. Outbox relay with U3a's file checks. Session journal. Bus relay with a **per-generation relay credential** (B6c) in a sidecar-only volume. Clone/commit/push with H1. **Listens only on the forwarder port**; its control plane is on unix sockets in sidecar-only volumes; it never runs `tmux attach` and treats tmux output as untrusted | M | cs | F2, P2, H1, B6c | `T:no-token-in-fence`, `T:hooks-off` on k8s; `T:fence-sees-only-fwd-port` (`ss -lntx`, `/proc/net/unix` from the fence); `T:hub-cred-sidecar-only`; `T:no-ptrace-sidecar` (hp + Mac kubeconfig) |
 | F4 | **In-cluster `ccsbx-hostd`** (in `cc-sandbox-doors`, role `hostd`, so the launcher can't exec into it or mount its PVC; amendments A1/A4): the same API (M2a/M3/M4), journal on K13's PVC, exposed via the operator, keyless (it verifies sidecars' signatures against `ccsbx-machines`); same-node delivery works with hp down | S | cs + k3s | F3, M2a, K13 | `T:journal-durable` across a pod deletion; two future-two sessions message each other with hp's hostd and hub stopped |
 | F5 | **Attach**: `ssh -t hp-ubuntu ccsbx attach <sid>` → `ccsbx-root attach` → `kubectl exec -it -c fence … tmux attach` with the kubeconfig under `ccsbx-keys` | XS | cs | F2 | `ccsbx attach <sid>` from the Mac lands in the pane; `/exit` ends the pod |
@@ -426,9 +426,8 @@ K3, K8, K9, K11 and the node watchdog are live. Pods we create must match:
 - per container at most 4Gi memory, 4 CPU and 40Gi ephemeral storage;
 - the worktree in an `emptyDir` with a `sizeLimit`.
 
-**COMING: applies once k3s devops:#5dxt merges** (k3s branch `ccsbx-vap-tighten`, 6802414; **not
-merged**, it waits for Tomas). It tightens the launcher VAP. Until it merges, none of this is
-enforced, but F2 builds to it from the start:
+**LIVE: k3s `1e76dc1` (devops:#5dxt, merged; k3s's own check 139/0).** The launcher VAP is tightened;
+the PriorityClass `ccsbx-session` and the scoped quotas exist. F2 must build to it:
 - every launcher-created session pod **must** set `priorityClassName: ccsbx-session` (a new class,
   value 500, `preemptionPolicy: Never`). The Priority plugin fills `preemptionPolicy` from the
   class, so the pod doesn't set it. `default-priority` and `low-priority` are for non-launcher
@@ -437,8 +436,8 @@ enforced, but F2 builds to it from the start:
 - `terminationGracePeriodSeconds` at most 60 (unset means 30, which is fine);
 - ephemeral containers (`kubectl debug`) are refused in both namespaces, for everyone. F5 attach
   and any debugging use `exec`;
-- `hostUsers: false` is allowed. It becomes **required** once a test pod proves it on future-two;
-  Tomas decides when.
+- **COMING (not live yet; the k3s side has not shipped it):** `hostUsers: false` is allowed. It
+  becomes **required** once a test pod proves it on future-two; Tomas decides when.
 
 The launcher kubeconfig (K8) is ready, and k3s encrypts it as soon as R10b's age public key
 arrives. **Second batch:** Tomas confirmed it to the k3s side on 2026-11-19. The exact spec is in

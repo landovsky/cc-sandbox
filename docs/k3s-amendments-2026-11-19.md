@@ -249,16 +249,17 @@ dropped, given A1 (no door or hostd is left in `cc-sandbox` for the launcher to 
 
 Also, `kubectl exec` into the watchdog pod is refused. The F2 reference pod is admitted.
 
-**COMING: applies once k3s devops:#5dxt merges** (branch `ccsbx-vap-tighten`, 6802414; **not
-merged**, it waits for Tomas). A tightening of the rules above for launcher-created pods:
+**LIVE: k3s `1e76dc1` (devops:#5dxt, merged; PriorityClass `ccsbx-session` and the scoped quotas
+exist; k3s's check 139/0).** A tightening of the rules above for launcher-created pods. Only the
+last row (`hostUsers`) is still **COMING**:
 
 | Change | Rule | Why |
 |---|---|---|
 | `priorityClassName: ccsbx-session` is **required** (new class, value 500, `preemptionPolicy: Never`, filled in from the class by the Priority plugin, so the pod doesn't set it); `default-priority` and `low-priority` are for non-launcher pods only | new | an independent k3s review found session pods could pick `system-node-critical` and evict other apps on future-two; 500 + `Never` means a session never preempts anything |
 | no `runtimeClassName`, no finalizers | new | no `runtimeClassName`: a session can't pick a runtime with weaker isolation than the default. No finalizers: a session pod can't block its own deletion (cleanup and quota stay in the launcher's hands) |
 | `terminationGracePeriodSeconds` at most 60 (unset = 30 is fine) | new | a stopping session can't hold the node's resources for long |
-| ephemeral containers (`kubectl debug`) refused in **both namespaces, for everyone** | widens rule 8 | F5 attach and any debugging use `exec` || `kubectl debug` would inject a container that bypasses the pod spec's fences (and could reach the sidecar's token); attach is exec only |
-| `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | with `hostUsers: false` a session's uid 0 maps to an unprivileged host uid, so a container escape on future-two's shared kernel lands as nobody, not as host root. Required only after a test pod proves it on future-two (k3s version, idmapped mount of the session volume); requiring it is Tomas's call |
+| ephemeral containers (`kubectl debug`) refused in **both namespaces, for everyone** | widens rule 8 | `kubectl debug` would inject a container that bypasses the pod spec's fences (and could reach the sidecar's token); attach is exec only |
+| **COMING:** `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | with `hostUsers: false` a session's uid 0 maps to an unprivileged host uid, so a container escape on future-two's shared kernel lands as nobody, not as host root. Required only after a test pod proves it on future-two (k3s version, idmapped mount of the session volume); requiring it is Tomas's call |
 
 ---
 

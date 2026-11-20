@@ -155,10 +155,12 @@ elif ! [[ "$IMAGE" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ ]]; t
 # the doors' revoke URLs: empty, or a comma list of plain base URLs (they land in a systemd ExecStart and a TOML list, so no quotes, spaces or paths)
 REVOKE_DOORS_TOML=""
 if [ -n "$REVOKE_DOORS" ]; then
+  [[ "$REVOKE_DOORS" =~ (^,|,,|,$) ]] && ROOT_ERRORS+=("revoke doors '$REVOKE_DOORS' has an empty entry (a lone, leading, trailing or doubled comma)")
   IFS=, read -r -a _rd <<<"$REVOKE_DOORS"
   for _u in "${_rd[@]}"; do
-    if [[ "$_u" =~ ^https?://[A-Za-z0-9._-]+(:[1-9][0-9]{0,4})?$ ]]; then REVOKE_DOORS_TOML+="\"$_u\", "
-    else ROOT_ERRORS+=("revoke door '$_u' is not a plain http(s)://host[:port] base URL (--revoke-doors)"); fi
+    _rp="${_u##*:}"; [[ "$_u" =~ ^https?://[A-Za-z0-9._-]+:[1-9][0-9]{0,4}$ ]] || _rp=0     # no port: nothing to cap
+    if [[ "$_u" =~ ^https?://[A-Za-z0-9._-]+(:[1-9][0-9]{0,4})?$ ]] && [ "$_rp" -le 65535 ]; then REVOKE_DOORS_TOML+="\"$_u\", "
+    else ROOT_ERRORS+=("revoke door '$_u' is not a plain http(s)://host[:port] base URL, port 1..65535 (--revoke-doors)"); fi
   done
   REVOKE_DOORS_TOML="${REVOKE_DOORS_TOML%, }"
 fi

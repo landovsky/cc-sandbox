@@ -14,8 +14,8 @@
 //     (gitroute's checkRepo, run by Runner.Cmd) is repeated before EVERY git command, fetch and push included.
 //   - Clone is staged: git checks the tree out into a sidecar-only directory, and the files are then created in
 //     /work through os.Root with O_EXCL, so nothing the fence does to /work (a directory swapped for a link, say)
-//     can send a write outside it. /work must be empty right before the copy, and a clone that finds it written
-//     fails instead of merging.
+//     can send a write outside it. /work must be empty when the clone starts and again right before the copy, and
+//     O_EXCL makes any file the fence creates in between fail the copy instead of being merged with.
 //   - Commit is snapshot-then-commit. H1's Commit wants proof that the fence is stopped, and a pod's sidecar
 //     cannot freeze the fence container, so it copies what git would commit (tracked files plus untracked ones
 //     that are not ignored, as `git ls-files` lists them) from /work through os.Root into a sidecar-only
@@ -108,9 +108,10 @@ type GitOps struct {
 	failLog appendFailures
 
 	// test seams
-	hookEntry    func(rel string) // called before each snapshot entry is read
-	hookSnapshot func()           // called once a snapshot has begun, holding mu
-	hookCopy     func()           // called after the checkout is staged, before it is copied into Work
+	hookEntry     func(rel string)  // called before each snapshot entry is read
+	hookSnapshot  func()            // called once a snapshot has begun, holding mu
+	hookCopy      func()            // called after the checkout is staged, before it is copied into Work
+	hookCopyEntry func(name string) // called before each entry is created in Work
 }
 
 // NewGitOps checks the configuration: the repo and branch are well-formed, the branch is not protected and not
@@ -399,8 +400,11 @@ func (g *GitOps) Clone(ctx context.Context) (err error) {
 	if g.hookCopy != nil {
 		g.hookCopy()
 	}
+	if err := emptyRoot(root); err != nil { // again, right before the copy: the fetch took seconds
+		return err
+	}
 	touched = true // from here on /work may hold some of it
-	n, err := copyInto(root, g.cfg.Snapshot)
+	n, err := copyInto(root, g.cfg.Snapshot, g.hookCopyEntry)
 	if err != nil {
 		return fmt.Errorf("copying the checkout into the worktree: %w", err)
 	}
@@ -435,7 +439,7 @@ func emptyRoot(root *os.Root) error {
 // O_EXCL: nothing can be redirected out of root, and anything the fence put there first makes the copy fail. Files
 // get 0664 (0775 when executable) and directories 0775, set on the opened file itself, so the fence's group can
 // write what the sidecar created whatever the process umask is.
-func copyInto(root *os.Root, src string) (int, error) {
+func copyInto(root *os.Root, src string, hook func(name string)) (int, error) {
 	n := 0
 	var walk func(rel string) error
 	walk = func(rel string) error {
@@ -456,6 +460,9 @@ func copyInto(root *os.Root, src string) (int, error) {
 				return err
 			}
 			n++
+			if hook != nil {
+				hook(name) // test seam: runs before this entry is created
+			}
 			switch m := fi.Mode(); {
 			case m.IsDir():
 				if err := root.Mkdir(name, 0o775); err != nil {

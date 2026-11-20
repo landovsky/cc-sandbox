@@ -436,7 +436,7 @@ func TestBodyIsHashedIntoTheProof(t *testing.T) {
 func TestARoutesFileCannotRouteGit(t *testing.T) {
 	u, _ := url.Parse("http://127.0.0.1:1")
 	doors := map[string]*url.URL{"egress": u}
-	for _, p := range []string{"/git/**", "/git/*/*/git-receive-pack", "/git"} {
+	for _, p := range []string{"/git/**", "/git/*/*/git-receive-pack", "/git", "/Git/**", "/GIT/*/*/git-receive-pack"} {
 		if err := ValidateRules([]Rule{{Door: "egress", Methods: []string{"POST"}, Path: p}}, doors); err == nil {
 			t.Errorf("rule %q accepted", p)
 		}
@@ -467,8 +467,10 @@ func TestABroadRuleStillCannotRouteGitForTheFence(t *testing.T) {
 	srv := httptest.NewServer(f)
 	defer srv.Close()
 	before := r.hits.Load()
-	for _, gate := range []string{"", "wrong"} {
-		req, _ := http.NewRequest("POST", srv.URL+"/egress/git/o/r.git/git-receive-pack", strings.NewReader("{}"))
+	for _, c := range []struct{ gate, path string }{{"", "/egress/git/o/r.git/git-receive-pack"}, {"wrong", "/egress/git/o/r.git/git-receive-pack"},
+		{"", "/egress/Git/o/r.git/git-receive-pack"}, {"", "/egress/GIT/o/r.git/git-receive-pack"}, {"", "/egress/git"}} {
+		gate := c.gate
+		req, _ := http.NewRequest("POST", srv.URL+c.path, strings.NewReader("{}"))
 		if gate != "" {
 			req.Header.Set(GitHeader, gate)
 		}

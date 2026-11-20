@@ -333,6 +333,11 @@ func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 		if o.Out == "" || o.Sid == "" || o.Gen < 1 || o.GitURL == "" || o.GitBranch == "" {
 			return fail("--git-repo needs --out, --sid, --gen, --git-url and --git-branch")
 		}
+		// the forwarder's git secret goes to whatever answers at --git-url, so it must be this sidecar's own listener and
+		// nothing else (127.0.0.2, ::1 or another port are addresses the fence could bind)
+		if gu, err := url.Parse(o.GitURL); err != nil || gu.Host != o.Config.Listen {
+			return fail("--git-url must point at this sidecar's own --listen address (%s), not %q", o.Config.Listen, o.GitURL)
+		}
 		var err error
 		gitops, err = NewGitOps(GitConfig{Repo: o.GitRepo, Base: o.GitBase, Branch: o.GitBranch, URL: o.GitURL, GitDir: o.GitDir,
 			Work: o.Work, Snapshot: o.SnapshotDir, Sid: o.Sid, Gen: o.Gen, Journal: jr, Gate: s.GitGate, MaxSnapshotBytes: o.GitMaxBytes, Logf: logf})

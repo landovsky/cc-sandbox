@@ -6,6 +6,7 @@ package stub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -42,7 +43,10 @@ Flags: (each also CCSBX_STUB_<NAME>)
   --machines-dir DIR the trusted-key list (config/machines or its mounted ConfigMap, plan M9) instead of a
                      keyring file: re-read every 15 s, so a removed key stops working with no restart, and
                      each key's profile→billing pairs are enforced. Give this or --keyring, not both
-                     (CCSBX_STUB_MACHINES_DIR)
+                     (CCSBX_STUB_MACHINES_DIR, or CCSBX_MACHINES_DIR as "ccsbx machines" reads it)
+  --machines-poll D  how often the list is re-read                      (default 15s; CCSBX_STUB_MACHINES_POLL)
+  --machines-max-stale D  trust no key once the last good read is this old (default 45s, at least the poll;
+                     CCSBX_STUB_MACHINES_MAX_STALE). A removed key is refused within 2 minutes.
   --aud NAME         audience the token must list            (default ccsbx-stub)
   --state FILE       persist max_gen/revocations here; the stub refuses to start if it can't
                      (default $XDG_STATE_HOME/ccsbx/<aud>-<port>.json, else under ~/.local/state; one door per file)
@@ -75,7 +79,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", envOr("LISTEN", ""), "")
 	keyring := fs.String("keyring", envOr("KEYRING", os.Getenv("CCSBX_KEYRING")), "")
-	machinesDir := fs.String("machines-dir", envOr("MACHINES_DIR", ""), "")
+	machinesDir := fs.String("machines-dir", envOr("MACHINES_DIR", os.Getenv("CCSBX_MACHINES_DIR")), "")
+	poll := fs.Duration("machines-poll", envDur("MACHINES_POLL", machines.DefaultEvery), "")
+	maxStale := fs.Duration("machines-max-stale", envDur("MACHINES_MAX_STALE", machines.DefaultMaxStale), "")
 	aud := fs.String("aud", envOr("AUD", DefaultAud), "")
 	state := fs.String("state", envOr("STATE", ""), "")
 	ownerListen := fs.String("owner-listen", envOr("OWNER_LISTEN", ""), "")
@@ -98,22 +104,10 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "stub: give exactly one of --keyring and --machines-dir")
 		return 2
 	}
-	var ring token.Keyring
-	var rl *machines.Reloader
-	if *machinesDir != "" {
-		if rl, err = machines.NewReloader(*machinesDir); err != nil {
-			fmt.Fprintln(stderr, "stub:", err)
-			return 2
-		}
-		rl.Logf = func(f string, a ...any) { fmt.Fprintf(stderr, f+"\n", a...) }
-		ring = rl.Ring()
-	} else if ring, err = token.LoadPublicKeyring(*keyring); err != nil {
+	v, err := Verifier(*keyring, *machinesDir, *aud, *poll, *maxStale, logf0(stderr))
+	if err != nil {
 		fmt.Fprintln(stderr, "stub:", err)
 		return 2
-	}
-	v := token.NewVerifier(ring, *aud)
-	if rl != nil {
-		go rl.Run(context.Background(), v.SetRing)
 	}
 	if err := persist(v, *state, *aud, *listen); err != nil {
 		fmt.Fprintln(stderr, "stub: cannot keep state, refusing to start:", err)
@@ -172,4 +166,47 @@ func persist(v *token.Verifier, state, aud, listen string) error {
 		return err
 	}
 	return v.PersistTo(state)
+}
+
+func logf0(w io.Writer) func(string, ...any) {
+	return func(f string, a ...any) { fmt.Fprintf(w, f+"\n", a...) }
+}
+
+// envDur reads CCSBX_STUB_<name> as a duration; an unparsable value is the default, loudly in --help
+// only, because flags override it and a bad flag is an error.
+func envDur(name string, def time.Duration) time.Duration {
+	if v := os.Getenv("CCSBX_STUB_" + name); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
+}
+
+// Verifier builds the stub's token verifier from exactly one key source. With a machines dir the
+// verifier asks the reloader for the ring on every request (so an expired list ends trust at once) and
+// a goroutine keeps re-reading the list; the returned verifier stops following it only with the process.
+func Verifier(keyring, machinesDir, aud string, poll, maxStale time.Duration, logf func(string, ...any)) (*token.Verifier, error) {
+	if (keyring == "") == (machinesDir == "") {
+		return nil, errors.New("give exactly one of --keyring and --machines-dir")
+	}
+	if machinesDir == "" {
+		ring, err := token.LoadPublicKeyring(keyring)
+		if err != nil {
+			return nil, err
+		}
+		return token.NewVerifier(ring, aud), nil
+	}
+	if poll <= 0 || maxStale < poll {
+		return nil, errors.New("--machines-poll must be positive and --machines-max-stale at least the poll")
+	}
+	rl, err := machines.NewReloader(machinesDir)
+	if err != nil {
+		return nil, err
+	}
+	rl.Every, rl.MaxStale, rl.Logf = poll, maxStale, logf
+	v := token.NewVerifier(rl.Ring(), aud)
+	v.SetRingSource(rl.Ring)
+	go rl.Run(context.Background(), nil)
+	return v, nil
 }

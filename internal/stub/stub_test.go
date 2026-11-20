@@ -5,7 +5,11 @@ package stub
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -17,6 +21,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/fwd"
+	"github.com/landovsky/cc-sandbox/internal/machines"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
@@ -230,5 +235,60 @@ func TestStubTakesExactlyOneKeySource(t *testing.T) {
 		if rc := Main(args, &o, &e); rc != 2 {
 			t.Errorf("%v: rc=%d, want 2 (%s)", args, rc, e.String())
 		}
+	}
+}
+
+// context "the stub is a door that follows the trusted-key list": a key removed from the list must stop
+// working in a RUNNING stub, with no restart. This is the wiring test: delete the refresher goroutine or
+// the ring source and it goes red.
+func TestStubFollowsTheListAndDropsARemovedKey(t *testing.T) {
+	k, err := token.LoadOrCreateKeyFile(filepath.Join(t.TempDir(), "k"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	os.Chmod(dir, 0o700)
+	e := machines.Entry{Machine: "mac", Owners: []string{"tomas"}, MaySignMachines: []string{"mac"},
+		PublicKeys: []machines.KeyRef{{KID: k.KID, Key: base64.StdEncoding.EncodeToString(k.Public)}},
+		MaxProfile: []string{"e2e-*"}, MaxBilling: []string{"stub"}, Pairs: map[string][]string{"e2e-default": {"stub"}}}
+	file := filepath.Join(dir, "mac.json")
+	if err := os.WriteFile(file, []byte(machines.Canonical(&e)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	v, err := Verifier("", dir, DefaultAud, 20*time.Millisecond, time.Second, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, _ := token.NewGenKey()
+	call := func(gen int) error {
+		now := time.Now()
+		tok, err := token.Mint(k, token.Claims{Sub: fmt.Sprintf("tomas/mac/sS1/g%d", gen), Label: "l", Billing: "stub", Profile: "e2e-default",
+			Aud: []string{DefaultAud}, Cnf: token.CnfOf(g.Public)}, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, _ := token.SignProof(g, "POST", "/x", DefaultAud, tok, nil, now)
+		_, err = v.Verify(tok, p, "POST", "/x", nil, now)
+		return err
+	}
+	if err := call(1); err != nil {
+		t.Fatalf("allow twin: a listed key: %v", err)
+	}
+	os.Remove(file)
+	for i := 2; ; i++ {
+		if err := call(i); errors.Is(err, token.ErrUnknownKID) {
+			return
+		}
+		if i > 400 {
+			t.Fatal("the removed key still verifies in the running stub")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestStubRefusesBadListTimings(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Verifier("", dir, DefaultAud, time.Second, time.Millisecond, nil); err == nil || !strings.Contains(err.Error(), "at least the poll") {
+		t.Fatalf("a stale limit under the poll: %v", err)
 	}
 }

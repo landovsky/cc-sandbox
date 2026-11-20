@@ -381,7 +381,8 @@ id = "key-signs-foreign-machine"
 title = "a machine key cannot sign for another machine"
 suite = "keys"
 allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
-block = "tests/go-test.sh ./internal/token 'TestKeySignsForeignMachine$|TestGenerationStateIsPerMachine$'"
+block = "tests/go-test.sh ./internal/token 'TestKeySignsForeignMachine$|TestGenerationStateIsPerMachine$' && tests/go-test.sh ./internal/machines 'TestTheListLimitsAStolenKey$|TestAMachineCannotSignForAnotherThatHasItsOwnFile$'"
+# the same rule against the trusted-key list (M9): see machines-list-limits-stolen-key
 invariants = [12, 27]
 backends = ["unit"]
 where = "any"
@@ -391,7 +392,7 @@ id = "mac-key-above-mac-max"
 title = "a Mac key cannot sign above the mac-max tier"
 suite = "keys"
 allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
-block = "tests/go-test.sh ./internal/token 'TestKeyScopedByProfileAndBilling$'"
+block = "tests/go-test.sh ./internal/token 'TestKeyScopedByProfileAndBilling$' && tests/go-test.sh ./internal/machines 'TestTheListLimitsAStolenKey$'"
 invariants = [12, 27]
 backends = ["unit"]
 where = "any"
@@ -1651,28 +1652,38 @@ where = "hp"
 id = "machines-list-limits-stolen-key"
 title = "the trusted-key list lets a door refuse what a stolen machine key can sign: foreign machine, billing above the ceiling, a profile or billing outside the pairs"
 suite = "keys"
-allow = "tests/go-test.sh ./internal/machines 'TestReadsAConfigMapVolumeLayout$'"
-block = "tests/go-test.sh ./internal/machines 'TestTheListLimitsAStolenKey$'"
+allow = "tests/go-test.sh ./internal/machines 'TestTheListAllowsWhatItsFilesSay$'"
+block = "tests/go-test.sh ./internal/machines 'TestTheListLimitsAStolenKey$|TestAMachineCannotSignForAnotherThatHasItsOwnFile$'"
 invariants = [18, 27]
 backends = ["unit"]
 where = "any"
 
 [[rule]]
 id = "machines-removed-key-refused"
-title = "a key removed from the trusted-key list stops verifying within minutes, and a list that stays unreadable ends trust"
+title = "a key removed from the trusted-key list stops verifying in a running door within minutes, and a list that stops being refreshed ends trust"
 suite = "keys"
-allow = "tests/go-test.sh ./internal/machines 'TestRenderAndRingLinesMatchTheRing$'"
-block = "tests/go-test.sh ./internal/machines 'TestRemovedKeyIsRefusedWithinTwoMinutes$|TestABrokenListKeepsTheLastGoodOneOnlyBriefly$|TestFirstLoadFailureStopsTheDoor$'"
+allow = "tests/go-test.sh ./internal/machines 'TestAListedKeyStaysTrustedAcrossPolls$'"
+block = "tests/go-test.sh ./internal/machines 'TestRemovedKeyIsRefusedByARunningDoor$|TestARefresherThatStopsEndsTrust$|TestABrokenListKeepsTheLastGoodOneOnlyBriefly$|TestDefaultsMeetThePlansTwoMinutes$|TestFirstLoadFailureStopsTheDoor$'"
 invariants = [18, 27]
 backends = ["unit"]
 where = "any"
 
 [[rule]]
 id = "machines-file-refuses-widening"
-title = "a machine file that would widen a key (unknown field, no pairs, pair above the ceiling, shared key, wrong name) is refused"
+title = "a machine file that would widen a key (a pasted seed, a duplicate or wrong-case key, no pairs, a pair above the ceiling, a shared key, a FIFO, a writable directory) is refused"
 suite = "keys"
 allow = "tests/go-test.sh ./internal/machines 'TestReadsAConfigMapVolumeLayout$'"
-block = "tests/go-test.sh ./internal/machines 'TestFilesThatWouldWidenAKeyAreRefused$|TestOneKeyCannotBelongToTwoMachines$'"
+block = "tests/go-test.sh ./internal/machines 'TestFilesThatWouldWidenAKeyAreRefused$|TestOneKeyCannotBelongToTwoMachines$|TestAFifoDoesNotHangTheLoad$|TestADirectoryOthersCanWriteIsRefused$'"
 invariants = [18, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "stub-follows-the-key-list"
+title = "a running stub stops trusting a key removed from the trusted-key list"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/stub 'TestStubTakesExactlyOneKeySource$'"
+block = "tests/go-test.sh ./internal/stub 'TestStubFollowsTheListAndDropsARemovedKey$|TestStubRefusesBadListTimings$'"
+invariants = [27]
 backends = ["unit"]
 where = "any"

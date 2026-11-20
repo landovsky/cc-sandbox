@@ -7,6 +7,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -18,16 +19,23 @@ const usage = `ccsbx machines: the trusted-key list (plan M9), config/machines/<
 Usage:
   ccsbx machines check [DIR]             read every file, refuse the first problem (exit 1), print one line per key
   ccsbx machines ring [DIR]              the same list as keyring lines (for ccsbx stub --keyring, ccsbx token verify)
+  ccsbx machines fmt FILE...             print each file in canonical form (what the loader accepts); writes nothing
   ccsbx machines render [DIR] [--name N] [--namespace NS]
                                          the ConfigMap YAML on stdout, to review; this command never applies it
   ccsbx machines --help                  this text; nothing runs
 
 DIR defaults to $CCSBX_MACHINES_DIR, else config/machines. Each file: machine, owners, public_keys,
-may_sign_machines, max_profile, max_billing, pairs (see internal/machines/machines.go).
+may_sign_machines, max_profile, max_billing, pairs (see internal/machines/machines.go). The bytes
+must be the canonical form: a duplicate or wrong-case key, or different spacing, is refused, and
+"fmt" shows what the file really says. public_keys lists {kid, key}; the kid must match the key.
 
 Flags:
   --name N        ConfigMap name for render (default ccsbx-machines; CCSBX_MACHINES_NAME)
   --namespace NS  namespace for render (default: none, kustomize sets it; CCSBX_MACHINES_NAMESPACE)
+
+A door that reads the list (ccsbx stub --machines-dir) re-reads it every 15 s (--machines-poll,
+CCSBX_STUB_MACHINES_POLL) and trusts nothing once the last good read is 45 s old
+(--machines-max-stale, CCSBX_STUB_MACHINES_MAX_STALE): a removed key is refused within 2 minutes.
 
 Recipes:
   roll a key      add the new key to public_keys, apply, roll the signer, then remove the old key
@@ -38,11 +46,20 @@ Exit: 0 ok, 1 the list is bad, 64 usage.
 
 // Main runs the command.
 func Main(args []string, stdout, stderr io.Writer, getenv func(string) string) int {
-	if len(args) == 0 || args[0] == "-h" || args[0] == "--help" || args[0] == "help" {
+	for _, a := range args {
+		if a == "-h" || a == "--help" || a == "-help" || a == "help" {
+			io.WriteString(stdout, usage)
+			return 0
+		}
+	}
+	if len(args) == 0 {
 		io.WriteString(stdout, usage)
 		return 0
 	}
 	sub := args[0]
+	if sub == "fmt" {
+		return fmtFiles(args[1:], stdout, stderr)
+	}
 	fs := flag.NewFlagSet("machines "+sub, flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	name := fs.String("name", orDefault(getenv("CCSBX_MACHINES_NAME"), "ccsbx-machines"), "")
@@ -65,6 +82,12 @@ func Main(args []string, stdout, stderr io.Writer, getenv func(string) string) i
 		return 64
 	}
 	dir := orDefault(getenv("CCSBX_MACHINES_DIR"), "config/machines")
+	switch sub {
+	case "check", "ring", "render":
+	default:
+		fmt.Fprintf(stderr, "ccsbx machines: unknown command %q (ccsbx machines --help)\n", sub)
+		return 64
+	}
 	if len(rest) == 1 {
 		dir = rest[0]
 	}
@@ -79,12 +102,6 @@ func Main(args []string, stdout, stderr io.Writer, getenv func(string) string) i
 	es, err := LoadDir(dir)
 	if err == nil {
 		_, err = Ring(es)
-	}
-	switch sub {
-	case "check", "ring", "render":
-	default:
-		fmt.Fprintf(stderr, "ccsbx machines: unknown command %q (ccsbx machines --help)\n", sub)
-		return 64
 	}
 	if err != nil {
 		fmt.Fprintln(stderr, "ccsbx machines:", err)
@@ -132,4 +149,31 @@ func Render(es []*Entry, name, namespace string) string {
 		}
 	}
 	return b.String()
+}
+
+// fmtFiles prints each file as the loader would need it to be. It reads loosely (the last duplicate
+// key wins, case is ignored) so a reviewer sees what a non-canonical file would have said.
+func fmtFiles(files []string, stdout, stderr io.Writer) int {
+	if len(files) == 0 {
+		fmt.Fprintln(stderr, "ccsbx machines fmt: give at least one FILE")
+		return 64
+	}
+	rc := 0
+	for _, f := range files {
+		b, err := readCapped(f, false)
+		var e *Entry
+		if err == nil {
+			e, err = ParseLoose(filepath.Base(f), b)
+		}
+		if err != nil {
+			fmt.Fprintln(stderr, "ccsbx machines fmt:", err)
+			rc = 1
+			continue
+		}
+		fmt.Fprint(stdout, Canonical(e))
+		if string(b) != Canonical(e) {
+			fmt.Fprintf(stderr, "ccsbx machines fmt: %s is not canonical; the loader would refuse it\n", f)
+		}
+	}
+	return rc
 }

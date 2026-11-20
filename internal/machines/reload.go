@@ -13,8 +13,17 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
-// Reloader re-reads Dir every Every. Defaults: 15 s, and MaxStale 5 min (the plan wants a removed key
-// refused within 2 min; the ConfigMap volume itself takes up to a minute to catch up, hence the poll).
+// DefaultEvery and DefaultMaxStale: a removed key must be refused within 2 minutes (plan M9). The
+// kubelet takes up to 60 s to update a ConfigMap volume, so the poll plus the stale limit have to fit
+// in the other 60 s even when the removal arrives together with a broken list.
+const (
+	DefaultEvery    = 15 * time.Second
+	DefaultMaxStale = 45 * time.Second
+)
+
+// Reloader re-reads Dir every Every. The ring it hands out goes empty once the last good read is
+// MaxStale old, judged when Ring() is called, so a poll that hangs or a goroutine that died still
+// ends trust in a removed key.
 type Reloader struct {
 	Dir      string
 	Every    time.Duration
@@ -30,7 +39,7 @@ type Reloader struct {
 
 // NewReloader loads once; an error means the door must not start (fail closed).
 func NewReloader(dir string) (*Reloader, error) {
-	r := &Reloader{Dir: dir, Every: 15 * time.Second, MaxStale: 5 * time.Minute}
+	r := &Reloader{Dir: dir, Every: DefaultEvery, MaxStale: DefaultMaxStale}
 	if err := r.Refresh(); err != nil {
 		return nil, err
 	}
@@ -44,8 +53,15 @@ func (r *Reloader) now() time.Time {
 	return time.Now()
 }
 
-// Ring is the keyring in force now.
-func (r *Reloader) Ring() token.Keyring { r.mu.Lock(); defer r.mu.Unlock(); return r.ring }
+// Ring is the keyring in force now: empty when the last good read is MaxStale old or more.
+func (r *Reloader) Ring() token.Keyring {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.now().Sub(r.lastGood) >= r.MaxStale {
+		return token.Keyring{}
+	}
+	return r.ring
+}
 
 // Refresh reads the list once. On a failure the last good ring stays until MaxStale has passed, then
 // the ring becomes empty. It returns the read error either way.
@@ -72,20 +88,21 @@ func (r *Reloader) Refresh() error {
 		r.Logf("machines: trusted-key list unreadable (%v); keeping the last good one until %s", err, r.lastGood.Add(r.MaxStale).Format(time.RFC3339))
 	}
 	r.failing = true
-	if now.Sub(r.lastGood) >= r.MaxStale && len(r.ring) > 0 {
-		r.ring = token.Keyring{}
-		if r.Logf != nil {
-			r.Logf("machines: trusted-key list stale for %s: trusting no key", r.MaxStale)
-		}
+	if now.Sub(r.lastGood) >= r.MaxStale && r.Logf != nil {
+		r.Logf("machines: trusted-key list stale for %s: trusting no key", r.MaxStale)
 	}
 	return err
 }
 
-// Run refreshes every Every and hands each ring to apply (for example a Verifier's SetRing), until
-// ctx ends. apply is called once at the start.
+// Run refreshes every Every until ctx ends. A door reads the result through Ring (for a Verifier:
+// SetRingSource(r.Ring)), so nothing is pushed anywhere and a stalled Run cannot keep an old ring alive.
+// apply, when not nil, also gets each ring (for callers that need a push).
 func (r *Reloader) Run(ctx context.Context, apply func(token.Keyring)) error {
-	if r.Every <= 0 {
-		return errors.New("machines: Every must be positive")
+	if r.Every <= 0 || r.MaxStale < r.Every {
+		return errors.New("machines: Every must be positive and MaxStale at least Every")
+	}
+	if apply == nil {
+		apply = func(token.Keyring) {}
 	}
 	apply(r.Ring())
 	t := time.NewTicker(r.Every)

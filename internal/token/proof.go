@@ -75,6 +75,7 @@ func SignProof(g *GenKey, method, path, aud, tok string, body []byte, now time.T
 type Verifier struct {
 	ringMu sync.RWMutex
 	ring   Keyring // swapped whole by SetRing; read through Ring()
+	source func() Keyring // when set, Ring() asks it on every request (SetRingSource)
 	aud    string
 
 	mu     sync.Mutex
@@ -91,7 +92,20 @@ type Verifier struct {
 
 // Ring is the keyring in force now. A door built on the trusted-key list (M9) swaps it with SetRing, so
 // a removed key stops verifying at the next request. Callers must not change the returned map.
-func (v *Verifier) Ring() Keyring { v.ringMu.RLock(); defer v.ringMu.RUnlock(); return v.ring }
+func (v *Verifier) Ring() Keyring {
+	v.ringMu.RLock()
+	src, r := v.source, v.ring
+	v.ringMu.RUnlock()
+	if src != nil {
+		return src()
+	}
+	return r
+}
+
+// SetRingSource makes the verifier ask f for the keyring on every request, so a list that expires
+// (machines.Reloader.Ring returns nothing once it is too old) is judged when the token arrives, not
+// when some background poll happens to run. f must be cheap and safe for concurrent use.
+func (v *Verifier) SetRingSource(f func() Keyring) { v.ringMu.Lock(); v.source = f; v.ringMu.Unlock() }
 
 // SetRing replaces the keyring. A nil or empty ring makes every token fail, which is the safe side.
 func (v *Verifier) SetRing(r Keyring) { v.ringMu.Lock(); v.ring = r; v.ringMu.Unlock() }

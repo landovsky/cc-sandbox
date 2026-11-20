@@ -59,6 +59,7 @@ type Daemon struct {
 	Socket       string // tmux -L name for the attach command; default ccsbx
 	Root         string // "direct" tonight
 	Launcher     Launcher
+	ReplaceWait  time.Duration // how long Replace waits for the old fence to shut down (default 15s)
 	Now          func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
 	Exe string
@@ -341,9 +342,17 @@ func (d *Daemon) Records() ([]*Record, error) { return d.records() }
 type Stopper interface{ Stop(sid string) error }
 
 // Replace is session.replace (C9b): generation+1 of a running session with a new brief. The
-// caller has already checked the turn is over. The old pane is ended, the record gets the next
-// generation (so `ccsbx run --gen` accepts only the new one, and the new generation has its own
-// outbox), and a new pane is launched. Same sid, same label, same workdir and profile.
+// caller has already checked the turn is over. Order matters, so that a failure at any step
+// leaves a consistent record:
+//
+//  1. end the old pane (a failure here changes nothing);
+//  2. wait until the old `ccsbx run` has torn its container down (its CLOSED marker), so two
+//     containers never hold the same workdir and per-node home read-write at once; if it does not
+//     in time, nothing new is started and the record stays as it was (the dead pane makes the next
+//     start mark it ended);
+//  3. only then save generation+1 (same sid, label, workdir, profile; a fresh Started, so
+//     "in this generation" checks don't accept messages sent to the previous one) and launch it; a
+//     failed launch restores the previous record and marks it ended, since its pane is gone.
 func (d *Daemon) Replace(sid, brief string) (*Record, error) {
 	unlock, err := d.lock()
 	if err != nil {
@@ -361,17 +370,34 @@ func (d *Daemon) Replace(sid, brief string) (*Record, error) {
 	if !ok {
 		return nil, refuse(NotBuilt, "this launcher cannot end a pane")
 	}
+	prev := *rec
+	if err := st.Stop(sid); err != nil {
+		return nil, fmt.Errorf("end the old pane: %w", err)
+	}
+	closed := d.path("s", sid, fmt.Sprintf("g%d", prev.Gen), "CLOSED")
+	wait := d.ReplaceWait
+	if wait == 0 {
+		wait = 15 * time.Second
+	}
+	for deadline := time.Now().Add(wait); ; {
+		if _, err := os.Stat(closed); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf("the old generation's fence did not shut down within %s; nothing was started", wait)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
 	rec.Gen++
+	rec.Started = d.now().UTC()
 	rec.Spec.Brief = &Brief{Text: brief}
 	rec.Reply.Gen = rec.Gen
 	rec.Reply.ID = fmt.Sprintf("%s/%s/%s/g%d", rec.Spec.Owner, d.Machine, sid, rec.Gen)
 	if err := d.save(rec); err != nil {
 		return nil, err
 	}
-	if err := st.Stop(sid); err != nil {
-		return nil, fmt.Errorf("end the old pane: %w", err)
-	}
 	if err := d.Launcher.Launch(rec); err != nil {
+		d.markEnded(&prev)
 		return nil, fmt.Errorf("launch generation %d: %w", rec.Gen, err)
 	}
 	return rec, nil

@@ -136,7 +136,7 @@ func (v *Verifier) Verify(tok, proofHdr, method, path string, body []byte, now t
 		return nil, err
 	}
 	// Invariant 27: the signing key must be allowed to speak for this owner and machine.
-	if sc := v.ring[c.kid]; !sc.allows(owner, machine) || !sc.allowsClaims(c) {
+	if sc := v.ring[c.kid]; sc.Permits(c) != nil { // the same rule the signer applies
 		return nil, ErrKeyScope
 	}
 	if err := c.validBilling(); err != nil { // invariant 18, checked again at the door

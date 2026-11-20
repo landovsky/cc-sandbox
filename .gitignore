@@ -3,5 +3,6 @@ spike/.state/
 spike/results/*.log
 __pycache__/
 /bin/ccsbx
+/bin/ccsbx-signer
 /dist/
 /bin/ccsbx-hostd

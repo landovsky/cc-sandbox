@@ -474,6 +474,21 @@ hostd's rights (tracking a fenced identity, reading hostd's frames), and the rev
   window: a squat BEFORE any worker bound to that node has started is accepted (nobody has said whose it is) and
   is overridden when the worker's hostd tracks; two tracks of one node at the very same moment can both pass the
   presence check (hostd's checks catch the result: a refused message, not an impersonation).
+  **A 409 on your OWN node** (a manager's tracking refused, `ccmsg`/cc-tree not resolving it) means look at
+  `GET /v1/nodes` (admin): another machine holds the claim. If it is a squatter that keeps renewing, it holds it
+  indefinitely (the 30 days count from the last refresh): `DELETE /v1/nodes/<url-encoded node>`, then the real
+  manager tracks. hostd's `binds` (its sessions' manager/peer machines, from their start specs) only cover nodes of
+  the hostd principal's `trees`, create or refresh a claim but NEVER move one: a claim whose machine has a live entry
+  for the node stays, and so does one another daemon bound within the last 90 s (two daemons disagreeing is a
+  conflict, the first wins, not a flip). The hub says so in the track reply and hostd logs `hub warning: <node> is
+  claimed by <machine>` once per ten minutes: it means the session's start spec put its manager on the wrong machine,
+  or someone is squatting; fix the spec's `manager.machine` (and re-start) or clear the claim. `--known-machines`
+  makes a start whose `msg_scope` names any other machine refuse (bad_spec) before anything is published. The claim
+  table lives in memory unless `SB_NODE_CLAIMS_FILE` is set (a hub restart then reopens the first-publisher window
+  until each hostd re-tracks, seconds); the file is written in a 0700 directory through an exclusive random temp
+  file, only when a claim appears or changes machine and every few minutes for the refresh times, and is ignored if it
+  is not a regular file of the hub's user that others cannot write. A fenced manager that MOVES to another machine
+  needs its workers' specs updated (their record names the old machine, so `SendRemote` ends `dropped`).
 - **Fenced to unfenced.** A relay reaches an unfenced target only if (a) that target's node is in the relay's
   `may_reach`, fixed at mint by root from the session's record (the MANAGER only for now: Tomas's open
   question #3cy2 decides peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held

@@ -36,6 +36,9 @@ type Client struct {
 	// HTTP is the transport; nil means a client with no overall timeout (long polls) but with
 	// connection and header timeouts.
 	HTTP *http.Client
+	// Warn, when set, receives what the hub says about a track that SUCCEEDED but did not fully hold (e.g. a
+	// node binding that was not accepted because another machine holds that node). Called from Track.
+	Warn func(string)
 }
 
 // Frame is one downlink message: Seq is the mailbox sequence, Event the broadcast event name
@@ -188,10 +191,16 @@ func (c *Client) Track(ctx context.Context, entries []map[string]any, ttl int) (
 		return nil, err
 	}
 	var r struct {
-		Tracked []string `json:"tracked"`
+		Tracked  []string `json:"tracked"`
+		Warnings []string `json:"warnings"`
 	}
 	if err := json.Unmarshal(b, &r); err != nil {
 		return nil, fmt.Errorf("hub's track answer: %w", err)
+	}
+	if c.Warn != nil {
+		for _, w := range r.Warnings {
+			c.Warn(w)
+		}
 	}
 	return r.Tracked, nil
 }

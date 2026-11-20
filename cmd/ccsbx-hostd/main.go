@@ -78,6 +78,7 @@ func app() *cli.App {
 				f.String("worktree-root", home, "session starts: comma-separated absolute directories (the syntax and meaning of ccsbx-root.toml allowed_roots, e.g. /home/u/git,/home/u/wt): a workdir must be strictly inside one of them after symlinks are resolved; a bad entry stops every start; hidden dirs of the home are refused when a root is the home")
 				f.String("cc-version", "", "Claude Code version recorded in a started session's pin")
 				f.Int("max-live", 8, "session starts: machine_full above this many live sessions")
+				f.String("known-machines", "", "comma-separated machines of this deployment (hub machine ids): a session start whose msg_scope puts its manager or a peer on any other machine is refused (bad_spec) before anything is published. Empty: only the shape is checked")
 				f.Int("max-per-hour", 20, "session starts: rate_capped above this many starts per caller per hour")
 				f.String("tmux-socket", "ccsbx", "tmux server the session panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (a socket shared between uids; hostd makes it 0660)")
 				f.String("machine", hostname(), "this machine's name, stamped on journal records")
@@ -231,6 +232,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		Pins: get("pins"), WorktreeRoots: get("worktree-root"), Image: get("image"),
 		CCVersion: get("cc-version"), TmuxSocket: get("tmux-socket"), RunDir: runDir,
 		MaxLive: num("max-live"), MaxPerHour: num("max-per-hour"), MinUID: num("min-uid"), LookupID: user.LookupId,
+		KnownMachines: splitList(get("known-machines")),
 	})
 	sock := get("local-socket")
 	if sock == "" {

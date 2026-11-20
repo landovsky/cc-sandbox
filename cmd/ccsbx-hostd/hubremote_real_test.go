@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -32,6 +33,14 @@ type realMachine struct {
 	j    *xJ
 	sp   *hubspoke.Spoke
 	tok  string
+	mu   sync.Mutex
+	warn []string // what the hub said about a track that did not fully hold
+}
+
+func (m *realMachine) warnings() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.warn...)
 }
 
 func adminPost(t *testing.T, url, admin, path string, body any) map[string]any {
@@ -54,12 +63,15 @@ func adminPost(t *testing.T, url, admin, path string, body any) map[string]any {
 	return m
 }
 
-func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s msg.Session) *realMachine {
+// startMachine starts a logical machine's hostd. ttl (optional, seconds) is the lease of its hub entries: a short one
+// makes it renew (and so re-bind) every ttl/3 seconds.
+func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s msg.Session, ttl ...int) *realMachine {
 	t.Helper()
 	tok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "spoke", "machine": name, "name": "ccsbx", "trees": []string{"cc-sandbox"}})["token"].(string)
 	out, j := &xOut{}, &xJ{}
 	rt := &msg.Router{Dir: &xDir{[]msg.Session{s}}, Out: out, Idle: xIdle{}, StateDir: t.TempDir()}
-	client := &hubc.Client{URL: url, Token: func() (string, error) { return tok, nil }}
+	rm := &realMachine{name: name}
+	client := &hubc.Client{URL: url, Token: func() (string, error) { return tok, nil }, Warn: func(w string) { rm.mu.Lock(); rm.warn = append(rm.warn, w); rm.mu.Unlock() }}
 	// (hostd's own principal: spoke:<machine>/ccsbx, fenced entries and its own downlink only)
 	// the stand-in for `ccsbx-root relay-mint`: the hub's admin API, which hostd itself never holds
 	mint := func(_ context.Context, sid string, gen int, pub string, _ bool) (string, error) {
@@ -75,7 +87,7 @@ func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s 
 	hr := newHubRemote(client, url, name, rt, j, t.Logf, mint, t.TempDir())
 	rt.Uplink = hr
 	sp := hubspoke.New(hubspoke.Config{
-		Client: client, Machine: name, Name: "ccsbx", TTL: 60, PollWait: time.Second,
+		Client: client, Machine: name, Name: "ccsbx", TTL: leaseTTL(ttl), PollWait: time.Second,
 		// the production entry builder, so what the real hub sees is what hostd really publishes
 		Entries: func() []map[string]any {
 			return fencedEntries(name, []msg.Session{s}, func(string, int) (time.Time, bool) { return time.Now(), true })
@@ -84,7 +96,15 @@ func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s 
 		Logf:      t.Logf,
 	})
 	go sp.Run(ctx)
-	return &realMachine{name: name, hr: hr, out: out, j: j, sp: sp, tok: tok}
+	rm.hr, rm.out, rm.j, rm.sp, rm.tok = hr, out, j, sp, tok
+	return rm
+}
+
+func leaseTTL(l []int) int {
+	if len(l) > 0 {
+		return l[0]
+	}
+	return 60
 }
 
 func waitLines(t *testing.T, m *realMachine, n int) {
@@ -405,17 +425,20 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		t.Fatalf("the shared secret re-tracking a held node: want 409, got %v", err)
 	}
 
-	// 9. (round 5) squatting an ABSENT manager's node. The worker's manager umgr5 is an unfenced session on mac3
-	// that is not tracked right now (a restart, a closed laptop). An owner token of a third machine, x4, publishes
-	// its node; then the worker starts (its record binds umgr5 to mac3, written from the owner's start spec).
+	// 9. (rounds 5 and 6) squatting an ABSENT manager's node. The worker's manager umgr5 is an unfenced session
+	// on mac3 that is not tracked right now (a restart, a closed laptop). An owner token of a third machine, x4,
+	// publishes its node (nobody has said whose it is yet, so the hub accepts it). Then the worker starts: its
+	// record binds umgr5 to mac3 (the owner's start spec), but a bind NEVER moves a claim whose machine has a live
+	// entry for the node, so while the squatter renews, the claim stays and hostd says so. Nothing leaks meanwhile:
+	// hostd hears and sends by the record's machine. When the squatter stops renewing, the next bind takes the claim.
 	w3 := msg.Session{Sid: "s0worker03", Label: "cc-sandbox:worker3", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
 	w3.Scope.Manager.Node, w3.Scope.Manager.Machine, w3.Scope.ReplyWindowS = "cc-sandbox:umgr5", "mac3", 3600
 	squatEntry := map[string]any{"key": "x4/%1", "label": "squat", "node": "cc-sandbox:umgr5", "uid": "eeeeeeee-0000-4000-8000-0000000000b1", "machine": "x4", "pane": "%1", "state": "waiting"}
 	x4Client := &hubc.Client{URL: url, Token: func() (string, error) { return x4Tok, nil }}
-	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 120); err != nil {
+	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 4); err != nil {
 		t.Fatalf("a squat with no worker bound to the node yet is accepted (nobody has said whose it is): %v", err)
 	}
-	hp3 := startMachine(t, ctx, url, admin, "hp3", w3)
+	hp3 := startMachine(t, ctx, url, admin, "hp3", w3, 3) // renews (and so re-binds) every second
 	var w3ID, squatID string
 	for i := 0; i < 100 && (w3ID == "" || squatID == ""); i++ {
 		es, _ := owner.Sessions(ctx)
@@ -427,8 +450,12 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
-	if w3ID == "" {
-		t.Fatal("worker3 is not on the hub")
+	if w3ID == "" || squatID == "" {
+		t.Fatalf("worker3 %q or the squatter %q is not on the hub", w3ID, squatID)
+	}
+	// B1: while the squatter is live the bind did not take the claim, and hostd was told
+	if ws := hp3.warnings(); len(ws) == 0 || !strings.Contains(ws[0], "claimed by x4") {
+		t.Errorf("hostd was not told that the manager's node is claimed by another machine: %v", ws)
 	}
 	// the squatter, bound correctly by its own spoke and the only holder, speaks as the manager: not heard
 	x4Client.Send(ctx, hubc.SendReq{To: w3ID, Text: "squatter speaking as your manager", From: map[string]string{"id": squatID, "machine": "x4"}})
@@ -440,16 +467,29 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		}
 	}
 	hp3.out.mu.Unlock()
-	// the squatter cannot renew (the hub holds the node for mac3 now), and the REAL manager is not locked out
-	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 120); !hubc.IsConflict(err) {
-		t.Errorf("the squatter's re-track after the worker bound the node: want 409, got %v", err)
+	macEntries := func() []map[string]any {
+		return []map[string]any{
+			entry("umgr", "cc-sandbox:umgr", "eeeeeeee-0000-4000-8000-0000000000a1", ""),
+			entry("uother", "cc-sandbox:uother", "eeeeeeee-0000-4000-8000-0000000000a2", ""),
+			entry("umgr5", "cc-sandbox:umgr5", "eeeeeeee-0000-4000-8000-0000000000b2", ""),
+		}
 	}
-	if _, err := mac.Track(ctx, []map[string]any{
-		entry("umgr", "cc-sandbox:umgr", "eeeeeeee-0000-4000-8000-0000000000a1", ""),
-		entry("uother", "cc-sandbox:uother", "eeeeeeee-0000-4000-8000-0000000000a2", ""),
-		entry("umgr5", "cc-sandbox:umgr5", "eeeeeeee-0000-4000-8000-0000000000b2", ""),
-	}, 120); err != nil {
-		t.Fatalf("the real manager coming back is locked out by the squatter: %v", err)
+	// the squatter lapses (its 4 s lease); hostd's next renewal binds umgr5 to mac3; the real manager gets in
+	var trackErr error
+	for i := 0; i < 80; i++ {
+		if _, trackErr = mac.Track(ctx, macEntries(), 120); trackErr == nil {
+			break
+		}
+		if !hubc.IsConflict(trackErr) {
+			t.Fatal(trackErr)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if trackErr != nil {
+		t.Fatalf("the real manager never got its node back after the squatter lapsed: %v", trackErr)
+	}
+	if _, err := x4Client.Track(ctx, []map[string]any{squatEntry}, 120); !hubc.IsConflict(err) {
+		t.Errorf("the squatter's re-track once the node is bound to mac3: want 409, got %v", err)
 	}
 	time.Sleep(300 * time.Millisecond)
 	// the worker's report goes to the REAL manager (mac3), never to the squatter
@@ -468,5 +508,21 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	}
 	if fs, _, err := x4Client.Poll(ctx, "spoke:x4", 0, time.Second); err == nil && len(fs) != 0 {
 		t.Fatalf("the squatter's downlink got the worker's report: %v", fs)
+	}
+
+	// 10. (round 6, B0-B3) a start spec that names the WRONG machine for a live manager (a typo, or a hostile
+	// spec): hostd's bind does not move the claim, the real manager is not locked out, and hostd says so.
+	w4 := msg.Session{Sid: "s0worker04", Label: "cc-sandbox:worker4", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	w4.Scope.Manager.Node, w4.Scope.Manager.Machine, w4.Scope.ReplyWindowS = "cc-sandbox:umgr5", "x6", 3600
+	hp4 := startMachine(t, ctx, url, admin, "hp4", w4, 3)
+	time.Sleep(1500 * time.Millisecond) // two renewals
+	if ws := hp4.warnings(); len(ws) == 0 || !strings.Contains(ws[0], "claimed by mac3") {
+		t.Errorf("the daemon was not told its session's manager node is claimed by mac3: %v", ws)
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := mac.Track(ctx, macEntries(), 120); err != nil {
+			t.Fatalf("the real manager was locked out by a wrong machine in someone's spec (renewal %d): %v", i, err)
+		}
+		time.Sleep(700 * time.Millisecond)
 	}
 }

@@ -140,25 +140,19 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	gd := ""
-	if rec.GitDir != "" {
-		if gd, err = e.cfg.gitdir(rec.GitDir, rec.Uid); err != nil {
-			return 0, err
-		}
-	}
 	// From here on the directories are held open: what is checked is what is mounted.
 	wpin, err := pin(e.d.OpenDir, wd, rec.Uid)
 	if err != nil {
 		return 0, err
 	}
 	defer wpin.close()
-	var gpin *pinned
-	if gd != "" {
-		if gpin, err = pin(e.d.OpenDir, gd, rec.Uid); err != nil {
-			return 0, err
-		}
-		defer gpin.close()
+	// The gitdir is not taken from the record: root derives it from the worktree's own .git, through
+	// the pinned descriptor, and the record has to agree (see gitdir.go).
+	gd, gpin, err := e.deriveGitDir(rec, wd, wpin, home)
+	if err != nil {
+		return 0, err
 	}
+	defer gpin.close()
 	extra, err := harnessArgs(rec.Spec.HarnessArgs)
 	if err != nil {
 		return 0, err

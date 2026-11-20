@@ -229,6 +229,21 @@ func (f *fx) writeConfig(extra string) {
 	}
 }
 
+// linkGitdir makes the workdir a linked worktree the way git does: <wd>/.git is a file naming a
+// host-owned gitdir that has a HEAD and a `gitdir` file pointing back at <wd>/.git. The record's
+// GitDir is set to it and written; the path is returned.
+func (f *fx) linkGitdir() string {
+	f.t.Helper()
+	gd := filepath.Join(f.roots, "git", "repo", ".git", "worktrees", "wt")
+	mk(f.t, gd, 0o755)
+	put(f.t, filepath.Join(gd, "HEAD"), "ref: refs/heads/x\n", 0o644)
+	put(f.t, filepath.Join(gd, "gitdir"), filepath.Join(f.wd, ".git")+"\n", 0o644)
+	put(f.t, filepath.Join(f.wd, ".git"), "gitdir: "+gd+"\n", 0o644)
+	f.rec.GitDir = gd
+	f.writeRecord()
+	return gd
+}
+
 func (f *fx) writeRecord() {
 	f.t.Helper()
 	b, err := json.Marshal(f.rec)
@@ -432,12 +447,12 @@ func TestRunBlocks(t *testing.T) {
 			put(f.t, filepath.Join(f.roots, "git", "file"), "x", 0o644)
 			f.rec.Spec.Workdir.Path = filepath.Join(f.roots, "git", "file")
 		}, ""},
-		{"a gitdir outside the allowed roots", func(f *fx) { f.rec.GitDir = "/etc" }, "not inside an allowed root"},
+		{"a gitdir for a worktree that has no .git (outside the roots)", func(f *fx) { f.rec.GitDir = "/etc" }, "does not match"},
 		{"a gitdir that is a symlink", func(f *fx) {
 			mk(f.t, filepath.Join(f.dir, "elsewhere"), 0o755)
 			os.Symlink(filepath.Join(f.dir, "elsewhere"), filepath.Join(f.roots, "git", "gd"))
 			f.rec.GitDir = filepath.Join(f.roots, "git", "gd")
-		}, "symlink"},
+		}, "does not match"},
 		{"a harness argument that switches the harness's safety off", func(f *fx) {
 			f.rec.Spec.HarnessArgs = []string{"--dangerously-skip-permissions"}
 		}, "not allowed"},
@@ -721,10 +736,10 @@ func TestGitdirAndWorkdirOwnerChecks(t *testing.T) {
 	gd := filepath.Join(f.roots, "git", "gd")
 	mk(t, gd, 0o755)
 	me := os.Getuid()
-	if _, err := f.cfg.gitdir(gd, me); err != nil {
+	if _, err := f.cfg.gitdir(gd, me, ""); err != nil {
 		t.Fatalf("the owner's gitdir was refused: %v", err)
 	}
-	if _, err := f.cfg.gitdir(gd, me+1); err == nil || !strings.Contains(err.Error(), "not owned") {
+	if _, err := f.cfg.gitdir(gd, me+1, ""); err == nil || !strings.Contains(err.Error(), "not owned") {
 		t.Errorf("a gitdir owned by someone else was accepted: %v", err)
 	}
 	if _, _, err := f.cfg.workdir(f.wd, me+1, ""); err == nil || !strings.Contains(err.Error(), "not owned") {
@@ -758,10 +773,7 @@ func TestHelpText(t *testing.T) {
 // staging mountpoints; docker is told to mount those, never the owner's paths.
 func TestRunStagesPinnedDirectories(t *testing.T) {
 	f := newFx(t)
-	gd := filepath.Join(f.roots, "git", "repo", ".git", "worktrees", "wt")
-	mk(t, gd, 0o755)
-	f.rec.GitDir = gd
-	f.writeRecord()
+	gd := f.linkGitdir()
 	wst, _ := os.Stat(f.wd)
 	gst, _ := os.Stat(gd)
 	if c, out := f.call("run", sid); c != 7 {
@@ -790,10 +802,7 @@ func TestRunStagesPinnedDirectories(t *testing.T) {
 // every check and before the mount. What is mounted must still be the directory that was checked.
 func TestSwappedWorkdirIsNotWhatGetsMounted(t *testing.T) {
 	f := newFx(t)
-	gd := filepath.Join(f.roots, "git", "repo", ".git", "worktrees", "wt")
-	mk(t, gd, 0o755)
-	f.rec.GitDir = gd
-	f.writeRecord()
+	gd := f.linkGitdir()
 	wst, _ := os.Stat(f.wd)
 	gst, _ := os.Stat(gd)
 	target := filepath.Join(f.dir, "victim") // a directory the owner must never get mounted
@@ -928,10 +937,7 @@ func minUID(extra string) string {
 // the fence (or anyone) could write is refused even if it looked fine when the record was made.
 func TestStagedGitdirIsCheckedForOwnershipAndMode(t *testing.T) {
 	f := newFx(t)
-	gd := filepath.Join(f.roots, "git", "repo", ".git", "worktrees", "wt")
-	mk(t, gd, 0o755)
-	f.rec.GitDir = gd
-	f.writeRecord()
+	f.linkGitdir()
 	f.mounter.after = func(target string) {
 		if strings.HasSuffix(target, "/gd") {
 			os.Chmod(target, 0o777) // what the bound gitdir would look like
@@ -1050,4 +1056,163 @@ func TestStopAndGcRefuseOutsideTheHostMountNamespace(t *testing.T) {
 	g.nsErr = fmt.Errorf("permission denied")
 	g.wantRefusedMsg("stop with an unreadable namespace", "cannot compare", "stop", sid)
 	g.wantRefusedMsg("gc with an unreadable namespace", "cannot compare", "gc", "--dry-run")
+}
+
+// ---- the gitdir is derived by root, not taken from the record ----
+
+// A plain repository: <wd>/.git is a directory, and it is mounted READ-ONLY. Otherwise the fence
+// could plant hooks in it that the owner's next git command runs as the owner.
+func TestPlainRepoDotGitIsDerivedAndMountedReadOnly(t *testing.T) {
+	f := newFx(t)
+	dg := filepath.Join(f.wd, ".git")
+	mk(t, dg, 0o755)
+	f.rec.GitDir = dg
+	f.writeRecord()
+	st, _ := os.Stat(dg)
+	if c, out := f.call("run", sid); c != 7 {
+		t.Fatalf("%d %s", c, out)
+	}
+	s := f.fb.ran[0]
+	if s.GitDir != dg || s.MountGitDir != filepath.Join(s.GenDir(), "gd") {
+		t.Fatalf("%q %q", s.GitDir, s.MountGitDir)
+	}
+	g := f.mounter.binds[len(f.mounter.binds)-1]
+	if g.ino != st.Sys().(*syscall.Stat_t).Ino || !g.readonly || g.target != s.MountGitDir {
+		t.Errorf("the plain repo's .git was not mounted read-only: %+v", g)
+	}
+}
+
+// The attack: a client sends an empty gitdir for a plain repo, so .git would stay writable.
+func TestPlainRepoWithAnEmptyGitDirIsRefused(t *testing.T) {
+	f := newFx(t)
+	mk(t, filepath.Join(f.wd, ".git"), 0o755)
+	f.rec.GitDir = ""
+	f.writeRecord()
+	f.wantRefusedMsg("a plain repo with an empty gitdir", "does not match", "run", sid)
+}
+
+func TestGitDirMustEqualWhatIsDerived(t *testing.T) {
+	cases := []struct {
+		why string
+		mod func(f *fx)
+	}{
+		{"a plain repo, another gitdir", func(f *fx) {
+			mk(f.t, filepath.Join(f.wd, ".git"), 0o755)
+			mk(f.t, filepath.Join(f.roots, "git", "other"), 0o755)
+			f.rec.GitDir = filepath.Join(f.roots, "git", "other")
+		}},
+		{"a linked worktree, an empty gitdir", func(f *fx) { f.linkGitdir(); f.rec.GitDir = "" }},
+		{"a linked worktree, another gitdir", func(f *fx) {
+			f.linkGitdir()
+			other := filepath.Join(f.roots, "git", "repo", ".git", "worktrees", "other")
+			mk(f.t, other, 0o755)
+			f.rec.GitDir = other
+		}},
+		{"no .git at all, a gitdir in the record", func(f *fx) { f.rec.GitDir = filepath.Join(f.roots, "git") }},
+	}
+	for _, c := range cases {
+		f := newFx(t)
+		c.mod(f)
+		f.writeRecord()
+		f.wantRefusedMsg(c.why, "does not match", "run", sid)
+	}
+}
+
+// A `.git` file is only as good as what it names: a git directory with a HEAD, that points back at
+// THIS worktree, and nothing that cannot be read within the bound.
+func TestDotGitFileIsHeldToWhatItNames(t *testing.T) {
+	cases := []struct {
+		why, msg string
+		mod      func(f *fx, gd string)
+	}{
+		{"not a gitdir: line", "does not start with", func(f *fx, gd string) { put(f.t, filepath.Join(f.wd, ".git"), "ref: x\n", 0o644) }},
+		{"an empty target", "no usable gitdir", func(f *fx, gd string) { put(f.t, filepath.Join(f.wd, ".git"), "gitdir:\n", 0o644) }},
+		{"a target without a HEAD", "no HEAD", func(f *fx, gd string) { os.Remove(filepath.Join(gd, "HEAD")) }},
+		{"no back-reference", "no back-reference", func(f *fx, gd string) { os.Remove(filepath.Join(gd, "gitdir")) }},
+		{"a back-reference to another worktree", "belongs to another worktree", func(f *fx, gd string) {
+			mk(f.t, filepath.Join(f.roots, "git", "elsewhere"), 0o755) // it exists: only the name differs
+			put(f.t, filepath.Join(gd, "gitdir"), filepath.Join(f.roots, "git", "elsewhere", ".git")+"\n", 0o644)
+		}},
+		{"a back-reference that is a symlink", "no back-reference", func(f *fx, gd string) {
+			real := filepath.Join(f.dir, "real-gitdir-file")
+			put(f.t, real, filepath.Join(f.wd, ".git")+"\n", 0o644)
+			os.Remove(filepath.Join(gd, "gitdir"))
+			os.Symlink(real, filepath.Join(gd, "gitdir"))
+		}},
+		{"a relative back-reference", "belongs to another worktree", func(f *fx, gd string) { put(f.t, filepath.Join(gd, "gitdir"), ".git\n", 0o644) }},
+		{"a huge .git file", "larger than", func(f *fx, gd string) {
+			put(f.t, filepath.Join(f.wd, ".git"), "gitdir: "+gd+"\n"+strings.Repeat("x", 5000), 0o644)
+		}},
+		{"a target through a symlink", "symlink", func(f *fx, gd string) {
+			ln := filepath.Join(f.roots, "git", "gdlink")
+			os.Symlink(gd, ln)
+			put(f.t, filepath.Join(f.wd, ".git"), "gitdir: "+ln+"\n", 0o644)
+			f.rec.GitDir = ln
+		}},
+		{"a .git that is a symlink", "symlink", func(f *fx, gd string) {
+			os.Remove(filepath.Join(f.wd, ".git"))
+			os.Symlink(gd, filepath.Join(f.wd, ".git"))
+		}},
+	}
+	for _, c := range cases {
+		f := newFx(t)
+		gd := f.linkGitdir()
+		c.mod(f, gd)
+		f.writeRecord()
+		f.wantRefusedMsg(c.why, c.msg, "run", sid)
+	}
+	// allow: a relative target is resolved against the worktree
+	f := newFx(t)
+	gd := f.linkGitdir()
+	rel, _ := filepath.Rel(f.wd, gd)
+	put(t, filepath.Join(f.wd, ".git"), "gitdir: "+rel+"\n", 0o644)
+	if c, out := f.call("run", sid); c != 7 {
+		t.Errorf("a relative gitdir target was refused: %d %s", c, out)
+	}
+}
+
+// The owner swaps .git for a symlink between root's look at it and the mount: what is mounted is
+// still the directory that was looked at (it was opened relative to the pinned worktree).
+func TestSwappedDotGitIsNotWhatGetsMounted(t *testing.T) {
+	f := newFx(t)
+	dg := filepath.Join(f.wd, ".git")
+	mk(t, dg, 0o755)
+	f.rec.GitDir = dg
+	f.writeRecord()
+	st, _ := os.Stat(dg)
+	victim := filepath.Join(f.dir, "victim")
+	mk(t, victim, 0o755)
+	f.fb.beforeStage = func() {
+		os.Rename(dg, dg+".moved")
+		os.Symlink(victim, dg)
+	}
+	if c, out := f.call("run", sid); c != 7 {
+		t.Fatalf("%d %s", c, out)
+	}
+	vst, _ := os.Stat(victim)
+	for _, b := range f.mounter.binds {
+		if b.ino == vst.Sys().(*syscall.Stat_t).Ino {
+			t.Fatal("the swapped-in directory was mounted")
+		}
+	}
+	if g := f.mounter.binds[len(f.mounter.binds)-1]; g.ino != st.Sys().(*syscall.Stat_t).Ino {
+		t.Errorf("the gitdir mount is not the directory that was checked: %+v", g)
+	}
+}
+
+// NIT 2: a gitdir in a hidden directory of the owner's home is refused as a workdir is.
+func TestGitdirInAHiddenHomeDirectoryIsRefused(t *testing.T) {
+	f := newFx(t)
+	home := filepath.Join(f.dir, "home")
+	hidden := filepath.Join(home, ".config", "repo.git")
+	mk(t, hidden, 0o755)
+	f.cfg.AllowedRoots = []string{home}
+	if _, err := f.cfg.gitdir(hidden, os.Getuid(), home); err == nil || !strings.Contains(err.Error(), "hidden directory") {
+		t.Errorf("a gitdir under ~/.config was accepted: %v", err)
+	}
+	ok := filepath.Join(home, "repo.git")
+	mk(t, ok, 0o755)
+	if _, err := f.cfg.gitdir(ok, os.Getuid(), home); err != nil {
+		t.Errorf("an ordinary gitdir was refused: %v", err)
+	}
 }

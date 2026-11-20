@@ -94,11 +94,11 @@
      It prints `DONE` only after hostd and the signer are up. hostd listens on loopback only
      (`127.0.0.1:7480`, with a token file), so the firewall question (S11) does not arise.
      Before step 2 do the manual checks listed in `docs/night-1-morning.md` (S5, S9, S14, S15).
-     **Signer scope:** the install writes the signer's scope (`/var/lib/ccsbx-keys/signer.scope`, 0600,
-     `ccsbx-keys`) before it enables the signer socket; without it the signer exits 2. It lists the owner,
-     the machine name, the profiles and the billings the machine key may sign; rerun `install --yes` with
-     `--machine/--profiles/--billings` to change it. `check` (as root) proves it by getting a token for one
-     in-scope test claim.
+     **Signer scope:** before it enables the signer socket the install has `ccsbx-signer --write-scope` write
+     `/var/lib/ccsbx-keys/signer.scope` (0600, `ccsbx-keys`); without it the signer exits 2. The scope lists the
+     owner, the machine name and the exact profile:billing pairs from `profiles/*.json` (a profile is signed
+     only with a billing in its own list). Rerun `install --yes` with `--machine/--pairs` to change it.
+     `check` (as root) proves it by getting a token for one in-scope test claim (api + dev-default).
      **Attach:** `/run/ccsbx` (hostd's tmux socket, 0600) is `ccsbx`-only, mode 0700, with no group: a
      group-writable tmux socket would let any process of the owner's uid type into fenced panes. The owner
      attaches with `sudo ccsbx-root attach <sid>`; the installer's one rule for `ccsbx-root` already covers

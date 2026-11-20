@@ -53,6 +53,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/fwd"
+	"github.com/landovsky/cc-sandbox/internal/gitname"
 	"github.com/landovsky/cc-sandbox/internal/gitroute"
 	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/journal"
@@ -88,23 +89,12 @@ type GitConfig struct {
 	Logf             func(string, ...any)
 }
 
-var (
-	repoRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
-	branchRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$`)
-	hexRe    = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
-	// protected: never pushed, whatever the door would say. (develop, release/*, production, gh-pages and the like are
-	// the door's call: U16 holds the protected-branch list.)
-	protectedBranches = map[string]bool{"main": true, "master": true, "head": true, "trunk": true}
-)
+// hexRe: a base of exactly 40 or 64 hex digits is a commit id, never a branch.
+var hexRe = regexp.MustCompile(`^([0-9a-f]{40}|[0-9a-f]{64})$`)
 
-// ValidBranch reports whether b may be the session branch: a plain ref name that is not protected.
-func ValidBranch(b string) bool {
-	if !branchRe.MatchString(b) || strings.Contains(b, "..") || strings.HasSuffix(b, "/") || strings.HasSuffix(b, ".lock") ||
-		strings.Contains(b, "//") || strings.Contains(b, "/.") {
-		return false
-	}
-	return !protectedBranches[strings.ToLower(b)] && !strings.HasPrefix(strings.ToLower(b), "refs/")
-}
+// ValidBranch reports whether b may be the session branch (the one definition lives in internal/gitname, shared with the
+// launcher so a bad name is refused at the start, not minutes later as "pod not ready").
+func ValidBranch(b string) bool { return gitname.Branch(b) == nil }
 
 // GitOps runs the pod's git. Create it with NewGitOps; it handles git.commit and git.push through Forward.
 type GitOps struct {
@@ -126,17 +116,11 @@ type GitOps struct {
 // NewGitOps checks the configuration: the repo and branch are well-formed, the branch is not protected and not
 // the base, the URL is plain http to a literal loopback address, and the three directories are distinct.
 func NewGitOps(cfg GitConfig) (*GitOps, error) {
-	if !repoRe.MatchString(cfg.Repo) || strings.Contains(cfg.Repo, "..") || strings.HasSuffix(strings.Split(cfg.Repo, "/")[1], ".git") {
-		return nil, fmt.Errorf("side git: %q is not owner/name", cfg.Repo)
+	if cfg.Base == "" {
+		cfg.Base = "main"
 	}
-	if !ValidBranch(cfg.Branch) {
-		return nil, fmt.Errorf("side git: %q is not a pushable session branch (plain name, not main/master/HEAD/trunk)", cfg.Branch)
-	}
-	if !hexRe.MatchString(cfg.Base) && (!branchRe.MatchString(cfg.Base) || strings.Contains(cfg.Base, "..") || strings.HasSuffix(cfg.Base, ".lock")) {
-		return nil, fmt.Errorf("side git: base %q is neither a branch name nor a full commit id", cfg.Base)
-	}
-	if cfg.Base == cfg.Branch {
-		return nil, errors.New("side git: the session branch must differ from the base")
+	if err := gitname.Pair(cfg.Repo, cfg.Base, cfg.Branch); err != nil {
+		return nil, fmt.Errorf("side git: %w", err)
 	}
 	u, err := url.Parse(cfg.URL)
 	if err != nil || u.Scheme != "http" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.HasSuffix(cfg.URL, "/") ||

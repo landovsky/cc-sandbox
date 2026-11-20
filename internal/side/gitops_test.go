@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/fwd"
+	"github.com/landovsky/cc-sandbox/internal/gitname"
 	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
@@ -792,5 +793,20 @@ func TestAGitFileInTheWorktreeNeverRedirectsOrRunsAnything(t *testing.T) {
 	files := r.door("ls-tree", "-r", "--name-only", "refs/heads/ccsbx/s1")
 	if strings.Contains(files, ".git\n") || strings.HasSuffix(files, ".git") || !strings.Contains(files, "real.txt") {
 		t.Errorf("tree at the door: %q", files)
+	}
+}
+
+// context "the launcher and the sidecar must agree on what a repo, branch and base may be called": the sidecar's checks are
+// internal/gitname's, so nothing the launcher accepted can be refused later as 'pod not ready'.
+func TestTheSidecarUsesTheSharedNameRules(t *testing.T) {
+	for _, b := range []string{"ccsbx/s1", "feature-x", "a.b/c_d", "x" + strings.Repeat("y", 99)} {
+		if !ValidBranch(b) || gitname.Branch(b) != nil {
+			t.Errorf("%q: sidecar %v, shared %v", b, ValidBranch(b), gitname.Branch(b))
+		}
+	}
+	for _, b := range []string{"main", "Master", "HEAD", "trunk", "", "-x", "a..b", "x" + strings.Repeat("y", 100), "refs/heads/x", "a/.b", "x.lock"} {
+		if ValidBranch(b) || gitname.Branch(b) == nil {
+			t.Errorf("%q accepted: sidecar %v, shared %v", b, ValidBranch(b), gitname.Branch(b))
+		}
 	}
 }

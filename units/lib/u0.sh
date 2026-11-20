@@ -46,9 +46,13 @@ sudoers_rollback() {
 
 u0_sudoers() {
   step "U0 sudoers: ccsbx-root is the only NOPASSWD grant"
+  note "ccsbx-root runs with a CLEAN environment: 'Defaults!/usr/local/sbin/ccsbx-root env_reset,!setenv' (the caller's env is reset and"
+  note "  cannot be passed through, so no sudo -E and no VAR=x reaches it)"
   note "1. the new rule goes in a dot-named staging file (sudo ignores it), is checked, then renamed"
   put /etc/sudoers.d/.90-ccsbx-root.new 0440 root:root <<EOT
 # ccsbx (U0, install-linux.sh): the only NOPASSWD rule. Fixed verbs; it validates every argument.
+# ccsbx-root gets a clean environment: the caller's env is reset and cannot be passed through (no sudo -E, no VAR=x).
+Defaults!/usr/local/sbin/ccsbx-root env_reset,!setenv
 $(real_user) ALL=(root) NOPASSWD: /usr/local/sbin/ccsbx-root
 ccsbx ALL=(root) NOPASSWD: /usr/local/sbin/ccsbx-root
 EOT

@@ -369,6 +369,13 @@ for mode in ok refuse; do
   else t "check: a signer that refuses the in-scope claim is a FAIL with its reason (a connect alone is not enough)" grep -q "^FAIL  signer refused or failed the in-scope test claim: claims outside" <<<"$out"; fi
 done
 
+echo "# PR #8 N4: ccsbx-root gets a clean environment"
+d="$(fx env)"; ins "$d" install --yes >/dev/null 2>&1; sf="$d/root/etc/sudoers.d/.90-ccsbx-root.new"
+t "N4: the sudoers file sets env_reset,!setenv for ccsbx-root, exactly" grep -qx 'Defaults!/usr/local/sbin/ccsbx-root env_reset,!setenv' "$sf"
+t "N4: …and it is a Defaults line, not an extra grant (still exactly two NOPASSWD rules)" bash -c '[ "$(grep -v "^#" "$1" | grep -c "NOPASSWD")" -eq 2 ] && ! grep -v "^#" "$1" | grep -E "^Defaults" | grep -q NOPASSWD' _ "$sf"
+t "N4: the file is still validated by visudo before it is renamed into place" bash -c 'a="$(grep -n "visudo -cf /etc/sudoers.d/.90-ccsbx-root.new" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "mv -f /etc/sudoers.d/.90-ccsbx-root.new" "$1" | head -1 | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
+t "N4: plan says ccsbx-root gets a clean environment" bash -c 'grep -q "CLEAN environment" <<<"$1" && grep -q "env_reset,!setenv" <<<"$1"' _ "$("$inst" plan 2>&1)"
+
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"
 

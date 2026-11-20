@@ -192,11 +192,13 @@ func TestPaneEnvUsesTheEmbeddedProfiles(t *testing.T) {
 	}
 }
 
-// context: the hub credential file is written by the installer (root) and read by hostd through a
-// group, so group-read is fine; group-write, any access by others, or a token of the wrong kind is
-// refused (a world-readable spoke token would let any local user speak for the machine).
-func TestHubTokenFileModesAndShape(t *testing.T) {
-	p := filepath.Join(t.TempDir(), "hub.token")
+// context: the hub credential file is written by the installer (root) and read by hostd through a group,
+// so group-read is fine; group-write, any access by others, a symlink, a FIFO, another user's file or a
+// token of the wrong kind is refused (a world-readable spoke token would let any local user speak for the
+// machine; a FIFO would hang every request, since the token is read on each).
+func TestHubTokenFileModesShapeAndKind(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "hub.token")
 	good := "sbp1.abcdefghijklmnop\n"
 	write := func(mode os.FileMode, body string) {
 		os.Remove(p)
@@ -218,5 +220,40 @@ func TestHubTokenFileModesAndShape(t *testing.T) {
 	write(0o600, "not-a-token-at-all-0123456789\n")
 	if _, err := readHubToken(p); err == nil {
 		t.Error("a token of the wrong kind was accepted")
+	}
+	write(0o600, "sbp1."+strings.Repeat("a", 5000))
+	if _, err := readHubToken(p); err == nil {
+		t.Error("an oversize file was accepted")
+	}
+	write(0o600, good)
+	link := filepath.Join(dir, "link")
+	os.Symlink(p, link)
+	if _, err := readHubToken(link); err == nil {
+		t.Error("a symlink was followed")
+	}
+	fifo := filepath.Join(dir, "fifo")
+	syscall.Mkfifo(fifo, 0o600)
+	done := make(chan error, 1)
+	go func() { _, err := readHubToken(fifo); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a FIFO was read")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a FIFO at the token path hung the read")
+	}
+	// the file belongs to the test user: with only root and some other uid allowed it is a foreign owner
+	if _, err := readHubTokenAs(p, 0, os.Getuid()+1); err == nil {
+		t.Error("a file of another user was accepted")
+	}
+}
+
+// context: --hub-ttl is the hub's lease: outside its 1..300 seconds the hub would refuse every track.
+func TestHubTtlIsRangeChecked(t *testing.T) {
+	for _, v := range []string{"0", "301", "-5"} {
+		if code, out := runHostd("run", "--once", "--state", t.TempDir(), "--hub-ttl", v); code == 0 || !strings.Contains(out, "hub-ttl") {
+			t.Errorf("%s: %d %s", v, code, out)
+		}
 	}
 }

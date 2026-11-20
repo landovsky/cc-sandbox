@@ -228,3 +228,55 @@ func TestStoppingUntracksEverything(t *testing.T) {
 		return len(hub.tracked) > 0 && len(hub.tracked[len(hub.tracked)-1]) == 0
 	})
 }
+
+// context: the hub (or one mailbox) restarts, so its sequence numbers and refs start again. A NEW frame
+// that happens to carry the same seq and ref as one whose ack never succeeded must be handled, not
+// swallowed with the old result (its sender would be told "delivered" and nothing typed).
+func TestANewFrameWithAReusedSeqAfterAHubRestartIsHandled(t *testing.T) {
+	hub := &fakeHub{failAck: 1000} // every ack fails: the first frame stays "seen"
+	var mu sync.Mutex
+	var got []string
+	_, cancel, _ := rig(t, hub, func(d hubc.Deliver) Result {
+		mu.Lock()
+		got = append(got, d.Text)
+		mu.Unlock()
+		return Result{OK: true}
+	})
+	defer cancel()
+	hub.push(1, "first", 9)
+	waitFor(t, "the first frame handled", func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == 1 })
+	hub.mu.Lock()
+	hub.queue = nil // the hub restarted: the queue is gone and the numbering starts again
+	hub.mu.Unlock()
+	hub.push(1, "second, a different message with the same seq and ref", 9)
+	waitFor(t, "the second frame handled", func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == 2 })
+}
+
+// context: a refused credential on track must not hammer the hub every backoff interval for ever: the
+// wait grows.
+func TestTrackBacksOffWhileItKeepsFailing(t *testing.T) {
+	hub := &fakeHub{authOK: "sbp1.never"}
+	ts := httptest.NewServer(hub.handler())
+	defer ts.Close()
+	sp := New(Config{
+		Client:  &hubc.Client{URL: ts.URL, Token: func() (string, error) { return "sbp1.bad", nil }},
+		Machine: "hp", Name: "ccsbx", TTL: 3, Backoff: 20 * time.Millisecond, PollWait: time.Second,
+		Entries: func() []map[string]any { return []map[string]any{{"key": "k"}} },
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	go sp.Run(ctx)
+	time.Sleep(600 * time.Millisecond)
+	cancel()
+	hub.mu.Lock()
+	n := 0
+	for _, tk := range hub.seenToken {
+		if tk == "sbp1.bad" {
+			n++
+		}
+	}
+	hub.mu.Unlock()
+	// track + poll both fail; with a fixed 20 ms wait this would be ~60 calls, with doubling about 10
+	if n > 30 {
+		t.Fatalf("%d calls in 600 ms: the track wait does not grow", n)
+	}
+}

@@ -125,6 +125,10 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ccsbx-hostd: helper mode needs --run-dir (ccsbx-root's run dir, /var/lib/ccsbx-run): without it hostd would look for outboxes in the state dir and see none")
 		return cli.ExitRefused
 	}
+	if ttl := num("hub-ttl"); ttl < 1 || ttl > 300 {
+		fmt.Fprintf(stderr, "ccsbx-hostd: --hub-ttl %d is outside the hub's 1..300 seconds\n", ttl)
+		return cli.ExitUsage
+	}
 	d := &start.Daemon{StateDir: get("state")}
 	tm := &msg.Tmux{Socket: get("tmux-socket")}
 	rt := &msg.Router{Dir: msg.DaemonDir{D: d, Alive: tm.Alive}, Out: tm, StateDir: get("state")}
@@ -270,26 +274,54 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	return cli.ExitOK
 }
 
-// readHubToken reads the hub spoke credential. The file may be group-readable (root-owned, group
-// ccsbx: the installer writes it, hostd reads it) but not writable by the group, nor reachable by
-// others, and the token must look like a principal token (sbp1.…).
-func readHubToken(path string) (string, error) {
-	st, err := os.Stat(path)
+// readHubToken reads the hub spoke credential: the installer (root) writes it, hostd reads it through
+// the group. It is opened without following a symlink and without blocking on a FIFO, judged on the
+// opened descriptor (a regular file, owned by root or by hostd's own uid, not writable by its group
+// nor reachable by others: 0640 or 0600), read through that descriptor and at most 4 KiB, and the
+// token must look like a principal token (sbp1.…).
+func readHubToken(path string) (string, error) { return readHubTokenAs(path, 0, os.Getuid()) }
+
+func readHubTokenAs(path string, okUIDs ...int) (string, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return "", &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	st, err := f.Stat()
 	if err != nil {
 		return "", err
+	}
+	if !st.Mode().IsRegular() {
+		return "", fmt.Errorf("%s is not a regular file", path)
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); !ok || !containsInt(okUIDs, int(sys.Uid)) {
+		return "", fmt.Errorf("%s is not owned by root or by the daemon's user", path)
 	}
 	if st.Mode().Perm()&0o037 != 0 {
 		return "", fmt.Errorf("%s is writable by its group or reachable by others (mode %o: want 0640 or 0600)", path, st.Mode().Perm())
 	}
-	b, err := os.ReadFile(path)
+	b, err := io.ReadAll(io.LimitReader(f, 4097))
 	if err != nil {
 		return "", err
+	}
+	if len(b) > 4096 {
+		return "", fmt.Errorf("%s is larger than 4 KiB: not a token file", path)
 	}
 	t := strings.TrimSpace(string(b))
 	if !strings.HasPrefix(t, "sbp1.") || len(t) < 16 {
 		return "", fmt.Errorf("%s does not hold a hub principal token (sbp1.…)", path)
 	}
 	return t, nil
+}
+
+func containsInt(l []int, v int) bool {
+	for _, x := range l {
+		if x == v {
+			return true
+		}
+	}
+	return false
 }
 
 // checkSigner dials the signer's socket with a short timeout, so a signer that is not up is a

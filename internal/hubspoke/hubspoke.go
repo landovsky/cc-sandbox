@@ -12,6 +12,7 @@ package hubspoke
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -23,6 +24,23 @@ import (
 // Result is what the handler says about a frame: OK "handled" (delivered, or accepted into a queue
 // that will deliver), Confirmed "seen to arrive in full".
 type Result struct{ OK, Confirmed bool }
+
+// seenKey identifies one delivery: the mailbox sequence, the hub's ack reference and a hash of the
+// payload. A hub or mailbox restart starts the sequence again and its refs are only unique within a
+// VM's life, so (seq, ref) alone could match a NEW frame to an old entry and swallow it; the payload
+// hash makes that collision a different message.
+type seenKey struct {
+	Seq, Ref int64
+	Hash     [32]byte
+}
+
+type seenVal struct {
+	Res Result
+	At  time.Time
+}
+
+// seenTTL: an entry whose ack never succeeded is forgotten after this, by time and not only by distance.
+const seenTTL = 10 * time.Minute
 
 // Config is one spoke.
 type Config struct {
@@ -59,7 +77,7 @@ type Spoke struct {
 	cfg  Config
 	mu   sync.Mutex
 	st   Status
-	seen map[[2]int64]Result // (seq, ack_ref) handled but possibly not yet acked, with the result to re-ack
+	seen map[seenKey]seenVal // frames handled but possibly not yet acked, with the result to re-ack
 }
 
 // New makes a spoke; call Run.
@@ -76,7 +94,7 @@ func New(cfg Config) *Spoke {
 	if cfg.Backoff <= 0 {
 		cfg.Backoff = 2 * time.Second
 	}
-	return &Spoke{cfg: cfg, seen: map[[2]int64]Result{}}
+	return &Spoke{cfg: cfg, seen: map[seenKey]seenVal{}}
 }
 
 // Status returns a copy of the counters.
@@ -111,6 +129,7 @@ func (s *Spoke) Run(ctx context.Context) {
 
 func (s *Spoke) trackLoop(ctx context.Context) {
 	every := time.Duration(s.cfg.TTL) * time.Second / 3
+	back := s.cfg.Backoff
 	for {
 		keys, err := s.cfg.Client.Track(ctx, s.cfg.Entries(), s.cfg.TTL)
 		s.setErr(err)
@@ -119,8 +138,12 @@ func (s *Spoke) trackLoop(ctx context.Context) {
 			s.mu.Lock()
 			s.st.Tracked, s.st.Renewals = len(keys), s.st.Renewals+1
 			s.mu.Unlock()
+			back = s.cfg.Backoff
 		} else {
-			wait = s.cfg.Backoff
+			wait = back // grows while it keeps failing: a refused credential must not hit the hub every 2 s
+			if back < 30*time.Second {
+				back *= 2
+			}
 		}
 		select {
 		case <-ctx.Done():
@@ -161,24 +184,23 @@ func (s *Spoke) handle(ctx context.Context, f hubc.Frame) {
 			s.cfg.Logf("hub: frame %d: unreadable deliver payload: %v", f.Seq, err)
 		}
 	}
-	key := [2]int64{f.Seq, d.AckRef}
+	key := seenKey{Seq: f.Seq, Ref: d.AckRef, Hash: sha256.Sum256(f.Payload)}
 	s.mu.Lock()
-	res, done := s.seen[key]
+	for k, v := range s.seen {
+		if time.Since(v.At) > seenTTL {
+			delete(s.seen, k)
+		}
+	}
+	prev, done := s.seen[key]
+	res := prev.Res
 	s.mu.Unlock()
 	if !done {
 		if f.Event == "deliver" && s.cfg.OnDeliver != nil {
 			res = s.cfg.OnDeliver(ctx, f, d)
 		}
 		s.mu.Lock()
-		s.seen[key] = res
+		s.seen[key] = seenVal{Res: res, At: time.Now()}
 		s.st.Frames++
-		if len(s.seen) > 2000 { // bounded: forget the oldest by dropping everything older than this frame
-			for k := range s.seen {
-				if k[0] < f.Seq-1000 {
-					delete(s.seen, k)
-				}
-			}
-		}
 		s.mu.Unlock()
 	}
 	err := s.cfg.Client.Ack(ctx, hubc.Ack{Topic: s.cfg.Topic(), Seq: f.Seq, AckTopic: d.AckTopic, AckRef: d.AckRef, OK: res.OK, Confirmed: res.Confirmed})

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -78,14 +79,37 @@ func IsAuth(err error) bool {
 	return errors.As(err, &e) && (e.Status == 401 || e.Status == 403)
 }
 
+// sharedTransport is used by every Client (the spoke's and each relay's): one pool, so connections
+// are reused instead of a new transport, idle connection and goroutines per request, and a dial or
+// TLS handshake to a black-holed hub fails in 5 s instead of the kernel's ~2 minutes (longer than
+// the 60 s lease, which would drop every tracked session).
+var sharedTransport = &http.Transport{
+	DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+	TLSHandshakeTimeout:   5 * time.Second,
+	MaxIdleConns:          8,
+	MaxIdleConnsPerHost:   4,
+	IdleConnTimeout:       90 * time.Second,
+	ResponseHeaderTimeout: 45 * time.Second,
+}
+
+var sharedHTTP = &http.Client{Transport: sharedTransport}
+
 func (c *Client) http() *http.Client {
 	if c.HTTP != nil {
 		return c.HTTP
 	}
-	return &http.Client{Transport: &http.Transport{ResponseHeaderTimeout: 45 * time.Second, IdleConnTimeout: 60 * time.Second}}
+	return sharedHTTP
 }
 
-func (c *Client) do(ctx context.Context, method, path string, q url.Values, body any) ([]byte, error) {
+// Per-call deadlines: a call must not outlive what it is for (a stuck hub must not stall a loop).
+var (
+	callTimeout = 10 * time.Second // track, ack, sessions
+	sendTimeout = 15 * time.Second // deliver: the hub itself waits up to ~8 s for the receiver's ack
+)
+
+func (c *Client) do(ctx context.Context, method, path string, q url.Values, body any, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -131,7 +155,7 @@ func (c *Client) Track(ctx context.Context, entries []map[string]any, ttl int) (
 	if entries == nil {
 		entries = []map[string]any{}
 	}
-	b, err := c.do(ctx, "POST", "/v1/track", nil, map[string]any{"entries": entries, "ttl": ttl})
+	b, err := c.do(ctx, "POST", "/v1/track", nil, map[string]any{"entries": entries, "ttl": ttl}, callTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -148,7 +172,7 @@ func (c *Client) Track(ctx context.Context, entries []map[string]any, ttl int) (
 // It returns the frames and the hub's `next` marker.
 func (c *Client) Poll(ctx context.Context, topic string, after int64, wait time.Duration) ([]Frame, int64, error) {
 	q := url.Values{"topic": {topic}, "after": {strconv.FormatInt(after, 10)}, "wait": {strconv.Itoa(int(wait / time.Second))}}
-	b, err := c.do(ctx, "GET", "/v1/downlink", q, nil)
+	b, err := c.do(ctx, "GET", "/v1/downlink", q, nil, wait+callTimeout)
 	if err != nil {
 		return nil, after, err
 	}
@@ -179,7 +203,7 @@ func (c *Client) Ack(ctx context.Context, a Ack) error {
 	if a.Via == "" {
 		a.Via = "http"
 	}
-	_, err := c.do(ctx, "POST", "/v1/ack", nil, a)
+	_, err := c.do(ctx, "POST", "/v1/ack", nil, a, callTimeout)
 	return err
 }
 
@@ -206,7 +230,7 @@ type SendResult struct {
 // Send posts a message and waits for the hub's answer (the hub waits for the receiver's ack, up to
 // about 8 s, so the context should allow ~10 s).
 func (c *Client) Send(ctx context.Context, r SendReq) (*SendResult, error) {
-	b, err := c.do(ctx, "POST", "/deliver", nil, r)
+	b, err := c.do(ctx, "POST", "/deliver", nil, r, sendTimeout)
 	if err != nil {
 		return nil, err
 	}

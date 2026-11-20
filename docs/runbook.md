@@ -141,8 +141,12 @@
 - **Steps:**
   1. If the old cockpit is alive: on it, `cc-tree cockpit down`.
   2. On the new machine: `cc-tree cockpit up`. It runs `cc-tree sync --pull`, checks that the last
-     cursor-ack commit is an ancestor of HEAD (else it refuses with "N commits not pushed": push
-     them on the old machine first), takes the daemon snapshot, then tails from the cursor.
+     cursor-ack commit of every daemon is an ancestor of HEAD (else it refuses, naming the machine
+     and the commit: "that machine's last commits are not pushed". Push them there first, or
+     `--wait 60` to keep pulling), takes the lease on every daemon (all or none), takes the
+     daemon snapshot, then tails from the old cockpit's cursor and applies the gap at once.
+     The daemons are the ones in `machines.json` at the root of the tree repo
+     (`{"machines": ["hp-ubuntu", "mac"]}`), else the hosts fenced nodes ran on.
   3. If the old machine is dead and holds the lease: `cc-tree cockpit up --steal`. Use it only
      when the old cockpit really is down, since two writers means duplicate verbs.
 - **Check:** `cc-tree cockpit status` on the new machine shows the lease held on every daemon

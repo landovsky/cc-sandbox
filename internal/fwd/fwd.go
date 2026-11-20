@@ -163,6 +163,16 @@ func New(cfg Config) (*Forwarder, error) {
 		ModifyResponse: func(resp *http.Response) error {
 			resp.Header.Del("Location")
 			resp.Header.Del("Set-Cookie")
+			// A door that echoes a credential header back must not hand the token to the fence. Bodies are
+			// not scanned (a stream can't be, cheaply); a door that echoes one is a door bug.
+			for k, vs := range resp.Header {
+				for _, v := range vs {
+					if cfg.Token != "" && strings.Contains(v, cfg.Token) {
+						resp.Header.Del(k)
+						break
+					}
+				}
+			}
 			return nil
 		},
 	}

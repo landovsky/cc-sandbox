@@ -5,13 +5,23 @@ need a question back. Risk / blast radius: High, Medium, Low.
 
 | # | what you do | where | risk | blast |
 |---|---|---|---|---|
-| 1 | Push main (226 commits) and check the first fence-image and side-image Actions runs | hp, GitHub | Low | Medium (public repo, first package) |
+| 1 | **DONE** Push main, watch the first fence-image and side-image Actions runs, close PR #7 (both runs green, built from main `2945647`) | hp, GitHub | Low | Medium (public repo, first package) |
+| 1b | **OPEN** Make the two ghcr packages public (`ccsbx-fence`, `ccsbx`), or the `read:packages` alternative | GitHub, hp | Low | Medium |
 | 2 | Decide the 6 P15 questions so the root installer stops refusing | this doc | Low | Low |
 | 3 | Install the seccomp profile and run its docker test (Gate M) | hp, sudo | Medium | Medium |
 | 4 | Run Gate M #4x65 (root install + reboot), moved to 2026-11-22 | hp, sudo | High | High |
 | 5 | Say Arm! once Gate M passes | this tab | Low | Medium |
 
 ## 1 · Push main, then the first fence-image and side-image runs
+
+**DONE** (main pushed, PR #7 closed, both Actions runs green, built from main `2945647`). The two digests Gate M passes:
+
+```
+FENCE (--image):      ghcr.io/landovsky/ccsbx-fence@sha256:c815f83c1b51866dda94b81f9133d4c024828247a2cadb14c023e301988a3afe
+SIDECAR (--side-image): ghcr.io/landovsky/ccsbx@sha256:8806715af5c1179c133f52804dc2baf1c25e6845d3660eb03599eacfbb9812af
+```
+
+**Still open for you: 1b, the package visibility choice** (last paragraph of this section). The commands below are kept as the record of what was done.
 
 Why: local main has PRs #2, #8–#14 and the new fence-image workflow merged (each reviewed, tests
 green after every merge), 226 commits ahead. The workflow can only reach GitHub with your

@@ -24,7 +24,7 @@ u0_binaries() {
 # written by install-linux.sh (U0). Root-owned: tomas can't widen it. Edit with sudoedit.
 allowed_roots = [${ALLOWED_ROOTS_TOML}]
 machine = "${MACHINE}"
-verbs = ["run", "stop", "renew", "gc", "attach", "exec-token"]
+verbs = ["run", "stop", "status", "renew", "gc", "attach", "exec-token"]
 EOT
   note "a root-owned copy of the pins: ccsbx-root and hostd read THIS, never the owner-writable repo"
   put /etc/ccsbx/pins.toml 0644 root:root < "$REPO_DIR/pins.toml"

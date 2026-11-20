@@ -39,6 +39,9 @@ const (
 type Runner struct {
 	GitDir   string // host-owned gitdir, outside Worktree
 	Worktree string
+	// Home is the owner's home, for the config files steering-check reads and for "~" in them;
+	// default os.UserHomeDir.
+	Home string
 	// AllowGitDirInWorktree is for a developer's own repo (steering-check on a normal checkout).
 	// A fenced session's gitdir is never inside its worktree.
 	AllowGitDirInWorktree bool
@@ -77,6 +80,14 @@ var overrides = []string{
 	"core.hooksPath=/dev/null",
 	"core.fsmonitor=false",
 	"core.untrackedCache=false",
+	// keys that decide what git NOTICES: a config the agent can write (developer-repo mode) must not
+	// be able to make a change invisible (stat comparison, mode bits, sparse checkout)
+	"core.checkStat=default",
+	"core.trustctime=true",
+	"core.fileMode=true",
+	"core.symlinks=true",
+	"core.sparseCheckout=false",
+	"color.ui=never",
 	"core.sshCommand=/bin/false",
 	"core.pager=cat",
 	"core.editor=/bin/false",
@@ -306,7 +317,7 @@ func (r *Runner) checkRepo() error {
 	}
 	// Host-owned and not writable by anyone else: git's own safe.directory idea. A gitdir the
 	// fence ever had write access to could carry a config with filter drivers or include paths.
-	for _, p := range []string{gd, filepath.Join(gd, "config"), filepath.Join(gd, "info"), filepath.Join(gd, "hooks")} {
+	for _, p := range []string{gd, filepath.Join(gd, "config"), filepath.Join(gd, "config.worktree"), filepath.Join(gd, "info"), filepath.Join(gd, "hooks")} {
 		if err := hostOwned(p); err != nil {
 			return err
 		}

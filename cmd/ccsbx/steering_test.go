@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/landovsky/cc-sandbox/internal/gitroute"
 )
 
 func devRepo(t *testing.T) string {
@@ -48,5 +50,69 @@ func TestSteeringCheckRefusesOldGit(t *testing.T) {
 	code := app().Main([]string{"steering-check", "--worktree", wt, "--base", "HEAD", "--state", t.TempDir(), "--git", fake}, &out, &errb)
 	if code != 2 || !strings.Contains(errb.String(), "--git") {
 		t.Fatalf("exit %d, stderr %q", code, errb.String())
+	}
+}
+
+// Husky-style: the repository's own config makes git run hooks from a directory inside the worktree.
+// A fence's edit there is what the owner's next `git commit` would run, so the check says exit 3.
+func TestSteeringCheckSeesHooksPathAndNestedRepos(t *testing.T) {
+	wt := devRepo(t)
+	g := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = wt
+		if b, err := c.CombinedOutput(); err != nil {
+			t.Fatalf("%v: %s", err, b)
+		}
+	}
+	g("config", "core.hooksPath", "tools/hooks")
+	var out, errb strings.Builder
+	a := []string{"steering-check", "--worktree", wt, "--base", "HEAD", "--state", t.TempDir()}
+	if code := app().Main(a, &out, &errb); code != 0 {
+		t.Fatalf("a clean repo with a hooksPath: exit %d %s", code, errb.String())
+	}
+	os.MkdirAll(filepath.Join(wt, "tools", "hooks"), 0o755)
+	os.WriteFile(filepath.Join(wt, "tools", "hooks", "pre-commit"), []byte("#!/bin/sh\n"), 0o755)
+	out.Reset()
+	if code := app().Main(a, &out, &errb); code != 3 || !strings.Contains(out.String(), "tools/hooks/pre-commit") {
+		t.Fatalf("hooksPath change: exit %d out %q err %q", code, out.String(), errb.String())
+	}
+	os.Remove(filepath.Join(wt, "tools", "hooks", "pre-commit"))
+	g("config", "--unset", "core.hooksPath")
+	g("init", "-q", "nested")
+	out.Reset()
+	if code := app().Main(a, &out, &errb); code != 3 || !strings.Contains(out.String(), "nested/.git") {
+		t.Fatalf("nested repo: exit %d out %q err %q", code, out.String(), errb.String())
+	}
+}
+
+// A walk that hit its cap is never "clean": exit 4, not 0 (an agent could pad a directory with
+// files so that the repository it hides sorts after the cap).
+func TestSteeringCheckIsIncompleteNotCleanWhenTheWalkIsCut(t *testing.T) {
+	wt := devRepo(t)
+	for i := 0; i < 20; i++ {
+		os.WriteFile(filepath.Join(wt, "pad"+string(rune('a'+i))), nil, 0o644)
+	}
+	defer gitroute.SetNestedWalkCap(3)()
+	var out, errb strings.Builder
+	a := []string{"steering-check", "--worktree", wt, "--base", "HEAD", "--state", t.TempDir()}
+	code := app().Main(a, &out, &errb)
+	if code != 4 || !strings.Contains(errb.String(), "INCOMPLETE") {
+		t.Errorf("exit %d (want 4): %s %s", code, out.String(), errb.String())
+	}
+}
+
+// An include file inside the worktree is for review whether or not it changed.
+func TestSteeringCheckFlagsAnIncludeInsideTheWorktree(t *testing.T) {
+	wt := devRepo(t)
+	os.WriteFile(filepath.Join(wt, "local.cfg"), []byte("[user]\n\tname = x\n"), 0o644)
+	c := exec.Command("git", "config", "include.path", filepath.Join(wt, "local.cfg"))
+	c.Dir = wt
+	if b, err := c.CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, b)
+	}
+	var out, errb strings.Builder
+	a := []string{"steering-check", "--worktree", wt, "--base", "HEAD", "--state", t.TempDir()}
+	if code := app().Main(a, &out, &errb); code != 3 || !strings.Contains(out.String(), "local.cfg") {
+		t.Errorf("exit %d out %q err %q", code, out.String(), errb.String())
 	}
 }

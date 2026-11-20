@@ -160,6 +160,21 @@
 - **Known: orphaned direct-mode homes.** The node home is now keyed by owner, class and label, so
   homes made by direct mode before this change are not found again: `--resume` of such a session
   starts without its old transcript. Nothing important lives there yet; they can be deleted by hand.
+- **Known limit: your own git in a worktree a fence wrote to.** The fence has the worktree read-write.
+  ccsbx-root mounts the repository's own gitdir read-only, and H1 keeps the HOST's git away from
+  anything the fence wrote, but your own `git commit` in that worktree trusts what it finds there:
+  hooks that `core.hooksPath` (the repository's config, or your global one) or an `include.path` points
+  into the worktree (Husky's `.husky/pre-commit`), include files that live in the worktree, and nested
+  repositories (`sub/.git`). Before you run your own git in such a worktree, run
+  `ccsbx steering-check --base <base>`: it lists changes under those paths, every in-worktree include
+  file (changed or not), every nested repository (an unignored `node_modules` included), unreadable
+  directories, and exits 3 if there is anything; exit 4 means it could not look everywhere (the walk cap)
+  and is NOT a clean result. Do not commit until it says exit 0.
+  **Exit 0 does not make your commit safe if a hook runs code the fence can edit and git ignores**:
+  Husky and lint-staged call `node_modules/.bin/...`. For a worktree a fence wrote to, commit with
+  `git -c core.hooksPath=/dev/null commit`, or review that code first. Command-valued config keys that
+  name a script in the worktree (`filter.*.clean`, `diff.*.textconv`, `core.fsmonitor`, `core.editor`,
+  `alias.*=!...`) are not read by the check either.
 
 ## 4. Night auto-start and stop
 <!-- procedure: NB4 -->

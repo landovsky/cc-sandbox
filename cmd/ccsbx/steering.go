@@ -18,6 +18,10 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
+// exitIncomplete: steering-check could not look everywhere (the walk cap), so "nothing found" is
+// not a verdict. Never 0.
+const exitIncomplete = 4
+
 func steeringCheckCmd() *cli.Command {
 	return &cli.Command{
 		Name:    "steering-check",
@@ -31,7 +35,21 @@ func steeringCheckCmd() *cli.Command {
   npm config, .gitattributes, .gitmodules (see internal/gitroute/steering.go). Also reported: a symlink
   or gitlink that is new or changed, edits behind a steering symlink (.claude -> docs/notes), and
   steering files that are untracked, modified or git-ignored in the worktree (CLAUDE.local.md,
-  .claude/settings.local.json). Paths with odd characters are printed quoted.
+  .claude/settings.local.json). Also reported, because your OWN git trusts them: changed files under
+  core.hooksPath or an include.path of the repository's config that point into the worktree (Husky's
+  .husky/pre-commit), and any nested repository (a .git directory or file below the worktree, other than
+  a submodule HEAD already has). Do not run your own git commit in a worktree a fence wrote to before this
+  says exit 0. Include files that live inside the worktree are flagged whether changed or not (the fence
+  can write them); the owner's global config and one level of included files are read for hooksPath
+  and includes too; a recorded submodule whose .git is not a file under the repository's modules/ is
+  flagged; a directory that cannot be read is listed as "<dir>/ (unreadable)"; an unignored
+  node_modules is searched like any directory.
+  LIMITS: exit 0 does not make your own git commit safe when a hook runs code the fence can edit
+  and git ignores (husky and lint-staged call node_modules/.bin/...: use git -c core.hooksPath=/dev/null
+  commit, or review that code), and command-valued config keys that name a script in the worktree
+  (filter.*.clean, diff.*.textconv, core.fsmonitor, core.editor, alias.*=!...) are not read.
+  Exit 4: incomplete (the walk hit its entry cap): never read as clean. Paths with odd characters are
+  printed quoted.
   Needs git >= 2.41 (Apple's /usr/bin/git 2.39 is refused): ccsbx steering-check --git /opt/homebrew/bin/git
   Exit 2: refused (old git, a fenced session's own .git, an unsafe gitdir).`,
 		Setup: func(f *cli.Flags) {
@@ -67,7 +85,10 @@ func steeringCheckCmd() *cli.Command {
 				}
 			}
 			st, err := r.SteeringSince(get("base"))
-			if err != nil {
+			incomplete := errors.Is(err, gitroute.ErrIncomplete)
+			if incomplete {
+				fmt.Fprintln(stderr, "ccsbx steering-check: INCOMPLETE:", err, "(the result below is only what was found; this is never exit 0)")
+			} else if err != nil {
 				fmt.Fprintln(stderr, "ccsbx steering-check:", err)
 				if errors.Is(err, gitroute.ErrRefused) {
 					return cli.ExitRefused
@@ -75,6 +96,9 @@ func steeringCheckCmd() *cli.Command {
 				return cli.ExitFail
 			}
 			if len(st) == 0 {
+				if incomplete {
+					return exitIncomplete
+				}
 				return cli.ExitOK
 			}
 			for _, p := range st {

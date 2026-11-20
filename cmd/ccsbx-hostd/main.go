@@ -86,6 +86,9 @@ func app() *cli.App {
 				f.String("listen-token-file", "", "file (mode 0600) holding the bearer token the --listen address requires")
 				f.Int("lease-ttl", 90, "cockpit lease TTL in seconds (one holder per realm)")
 				f.Int("queue-max", 10000, "pending cockpit requests per realm before refused: queue_full")
+				f.String("hub-url", "", "the session-bus hub's HTTP address, e.g. http://127.0.0.1:4011: hostd tracks its fenced sessions there and receives deliveries on spoke:<machine>/ccsbx (B1). Empty: no hub (logged)")
+				f.String("hub-token-file", "", "file (mode 0600/0640, owned by the daemon's user or group) holding this machine's hub SPOKE credential (sbp1.…); hostd never holds the hub's admin secret and never touches the owner's bus sockets. Re-read after a 401")
+				f.Int("hub-ttl", 60, "lease, in seconds, of the sessions tracked on the hub (the hub allows 1..300); renewed every third of it")
 				f.String("ccmsg-bin", "", "ccmsg (session-bus) to reach an unfenced manager on this machine, e.g. ~/.dotfiles/session-bus/bin/ccmsg; empty: only ccsbx sessions are reachable")
 				f.Bool("hear", false, "C23 hear: tell a worker's manager by message when the worker needs a human decision (permission prompt, question dialog)")
 				f.String("ccsbx-bin", "", "the ccsbx binary a replaced session's pane runs (default: ccsbx next to this binary)")
@@ -172,6 +175,13 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "accepted=%d refused=%d shed=%d reasons=%v\n", st.Accepted, st.Refused, st.Shed, st.Reasons)
 		return cli.ExitOK
 	}
+	hubCancel := func() {}
+	if u := get("hub-url"); u != "" {
+		hubCancel = startHubSpoke(get, num, rt, j, lg, u)
+	} else {
+		lg.Printf("--hub-url is not set: hostd is not on the session bus (no cross-machine messages, no presence)")
+	}
+	defer hubCancel()
 	exe := get("ccsbx-bin")
 	if exe == "" {
 		if self, err := os.Executable(); err == nil {
@@ -258,6 +268,28 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		hs.Close()
 	}
 	return cli.ExitOK
+}
+
+// readHubToken reads the hub spoke credential. The file may be group-readable (root-owned, group
+// ccsbx: the installer writes it, hostd reads it) but not writable by the group, nor reachable by
+// others, and the token must look like a principal token (sbp1.…).
+func readHubToken(path string) (string, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if st.Mode().Perm()&0o037 != 0 {
+		return "", fmt.Errorf("%s is writable by its group or reachable by others (mode %o: want 0640 or 0600)", path, st.Mode().Perm())
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	t := strings.TrimSpace(string(b))
+	if !strings.HasPrefix(t, "sbp1.") || len(t) < 16 {
+		return "", fmt.Errorf("%s does not hold a hub principal token (sbp1.…)", path)
+	}
+	return t, nil
 }
 
 // checkSigner dials the signer's socket with a short timeout, so a signer that is not up is a

@@ -1550,3 +1550,25 @@ block = "tests/twin-go.sh ./internal/start TestStoppedProofAsksTheRuntime && tes
 invariants = [11, 24]
 backends = ["unit"]
 where = "hp"
+
+# ---- B1: hostd on the session bus (n1-g-b1). Direct mode: not evidence. ----
+
+[[rule]]
+id = "hub-spoke-registers"
+title = "hostd registers its fenced sessions on the real hub (B11, a test hub on a spare port) and receives a test frame whose ack reaches the waiting /deliver; a spoke credential others can read or write is refused"
+suite = "msg"
+allow = "tests/hub-spoke-test.sh"
+block = "tests/twin-go.sh ./cmd/ccsbx-hostd TestHubTokenFileModesAndShape"
+invariants = [13]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "hub-frame-once"
+title = "a hub delivery is handled once even when its ack fails and the hub sends it again; the lease is renewed and a stopped hostd untracks"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/hubspoke TestReceivesATestFrameAndAcksTheResult"
+block = "tests/twin-go.sh ./internal/hubspoke TestAFrameWhoseAckFailedIsNotHandledTwice"
+invariants = [13]
+backends = ["unit"]
+where = "hp"

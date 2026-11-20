@@ -191,3 +191,32 @@ func TestPaneEnvUsesTheEmbeddedProfiles(t *testing.T) {
 		t.Fatalf("%s", env)
 	}
 }
+
+// context: the hub credential file is written by the installer (root) and read by hostd through a
+// group, so group-read is fine; group-write, any access by others, or a token of the wrong kind is
+// refused (a world-readable spoke token would let any local user speak for the machine).
+func TestHubTokenFileModesAndShape(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "hub.token")
+	good := "sbp1.abcdefghijklmnop\n"
+	write := func(mode os.FileMode, body string) {
+		os.Remove(p)
+		os.WriteFile(p, []byte(body), mode)
+		os.Chmod(p, mode)
+	}
+	for _, m := range []os.FileMode{0o600, 0o640, 0o400} {
+		write(m, good)
+		if tok, err := readHubToken(p); err != nil || tok != "sbp1.abcdefghijklmnop" {
+			t.Errorf("mode %o refused: %v", m, err)
+		}
+	}
+	for _, m := range []os.FileMode{0o660, 0o644, 0o604, 0o666, 0o610} {
+		write(m, good)
+		if _, err := readHubToken(p); err == nil {
+			t.Errorf("mode %o accepted", m)
+		}
+	}
+	write(0o600, "not-a-token-at-all-0123456789\n")
+	if _, err := readHubToken(p); err == nil {
+		t.Error("a token of the wrong kind was accepted")
+	}
+}

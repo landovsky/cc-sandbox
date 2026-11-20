@@ -5,6 +5,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/hostd"
+	"github.com/landovsky/cc-sandbox/internal/hubc"
+	"github.com/landovsky/cc-sandbox/internal/hubspoke"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
@@ -232,4 +235,56 @@ func startHandler(sd *start.Daemon, p startPolicy) func(uid int, spec []byte) (*
 		d.MaxLive, d.MaxPerHour = p.MaxLive, p.MaxPerHour
 		return d.Start(spec)
 	}
+}
+
+// startHubSpoke puts hostd on the session bus (B1): its live fenced sessions are tracked on the hub,
+// and deliveries to spoke:<machine>/ccsbx are received. For now a delivery is journaled
+// (host/hub.frame) and acked as NOT delivered: the receive path that verifies the sender, re-checks
+// scope and types into the pane is M2b. It returns the function that stops it.
+func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router, j appender, lg *log.Logger, url string) func() {
+	tokFile := get("hub-token-file")
+	token := func() (string, error) {
+		if tokFile == "" {
+			return "", fmt.Errorf("--hub-token-file is not set")
+		}
+		return readHubToken(tokFile)
+	}
+	machine := get("machine")
+	sp := hubspoke.New(hubspoke.Config{
+		Client:  &hubc.Client{URL: url, Token: token},
+		Machine: machine, Name: "ccsbx", TTL: num("hub-ttl"),
+		Logf: lg.Printf,
+		Entries: func() []map[string]any {
+			all, err := rt.Dir.Sessions()
+			if err != nil {
+				return nil
+			}
+			var out []map[string]any
+			for _, s := range all {
+				if !s.Live {
+					continue
+				}
+				state := "working"
+				if _, idle := rt.Idle.IdleSince(s.Sid, s.Gen); idle {
+					state = "waiting"
+				}
+				// facts the daemon knows; never the session's last output line (B5)
+				out = append(out, map[string]any{"key": "ccsbx:" + s.Sid, "uid": s.Sid, "label": s.Label, "machine": machine,
+					"fenced": true, "downlink": "spoke:" + machine + "/ccsbx", "attach": "ccsbx:" + s.Sid, "state": state})
+			}
+			return out
+		},
+		OnDeliver: func(_ context.Context, f hubc.Frame, d hubc.Deliver) hubspoke.Result {
+			data, _ := json.Marshal(map[string]any{"seq": f.Seq, "uid": d.UID, "bytes": len(d.Text)})
+			if _, err := j.Append(journal.Event{Src: "host", Type: "hub.frame", Realm: "production", Data: data}); err != nil {
+				lg.Printf("hub: frame %d could not be journaled: %v", f.Seq, err)
+			}
+			return hubspoke.Result{OK: false} // not delivered: the receive path is M2b
+		},
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { sp.Run(ctx); close(done) }()
+	lg.Printf("hub: tracking fenced sessions on %s as spoke:%s/ccsbx", url, machine)
+	return func() { cancel(); <-done }
 }

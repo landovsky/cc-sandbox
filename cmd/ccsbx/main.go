@@ -9,6 +9,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/fwd"
 	"github.com/landovsky/cc-sandbox/internal/machines"
+	"github.com/landovsky/cc-sandbox/internal/side"
 	"github.com/landovsky/cc-sandbox/internal/stub"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
@@ -42,6 +43,11 @@ func app() *cli.App {
 				Name: "fwd", Raw: true,
 				Summary: "the per-session forwarder: holds the token, signs door calls (P2)",
 				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return fwd.Main(a, os.Stdin, o, e) },
+			},
+			{
+				Name: "side", Raw: true,
+				Summary: "the pod sidecar: receives the token over exec, runs the forwarder (F3a)",
+				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return side.Main(a, os.Stdin, o, e) },
 			},
 			{
 				Name: "stub", Raw: true,

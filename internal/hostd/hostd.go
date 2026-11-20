@@ -296,7 +296,9 @@ func (h *Hostd) Scan() Stats {
 			}
 			h.lifecycle(gdir, rec, box, "session.ended")
 			h.done[gdir] = true
-			if h.Cfg.OnGenerationEnd != nil {
+			// (a pod generation is revoked by ccsbx-root's pod verbs, which hold the signer's launch socket; hostd
+			// is refused for the pod machine, so firing for it would only raise a false "revoke by hand")
+			if h.Cfg.OnGenerationEnd != nil && rec.Backend != "k8s" {
 				h.Cfg.OnGenerationEnd(sid, genN, rec.Spec.Owner, rec.Spec.Machine)
 			}
 			delete(h.boxes, gdir)

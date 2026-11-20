@@ -293,7 +293,7 @@ func (c *Config) validate(roots []string) error {
 	if c.K8sMachine == "" || strings.ContainsAny(c.K8sMachine, "/ :\n") || c.K8sMachine == c.Machine {
 		return fmt.Errorf("k8s_machine %q must be a name other than this machine", c.K8sMachine)
 	}
-	if _, err := k8s.SideArgv(k8s.SideInfo{Sid: "s0config00", Gen: 1, Label: "config-check", FullID: "o/m/s0config00/g1", Machine: "m", Scope: []byte("{}"), GitRepo: "o/n", HubURL: c.K8sHubURL, Doors: c.K8sDoors}); err != nil {
+	if _, err := k8s.SideArgv(k8s.SideInfo{Sid: "s0config00", Gen: 1, Label: "config-check", FullID: "o/m/s0config00/g1", Machine: "m", Scope: []byte("{}"), GitRepo: "o/n", GitBase: strings.Repeat("b", 100), GitBranch: strings.Repeat("a", 100), HubURL: c.K8sHubURL, Doors: c.K8sDoors}); err != nil {
 		return fmt.Errorf("k8s_hub_url / k8s_doors: %v", err)
 	}
 	if c.K8sSideImage != "" && !sideImageRe.MatchString(c.K8sSideImage) {

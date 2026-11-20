@@ -811,3 +811,20 @@ func TestOnGenerationEndIsCalledOnceWhenTheOutboxIsDrained(t *testing.T) {
 		t.Errorf("%v", ends)
 	}
 }
+
+// a pod generation is revoked by ccsbx-root's pod verbs: hostd's callback does not fire for it
+func TestOnGenerationEndIsNotCalledForAPodSession(t *testing.T) {
+	called := 0
+	f := newFixture(t, func(c *Config) { c.OnGenerationEnd = func(string, int, string, string) { called++ } })
+	b, _ := os.ReadFile(filepath.Join(f.state, "sessions", sid+".json"))
+	var rec start.Record
+	json.Unmarshal(b, &rec)
+	rec.Backend = "k8s"
+	b, _ = json.Marshal(rec)
+	os.WriteFile(filepath.Join(f.state, "sessions", sid+".json"), b, 0o600)
+	os.WriteFile(filepath.Join(f.g, "CLOSED"), []byte("closed\n"), 0o600)
+	f.h.Scan()
+	if called != 0 {
+		t.Error("the callback fired for a pod session")
+	}
+}

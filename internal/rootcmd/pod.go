@@ -485,7 +485,10 @@ func (e *env) podStatus(sid string, stdout io.Writer) error {
 // signs the revoke (as the launch user, which this process is by now), and it is posted to every door in
 // revoke_doors. Best effort, never fails the verb: a failure is in the audit line with the sid and generation,
 // so the owner can revoke by hand, and the token expires within k8s_token_hours in any case.
-func (e *env) revokeToken(ctx context.Context, rec *start.Record) {
+func (e *env) revokeToken(_ context.Context, rec *start.Record) {
+	// a context of its own: the caller's may be the very deadline that failed the load
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	err := e.d.RevokeToken(ctx, e.cfg, token.RevokeBody{Owner: rec.Spec.Owner, Machine: rec.Spec.Machine, Sid: rec.Sid, Gen: rec.Gen})
 	if err != nil {
 		e.audit("token-revoke", rec.Sid, rec.Gen, "", "FAILED, revoke by hand: "+err.Error())

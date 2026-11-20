@@ -28,6 +28,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
+	"github.com/landovsky/cc-sandbox/internal/revoke"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
 	"github.com/landovsky/cc-sandbox/internal/whois"
@@ -193,9 +194,17 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	if runDir == "" {
 		runDir = get("state")
 	}
+	for _, u := range strings.Split(get("revoke-door"), ",") {
+		if u = strings.TrimSpace(u); u != "" {
+			if err := revoke.CheckURL(u); err != nil {
+				fmt.Fprintln(stderr, "ccsbx-hostd:", err)
+				return cli.ExitFail
+			}
+		}
+	}
 	h := hostd.New(hostd.Config{Journal: j, OnEvent: onEvent, OnTick: func() { rt.Pump(pumpReply(runDir)) },
 		StateDir: get("state"), RunDir: runDir, FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
-		OnGenerationEnd: generationEndRevoker(get("signer-socket"), get("revoke-door"), lg.Printf),
+		OnGenerationEnd: generationEndRevoker(get("signer-socket"), get("revoke-door"), get("state"), lg.Printf),
 		Handler:         m.handle, Rate: float64(num("rate")), Burst: num("burst"), EventRate: float64(num("event-rate")), EventBurst: num("event-burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
 	})
 	if get("once") == "true" {

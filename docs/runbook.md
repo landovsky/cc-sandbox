@@ -752,3 +752,18 @@ and `--git-url http://127.0.0.1:8080/egress/git`. The sidecar clones into the em
 `/run/ccsbx/in/worktree-ready` (or `worktree-failed` with a reason); the fence's default command waits for the first
 (10 minutes at most), shows the reason and exits on the second, and only then starts tmux and claude. The snapshot and
 git directories are the sidecar's defaults (`/run/ccsbx/side/snapshot/s`, `/run/ccsbx/side/git`).
+
+**Round F2x-2 (review).** A resume is refused while the session's start is still in flight (`starting` in the record, until the pod
+is loaded; a start hostd died in the middle of is stopped by the sweep after 15 minutes), and the cleanup of a failed start
+acts only if the record is still its own generation. A failed generation keeps its number, ended (the doors refuse every
+token at or below a revoked generation, so the next resume is the next number). A resume stops the previous generation's
+pod whenever the record names one, even an ended record; it counts against `--max-per-hour`. A pod that disappeared outside
+`pod-stop` is passed to `pod-stop` by the sweep (it revokes; an absent pod is fine). **A resume deletes the previous pod and
+its `/work` before the new one is up: unpushed work in the old pod is lost; the new pod clones the session branch.** hostd's
+revoke for docker generations skips pod sessions and remembers each generation it revoked (`<state>/revoked/<sid>-g<n>`);
+`--revoke-door` is checked at startup (http is accepted, so keep the doors on loopback or the tailnet). The sidecar's git
+directory is `/run/ccsbx/side/git/g` (a subdirectory of its volume: the volume root is the kubelet's and the sidecar accepts
+only a directory of its own). Repository, branch and base are checked by `internal/gitname`, the same rules the sidecar
+uses (branch required, at most 100 characters, never main, master, HEAD or trunk). Disk: the worktree, snapshot and git volumes are
+each as large as the worktree: size the pod's ephemeral storage for their sum plus home, out and journal (a node eviction
+comes before any one limit).

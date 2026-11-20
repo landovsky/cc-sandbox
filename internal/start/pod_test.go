@@ -56,7 +56,7 @@ func podDaemon(t *testing.T) (*Daemon, *fakeRoot, *[]string) {
 
 func podSpec(mod func(*LaunchSpec)) *LaunchSpec {
 	return spec(func(s *LaunchSpec) {
-		s.Machine, s.Workdir = "future-two", Workdir{Repo: "landovsky/cc-sandbox"}
+		s.Machine, s.Workdir = "future-two", Workdir{Repo: "landovsky/cc-sandbox", Branch: "ccsbx/work"}
 		if mod != nil {
 			mod(s)
 		}
@@ -363,8 +363,8 @@ func TestSweepPods(t *testing.T) {
 	// the owner stopped it: the pod is gone, the record ends and the token is dealt with
 	fr.gone, fr.calls = true, nil
 	d.SweepPods(8 * time.Hour)
-	if rec, _ := d.Load(rep.Sid); rec.Ended == nil || len(*revoked) != 1 {
-		t.Errorf("a gone pod: ended %v revoked %v", rec.Ended, *revoked)
+	if rec, _ := d.Load(rep.Sid); rec.Ended == nil || strings.Join(fr.calls, ",") != "gone,stop" || len(*revoked) != 0 {
+		t.Errorf("a gone pod: ended %v calls %v (pod-stop revokes it, hostd does not)", rec.Ended, fr.calls)
 	}
 	// past its token's life it is stopped, not asked about
 	d2, fr2, rev2 := podDaemon(t)
@@ -499,9 +499,9 @@ func TestResumeWhenTheOldPodCannotBeDeletedChangesNothing(t *testing.T) {
 	}
 }
 
-// a new generation that fails to come up leaves the session as it was: the previous generation, ended,
-// with its own UID; and the new pod that was made is deleted
-func TestAFailedResumePutsTheSessionBack(t *testing.T) {
+// a generation that fails to come up keeps its own number, ended: the doors refuse every token at or below a
+// revoked generation, so giving the number back would make the next resume a generation that is dead on arrival
+func TestAFailedResumeNeverGivesTheGenerationNumberBack(t *testing.T) {
 	d, fr, _ := podDaemon(t)
 	first, _ := d.Start(podSpec(nil))
 	fr.calls, fr.uid, fr.loadEr = nil, "pod-uid-2", ErrPodNotReady
@@ -510,13 +510,21 @@ func TestAFailedResumePutsTheSessionBack(t *testing.T) {
 		t.Fatalf("%v calls %v", err, fr.calls)
 	}
 	rec, _ := d.Load(first.Sid)
-	if rec.Gen != 1 || rec.Ended == nil || rec.PodUID != "pod-uid-1" || rec.RequestID != "rid-1" {
-		t.Errorf("the session was not put back: %+v", rec)
+	if rec.Gen != 2 || rec.Ended == nil || rec.PodUID != "" || rec.Starting || rec.RequestID != "rid-1" {
+		t.Errorf("the failed generation is kept as generation 2, ended, its pod gone, its request not answered as a success: %+v", rec)
 	}
-	// and it can be resumed again
-	fr.calls, fr.loadEr = nil, nil
-	if rep, err := d.Start(resumeSpec(first.Sid, func(s *LaunchSpec) { s.RequestID = "rid-resume-2" })); err != nil || rep.Gen != 2 {
-		t.Errorf("a second try: %+v %v", rep, err)
+	fr.calls, fr.loadEr, fr.uid = nil, nil, "pod-uid-3"
+	if rep, err := d.Start(resumeSpec(first.Sid, func(s *LaunchSpec) { s.RequestID = "rid-resume-2" })); err != nil || rep.Gen != 3 {
+		t.Errorf("the next resume must be generation 3: %+v %v", rep, err)
+	}
+	// a retry of the FAILED request is a new resume, not the reply of a start that never came up
+	d2, fr2, _ := podDaemon(t)
+	f2, _ := d2.Start(podSpec(nil))
+	fr2.loadEr = ErrPodNotReady
+	d2.Start(resumeSpec(f2.Sid, nil))
+	fr2.loadEr = nil
+	if rep, err := d2.Start(resumeSpec(f2.Sid, nil)); err != nil || rep.Gen != 3 {
+		t.Errorf("a retry of the failed request: %+v %v", rep, err)
 	}
 }
 
@@ -548,5 +556,226 @@ func TestHostdSaysNothingAboutRevokingWhenThePodVerbsDoIt(t *testing.T) {
 	d.Start(podSpec(func(s *LaunchSpec) { s.RequestID, s.Label = "rid-3", "cc-sandbox:c" }))
 	if len(*l) != 1 {
 		t.Errorf("without the verbs revoking, the by-hand line must come back: %v", *l)
+	}
+}
+
+// ---- F2x review: a resume must not race a start that is still creating or loading ----
+
+// the first start is blocked inside Load (the pod exists); a resume of the same session is refused, touches
+// nothing, and the start then finishes undisturbed
+func TestAResumeIsRefusedWhileTheSessionIsStillStarting(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	entered, free := make(chan struct{}), make(chan struct{})
+	d.PodRoot = &blockingLoad{fakeRoot: fr, entered: entered, free: free}
+	done := make(chan *StartReply, 1)
+	go func() { rep, _ := d.Start(podSpec(nil)); done <- rep }()
+	<-entered
+	files := d.recordFiles(t)
+	if len(files) != 1 {
+		t.Fatalf("records %v", files)
+	}
+	sid := strings.TrimSuffix(files[0], ".json")
+	fr.calls = nil
+	_, err := d.Start(resumeSpec(sid, nil))
+	if code(err) != SessionBusy || len(fr.calls) != 0 {
+		t.Errorf("a resume during the load: %v calls %v", err, fr.calls)
+	}
+	close(free)
+	rep := <-done
+	if rep == nil {
+		t.Fatal("the start failed")
+	}
+	if rec, _ := d.Load(sid); rec.Gen != 1 || rec.Starting || rec.PodUID != "pod-uid-1" || rec.Ended != nil {
+		t.Errorf("the start was disturbed: %+v", rec)
+	}
+}
+
+// and during the create, before any UID is recorded
+func TestAResumeIsRefusedBetweenTheFirstSaveAndTheCreate(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	entered, free := make(chan struct{}), make(chan struct{})
+	d.PodRoot = &blockingCreate{fakeRoot: fr, entered: entered, free: free}
+	done := make(chan error, 1)
+	go func() { _, err := d.Start(podSpec(nil)); done <- err }()
+	<-entered
+	files := d.recordFiles(t)
+	sid := strings.TrimSuffix(files[0], ".json")
+	if _, err := d.Start(resumeSpec(sid, nil)); code(err) != SessionBusy {
+		t.Errorf("a resume before the create: %v", err)
+	}
+	close(free)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	if rec, _ := d.Load(sid); rec.Gen != 1 || rec.PodUID != "pod-uid-1" {
+		t.Errorf("%+v", rec)
+	}
+}
+
+type blockingCreate struct {
+	*fakeRoot
+	entered, free chan struct{}
+}
+
+func (b *blockingCreate) Create(sid string) (string, error) {
+	close(b.entered)
+	<-b.free
+	return b.fakeRoot.Create(sid)
+}
+
+// the cleanup of a failed start acts on its own generation only: if the record has moved on (a stop, a sweep,
+// anything), it neither deletes the pod nor removes or ends the record
+func TestTheCleanupOfAFailedStartLeavesAMovedOnRecordAlone(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	l := logs(d)
+	var sid string
+	d.PodRoot = &moveOnLoad{fakeRoot: fr, move: func(s string) {
+		sid = s
+		rec, _ := d.Load(s)
+		rec.Gen, rec.PodUID = 2, "someone-elses-pod" // another generation, made by somebody else, meanwhile
+		d.save(rec)
+	}}
+	fr.loadEr = errors.New("side load refused: bad key")
+	if _, err := d.Start(podSpec(nil)); err == nil {
+		t.Fatal("the start should have failed")
+	}
+	for _, c := range fr.calls {
+		if c == "stop" {
+			t.Errorf("the cleanup deleted a pod of a generation that is not its own: %v", fr.calls)
+		}
+	}
+	if rec, err := d.Load(sid); err != nil || rec.Gen != 2 || rec.PodUID != "someone-elses-pod" || rec.Ended != nil {
+		t.Errorf("the record of the other generation was touched: %+v %v", rec, err)
+	}
+	if len(*l) == 0 || !strings.Contains(strings.Join(*l, "\n"), "no longer that generation's") {
+		t.Errorf("nothing said: %v", *l)
+	}
+}
+
+type moveOnLoad struct {
+	*fakeRoot
+	move func(sid string)
+}
+
+func (m *moveOnLoad) Load(sid string) error {
+	err := m.fakeRoot.Load(sid)
+	m.move(sid)
+	return err
+}
+
+// S2: an ended record that still names a pod (it could not be deleted) is stopped by a resume, not overwritten
+func TestAResumeOfAnEndedRecordStillStopsThePodItNames(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	first, _ := d.Start(podSpec(nil))
+	rec, _ := d.Load(first.Sid)
+	now := time.Now()
+	rec.Ended = &now
+	d.save(rec) // ended, but PodUID still names the pod
+	fr.calls = nil
+	if _, err := d.Start(resumeSpec(first.Sid, nil)); err != nil || strings.Join(fr.calls, ",") != "stop,create,load" {
+		t.Errorf("%v calls %v", err, fr.calls)
+	}
+	// and when that stop fails the resume is refused with the record untouched
+	d2, fr2, _ := podDaemon(t)
+	f2, _ := d2.Start(podSpec(nil))
+	r2, _ := d2.Load(f2.Sid)
+	r2.Ended = &now
+	d2.save(r2)
+	fr2.stopEr = errors.New("api down")
+	if _, err := d2.Start(resumeSpec(f2.Sid, nil)); code(err) != SessionBusy {
+		t.Errorf("%v", err)
+	}
+	if r, _ := d2.Load(f2.Sid); r.PodUID != "pod-uid-1" || r.Gen != 1 {
+		t.Errorf("the pod's name was lost: %+v", r)
+	}
+}
+
+// S3: a resume is a start: resuming in a loop is rate-capped like starting in a loop
+func TestResumesCountAgainstMaxPerHour(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	d.MaxPerHour = 3
+	first, err := d.Start(podSpec(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var last error
+	for i := 0; i < 4; i++ {
+		fr.uid = "pod-uid-x"
+		_, last = d.Start(resumeSpec(first.Sid, func(s *LaunchSpec) { s.RequestID = "rid-r" + string(rune('a'+i)) }))
+		if last != nil {
+			break
+		}
+	}
+	if code(last) != RateCapped {
+		t.Errorf("the loop was never capped: %v", last)
+	}
+	if rec, _ := d.Load(first.Sid); rec.Gen != 3 {
+		t.Errorf("two resumes were allowed (3 starts in the hour): generation %d", rec.Gen)
+	}
+}
+
+// S4: a pod that vanished outside pod-stop has its token revoked by pod-stop (which accepts an absent pod)
+func TestAPodThatVanishedIsStoppedSoItsTokenIsRevoked(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	l := logs(d)
+	rep, _ := d.Start(podSpec(nil))
+	fr.gone, fr.calls = true, nil
+	d.SweepPods(8 * time.Hour)
+	if strings.Join(fr.calls, ",") != "gone,stop" {
+		t.Errorf("calls %v", fr.calls)
+	}
+	if rec, _ := d.Load(rep.Sid); rec.Ended == nil {
+		t.Error("the record was not ended")
+	}
+	// when the revoke (pod-stop) fails, the record stays and the line says what to revoke by hand
+	d2, fr2, _ := podDaemon(t)
+	l2 := logs(d2)
+	rep2, _ := d2.Start(podSpec(nil))
+	fr2.gone, fr2.stopEr = true, errors.New("signer down")
+	d2.SweepPods(8 * time.Hour)
+	if rec, _ := d2.Load(rep2.Sid); rec.Ended != nil || len(*l2) == 0 || !strings.Contains((*l2)[0], "by hand") {
+		t.Errorf("ended %v log %v", rec.Ended, *l2)
+	}
+	_ = l
+}
+
+// a start that hostd died in the middle of (Starting, a pod recorded) is stopped by the sweep after the grace period,
+// and one that is merely in flight is left alone
+func TestTheSweepStopsAStuckStartAndSparesAnInFlightOne(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	now := time.Now()
+	d.Now = func() time.Time { return now }
+	os.MkdirAll(filepath.Join(d.StateDir, "sessions"), 0o700)
+	stuck := &Record{Sid: "s0stuckone", Gen: 1, Backend: "k8s", Uid: 1000, Started: now.Add(-time.Hour), Starting: true, PodUID: "u1", Spec: *podSpec(nil)}
+	young := &Record{Sid: "s0younggg1", Gen: 1, Backend: "k8s", Uid: 1000, Started: now.Add(-time.Minute), Starting: true, PodUID: "u2", Spec: *podSpec(nil)}
+	d.save(stuck)
+	d.save(young)
+	d.SweepPods(8 * time.Hour)
+	if r, _ := d.Load("s0stuckone"); r.Ended == nil {
+		t.Error("a stuck start was left running")
+	}
+	if r, _ := d.Load("s0younggg1"); r.Ended != nil {
+		t.Error("a start in flight was ended")
+	}
+	if strings.Contains(strings.Join(fr.calls, ","), "gone") && len(fr.calls) > 3 {
+		t.Errorf("calls %v", fr.calls)
+	}
+}
+
+// the sidecar's own rules for the repository and branch are checked at the start (BadSpec), not found later
+func TestAPodStartNeedsAGoodRepositoryAndBranch(t *testing.T) {
+	for why, mod := range map[string]func(*LaunchSpec){
+		"no branch":                  func(s *LaunchSpec) { s.Workdir.Branch = "" },
+		"the branch main":            func(s *LaunchSpec) { s.Workdir.Branch = "main" },
+		"the branch HEAD":            func(s *LaunchSpec) { s.Workdir.Branch = "HEAD" },
+		"a branch of 101 chars":      func(s *LaunchSpec) { s.Workdir.Branch = strings.Repeat("a", 101) },
+		"a branch that is an option": func(s *LaunchSpec) { s.Workdir.Branch = "--upload-pack=x" },
+		"a repository that is a URL": func(s *LaunchSpec) { s.Workdir.Repo = "https://x/y" },
+		"a base that is an option":   func(s *LaunchSpec) { s.Workdir.Base = "--x" },
+	} {
+		d, fr, _ := podDaemon(t)
+		if _, err := d.Start(podSpec(mod)); code(err) != BadSpec || len(fr.calls) != 0 || len(d.recordFiles(t)) != 0 {
+			t.Errorf("%s: %v calls %v", why, err, fr.calls)
+		}
 	}
 }

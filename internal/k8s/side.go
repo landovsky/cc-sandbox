@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/gitname"
 	"io"
 	"net/url"
 	"regexp"
@@ -32,7 +33,10 @@ const (
 	SideState      = "/run/ccsbx/side/state"
 	SideJournalDir = "/run/ccsbx/journal/s"
 	SideOut        = "/run/ccsbx/out"
-	SideIn         = "/run/ccsbx/in"
+	// SideGitDir is one level below the git volume's mount: the volume root is the kubelet's (root, 0777) and the
+	// sidecar accepts only a directory of its own (0700), so it makes this one, as it does for state/, journal/s and snapshot/s.
+	SideGitDir = "/run/ccsbx/side/git/g"
+	SideIn     = "/run/ccsbx/in"
 )
 
 // SideInfo is what the sidecar is told about its session.
@@ -50,8 +54,6 @@ var (
 	fullIDRe  = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}/[A-Za-z0-9._-]{1,64}/s[0-9a-z]{6,16}/g[0-9]{1,4}$`)
 	machineRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 	doorRe    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}=`)
-	gitRepoRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
-	gitRefRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$`)
 )
 
 const maxScope = 8 << 10
@@ -74,13 +76,10 @@ func SideArgv(i SideInfo) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sidecar: msg_scope: %v", err)
 	}
-	if !gitRepoRe.MatchString(i.GitRepo) {
-		return nil, fmt.Errorf("sidecar: repository %q must be owner/name", i.GitRepo)
-	}
-	for _, r := range []string{i.GitBase, i.GitBranch} {
-		if r != "" && (!gitRefRe.MatchString(r) || strings.Contains(r, "..") || strings.HasPrefix(r, "-") || strings.HasSuffix(r, "/") || strings.HasSuffix(r, ".lock")) {
-			return nil, fmt.Errorf("sidecar: git ref %q is not a plain branch name", r)
-		}
+	// the same rules as the sidecar's own (internal/gitname): a bad name is refused here, at the start, not
+	// found minutes later as a pod that never gets ready
+	if err := gitname.Pair(i.GitRepo, i.GitBase, i.GitBranch); err != nil {
+		return nil, fmt.Errorf("sidecar: %v", err)
 	}
 	args := []string{SideBinary, "side", "serve",
 		"--listen", "127.0.0.1:" + strconv.Itoa(SidePort),
@@ -92,9 +91,7 @@ func SideArgv(i SideInfo) ([]string, error) {
 	if i.GitBase != "" {
 		args = append(args, "--git-base", i.GitBase)
 	}
-	if i.GitBranch != "" {
-		args = append(args, "--git-branch", i.GitBranch)
-	}
+	args = append(args, "--git-branch", i.GitBranch, "--git-dir", SideGitDir)
 	if i.HubURL != "" {
 		if err := checkHTTPURL(i.HubURL); err != nil {
 			return nil, fmt.Errorf("sidecar: hub url: %v", err)

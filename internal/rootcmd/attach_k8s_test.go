@@ -55,7 +55,7 @@ func newK8sFx(t *testing.T) (*fx, *k8sCalls) {
 	owner := me + 7 // the session's owner is neither root, the service user nor the launch user
 	f.env["SUDO_UID"] = fmt.Sprint(owner)
 	f.rec.Uid, f.rec.Backend, f.rec.PodUID, f.rec.Spec.Machine = owner, "k8s", podUID, "future-two"
-	f.rec.Spec.Workdir = start.Workdir{Repo: "landovsky/cc-sandbox"}
+	f.rec.Spec.Workdir = start.Workdir{Repo: "landovsky/cc-sandbox", Branch: "ccsbx/" + sid}
 	f.writeRecord()
 	calls := &k8sCalls{uid: podUID}
 	lookup := f.d.LookupUser

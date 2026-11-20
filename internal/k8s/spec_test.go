@@ -16,7 +16,7 @@ const (
 
 func goodSpec() Spec {
 	cmd, err := SideArgv(SideInfo{Sid: "s0abcdefgh", Gen: 2, Label: "cc-sandbox:x", FullID: "tomas/future-two/s0abcdefgh/g2", Machine: "future-two",
-		Scope: []byte(`{"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":[]}`), GitRepo: "landovsky/cc-sandbox"})
+		Scope: []byte(`{"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":[]}`), GitRepo: "landovsky/cc-sandbox", GitBranch: "ccsbx/s0abcdefgh"})
 	if err != nil {
 		panic(err)
 	}

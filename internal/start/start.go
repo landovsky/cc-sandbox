@@ -52,6 +52,11 @@ type Record struct {
 	// with secrets, attach, delete) checks against the live pod.
 	Backend string `json:"backend,omitempty"`
 	PodUID  string `json:"pod_uid,omitempty"`
+	// Starting is set from a pod session's first save until its pod is loaded (or the start failed): the
+	// generation is being made, and nothing else may act on this session (a resume is refused). Starts are the
+	// times this session's generations were started, so a resume counts against the hourly cap.
+	Starting bool        `json:"starting,omitempty"`
+	Starts   []time.Time `json:"starts,omitempty"`
 }
 
 // Daemon holds the policy knobs and the state directory.

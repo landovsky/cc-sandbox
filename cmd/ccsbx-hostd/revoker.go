@@ -6,6 +6,9 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,7 +20,7 @@ import (
 // revokeBackoff is the wait before each retry; a variable so a test can shorten it.
 var revokeBackoff = []time.Duration{5 * time.Second, 30 * time.Second, 2 * time.Minute}
 
-func generationEndRevoker(sock, doors string, logf func(string, ...any)) func(sid string, gen int, owner, machine string) {
+func generationEndRevoker(sock, doors, stateDir string, logf func(string, ...any)) func(sid string, gen int, owner, machine string) {
 	var urls []string
 	for _, u := range strings.Split(doors, ",") {
 		if u = strings.TrimSpace(u); u != "" {
@@ -28,6 +31,13 @@ func generationEndRevoker(sock, doors string, logf func(string, ...any)) func(si
 		return nil
 	}
 	return func(sid string, gen int, owner, machine string) {
+		// a generation that was revoked at every door is remembered across hostd restarts (a marker file under
+		// the state dir), so a restart does not revoke every generation that ever ran again; a failed revoke
+		// leaves no marker, so a restart tries again
+		marker := filepath.Join(stateDir, "revoked", fmt.Sprintf("%s-g%d", sid, gen))
+		if _, err := os.Stat(marker); err == nil {
+			return
+		}
 		go func() {
 			b := token.RevokeBody{Owner: owner, Machine: machine, Sid: sid, Gen: gen}
 			var err error
@@ -40,6 +50,9 @@ func generationEndRevoker(sock, doors string, logf func(string, ...any)) func(si
 				}
 				cancel()
 				if err == nil {
+					if os.MkdirAll(filepath.Dir(marker), 0o700) == nil {
+						os.WriteFile(marker, nil, 0o600)
+					}
 					logf("revoke: %s generation %d revoked at the doors", sid, gen)
 					return
 				}

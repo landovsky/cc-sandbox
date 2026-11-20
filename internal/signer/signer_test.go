@@ -984,11 +984,14 @@ func TestTheSignerSignsARevokeTheDoorAccepts(t *testing.T) {
 		t.Fatalf("%+v", out)
 	}
 	v, h := doorFor(t, r)
+	if err := v.PersistTo(filepath.Join(t.TempDir(), "doors.state")); err != nil {
+		t.Fatal(err)
+	}
 	rq := httptest.NewRequest("POST", token.RevokePath, strings.NewReader(out.Body))
 	rq.Header.Set(token.RevokeHeader, out.Revoke)
 	rw := httptest.NewRecorder()
 	h.ServeHTTP(rw, rq)
-	if rw.Code != 204 && rw.Code != 503 { // 503: no state file to persist to in this test; the signature was accepted
+	if rw.Code != 204 { // 204: signature accepted AND persisted (a door that could not persist answers 503)
 		t.Fatalf("the door answered %d", rw.Code)
 	}
 	if v.MaxGen("tomas", "hp-ubuntu", "s0signxx1") != 3 {

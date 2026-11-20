@@ -27,14 +27,14 @@ func TestSideArgvIsExactlyWhatTheSidecarsPathsAndRecordSay(t *testing.T) {
 	want := "/usr/local/bin/ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
 		"--out /run/ccsbx/out --in /run/ccsbx/in --fence-uid 10001 --sid s0abcdefgh --gen 2 --label cc-sandbox:x --full-id tomas/future-two/s0abcdefgh/g2 " +
 		`--machine future-two --scope {"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":[]} ` +
-		"--git-repo landovsky/cc-sandbox --git-url http://127.0.0.1:8080/egress/git --git-base main --git-branch work/s0abcdefgh " +
+		"--git-repo landovsky/cc-sandbox --git-url http://127.0.0.1:8080/egress/git --git-base main --git-branch work/s0abcdefgh --git-dir /run/ccsbx/side/git/g " +
 		"--hub-url http://hub-egress.cc-sandbox.svc:4011 --door model=http://ccsp-model.cc-sandbox-doors.svc:8080"
 	if strings.Join(got, " ") != want {
 		t.Errorf("got  %s\nwant %s", strings.Join(got, " "), want)
 	}
 	// no hub URL until the egress Service exists: the flag is left out, not empty
 	i := goodSide()
-	i.HubURL, i.Doors, i.GitBase, i.GitBranch = "", nil, "", ""
+	i.HubURL, i.Doors, i.GitBase = "", nil, ""
 	got, _ = SideArgv(i)
 	if strings.Contains(strings.Join(got, " "), "--hub-url") || strings.Contains(strings.Join(got, " "), "--door") {
 		t.Errorf("%v", got)

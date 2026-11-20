@@ -85,7 +85,7 @@ type Verifier struct {
 
 	statePath string
 	lock      *os.File // held for the life of the process: one door per state file
-	stateErr  error // set when the last save failed; the door refuses requests until it clears
+	stateErr  error    // set when the last save failed; the door refuses requests until it clears
 }
 
 // NewVerifier builds a verifier for one door. aud is the door's name

@@ -422,3 +422,169 @@
   section's five fields). `make procedures` is the same command once P1's Makefile exists.
   `~/git/k3s/scripts/gitops-inventory.sh` lists cc-sandbox as compliant.
 - **Rollback:** a doc: revert the commit.
+
+
+## Messages across machines through the hub (M2b)
+
+hostd is a client of the session-bus hub over HTTP (`--hub-url`, `--hub-token-file`: a spoke credential for
+THIS machine, minted once by the hub's admin; hostd never holds the admin secret and never touches the
+owner's bus sockets). It tracks its fenced sessions there (with their tree `node`, taken from the session
+record, never from the fence) and polls `spoke:<machine>/ccsbx`.
+
+**Two principals per machine, enforced by the hub.** `spoke:<machine>/ccsbx` is hostd's: it may track FENCED
+entries only, join/poll only `spoke:<machine>/ccsbx`, and may not deliver; its token lives only in the
+root:ccsbx 0640 file. `spoke:<machine>` is the owner's sessions' (ccmsg, the spoke service, hooks): UNFENCED
+entries only (any fenced flag, attach claim or routing into the ccsbx downlink is refused, 403) and it may
+not join or poll the ccsbx downlink. So an owner-uid process holding the owner's token can never act with
+hostd's rights (tracking a fenced identity, reading hostd's frames), and the reverse.
+
+- **Receiving.** A delivery that claims `fenced` is verified by hostd itself: the Ed25519 stamp (domain
+  `ccsbx-stamp-v1`, 120 s skew, 10-minute nonce cache), the `to` it names must be THIS target, the sender's
+  node comes from the hub's presence entry for its sid, and scope is re-checked against the target's own
+  record (manager, peers, reply-to-sender). An unfenced sender is delivered as `unfenced (hub)` under the same
+  scope. The typed text is rendered by hostd from the verified body, and the hub's own line must carry the
+  same flattened body or the message is refused.
+- **Unfenced senders** (an ordinary Mac manager using ccmsg) are heard only through THEIR MACHINE'S SPOKE
+  PRINCIPAL. The shared owner secret is held by every owner session on every machine, so a message posted with
+  it binds nothing and is refused. The deliver must have come in on `spoke:<machine>`, the hub must have bound
+  `from.id` to an entry that same principal tracked on that machine, `from.machine` must name it (it may not
+  be left out), and hostd confirms the binding against its own read of the presence list (the entry exists, is
+  not fenced, is tracked by that principal). The line is typed visibly as `unfenced (hub)` and the normal
+  scope check runs on the bound node. Residual: any owner-uid process on THAT one machine holds its spoke
+  credential and can name another session tracked under it (the local ccmsg trust, hence the label). It can
+  never claim a fenced identity (that needs a relay signature), and a node is held by ONE principal: the hub
+  refuses (409) an owner entry carrying a node a fenced entry or another principal's live entry already holds,
+  and hostd independently hears no sender whose node anything else holds (another hub entry or a session
+  record of this machine), so an owner token of any machine cannot be heard as a fenced manager, nor make the
+  real manager's node ambiguous. Owner sessions route only to `spoke:<machine>` (no named downlink), and an
+  owner spoke's focus/rename/drop/read reach unfenced sessions of its own machine only; hostd's principal
+  gets none of those four.
+- **A node belongs to a machine** (round 5). A session's record carries the machine of its manager and peers
+  (`msg_scope.manager.machine`, `msg_scope.peer_machines`: from the owner's start spec, cc-tree sends the tree
+  record's Host), never from the fence. hostd hears an UNFENCED manager or peer only from that machine, and
+  sends to it only if the hub's entry for the node is on that machine (otherwise `msg.dropped`; another
+  machine's entry for the same node is a squatter's and neither receives a report nor makes the real one
+  ambiguous); a scope that names no machine for an unfenced node reaches nobody unfenced. The relay's
+  `may_reach` is `<machine>/<node>` and the hub matches both. The hub keeps a durable claim node→machine (first
+  publisher, or hostd's `binds` for its session's manager/peers, which take over a claim): another machine's
+  entry for a claimed node is refused (409), so the real manager is never locked out; `GET /v1/nodes` (admin)
+  lists claims, `DELETE /v1/nodes/<url-encoded node>` clears one when a node moves machines on purpose, and an
+  unrefreshed claim ends after 30 days (`SB_NODE_CLAIMS_FILE` keeps them across a hub restart). The shared secret
+  is conflict-checked too (a node a fenced entry or a principal holds cannot be re-published with it). Known
+  window: a squat BEFORE any worker bound to that node has started is accepted (nobody has said whose it is) and
+  is overridden when the worker's hostd tracks; two tracks of one node at the very same moment can both pass the
+  presence check (hostd's checks catch the result: a refused message, not an impersonation).
+- **Fenced to unfenced.** A relay reaches an unfenced target only if (a) that target's node is in the relay's
+  `may_reach`, fixed at mint by root from the session's record (the MANAGER only for now: Tomas's open
+  question #3cy2 decides peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held
+  by more than one live entry (which of them is the manager is not for it to guess): `msg.dropped`.
+- **A spoke principal's deliver** may reach its own machine's sessions and any FENCED session (the receiving
+  hostd verifies and scopes it); focus, rename, drop and read stay on its own machine.
+- **Minting hostd's credential** (once, as the hub admin, on the hub host; the file is root-owned, 0640, group
+  ccsbx): `curl -X POST -H "authorization: Bearer $ADMIN" -d '{"role":"spoke","machine":"<machine>","name":"ccsbx","trees":["cc-sandbox"]}' http://127.0.0.1:4011/v1/principals`
+  (`name` is only ever `ccsbx`; the id is `spoke:<machine>/ccsbx`). The same call without `name` mints the
+  owner's `spoke:<machine>`. Without `trees` the hub drops every node and nothing can be scoped or addressed;
+  hostd logs a warning when its own entries come back without one. Re-minting a principal replaces ITS old
+  token only; the other principal of the machine is untouched.
+
+### Moving a machine's owner sessions onto its spoke principal (deploy gate ❓ 2xq4: NOT deployed)
+What changes: today every spoke and every reader (ccmsg, ccq, cc-pick, cc-tree, sb-hook) on a machine uses the
+ONE shared secret. After the switch, that machine uses its own spoke principal token (`sbp1.…`, minted with
+`trees:["cc-sandbox", ...]` for the trees whose nodes its sessions publish). Nothing in the hub changes mode:
+it accepts both, so machines move one at a time. The shared secret stays for the admin API (minting) and as
+the default until a machine opts in.
+- **The opt-in is a file**, not a code path: `~/.config/session-bus/spoke-token` (mode 600; `$SB_SPOKE_TOKEN_FILE`
+  overrides). When it exists and is non-empty, `sb_secret` (shell), `sb_auth.secret()` (python) and cc-tree's
+  `hub_secret()` return it instead of the shared secret; an explicit `$SB_SECRET` still wins; an empty file
+  falls back to the shared secret. The websocket spoke (the Elixir client) reads `SB_SECRET` from its service
+  environment, so that env value is the second half of the switch.
+- **Order, per machine** (do hp, check, then the Mac): (1) on the hub host mint the spoke credential for the
+  machine (above); (2) put the token in `~/.config/session-bus/spoke-token` (600); (3) readers pick it up at once:
+  check `ccq` and `ccmsg --help`-less dry run (`CCMSG_DRY_RUN=1 ccmsg <node> x`) still resolve nodes; (4) change
+  the spoke service's `SB_SECRET` to the token and restart it: on hp `systemctl --user edit` the spoke unit's
+  Environment, then `systemctl --user restart`; on the Mac edit the LaunchAgent plist's `SB_SECRET` and
+  `launchctl kickstart -k`; (5) `ccq` shows the machine's sessions again under the new principal within one
+  lease; (6) hostd gets its OWN principal, `spoke:<machine>/ccsbx` (minted with `"name":"ccsbx"`, above), in its own
+  file (`--hub-token-file`, root:ccsbx 0640, the ONLY place that token lives: never in the owner's
+  `spoke-token`, the spoke service's `SB_SECRET` or any owner-readable file; the hub refuses the owner's token
+  on the ccsbx downlink and on fenced entries, and hostd's on everything else). Re-minting one principal
+  replaces only its own token: update the files that hold THAT one (the owner's `spoke-token` and the spoke
+  service's `SB_SECRET` for `spoke:<machine>`; hostd's token file for the ccsbx one) and restart those that
+  cache it. Order matters only for hostd: until it has its own token, run it with `--hub-token-file` unset
+  (no hub traffic) rather than with the owner's token, which the hub now refuses for it.
+- **What keeps working**: nodes still resolve in `ccmsg` and cc-tree deliver (an entry from a spoke principal keeps
+  its node when the tree is in its `trees`; a tree not listed is dropped, so mint with every tree you use).
+  Standalone (no cc-sandbox) works either way: the flag is a file in the owner's config dir.
+- **Rollback**: delete `~/.config/session-bus/spoke-token`, put the shared secret back in the spoke service's
+  `SB_SECRET`, restart it; the readers go back to the shared secret at once. The principals can be revoked
+  (`DELETE /v1/principals/spoke:<machine>`, `.../spoke:<machine>/ccsbx`) or simply left to expire (their default
+  lifetime). Rolling back the owner side never touches hostd's: it keeps its own token and file; to switch hostd's hub
+  traffic off, unset `--hub-token-file` and restart it.
+- **Node bound.** The hub keeps a fenced entry's `node` only for the trees the machine's spoke principal was
+  minted for (`trees`), so a fence cannot publish an owner's unrelated tree node.
+- **Known limit: the public key is supplied by the hub.** hostd verifies the stamp against the `pub` the hub
+  sends with the message, so it trusts the hub's routing and its key bookkeeping (a compromised hub could
+  substitute a key and forge a stamp for any sender whose node the hub can also fake). Scope still bounds the
+  damage to messages a target would accept from that node. The end-to-end chain (the hp-signed token carrying
+  the sender's key, checked by the receiver) comes with U5/M9.
+- **Sending.** A fenced session's message to a node that is not on this machine is signed by hostd with a
+  per-generation key (in memory only); `ccsbx-root relay-mint` registers its public half as a relay principal
+  (spec: docs/relay-mint-spec.md; until it exists, sending fails with "no relay credential" and is reported as
+  `undeliverable`). A target the hub does not hold, or that did not take the message, is `dropped`: the sender's
+  reply says `error/dropped` and the journal records `msg.dropped` (reason and node, never the text).
+- **Not wired in the unit until:** the hub has B10/B11 and the downlink payload change (dotfiles `n1-g-hub`, a
+  merge that is Tomas's), the spoke credential file exists, and `relay-mint` is installed.
+
+## The daemon on the tailnet (M2a)
+
+`ccsbx-hostd --tailnet-listen <this machine's tailnet ip>:7480 --tailnet-host <this node's MagicDNS name>
+--owner-login <you> --owner-devices <FQDNs> --peer-devices <the other machines' FQDNs>`. For example on the Mac:
+`--owner-devices mac-tomas.<tailnet>.ts.net --peer-devices hp-ubuntu.<tailnet>.ts.net,future-two.<tailnet>.ts.net`
+(hp, the Mac and future-two are untagged devices of the owner's login; peers are listed DEVICES, not tags, for
+Night 2). `--peer-tags` is empty by default and stays so until F4 (Night 3), when an in-cluster hostd comes
+through a `tag:ccsbx-hostd` egress proxy; until then no cluster source gets :7480 at all. OFF by
+default, and not turned on in the unit until the tailnet ACL (R4) and `ufw allow in on tailscale0 to any port
+7480` exist. At start hostd refuses: an address that is not one of THIS node's own tailnet addresses (asked of
+tailscaled, so another VPN's 100.64/10 address does not pass), a short device name (use `host.<tailnet>.ts.net`),
+`--owner-login` without `--owner-devices` (and the reverse), a `--peer-tags` of `tag:ccsbx`, a `--tailscale-bin`
+that is not absolute or is writable by group/other, a `--whois-socket` that is not a socket of root or the
+daemon's user.
+
+**Never `tag:ccsbx` as a peer tag.** It is the cluster operator proxies' tag, and a fenced pod can reach the
+egress proxy (NetPol is per pod): a peer from `tag:ccsbx` would be a fenced pod (hostd refuses it at start). hp
+and the Mac stay untagged user devices; later (F4) only a `tag:ccsbx-hostd` egress proxy used by the in-cluster
+hostd gets :7480 (the ACL text for that is the k3s/D owners' to change: plan §5.2 grant 3 and k3s-amendments A7
+still say `tag:ccsbx`). An
+in-cluster hostd (F4) behind the operator's ingress would see the proxy pod's address, not the caller's, so
+WhoIs-by-address cannot classify callers there: F4 must not use this listener.
+
+Who a caller is comes from Tailscale WhoIs for the connection's own peer address, asked of tailscaled's
+LocalAPI socket (hp) or `tailscale whois --json` (the Mac; `--whois cli|localapi|auto`, `--tailscale-bin`, an
+absolute path resolved once at start, logged; on the Mac the App Store build's CLI talks to the GUI's LocalAPI:
+check it answers `whois` for the service uid before relying on it); nothing the caller sends counts. Before
+WhoIs is asked, a request must come from a tailnet address that is not one of this machine's own (a local
+process connecting to the machine's tailnet address is the machine itself, never the owner), name this daemon in
+`Host` (the listen address or `--tailnet-host`; DNS rebinding is refused), carry no `Origin` and no cross-site
+`Sec-Fetch-Site` (a web page in the owner's browser), and a POST must be `Content-Type: application/json` (415).
+The answer is believed only if the asked address is one of the node's own, and never for a node that advertises
+subnet routes. **owner** = the owner's login on a node in `--owner-devices` (a tagged node is never the owner);
+**peer** = a node tagged with a `--peer-tags` tag, or a `--peer-devices` node that carries the owner's login;
+anything else, and any failed WhoIs, is 403. What each class may call is an explicit table (route, method) in
+`internal/daemonapi/tailnet.go`; a route added to the API is closed on the tailnet until it is classified (a test
+walks the mux). An owner gets the owner operations the local socket serves except session start (M2c adds the
+remote form); a peer gets info, resolve and the session list. `/v1/info` shows the caller's class as
+`caller_class`.
+
+Answers: no cache for the LocalAPI; 5 s for the CLI, a failure remembered 2 s (still an error), one question per
+peer at a time, at most 8 at once. A stream or long poll on the tailnet ends after 60 s (the client reconnects
+and is classed again), at most 64 connections are open at once (`--tailnet-max-conns`), idle ones close after 2 minutes.
+
+**Owner authority is ambient, so the tailnet gives the owner little** (SEC-20, ❓ cc-sandbox:#2dsc, the manager's
+default until Tomas answers): any process on a LISTED owner device, whichever user runs it, would act as the
+owner there with no secret (the loopback TCP port, by contrast, refuses deliver and steal even with its token).
+So over the tailnet the owner gets only `info`, `resolve`, the session list and (M2c) session start. **deliver,
+prompt, replace, the cockpit lease (steal) and the journal (events, streams, cursors, the cockpit's request queue)
+are local-only**: 403 `forbidden` on the tailnet even to the owner, still served on the unix socket. What that
+means for a cockpit on the OTHER machine: it cannot lease, stream events or type into this machine's panes over
+the tailnet; it runs against its own machine's socket until M2d gives these a per-device secret. (`attach` is
+tmux, not an API route.) hostd also warns at start when `--owner-devices` lists this machine.

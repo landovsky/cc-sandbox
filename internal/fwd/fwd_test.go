@@ -4,10 +4,10 @@
 package fwd
 
 import (
-	"fmt"
-	"context"
 	"bytes"
+	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"

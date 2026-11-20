@@ -191,3 +191,102 @@ func TestPaneEnvUsesTheEmbeddedProfiles(t *testing.T) {
 		t.Fatalf("%s", env)
 	}
 }
+
+// context: the hub credential file is written by the installer (root) and read by hostd through a group,
+// so group-read is fine; group-write, any access by others, a symlink, a FIFO, another user's file or a
+// token of the wrong kind is refused (a world-readable spoke token would let any local user speak for the
+// machine; a FIFO would hang every request, since the token is read on each).
+func TestHubTokenFileModesShapeAndKind(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "hub.token")
+	good := "sbp1.abcdefghijklmnop\n"
+	write := func(mode os.FileMode, body string) {
+		os.Remove(p)
+		os.WriteFile(p, []byte(body), mode)
+		os.Chmod(p, mode)
+	}
+	for _, m := range []os.FileMode{0o600, 0o640, 0o400} {
+		write(m, good)
+		if tok, err := readHubToken(p); err != nil || tok != "sbp1.abcdefghijklmnop" {
+			t.Errorf("mode %o refused: %v", m, err)
+		}
+	}
+	for _, m := range []os.FileMode{0o660, 0o644, 0o604, 0o666, 0o610} {
+		write(m, good)
+		if _, err := readHubToken(p); err == nil {
+			t.Errorf("mode %o accepted", m)
+		}
+	}
+	write(0o600, "not-a-token-at-all-0123456789\n")
+	if _, err := readHubToken(p); err == nil {
+		t.Error("a token of the wrong kind was accepted")
+	}
+	write(0o600, "sbp1."+strings.Repeat("a", 5000))
+	if _, err := readHubToken(p); err == nil {
+		t.Error("an oversize file was accepted")
+	}
+	write(0o600, good)
+	link := filepath.Join(dir, "link")
+	os.Symlink(p, link)
+	if _, err := readHubToken(link); err == nil {
+		t.Error("a symlink was followed")
+	}
+	fifo := filepath.Join(dir, "fifo")
+	syscall.Mkfifo(fifo, 0o600)
+	done := make(chan error, 1)
+	go func() { _, err := readHubToken(fifo); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("a FIFO was read")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("a FIFO at the token path hung the read")
+	}
+	// the file belongs to the test user: with only root and some other uid allowed it is a foreign owner
+	if _, err := readHubTokenAs(p, 0, os.Getuid()+1); err == nil {
+		t.Error("a file of another user was accepted")
+	}
+}
+
+// context: --hub-ttl is the hub's lease: outside its 1..300 seconds the hub would refuse every track.
+func TestHubTtlIsRangeChecked(t *testing.T) {
+	for _, v := range []string{"0", "301", "-5"} {
+		if code, out := runHostd("run", "--once", "--state", t.TempDir(), "--hub-ttl", v); code == 0 || !strings.Contains(out, "hub-ttl") {
+			t.Errorf("%s: %d %s", v, code, out)
+		}
+	}
+}
+
+// context: the tailnet listener is off by default and, when asked for, refuses a wildcard, a LAN address, or a
+// config under which every caller would be refused: "nothing live before the ACL".
+func TestTailnetListenerIsOffByDefaultAndRefusesBadConfig(t *testing.T) {
+	_, h := runHostd("run", "--help")
+	for _, w := range []string{"-tailnet-listen", "-owner-login", "-owner-devices", "-peer-devices", "-peer-tags", "-whois", "-tailscale-bin", "-tailnet-host", "-tailnet-max-conns", "CCSBX_TAILNET_LISTEN"} {
+		if !strings.Contains(h, w) {
+			t.Errorf("--help does not list %s", w)
+		}
+	}
+	for _, args := range [][]string{
+		{"--tailnet-listen", "0.0.0.0:7480", "--owner-login", "a@b.c", "--owner-devices", "x"},
+		{"--tailnet-listen", "192.168.1.2:7480", "--owner-login", "a@b.c", "--owner-devices", "x"},
+		{"--tailnet-listen", "100.64.0.1:7480"}, // no one would be allowed
+		// the configuration itself must not widen the classes (M3, S4, N2)
+		{"--tailnet-listen", "100.64.0.1:7480", "--peer-tags", "tag:ccsbx"},                                               // the operator proxies' tag, which a fenced pod can reach
+		{"--tailnet-listen", "100.64.0.1:7480", "--owner-login", "a@b.c", "--owner-devices", "mac-tomas"},                 // a short name
+		{"--tailnet-listen", "100.64.0.1:7480", "--owner-login", "a@b.c"},                                                 // an owner with no device: silently nobody
+		{"--tailnet-listen", "100.64.0.1:7480", "--peer-tags", "tag:h", "--whois", "cli", "--tailscale-bin", "tailscale"}, // a bare name: PATH lookup
+	} {
+		base := []string{"run", "--state", t.TempDir(), "--local-socket", "-"}
+		done := make(chan int, 1)
+		go func() { c, _ := runHostd(append(base, args...)...); done <- c }()
+		select {
+		case c := <-done:
+			if c == 0 {
+				t.Errorf("%v: started", args)
+			}
+		case <-time.After(3 * time.Second):
+			t.Errorf("%v: the daemon started (it would have run until stopped)", args)
+		}
+	}
+}

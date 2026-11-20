@@ -6,8 +6,8 @@ package token
 
 import (
 	"crypto/ed25519"
-	"encoding/json"
 	"encoding/base64"
+	"encoding/json"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -419,9 +419,9 @@ func TestKeyringLineWithoutTierLimitsIsRefused(t *testing.T) {
 	f := filepath.Join(t.TempDir(), "ring")
 	base := k.KID + " " + base64.StdEncoding.EncodeToString(k.Public) + " owners=tomas machines=mac"
 	for name, line := range map[string]string{
-		"no limits":     base,
-		"no billings":   base + " profiles=dev-*",
-		"no profiles":   base + " billings=api",
+		"no limits":   base,
+		"no billings": base + " profiles=dev-*",
+		"no profiles": base + " billings=api",
 	} {
 		os.WriteFile(f, []byte(line+"\n"), 0o600)
 		if _, err := LoadPublicKeyring(f); err == nil {

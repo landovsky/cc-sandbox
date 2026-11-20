@@ -22,7 +22,6 @@
 package token
 
 import (
-	"path"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -32,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"strconv"
 	"strings"
 	"time"

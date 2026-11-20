@@ -5,7 +5,7 @@ need a question back. Risk / blast radius: High, Medium, Low.
 
 | # | what you do | where | risk | blast |
 |---|---|---|---|---|
-| 1 | Push main (90 commits) and check the first fence-image Actions run | hp, GitHub | Low | Medium (public repo, first package) |
+| 1 | Push main (107 commits) and check the first fence-image Actions run | hp, GitHub | Low | Medium (public repo, first package) |
 | 2 | Decide the 6 P15 questions so the root installer stops refusing | this doc | Low | Low |
 | 3 | Install the seccomp profile and run its docker test (Gate M) | hp, sudo | Medium | Medium |
 | 4 | Run Gate M #4x65 (root install + reboot), moved to 2026-11-22 | hp, sudo | High | High |
@@ -14,7 +14,7 @@ need a question back. Risk / blast radius: High, Medium, Low.
 ## 1 · Push main, then the first fence-image run
 
 Why: local main has PRs #2, #8–#14 and the new fence-image workflow merged (each reviewed, tests
-green after every merge), 90 commits ahead. The workflow can only reach GitHub with your
+green after every merge), 107 commits ahead. The workflow can only reach GitHub with your
 credentials: my token, and the workers', lacks the `workflow` scope (GitHub refuses a push that
 adds a workflow file without it), and `git push … main` is on the builders' deny list.
 
@@ -87,7 +87,7 @@ could start a fence yet: the client that calls `ccsbx-root` (U1c) isn't built, a
 first would also cut every hp worker off from docker. A builds U1c by 11-21; D fixes two steps
 in the Gate M list (go under sudo; the seccomp step moves into the table as 8b, so §3 above
 becomes part of the gate). Merged and ready: the signer, `ccsbx-root`, the fence image.
-Steps with commands: `docs/night-1-morning.md` (§ "Gate M, step by step").
+Steps with commands: `docs/night-1-morning.md` (§ "Gate M, step by step"). The title of #4x65 says "ACL paste": that is step 11b there, a placeholder until the k3s PR number is known (`paste k3s PR <TBD>: steps follow`).
 
 ## 5 · Arm!
 

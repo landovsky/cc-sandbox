@@ -171,7 +171,7 @@ def c_r4_evening(ctx):
     rc, out = ctx.sh(["tailscale", "status", "--json"])
     if rc != 0:
         return F(f"tailscale status: {out[:50]}")
-    return P("tag:ccsbx seen in status") if "tag:ccsbx" in out else F("no tag:ccsbx device (ACL not pasted?)")
+    return P("tag:ccsbx seen in status") if '"tag:ccsbx"' in out else F("no tag:ccsbx device (ACL not pasted?)")
 
 
 def health(ctx, key, env_name, want):

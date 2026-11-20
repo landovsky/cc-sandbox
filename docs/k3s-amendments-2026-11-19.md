@@ -338,13 +338,13 @@ spec:
 
 The operator makes **one egress proxy per ExternalName Service**. The pods run in namespace
 `tailscale` (on the `k3s` control-plane node), labelled `tailscale.com/parent-resource=<svc>` and
-`tailscale.com/parent-resource-ns=<ns>`. We need three, all tagged `tag:ccsbx`:
+`tailscale.com/parent-resource-ns=<ns>`. We need three. The hub one is tagged `tag:ccsbx`; the two hostd peer ones (**with F4 (Night 3), not in the Gate M paste**, no cluster source gets :7480 until F4) are tagged **`tag:ccsbx-hostd`**, because a fenced pod can reach a `tag:ccsbx` proxy and so must not hold the :7480 grant:
 
 | Egress Service (ns `cc-sandbox`) | Tailnet target | Port | Used by |
 |---|---|---|---|
-| `session-bus-egress` (the live draft variant E) | hp-ubuntu | 4011 | session pods (the sidecar) and hostd |
-| `hp-hostd-egress` | hp-ubuntu | 7480 | hostd only (M2d direct fallback) |
-| `mac-hostd-egress` | the Mac | 7480 | hostd only (M2d) |
+| `session-bus-egress` (the live draft variant E, `tag:ccsbx`) | hp-ubuntu | 4011 | session pods (the sidecar) and hostd |
+| `hp-hostd-egress` (`tag:ccsbx-hostd`, with F4) | hp-ubuntu | 7480 | hostd only (M2d direct fallback) |
+| `mac-hostd-egress` (`tag:ccsbx-hostd`, with F4) | the Mac | 7480 | hostd only (M2d) |
 
 ```yaml
 # in namespace tailscale (SHARED); one policy per proxy, so each admits only its own clients
@@ -382,7 +382,7 @@ spec:
 ```
 
 - **Proxy egress isn't restricted.** It carries WireGuard to DERP and peers, which NetPol can't
-  read. **The ACL limits the destination** (A7: `tag:ccsbx` reaches only hp:4011 and 7480, and
+  read. **The ACL limits the destination** (A7: `tag:ccsbx` reaches only hp:4011; `tag:ccsbx-hostd`, with F4, reaches only hp:7480 and
   the Mac:7480).
 - Sessions have no DNS, so the launcher passes `session-bus-egress`'s proxy ClusterIP in through
   `hostAliases`, and hostd gets all three as env.
@@ -481,6 +481,7 @@ as well, so Tomas can tag a probe device:
 	"tagOwners": {
 		// … existing entries …
 		"tag:ccsbx":         ["autogroup:admin", "tag:k8s-operator"],
+		"tag:ccsbx-hostd":   ["autogroup:admin", "tag:k8s-operator"],
 	},
 ```
 
@@ -497,12 +498,15 @@ for the same reason the file gives for hp):
 **grants:**
 
 ```jsonc
-		// cc-sandbox: operator EGRESS proxies (tag:ccsbx) -> the session-bus hub and the session
-		// daemons on hp and the Mac. Nothing else is reachable from tag:ccsbx.
-		{"src": ["tag:ccsbx"], "dst": ["hp-ubuntu"], "ip": ["tcp:4011", "tcp:7480"]},
-		{"src": ["tag:ccsbx"], "dst": ["tomas-mac"], "ip": ["tcp:7480"]},
-		// cc-sandbox: hp and the Mac -> door and hostd INGRESS proxies (tag:ccsbx), HTTPS only.
-		{"src": ["hp-ubuntu", "tomas-mac"], "dst": ["tag:ccsbx"], "ip": ["tcp:443"]},
+		// cc-sandbox: the operator EGRESS proxy to the session-bus hub (tag:ccsbx). A fenced pod can
+		// reach this proxy, so the hub port is all it gets. Nothing else is reachable from tag:ccsbx.
+		{"src": ["tag:ccsbx"], "dst": ["hp-ubuntu"], "ip": ["tcp:4011"]},
+		// WITH F4 (Night 3), NOT IN THE GATE M PASTE: hostd's own devices (tag:ccsbx-hostd, never on
+		// a door or hub proxy) -> the session daemons on hp and the Mac.
+		{"src": ["tag:ccsbx-hostd"], "dst": ["hp-ubuntu", "tomas-mac"], "ip": ["tcp:7480"]},
+		// cc-sandbox: hp and the Mac -> door INGRESS proxies (tag:ccsbx) and hostd INGRESS proxy
+		// HTTPS only. The Gate M paste has exactly two grants: tag:ccsbx -> hp-ubuntu tcp:4011, and this one.
+		{"src": ["hp-ubuntu", "tomas-mac"], "dst": ["tag:ccsbx"], "ip": ["tcp:443"]},   // the hostd ingress proxy's tag is k3s's call in its PR
 		// cc-sandbox launcher on hp -> kube-apiserver (tag:infra). ALREADY LIVE (keep as is).
 		{"src": ["hp-ubuntu"], "dst": ["tag:infra"], "ip": ["tcp:6443"]},
 ```
@@ -511,14 +515,15 @@ Notes:
 - **hp ↔ Mac on 7480** needs no new grant. Both are tomas's devices, so the existing
   `autogroup:member → autogroup:self` grant covers them. The host firewalls are the limit: ufw
   on hp, and the macOS firewall.
-- **`tag:ccsbx` is shared by the egress and the ingress proxies.** So the door ingress proxies
-  could also reach hp:4011 and 7480. They're operator-managed, never agent-controlled, so this
-  is accepted. If that's not good enough, split the tag into `tag:ccsbx-egress`, which carries
-  the outbound grants, and `tag:ccsbx`.
+- **`tag:ccsbx` is shared by the hub egress proxy and the door ingress proxies.** So the door
+  ingress proxies could also reach hp:4011. They're operator-managed, never agent-controlled, so
+  this is accepted. It holds **only** the hub port: the :7480 grant is on `tag:ccsbx-hostd`
+  (M2a review MUST-3), because a fenced pod can reach `tag:ccsbx` proxies and a grant to the
+  peer daemons there would give it a path to them.
 - The existing `autogroup:admin → *` grant already lets Tomas's devices reach everything. The
   explicit grants above keep working once that grant is tightened, as the file plans.
 - **Acceptance:**
-  - `tailscale status` lists the proxy devices with `tag:ccsbx`;
+  - `tailscale status` lists the proxy devices with `tag:ccsbx` (hub, doors) and `tag:ccsbx-hostd` (hostd);
   - from the session-bus proxy, hp:4011 connects and hp:22 times out;
   - from hp, a door's `https://<door device>/health` → 200.
 

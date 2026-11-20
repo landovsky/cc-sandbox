@@ -96,6 +96,7 @@ type Server struct {
 	loadCh  chan struct{} // closed once the secrets are in
 	failed  chan error    // the forwarder died
 	fwdp    atomic.Pointer[fwd.Forwarder]
+	failLog appendFailures
 	logs    int // fwd.denied summaries written (Serve's goroutine only)
 	lastDen int64
 }
@@ -230,7 +231,7 @@ func (s *Server) note(typ string, data map[string]any) {
 	}
 	b, _ := json.Marshal(data)
 	if _, err := s.cfg.Journal.Append(journal.Event{Sid: s.cfg.Sid, Gen: s.cfg.Gen, Src: "host", Type: typ, Data: b}); err != nil {
-		s.cfg.Logf("side: journal append failed (%v)", err)
+		s.failLog.log(s.cfg.Logf, "side", err)
 	}
 }
 
@@ -399,4 +400,16 @@ func Load(control string, in io.Reader) error {
 		return fmt.Errorf("side load: refused: %s", r.Error)
 	}
 	return nil
+}
+
+// appendFailures rate-limits the log line for a failing journal: once the store is broken (journal.ErrBroken)
+// every append fails, and a line per decision would flood the sidecar's log. The first failure is logged,
+// then every 1000th with the count.
+type appendFailures struct{ n atomic.Int64 }
+
+func (a *appendFailures) log(logf func(string, ...any), who string, err error) {
+	n := a.n.Add(1)
+	if n == 1 || n%1000 == 0 {
+		logf("%s: journal append failed (%v); %d failures so far", who, err, n)
+	}
 }

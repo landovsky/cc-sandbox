@@ -38,10 +38,15 @@ type RelayConfig struct {
 	MaxTotal       int     // requests per generation lifetime; beyond that they are shed (default 20000)
 	ShedReplies    int     // refusal replies per scan once the bucket is empty (default 20)
 	Forward        func(context.Context, hostd.Request) hostd.Reply
-	// Journal, when set, gets one record per decision (relay.forwarded, relay.refused) and a bounded number of
-	// relay.shed summaries. It is observability, not the replay guard (the ledger is), so an append failure is
-	// logged and the relay carries on. Size its volume: about 300 bytes a record, one per request, at most
-	// MaxTotal of them, so the default 20000 is about 6 MB on top of the ledger's 3 MB.
+	// Journal, when set, gets one record per request the relay counts against MaxTotal (relay.forwarded, or
+	// relay.refused with the code, including rate_capped when a refusal reply is sent) and a bounded number of
+	// relay.shed summaries (cumulative, with a reserved final one from Close). NOT journalled: requests shed
+	// silently (the summary counts them) and ledger_io_error, which retries the same name every scan and so
+	// would grow the journal without bound; a broken ledger volume is logged instead.
+	// It is observability, not the replay guard (the ledger is), so an append failure is logged (rate-limited)
+	// and the relay carries on. Append fsyncs inline: the scan loop waits for the disk once per decision,
+	// at most MaxTotal times a lifetime, which is cheap next to the Forward call it sits beside.
+	// Size its volume: about 300 bytes a record, so the default 20000 is about 6 MB on top of the ledger's 3 MB.
 	Journal     Appender
 	MaxShedLogs int // relay.shed summaries per lifetime (default 50): a flood must not grow the journal either
 	Now         func() time.Time
@@ -65,6 +70,9 @@ type Relay struct {
 	seen     map[string]bool
 	total    int
 	shedLogs int
+	shedTot  int // sheds over the lifetime, for the summary
+	shedSeen int // shedTot at the last summary
+	failLog  appendFailures
 	tokens   float64
 	last     time.Time
 }
@@ -147,7 +155,7 @@ func (r *Relay) note(id, typ string, data map[string]any) {
 	}
 	b, _ := json.Marshal(data)
 	if _, err := r.cfg.Journal.Append(journal.Event{ID: id, Sid: r.cfg.Sid, Gen: r.cfg.Gen, Src: "host", Type: typ, Data: b}); err != nil {
-		r.cfg.Logf("side relay: journal append failed (%v)", err)
+		r.failLog.log(r.cfg.Logf, "side relay", err)
 	}
 }
 
@@ -242,6 +250,7 @@ func (r *Relay) Scan(ctx context.Context) RelayStats {
 			if shed > 0 {
 				shed--
 				r.reply(refusal(rid, id, "rate_capped"))
+				r.note(id, "relay.refused", map[string]any{"rid": rid, "code": "rate_capped"})
 				st.Refused++
 			} else {
 				st.Shed++
@@ -295,11 +304,25 @@ func (r *Relay) Scan(ctx context.Context) RelayStats {
 		r.reply(rep)
 		r.note(id, "relay.forwarded", map[string]any{"rid": rid, "type": typ, "status": rep.Status})
 	}
-	if st.Shed > 0 && r.shedLogs < r.cfg.MaxShedLogs {
-		r.shedLogs++
-		r.note("", "relay.shed", map[string]any{"shed": st.Shed, "refused": st.Refused})
+	r.shedTot += st.Shed
+	if r.shedTot > r.shedSeen && r.shedLogs < r.cfg.MaxShedLogs-1 { // the last slot is Close's
+		r.shedSummary()
 	}
 	return st
+}
+
+func (r *Relay) shedSummary() {
+	r.shedLogs++
+	r.shedSeen = r.shedTot
+	r.note("", "relay.shed", map[string]any{"shed_total": r.shedTot})
+}
+
+// Close writes the final shed summary (the slot the periodic ones leave free) if anything was shed since
+// the last one, so the journal's last word holds the lifetime total.
+func (r *Relay) Close() {
+	if r.shedTot > r.shedSeen && r.shedLogs < r.cfg.MaxShedLogs {
+		r.shedSummary()
+	}
 }
 
 // Run scans every `every` until ctx ends.
@@ -310,6 +333,7 @@ func (r *Relay) Run(ctx context.Context, every time.Duration) {
 		r.Scan(ctx)
 		select {
 		case <-ctx.Done():
+			r.Close()
 			return
 		case <-t.C:
 		}

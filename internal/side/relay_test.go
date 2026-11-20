@@ -333,25 +333,112 @@ func TestRelayKeepsForwardingWhenTheJournalFails(t *testing.T) {
 }
 
 // context "a flood past the cap would otherwise write a journal record per scan forever": shed summaries
-// have a fixed per-lifetime bound, and the bound is asserted on a small fixed flood.
+// have a fixed per-lifetime bound, the last slot is kept for Close, and that last one holds the lifetime
+// total. The bound is asserted on a small fixed flood.
 func TestRelayShedSummariesInTheJournalAreBounded(t *testing.T) {
 	r := newRelayRig(t)
 	j := &fakeJournal{}
 	x := r.relay(func(c *RelayConfig) { c.Journal = j; c.MaxTotal = 2; c.MaxShedLogs = 3 })
+	shed := 0
 	for round := 0; round < 8; round++ {
 		for i := 0; i < 4; i++ {
 			r.put(fmt.Sprintf("f%d-%d.json", round, i), `{"type":"msg.send"}`)
 		}
-		x.Scan(context.Background())
+		shed += x.Scan(context.Background()).Shed
 	}
-	n := 0
+	x.Close()
+	x.Close() // nothing new to say: no second final summary
+	var sums []journal.Event
 	for _, e := range j.evs {
 		if e.Type == "relay.shed" {
+			sums = append(sums, e)
+		}
+	}
+	if len(sums) != 3 {
+		t.Fatalf("%d shed summaries, want exactly the bound of 3", len(sums))
+	}
+	if want := fmt.Sprintf(`{"shed_total":%d}`, shed); string(sums[2].Data) != want {
+		t.Fatalf("the last summary is %s, want the lifetime total %s", sums[2].Data, want)
+	}
+}
+
+// context "the journal is read by the cockpit and the fence's request body is untrusted text": whichever
+// way a request is refused, a secret sitting in its body must not reach the journal. The read-error path is
+// an oversize file with the secret at the front (what a rejected read could most easily echo).
+func TestRelayJournalNeverHoldsABodyOnAnyRefusalPath(t *testing.T) {
+	r := newRelayRig(t)
+	j := &fakeJournal{}
+	const secret = "SECRET-sk-ant-0123456789"
+	r.put("badjson.json", `{"type":"msg.send" `+secret)
+	r.put("unknown.json", `{"type":"`+secret+`"}`)
+	r.put("toolarge.json", `{"type":"msg.send","text":"`+secret+strings.Repeat("x", 200)+`"}`)
+	r.relay(func(c *RelayConfig) { c.Journal = j; c.MaxBytes = 64 }).Scan(context.Background())
+	codes := map[string]bool{}
+	for _, e := range j.evs {
+		if strings.Contains(string(e.Data), "SECRET") || strings.Contains(e.Type, "SECRET") {
+			t.Errorf("a record carries the body: %+v", e)
+		}
+		codes[string(e.Data)] = true
+	}
+	if len(j.evs) != 3 {
+		t.Fatalf("%d records, want one refusal per file: %+v", len(j.evs), j.evs)
+	}
+	for _, rid := range []string{"badjson", "unknown", "toolarge"} {
+		found := false
+		for _, e := range j.evs {
+			found = found || strings.Contains(string(e.Data), `"rid":"`+rid+`"`)
+		}
+		if !found {
+			t.Errorf("no refusal record for %s", rid)
+		}
+	}
+}
+
+// context "a rate-capped request gets a refusal reply the fence acts on": the cockpit must be able to see
+// the same refusal, keyed on the same id the reply carries.
+func TestRelayJournalsTheRateCappedReplies(t *testing.T) {
+	r := newRelayRig(t)
+	j := &fakeJournal{}
+	r.put("a.json", `{"type":"msg.send"}`)
+	r.put("b.json", `{"type":"msg.send"}`)
+	r.put("c.json", `{"type":"msg.send"}`)
+	r.relay(func(c *RelayConfig) { c.Journal = j; c.Burst = 1; c.Rate = 0.0001 }).Scan(context.Background())
+	n := 0
+	for _, e := range j.evs {
+		if e.Type == "relay.refused" && strings.Contains(string(e.Data), "rate_capped") {
+			n++
+			var rid struct{ Rid string }
+			json.Unmarshal(e.Data, &rid)
+			if e.ID == "" || e.ID != r.replyOf(rid.Rid).ID {
+				t.Errorf("record id %q, reply id %q", e.ID, r.replyOf(rid.Rid).ID)
+			}
+		}
+	}
+	if n != 2 {
+		t.Fatalf("%d rate_capped records, want 2: %+v", n, j.evs)
+	}
+}
+
+// context "the journal volume breaks and every append fails from then on": the log says so once, then
+// only now and then, instead of one line per request.
+func TestRelayLogsAFailingJournalOnceNotPerRequest(t *testing.T) {
+	r := newRelayRig(t)
+	var lines []string
+	for i := 0; i < 5; i++ {
+		r.put(fmt.Sprintf("n%d.json", i), `{"type":"msg.send"}`)
+	}
+	r.relay(func(c *RelayConfig) {
+		c.Journal = &fakeJournal{fail: true}
+		c.Logf = func(f string, a ...any) { lines = append(lines, fmt.Sprintf(f, a...)) }
+	}).Scan(context.Background())
+	n := 0
+	for _, l := range lines {
+		if strings.Contains(l, "journal append failed") {
 			n++
 		}
 	}
-	if n != 3 {
-		t.Fatalf("%d shed summaries, want exactly the bound of 3", n)
+	if n != 1 {
+		t.Fatalf("%d log lines for 5 failures, want 1: %q", n, lines)
 	}
 }
 

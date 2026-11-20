@@ -480,6 +480,21 @@ func TestProcNetParsing(t *testing.T) {
    3: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  7777        0 44444 1 0000000000000000 100 0 0 10 0
    4: garbage
 `
+	tcp6 := `  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 00000000000000000000000000000000:0FAB 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  2222        0 55555 1 0000000000000000 100 0 0 10 0
+   1: 0000000000000000FFFF00000100007F:0FAB 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  3333        0 66666 1 0000000000000000 100 0 0 10 0
+   2: 00000000000000000000000001000000:0FAB 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  4444        0 77777 1 0000000000000000 100 0 0 10 0
+   3: 00000000000000000000000001000000:1F90 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000  5555        0 88888 1 0000000000000000 100 0 0 10 0
+`
+	// IPv6 wildcard, a v4-mapped loopback and ::1 are all listeners on the port, whoever holds them
+	if got := parseProcNet(strings.NewReader(tcp6), 0x0FAB); len(got) != 3 || got[0].UID != 2222 || got[1].UID != 3333 || got[2].UID != 4444 {
+		t.Errorf("tcp6: %+v", got)
+	}
+	// a header-only file (no sockets at all) and an empty one hold no listener
+	hdr := tcp[:strings.Index(tcp, "\n")+1]
+	if len(parseProcNet(strings.NewReader(hdr), 0x0FAB)) != 0 {
+		t.Error("a header-only file has listeners")
+	}
 	got := parseProcNet(strings.NewReader(tcp), 0x0FAB) // 4011
 	if len(got) != 2 || got[0].UID != 1000 || got[1].UID != 1234 || got[1].IP != "00000000" {
 		t.Errorf("%+v (only LISTEN sockets on the port: an established connection and another port are not listeners)", got)

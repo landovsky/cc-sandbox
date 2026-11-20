@@ -2,6 +2,7 @@ package termfilter
 
 import (
 	"bytes"
+	"regexp"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -160,21 +161,28 @@ func TestARawC1AfterAnInterruptedCharacterIsStillDropped(t *testing.T) {
 // context "whatever the agent sends": the output is valid UTF-8 with no C1 control and no escape except
 // the ones the filter itself writes (ESC followed by [ or one of 78DEM=>c).
 func TestWhateverIsSentTheOutputIsCleanUTF8(t *testing.T) {
+	// every escape in the output is exactly one the filter is meant to write: a single-character escape, a
+	// CSI of digits, ; and : ending in a drawing final, or a private-mode switch of a passed mode
+	allow := regexp.MustCompile(`^(\x1b[78DEM=>c]|\x1b\[[0-9;:]*[mABCDEFGHfdJKLMP@XSTrsul` + "`" + `ea]|\x1b\[\?(` + strings.ReplaceAll(strings.Join(Modes, "|"), "?", "") + `)[hl])`)
 	rnd := uint64(88172645463325252)
-	next := func() byte { rnd ^= rnd << 13; rnd ^= rnd >> 7; rnd ^= rnd << 17; return byte(rnd) }
-	alphabet := []byte{0x1b, '[', ']', 'P', '_', '^', 'X', 0x07, 0x9b, 0x9d, 0x90, 0xc2, 0xc3, 0xe0, 0xe2, 0xed, 0xf0, 0xf4, 0x80, 0xbf, 0xa0, '5', '2', ';', 'c', 'n', 'm', '?', '\\', 0x9c, 'a'}
-	for i := 0; i < 3000; i++ {
+	next := func() uint64 { rnd ^= rnd << 13; rnd ^= rnd >> 7; rnd ^= rnd << 17; return rnd }
+	alphabet := []byte{0x1b, '[', ']', 'P', '_', '^', 'X', 0x07, 0x9b, 0x9d, 0x90, 0xc2, 0xc3, 0xe0, 0xe2, 0xed, 0xf0, 0xf4, 0x80, 0xbf, 0xa0, '5', '2', ';', 'c', 'n', 'm', '?', '\\', 0x9c, 'a', 't', 'h', 'l', '1', '0', '4', 'H', ' ', 'q'}
+	for i := 0; i < 4000; i++ {
 		in := make([]byte, 64)
 		for j := range in {
 			if next()%4 == 0 {
-				in[j] = next()
+				in[j] = byte(next())
 			} else {
-				in[j] = alphabet[int(next())%len(alphabet)]
+				in[j] = alphabet[next()%uint64(len(alphabet))]
 			}
 		}
 		var f Filter
-		out := f.Write(in[:20])
-		out = append(out, f.Write(in[20:])...)
+		var out []byte
+		for rest := in; len(rest) > 0; { // split at random points, not at a fixed one
+			n := 1 + int(next()%uint64(len(rest)))
+			out = append(out, f.Write(rest[:n])...)
+			rest = rest[n:]
+		}
 		if !utf8.Valid(out) {
 			t.Fatalf("input %q gave invalid UTF-8 %q", in, out)
 		}
@@ -184,8 +192,8 @@ func TestWhateverIsSentTheOutputIsCleanUTF8(t *testing.T) {
 			}
 		}
 		for k := 0; k < len(out); k++ {
-			if out[k] == 0x1b && (k+1 >= len(out) || !strings.ContainsRune("[78DEM=>c", rune(out[k+1]))) {
-				t.Fatalf("input %q gave a stray escape %q", in, out)
+			if out[k] == 0x1b && !allow.Match(out[k:]) {
+				t.Fatalf("input %q gave an escape that is not on the allow-list: %q", in, out[k:])
 			}
 		}
 	}

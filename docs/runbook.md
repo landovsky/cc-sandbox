@@ -675,3 +675,7 @@ trust boundary is that uid; this stops hostd and every other uid from catching i
 hold; a listener that appears between the check and the connect is possible and no wider than a hub restart.
 The terminal filter is sound for UTF-8 terminals only (it emits only complete, valid UTF-8 without C1
 controls); the session runs with `LANG=C.UTF-8`.
+
+Systemd sockets of the signer are picked **by name**, never by order: the main socket unit sets
+`FileDescriptorName=main`, the keys peer's `FileDescriptorName=launch`, and the signer refuses to start
+unless `LISTEN_FDNAMES` is exactly those two names (either order) with `LISTEN_FDS=2`.

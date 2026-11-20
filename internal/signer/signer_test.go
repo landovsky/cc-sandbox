@@ -881,27 +881,50 @@ func TestEachSocketTakesItsOwnClassOnly(t *testing.T) {
 	}
 }
 
-func TestTwoSystemdSocketsAreTakenExactly(t *testing.T) {
+func TestTwoSystemdSocketsAreTakenByNameNotByOrder(t *testing.T) {
 	fd1, c1 := listeningFD(t)
 	fd2, c2 := listeningFD(t)
 	defer c1()
 	defer c2()
 	pid := os.Getpid()
-	first := dupFD(t, fd1)
-	if dupFD(t, fd2) != first+1 {
-		t.Skip("could not get two consecutive descriptors")
+	// every call takes (and closes) its own two consecutive descriptors, as a fresh process would be given them
+	pair := func() int {
+		first := dupFD(t, fd1)
+		if dupFD(t, fd2) != first+1 {
+			t.Skip("could not get two consecutive descriptors")
+		}
+		return first
 	}
-	ls, err := SystemdListeners(envOf(map[string]string{"LISTEN_PID": itoa(pid), "LISTEN_FDS": "2"}), pid, first, 2)
+	names := []string{SocketNameHostd, SocketNameKeys}
+	env := func(fds, fdnames string) func(string) string {
+		return envOf(map[string]string{"LISTEN_PID": itoa(pid), "LISTEN_FDS": fds, "LISTEN_FDNAMES": fdnames})
+	}
+	ls, err := SystemdListeners(env("2", "main:launch"), pid, pair(), names)
 	if err != nil || len(ls) != 2 {
-		t.Fatalf("%v %v", ls, err)
+		t.Fatalf("in order: %v %v", ls, err)
 	}
-	for _, o := range ls {
-		o.Close()
+	a1, a2 := ls[0].Addr().String(), ls[1].Addr().String()
+	ls[0].Close()
+	ls[1].Close()
+	// the units started the other way round: the names still decide, so hostd's socket stays hostd's
+	ls, err = SystemdListeners(env("2", "launch:main"), pid, pair(), names)
+	if err != nil || ls[0].Addr().String() != a2 || ls[1].Addr().String() != a1 {
+		t.Fatalf("swapped: %v %v", ls, err)
 	}
-	// a count that does not match what the caller expects is refused (one socket where two are wanted, and the reverse)
-	for _, n := range []string{"1", "3", "0", ""} {
-		if _, err := SystemdListeners(envOf(map[string]string{"LISTEN_PID": itoa(pid), "LISTEN_FDS": n}), pid, first, 2); err == nil {
-			t.Errorf("LISTEN_FDS=%q accepted for two sockets", n)
+	ls[0].Close()
+	ls[1].Close()
+	// anything that is not exactly the two names is refused
+	for why, e := range map[string]func(string) string{
+		"one socket where two are wanted": env("1", "main"),
+		"three sockets":                   env("3", "main:launch:x"),
+		"no names":                        env("2", ""),
+		"systemd's default name":          env("2", "unknown:unknown"),
+		"a name twice":                    env("2", "main:main"),
+		"another name":                    env("2", "main:other"),
+		"a count that is not a number":    env("many", "main:launch"),
+	} {
+		if _, err := SystemdListeners(e, pid, pair(), names); err == nil {
+			t.Errorf("%s was accepted", why)
 		}
 	}
 }

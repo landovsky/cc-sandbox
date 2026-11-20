@@ -255,7 +255,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	switch {
 	case *sysd && keysUID != nil:
 		var ls []net.Listener
-		if ls, err = SystemdListeners(os.Getenv, os.Getpid(), 3, 2); err == nil {
+		if ls, err = SystemdListeners(os.Getenv, os.Getpid(), 3, []string{SocketNameHostd, SocketNameKeys}); err == nil {
 			l, kl = ls[0], ls[1]
 		}
 	case *sysd:
@@ -294,39 +294,73 @@ func Main(args []string, stdout, stderr io.Writer) int {
 // exactly 1, the socket being the fd at first (3 under systemd). Anything else is refused, so a
 // stray environment can't make the signer serve on an fd it didn't get from its parent.
 func SystemdListener(env func(string) string, pid, first int) (net.Listener, error) {
-	ls, err := SystemdListeners(env, pid, first, 1)
+	ls, err := SystemdListeners(env, pid, first, []string{""})
 	if err != nil {
 		return nil, err
 	}
 	return ls[0], nil
 }
 
-// SystemdListeners is SystemdListener for exactly n sockets, at fds first..first+n-1 (the main socket
-// first, then the keys peer's), and nothing else.
-func SystemdListeners(env func(string) string, pid, first, n int) ([]net.Listener, error) {
+// Names of the two systemd sockets (FileDescriptorName= in the .socket units): which fd is which is
+// decided by name, never by order, so units that start in another order cannot swap the classes.
+const (
+	SocketNameHostd = "main"
+	SocketNameKeys  = "launch"
+)
+
+// SystemdListeners is SystemdListener for exactly the named sockets, taken from the fds at first.. by
+// LISTEN_FDNAMES, and returned in the order of names. Exactly len(names) fds must be passed, each name
+// once, and nothing else.
+func SystemdListeners(env func(string) string, pid, first int, names []string) ([]net.Listener, error) {
+	n := len(names)
 	if p, err := strconv.Atoi(env("LISTEN_PID")); err != nil || p != pid {
 		return nil, fmt.Errorf("LISTEN_PID %q is not this process (%d): not started by systemd socket activation", env("LISTEN_PID"), pid)
 	}
 	if got, err := strconv.Atoi(env("LISTEN_FDS")); err != nil || got != n {
 		return nil, fmt.Errorf("LISTEN_FDS is %q, want exactly %d socket(s)", env("LISTEN_FDS"), n)
 	}
+	fd := make([]int, n)
+	if n == 1 {
+		fd[0] = first
+	} else {
+		have := strings.Split(env("LISTEN_FDNAMES"), ":")
+		if len(have) != n {
+			return nil, fmt.Errorf("LISTEN_FDNAMES is %q, want the %d names %v (set FileDescriptorName= on the socket units)", env("LISTEN_FDNAMES"), n, names)
+		}
+		for i, want := range names {
+			idx := -1
+			for j, h := range have {
+				if h == want {
+					if idx >= 0 {
+						return nil, fmt.Errorf("LISTEN_FDNAMES names %q twice", want)
+					}
+					idx = j
+				}
+			}
+			if idx < 0 {
+				return nil, fmt.Errorf("LISTEN_FDNAMES %q has no socket named %q", env("LISTEN_FDNAMES"), want)
+			}
+			fd[i] = first + idx
+		}
+	}
 	var out []net.Listener
-	for i := 0; i < n; i++ {
-		f := os.NewFile(uintptr(first+i), "systemd-socket")
+	closeAll := func() {
+		for _, o := range out {
+			o.Close()
+		}
+	}
+	for _, d := range fd {
+		f := os.NewFile(uintptr(d), "systemd-socket")
 		l, err := net.FileListener(f)
 		f.Close()
 		if err != nil {
-			for _, o := range out {
-				o.Close()
-			}
-			return nil, fmt.Errorf("fd %d is not a listening socket: %w", first+i, err)
+			closeAll()
+			return nil, fmt.Errorf("fd %d is not a listening socket: %w", d, err)
 		}
 		if _, ok := l.(*net.UnixListener); !ok {
 			l.Close()
-			for _, o := range out {
-				o.Close()
-			}
-			return nil, fmt.Errorf("fd %d is not a unix socket", first+i)
+			closeAll()
+			return nil, fmt.Errorf("fd %d is not a unix socket", d)
 		}
 		out = append(out, l)
 	}

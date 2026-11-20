@@ -4,6 +4,8 @@
 package fwd
 
 import (
+	"fmt"
+	"context"
 	"bytes"
 	"errors"
 	"io"
@@ -63,7 +65,7 @@ func newRig(t *testing.T) *rig {
 	du, _ := url.Parse(r.door.URL)
 	eu, _ := url.Parse(egress.URL)
 	f, err := New(Config{Token: tok, Key: gen, Doors: map[string]*url.URL{"model": du, "egress": eu},
-		Logf: func(format string, a ...any) { r.logs.WriteString(strings.TrimSpace(format) + "\n") }})
+		Logf: func(format string, a ...any) { r.logs.WriteString(fmt.Sprintf(format, a...) + "\n") }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +225,9 @@ func TestCannotReachNonDoor(t *testing.T) {
 		b, _ := io.ReadAll(c)
 		return string(b)
 	}
-	if out := raw("POST " + evil.URL + "/v1/messages HTTP/1.1\r\nHost: " + evilAddr + "\r\nConnection: close\r\n\r\n"); !strings.Contains(out, "403") {
+	// The path names a REAL door ("model"), so only the absolute-form check can stop this one;
+	// with a path like /v1/messages the unknown door "v1" would refuse it and hide a missing check.
+	if out := raw("POST " + evil.URL + "/model/v1/messages HTTP/1.1\r\nHost: " + evilAddr + "\r\nConnection: close\r\n\r\n"); !strings.Contains(out, "403") {
 		t.Fatalf("absolute-form: %s", out)
 	}
 	if out := raw("CONNECT " + evilAddr + " HTTP/1.1\r\nHost: " + evilAddr + "\r\nConnection: close\r\n\r\n"); strings.Contains(out, " 200") {
@@ -234,6 +238,15 @@ func TestCannotReachNonDoor(t *testing.T) {
 	}
 	if len(r.f.cfg.pinned[evilAddr]) > 0 {
 		t.Fatal("a non-door is in the dial set")
+	}
+	// The transport itself refuses an address that is not a pinned door, whatever the request says.
+	tr := r.f.proxy.Transport.(*http.Transport)
+	if c, err := tr.DialContext(context.Background(), "tcp", evilAddr); err == nil {
+		c.Close()
+		t.Fatal("the transport dialled a non-door address")
+	}
+	if other.Load() != 0 {
+		t.Fatal("the direct dial reached a non-door")
 	}
 }
 
@@ -261,10 +274,39 @@ func TestNoTokenInAnythingTheFenceSees(t *testing.T) {
 			seen.WriteString(k + strings.Join(vs, ","))
 		}
 	}
+	// Force the upstream-error path: a door that drops the connection after the request.
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		c, _, _ := w.(http.Hijacker).Hijack()
+		c.Close()
+	}))
+	defer bad.Close()
+	bu, _ := url.Parse(bad.URL)
+	var badLogs strings.Builder
+	f2, err := New(Config{Token: r.tok, Key: r.gen, Doors: map[string]*url.URL{"model": bu},
+		Logf: func(format string, a ...any) { badLogs.WriteString(fmt.Sprintf(format, a...) + "\n") }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s2 := httptest.NewServer(f2)
+	defer s2.Close()
+	resp, err := http.Post(s2.URL+"/model/v1/messages", "application/json", strings.NewReader("{}"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b2, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != 502 || !strings.Contains(badLogs.String(), "upstream error") {
+		t.Fatalf("the error path was not exercised: %d %q", resp.StatusCode, badLogs.String())
+	}
+	seen.Write(b2)
+	seen.WriteString(badLogs.String())
 	seen.WriteString(r.logs.String())
 	sig := r.tok[strings.LastIndexByte(r.tok, '.')+1:]
 	if strings.Contains(seen.String(), sig) || strings.Contains(seen.String(), "Bearer") {
 		t.Fatal("token material visible on the fence side")
+	}
+	if !strings.Contains(r.logs.String(), `"fwd":"deny"`) {
+		t.Fatal("the rig's log sink recorded nothing, so the log check above proves nothing")
 	}
 	if scrub("dial "+r.tok, r.tok) != "dial [token]" {
 		t.Fatal("scrub")

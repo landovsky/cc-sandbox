@@ -28,6 +28,12 @@ var DefaultRules = []Rule{
 	{Door: "model", Methods: []string{"POST"}, Path: "/v1/messages/count_tokens"},
 	{Door: "model", Methods: []string{"GET"}, Path: "/v1/models"},
 	{Door: "model", Methods: []string{"GET"}, Path: "/v1/models/*"},
+	// The scripted stub (C18) is its own door with its own audience, so a stub token never verifies at
+	// the real model door; its routes are the model's.
+	{Door: "stub", Methods: []string{"POST"}, Path: "/v1/messages"},
+	{Door: "stub", Methods: []string{"POST"}, Path: "/v1/messages/count_tokens"},
+	{Door: "stub", Methods: []string{"GET"}, Path: "/v1/models"},
+	{Door: "stub", Methods: []string{"GET"}, Path: "/v1/models/*"},
 	{Door: "egress", Methods: []string{"GET"}, Path: "/github/**"},
 	{Door: "egress", Methods: []string{"POST"}, Path: "/github/repos/*/*/pulls"},
 	{Door: "egress", Methods: []string{"POST"}, Path: "/github/repos/*/*/issues/*/comments"},

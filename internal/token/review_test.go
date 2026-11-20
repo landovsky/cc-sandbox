@@ -5,6 +5,8 @@
 package token
 
 import (
+	"crypto/ed25519"
+	"encoding/json"
 	"encoding/base64"
 	"io"
 	"net/http"
@@ -268,5 +270,143 @@ func TestKeyCreationRefusesSymlink(t *testing.T) {
 	}
 	if _, err := os.Stat(target); err == nil {
 		t.Fatal("the symlink target was created")
+	}
+}
+
+// handSigned signs claims WITHOUT Mint's checks, the way a buggy or future signer could.
+func handSigned(k *Key, c Claims) string {
+	c.Iat, c.Exp = t0.Unix(), t0.Add(time.Hour).Unix()
+	hb, _ := json.Marshal(header{Alg: "EdDSA", Typ: "JWT", KID: k.KID})
+	pb, _ := json.Marshal(c)
+	h, p := b64.EncodeToString(hb), b64.EncodeToString(pb)
+	return h + "." + p + "." + b64.EncodeToString(ed25519.Sign(k.Private, signingInput(h, p)))
+}
+
+// context "a door must not trust the signer to have checked billing (review S2, invariant 18)":
+// a token with an empty billing or profile is refused by Verify even though its signature is good.
+func TestDoorRechecksBillingAndProfile(t *testing.T) {
+	k := newKey(t)
+	v := NewVerifier(k.Ring([]string{"tomas"}, []string{"hp-ubuntu"}), "ccsbx-model")
+	g, _ := NewGenKey()
+	for _, tc := range []struct{ billing, profile string }{{"", "dev-default"}, {"free", "dev-default"}, {"api", ""}} {
+		c := claimsFor("tomas/hp-ubuntu/sX/g1", g, "ccsbx-model")
+		c.Billing, c.Profile = tc.billing, tc.profile
+		tok := handSigned(k, c)
+		p, _ := SignProof(g, "POST", "/x", "ccsbx-model", tok, nil, t0)
+		if _, err := v.Verify(tok, p, "POST", "/x", nil, t0); err != ErrClaim {
+			t.Fatalf("%+v: %v", tc, err)
+		}
+	}
+	// allow twin: the same hand-signing path with good claims verifies, so the test isn't vacuous.
+	tok := handSigned(k, claimsFor("tomas/hp-ubuntu/sX/g1", g, "ccsbx-model"))
+	p, _ := SignProof(g, "POST", "/x", "ccsbx-model", tok, nil, t0)
+	if _, err := v.Verify(tok, p, "POST", "/x", nil, t0); err != nil {
+		t.Fatalf("hand-signed good token refused: %v", err)
+	}
+}
+
+// context "the Mac key must not sign above the Mac's tier (T:mac-key-above-mac-max, review S1)":
+// a key whose keyring line limits profiles and billings can't sign anything outside them.
+func TestKeyScopedByProfileAndBilling(t *testing.T) {
+	k := newKey(t)
+	f := filepath.Join(t.TempDir(), "ring")
+	line := k.KeyringLineScoped([]string{"tomas"}, []string{"mac"}, []string{"dev-*", "e2e-*"}, []string{"api", "stub"})
+	if err := os.WriteFile(f, []byte(line+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ring, err := LoadPublicKeyring(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := NewVerifier(ring, "ccsbx-model")
+	g, _ := NewGenKey()
+	try := func(profile, billing string) error {
+		c := claimsFor("tomas/mac/sM/g1", g, "ccsbx-model")
+		c.Profile, c.Billing = profile, billing
+		tok, err := Mint(k, c, t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, _ := SignProof(g, "POST", "/x", "ccsbx-model", tok, nil, t0)
+		_, err = v.Verify(tok, p, "POST", "/x", nil, t0)
+		return err
+	}
+	if err := try("dev-default", "api"); err != nil {
+		t.Fatalf("allow twin: %v", err)
+	}
+	if err := try("e2e-basic", "stub"); err != nil {
+		t.Fatalf("allow twin: %v", err)
+	}
+	if err := try("dev-default", "subscription"); err != ErrKeyScope {
+		t.Fatalf("billing above the key's tier: %v", err)
+	}
+	if err := try("prod-admin", "api"); err != ErrKeyScope {
+		t.Fatalf("profile outside the key's tier: %v", err)
+	}
+	// an empty profiles= is a mistake, not allow-all; a duplicate kid is refused (review N7).
+	os.WriteFile(f, []byte(strings.Replace(line, "machines=mac", "machines=mac profiles=", 1)+"\n"), 0o600)
+	if _, err := LoadPublicKeyring(f); err == nil {
+		t.Fatal("empty profiles= accepted")
+	}
+	os.WriteFile(f, []byte(line+"\n"+line+"\n"), 0o600)
+	if _, err := LoadPublicKeyring(f); err == nil {
+		t.Fatal("a kid listed twice was accepted")
+	}
+}
+
+// context "a generation ends and hostd revokes it over the wire (T:token-after-exit, review S4)":
+// only a signed request from a key scoped to that machine kills a generation at the door.
+func TestRevokeEndpoint(t *testing.T) {
+	hp, mac := newKey(t), newKey(t)
+	ring := Keyring{
+		hp.KID:  {Pub: hp.Public, Owners: []string{"tomas"}, Machines: []string{"hp-ubuntu"}},
+		mac.KID: {Pub: mac.Public, Owners: []string{"tomas"}, Machines: []string{"mac"}},
+	}
+	v := NewVerifier(ring, "ccsbx-model")
+	srv := httptest.NewServer(v.RevokeHandler(func() time.Time { return t0 }))
+	defer srv.Close()
+	g, _ := NewGenKey()
+	tok, _ := Mint(hp, claimsFor("tomas/hp-ubuntu/sR/g2", g, "ccsbx-model"), t0)
+	use := func() error {
+		p, _ := SignProof(g, "POST", "/x", "ccsbx-model", tok, nil, t0)
+		_, err := v.Verify(tok, p, "POST", "/x", nil, t0)
+		return err
+	}
+	send := func(hdr string, body []byte) int {
+		req, _ := http.NewRequest("POST", srv.URL+RevokePath, strings.NewReader(string(body)))
+		if hdr != "" {
+			req.Header.Set(RevokeHeader, hdr)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	body := []byte(`{"owner":"tomas","machine":"hp-ubuntu","sid":"sR","gen":2}`)
+	if err := use(); err != nil {
+		t.Fatalf("allow twin: %v", err)
+	}
+	if c := send("", body); c != 401 {
+		t.Fatalf("unsigned revoke: %d", c)
+	}
+	if c := send(SignRevoke(mac, body, t0), body); c != 401 {
+		t.Fatalf("the Mac key revoked an hp session: %d", c)
+	}
+	if c := send(SignRevoke(hp, body, t0.Add(-time.Hour)), body); c != 401 {
+		t.Fatalf("stale revoke: %d", c)
+	}
+	if c := send(SignRevoke(hp, body, t0), []byte(`{"owner":"tomas","machine":"hp-ubuntu","sid":"sR","gen":9}`)); c != 401 {
+		t.Fatalf("signature moved to another body: %d", c)
+	}
+	if err := use(); err != nil {
+		t.Fatalf("a refused revoke still killed the token: %v", err)
+	}
+	if c := send(SignRevoke(hp, body, t0), body); c != 204 {
+		t.Fatalf("valid revoke: %d", c)
+	}
+	if err := use(); err != ErrGenRevoked {
+		t.Fatalf("token still works after revoke: %v", err)
 	}
 }

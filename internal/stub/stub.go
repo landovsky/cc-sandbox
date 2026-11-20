@@ -55,6 +55,9 @@ var Catalog = map[string]Script{
 	"done":       {Tool: "done", Args: map[string]string{"text": "e2e done"}, Text: "calling done"},
 }
 
+// DefaultAud is the stub door's audience: never the real model door's, so a stub token is useless there.
+const DefaultAud = "ccsbx-stub"
+
 // DoneText ends a turn after a tool result.
 const DoneText = "E2E-DONE"
 

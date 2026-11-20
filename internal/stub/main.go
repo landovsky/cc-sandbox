@@ -4,6 +4,7 @@
 package stub
 
 import (
+	"path/filepath"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -25,7 +26,7 @@ Usage:
   ccsbx stub --print-catalog
 
 A fake Anthropic Messages API for e2e runs. Put it behind the forwarder as the
-"model" door:  ccsbx fwd --door model=http://127.0.0.1:PORT ...
+"stub" door:  ccsbx fwd --door stub=http://127.0.0.1:PORT ...
 It serves only session tokens whose profile starts "e2e-" and whose billing is
 "stub"; everything else is refused 403. --listen must be a loopback address.
 
@@ -36,8 +37,11 @@ Flags: (each also CCSBX_STUB_<NAME>)
   --listen ADDR      loopback host:port                      (required)
   --keyring FILE     public keys that may sign tokens, with owner/machine scope; make it with
                      'ccsbx token pubkey'. A door never gets a signing key. (default $CCSBX_KEYRING)
-  --aud NAME         audience the token must list            (default ccsbx-model)
-  --state FILE       persist max_gen/revocations here        (default: memory only)
+  --aud NAME         audience the token must list            (default ccsbx-stub)
+  --state FILE       persist max_gen/revocations here; the stub refuses to start if it can't
+                     (default $XDG_STATE_HOME/ccsbx/<aud>.json, else ~/.local/state/ccsbx/<aud>.json)
+  --owner-listen ADDR  loopback host:port serving POST /_ccsbx/revoke for hostd (signed by a machine
+                     key in the keyring); never route it through the forwarder. Default: off
   --print-catalog    print the scripts as JSON and exit (starts nothing)
   --help             this text (starts nothing)
 
@@ -65,8 +69,9 @@ func Main(args []string, stdout, stderr io.Writer) int {
 	fs.SetOutput(stderr)
 	listen := fs.String("listen", envOr("LISTEN", ""), "")
 	keyring := fs.String("keyring", envOr("KEYRING", os.Getenv("CCSBX_KEYRING")), "")
-	aud := fs.String("aud", envOr("AUD", "ccsbx-model"), "")
+	aud := fs.String("aud", envOr("AUD", DefaultAud), "")
 	state := fs.String("state", envOr("STATE", ""), "")
+	ownerListen := fs.String("owner-listen", envOr("OWNER_LISTEN", ""), "")
 	printCat := fs.Bool("print-catalog", false, "")
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -88,13 +93,24 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		return 2
 	}
 	v := token.NewVerifier(ring, *aud)
-	if *state != "" {
-		if err := v.PersistTo(*state); err != nil {
-			fmt.Fprintln(stderr, "stub:", err)
-			return 2
-		}
+	if err := persist(v, *state, *aud); err != nil {
+		fmt.Fprintln(stderr, "stub: cannot keep state, refusing to start:", err)
+		return 2
 	}
 	logf := func(f string, a ...any) { fmt.Fprintf(stderr, f+"\n", a...) }
+	if *ownerListen != "" {
+		oh, _, err := net.SplitHostPort(*ownerListen)
+		if err != nil || !isLoopback(oh) {
+			fmt.Fprintln(stderr, "stub: --owner-listen must be a loopback host:port, got", *ownerListen)
+			return 2
+		}
+		go func() {
+			o := &http.Server{Addr: *ownerListen, Handler: v.RevokeHandler(nil), ReadHeaderTimeout: 10 * time.Second}
+			if err := o.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				logf("stub: owner listener: %v", err)
+			}
+		}()
+	}
 	srv := &http.Server{Addr: *listen, Handler: Gate(v, Handler(), logf), ReadHeaderTimeout: 10 * time.Second}
 	logf("stub: serving e2e scripts on %s", *listen)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -109,4 +125,27 @@ func Main(args []string, stdout, stderr io.Writer) int {
 func isLoopback(h string) bool {
 	ip := net.ParseIP(strings.Trim(h, "[]"))
 	return ip != nil && ip.IsLoopback()
+}
+
+// defaultState is where a door keeps max_gen and revocations when --state is not given.
+func defaultState(aud string) string {
+	base := os.Getenv("XDG_STATE_HOME")
+	if base == "" {
+		h, _ := os.UserHomeDir()
+		base = filepath.Join(h, ".local", "state")
+	}
+	return filepath.Join(base, "ccsbx", aud+".json")
+}
+
+// persist gives the verifier durable state. Review S5: a door that forgets revocations and max_gen
+// on restart fails open against T:token-gen-bump and T:token-after-exit, so there is no
+// memory-only mode: an empty path means the default one.
+func persist(v *token.Verifier, state, aud string) error {
+	if state == "" {
+		state = defaultState(aud)
+	}
+	if err := os.MkdirAll(filepath.Dir(state), 0o700); err != nil {
+		return err
+	}
+	return v.PersistTo(state)
 }

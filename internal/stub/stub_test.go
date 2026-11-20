@@ -4,6 +4,7 @@
 package stub
 
 import (
+	"os"
 	"bytes"
 	"encoding/json"
 	"io"
@@ -30,15 +31,15 @@ func newChain(t *testing.T, profile, billing string) *chain {
 	}
 	gen, _ := token.NewGenKey()
 	tok, err := token.Mint(key, token.Claims{Sub: "tomas/hp-ubuntu/sSTUB/g1", Billing: billing, Profile: profile,
-		Aud: []string{"ccsbx-model"}, Cnf: token.CnfOf(gen.Public)}, time.Now())
+		Aud: []string{"ccsbx-stub"}, Cnf: token.CnfOf(gen.Public)}, time.Now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	v := token.NewVerifier(key.Ring([]string{"tomas"}, []string{"hp-ubuntu"}), "ccsbx-model")
+	v := token.NewVerifier(key.Ring([]string{"tomas"}, []string{"hp-ubuntu"}), "ccsbx-stub")
 	door := httptest.NewServer(Gate(v, Handler(), t.Logf))
 	t.Cleanup(door.Close)
 	du, _ := url.Parse(door.URL)
-	f, err := fwd.New(fwd.Config{Token: tok, Key: gen, Doors: map[string]*url.URL{"model": du}})
+	f, err := fwd.New(fwd.Config{Token: tok, Key: gen, Doors: map[string]*url.URL{"stub": du}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -51,7 +52,7 @@ const toolsJSON = `[{"name":"mcp__ccf__outcome","input_schema":{"properties":{"t
 
 func (c *chain) post(t *testing.T, body string) (int, string) {
 	t.Helper()
-	resp, err := http.Post(c.fwdURL+"/model/v1/messages", "application/json", strings.NewReader(body))
+	resp, err := http.Post(c.fwdURL+"/stub/v1/messages", "application/json", strings.NewReader(body))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,5 +172,48 @@ func TestLocalhostNameIsNotTrusted(t *testing.T) {
 	}
 	if !isLoopback("127.0.0.1") || !isLoopback("[::1]") || isLoopback("10.0.0.1") {
 		t.Fatal("IP literals")
+	}
+}
+
+// Review S3: the stub has its own audience. A stub token must not verify at the real model door,
+// or an e2e run with a real door in reach could spend real credit.
+func TestStubTokenIsNotAcceptedByTheModelDoor(t *testing.T) {
+	key, _ := token.LoadOrCreateKeyFile(filepath.Join(t.TempDir(), "dev.key"))
+	gen, _ := token.NewGenKey()
+	tok, err := token.Mint(key, token.Claims{Sub: "tomas/hp-ubuntu/sSTUB/g1", Billing: "stub", Profile: "e2e-basic",
+		Aud: []string{DefaultAud}, Cnf: token.CnfOf(gen.Public)}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring := key.Ring([]string{"tomas"}, []string{"hp-ubuntu"})
+	p, _ := token.SignProof(gen, "POST", "/v1/messages", DefaultAud, tok, nil, time.Now())
+	if _, err := token.NewVerifier(ring, "ccsbx-model").Verify(tok, p, "POST", "/v1/messages", nil, time.Now()); err == nil {
+		t.Fatal("the real model door accepted a stub token")
+	}
+	if _, err := token.NewVerifier(ring, DefaultAud).Verify(tok, p, "POST", "/v1/messages", nil, time.Now()); err != nil {
+		t.Fatalf("allow twin: the stub refused its own token: %v", err)
+	}
+}
+
+// Review S5: a stub that can't persist revocations refuses to start instead of serving from memory.
+func TestStubRefusesToRunWithoutDurableState(t *testing.T) {
+	key, _ := token.LoadOrCreateKeyFile(filepath.Join(t.TempDir(), "dev.key"))
+	ring := filepath.Join(t.TempDir(), "ring")
+	os.WriteFile(ring, []byte(key.KeyringLine([]string{"tomas"}, []string{"hp-ubuntu"})+"\n"), 0o600)
+	blocker := filepath.Join(t.TempDir(), "file")
+	os.WriteFile(blocker, nil, 0o600) // a state path below a regular file can never be written
+	var out, errb bytes.Buffer
+	if Main([]string{"--listen", "127.0.0.1:0", "--keyring", ring, "--state", filepath.Join(blocker, "s.json")}, &out, &errb) != 2 {
+		t.Fatalf("started without durable state: %s", errb.String())
+	}
+	// With no --state the door still persists, under the default path.
+	xdg := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", xdg)
+	rg, _ := token.LoadPublicKeyring(ring)
+	if err := persist(token.NewVerifier(rg, "ccsbx-stub"), "", "ccsbx-stub"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(xdg, "ccsbx", "ccsbx-stub.json")); err != nil {
+		t.Fatalf("no default state file: %v", err)
 	}
 }

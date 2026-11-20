@@ -198,16 +198,16 @@ no-token-in-fence/allow|no-token-in-fence/block)
   [ "$RULE" = no-token-in-fence ] || fail "internal"
   BINABS=$(readlink -f "$BIN")
   "$BIN" token mint --key-file "$STATE/dev.key" --sub "tomas/hp-ubuntu/$sid/g1" --label nt --billing stub --profile e2e-test \
-      --aud ccsbx-model --fwd-secrets > "$STATE/secrets.json" || fail "mint"
+      --aud ccsbx-stub --fwd-secrets > "$STATE/secrets.json" || fail "mint"
   chmod 0600 "$STATE/dev.key"
   "$BIN" token pubkey --key-file "$STATE/dev.key" --owners tomas --machines hp-ubuntu > "$STATE/keyring" || fail "pubkey"
   docker run --rm -i --name "ccsbx-fwd-$$" --network "$net" --network-alias fwd \
       -v "$BINABS:/ccsbx:ro" -v "$STATE/keyring:/keyring:ro" "$IMG" sh -c \
-      '/ccsbx stub --listen 127.0.0.1:8081 --keyring /keyring & exec /ccsbx fwd --listen :8080 --door model=http://127.0.0.1:8081' \
+      '/ccsbx stub --listen 127.0.0.1:8081 --keyring /keyring --state /tmp/stub-state.json & exec /ccsbx fwd --listen :8080 --door stub=http://127.0.0.1:8081' \
       < "$STATE/secrets.json" >"$STATE/fwd.log" 2>&1 &
   PIDS+=("$!")
   call="import urllib.request,json
-r=urllib.request.Request('http://fwd:8080/model/v1/messages',data=json.dumps({'model':'m','messages':[{'role':'user','content':'E2E:hi'}]}).encode(),headers={'content-type':'application/json'})
+r=urllib.request.Request('http://fwd:8080/stub/v1/messages',data=json.dumps({'model':'m','messages':[{'role':'user','content':'E2E:hi'}]}).encode(),headers={'content-type':'application/json'})
 print(urllib.request.urlopen(r,timeout=5).read().decode())"
   got=""
   for _ in $(seq 1 25); do got=$(docker exec "ccsbx-$sid-g1" $PY "$call" 2>&1) && break; sleep 0.4; done

@@ -22,6 +22,7 @@
 package token
 
 import (
+	"path"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -238,8 +239,8 @@ func Mint(k *Key, c Claims, now time.Time) (string, error) {
 	if len(c.Aud) == 0 {
 		return "", errors.New("token: aud required")
 	}
-	if (c.Billing != "api" && c.Billing != "subscription" && c.Billing != "stub") || c.Profile == "" {
-		return "", ErrClaim // invariant 18: no door may invent a default billing
+	if err := c.validBilling(); err != nil {
+		return "", err
 	}
 	if pk, err := b64.DecodeString(c.Cnf); err != nil || len(pk) != ed25519.PublicKeySize {
 		return "", errors.New("token: cnf must be a base64url ed25519 public key")
@@ -254,13 +255,52 @@ func Mint(k *Key, c Claims, now time.Time) (string, error) {
 	return h + "." + p + "." + b64.EncodeToString(sig), nil
 }
 
+// validBilling is invariant 18: billing is one of three values and the profile is named, so no
+// door ever picks a default. Mint and Verify both call it; the signer's own check can't be the
+// only one, since a signer bug lives on the same side.
+func (c *Claims) validBilling() error {
+	if (c.Billing != "api" && c.Billing != "subscription" && c.Billing != "stub") || c.Profile == "" {
+		return ErrClaim
+	}
+	return nil
+}
+
 // KeyScope is what one trusted key may sign for (invariant 27): sessions whose sub names an
 // owner in Owners and a machine in Machines. An empty list allows nothing, so a scope can't be
-// "forgotten" into allow-all.
+// "forgotten" into allow-all. Profiles (glob patterns, e.g. "e2e-*") and Billings, when set,
+// narrow it further: a Mac key limited to profiles=dev-* billings=api,stub can't sign a
+// subscription session (T:mac-key-above-mac-max). Unset means no narrowing.
 type KeyScope struct {
 	Pub      ed25519.PublicKey
 	Owners   []string
 	Machines []string
+	Profiles []string
+	Billings []string
+}
+
+// allowsClaims is the profile and billing half of the scope check.
+func (k KeyScope) allowsClaims(c *Claims) bool {
+	if k.Billings != nil {
+		ok := false
+		for _, b := range k.Billings {
+			ok = ok || b == c.Billing
+		}
+		if !ok {
+			return false
+		}
+	}
+	if k.Profiles != nil {
+		ok := false
+		for _, pat := range k.Profiles {
+			if m, err := path.Match(pat, c.Profile); err == nil && m {
+				ok = true
+			}
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func (k KeyScope) allows(owner, machine string) bool {
@@ -309,12 +349,23 @@ func LoadPublicKeyring(path string) (Keyring, error) {
 				sc.Owners = splitList(v)
 			case "machines":
 				sc.Machines = splitList(v)
+			case "profiles":
+				if sc.Profiles = splitList(v); len(sc.Profiles) == 0 {
+					return nil, fmt.Errorf("token: keyring %s:%d: profiles= is empty (leave it out to allow all)", path, i+1)
+				}
+			case "billings":
+				if sc.Billings = splitList(v); len(sc.Billings) == 0 {
+					return nil, fmt.Errorf("token: keyring %s:%d: billings= is empty (leave it out to allow all)", path, i+1)
+				}
 			default:
 				return nil, fmt.Errorf("token: keyring %s:%d: unknown field %q", path, i+1, k)
 			}
 		}
 		if len(sc.Owners) == 0 || len(sc.Machines) == 0 {
 			return nil, fmt.Errorf("token: keyring %s:%d: owners= and machines= are required", path, i+1)
+		}
+		if _, dup := ring[f[0]]; dup {
+			return nil, fmt.Errorf("token: keyring %s:%d: kid %s appears twice", path, i+1, f[0])
 		}
 		ring[f[0]] = sc
 	}
@@ -326,8 +377,20 @@ func LoadPublicKeyring(path string) (Keyring, error) {
 
 // KeyringLine is the line a host writes for a key it has the seed of.
 func (k *Key) KeyringLine(owners, machines []string) string {
-	return fmt.Sprintf("%s %s owners=%s machines=%s", k.KID, base64.StdEncoding.EncodeToString(k.Public),
+	return k.KeyringLineScoped(owners, machines, nil, nil)
+}
+
+// KeyringLineScoped is KeyringLine with the optional profile and billing narrowing.
+func (k *Key) KeyringLineScoped(owners, machines, profiles, billings []string) string {
+	line := fmt.Sprintf("%s %s owners=%s machines=%s", k.KID, base64.StdEncoding.EncodeToString(k.Public),
 		strings.Join(owners, ","), strings.Join(machines, ","))
+	if len(profiles) > 0 {
+		line += " profiles=" + strings.Join(profiles, ",")
+	}
+	if len(billings) > 0 {
+		line += " billings=" + strings.Join(billings, ",")
+	}
+	return line
 }
 
 // parse checks structure, alg, kid and signature, and returns the claims.

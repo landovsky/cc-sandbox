@@ -283,7 +283,7 @@ id = "token-after-exit"
 title = "a token is refused after its session exits"
 suite = "keys"
 allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
-block = "tests/go-test.sh ./internal/token 'TestTokenAfterExit$'"
+block = "tests/go-test.sh ./internal/token 'TestTokenAfterExit$|TestRevokeEndpoint$'"
 invariants = [8]
 backends = ["unit"]
 where = "any"
@@ -314,7 +314,7 @@ title = "a machine key cannot sign for another machine"
 suite = "keys"
 allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
 block = "tests/go-test.sh ./internal/token 'TestKeySignsForeignMachine$|TestGenerationStateIsPerMachine$'"
-invariants = [8]
+invariants = [12, 27]
 backends = ["unit"]
 where = "any"
 
@@ -322,11 +322,11 @@ where = "any"
 id = "mac-key-above-mac-max"
 title = "a Mac key cannot sign above the mac-max tier"
 suite = "keys"
-allow = "pending"
-block = "pending"
-invariants = [8]
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestKeyScopedByProfileAndBilling$'"
+invariants = [12, 27]
 backends = ["unit"]
-where = "mac"
+where = "any"
 
 [[rule]]
 id = "git-hooks-off"
@@ -605,8 +605,8 @@ suite = "doors"
 allow = "tests/go-test.sh ./internal/fwd 'TestForwardsWithTokenAndProof$'"
 block = "tests/go-test.sh ./internal/fwd 'TestAllowlistIsDefaultDeny$'"
 invariants = [4]
-backends = ["docker", "k8s"]
-where = "hp"
+backends = ["unit"] # go test only; no fence crossed yet (P2 backend wiring not built)
+where = "any"
 
 [[rule]]
 id = "fwd-cannot-reach-non-door"
@@ -615,8 +615,8 @@ suite = "doors"
 allow = "tests/go-test.sh ./internal/fwd 'TestForwardsWithTokenAndProof$'"
 block = "tests/go-test.sh ./internal/fwd 'TestCannotReachNonDoor$'"
 invariants = [4]
-backends = ["docker", "k8s"]
-where = "hp"
+backends = ["unit"] # go test only; no fence crossed yet (P2 backend wiring not built)
+where = "any"
 
 [[rule]]
 id = "msg-in-scope"
@@ -755,8 +755,8 @@ suite = "approvals"
 allow = "tests/go-test.sh ./internal/fwd 'TestForwardsWithTokenAndProof$'"
 block = "tests/go-test.sh ./internal/fwd 'TestApproveViaFwd$'"
 invariants = [14]
-backends = ["docker", "k8s"]
-where = "hp"
+backends = ["unit"] # go test only; no fence crossed yet (P2 backend wiring not built)
+where = "any"
 
 [[rule]]
 id = "approve-decide-twice"

@@ -42,12 +42,16 @@ type SideInfo struct {
 	Scope                       json.RawMessage // the record's msg_scope: {manager:{node,machine},peers,peer_machines,...}
 	HubURL                      string          // the operator egress Service to the hub; "" until it exists
 	Doors                       []string        // NAME=URL, the doors the forwarder may reach
+	// the repository the sidecar clones into the empty /work after the load (F3c), from the record's workdir
+	GitRepo, GitBase, GitBranch string
 }
 
 var (
 	fullIDRe  = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}/[A-Za-z0-9._-]{1,64}/s[0-9a-z]{6,16}/g[0-9]{1,4}$`)
 	machineRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
 	doorRe    = regexp.MustCompile(`^[a-z][a-z0-9-]{0,30}=`)
+	gitRepoRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}/[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
+	gitRefRe  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$`)
 )
 
 const maxScope = 8 << 10
@@ -70,12 +74,27 @@ func SideArgv(i SideInfo) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sidecar: msg_scope: %v", err)
 	}
+	if !gitRepoRe.MatchString(i.GitRepo) {
+		return nil, fmt.Errorf("sidecar: repository %q must be owner/name", i.GitRepo)
+	}
+	for _, r := range []string{i.GitBase, i.GitBranch} {
+		if r != "" && (!gitRefRe.MatchString(r) || strings.Contains(r, "..") || strings.HasPrefix(r, "-") || strings.HasSuffix(r, "/") || strings.HasSuffix(r, ".lock")) {
+			return nil, fmt.Errorf("sidecar: git ref %q is not a plain branch name", r)
+		}
+	}
 	args := []string{SideBinary, "side", "serve",
 		"--listen", "127.0.0.1:" + strconv.Itoa(SidePort),
 		"--control", SideControl, "--state", SideState, "--journal-dir", SideJournalDir,
 		"--out", SideOut, "--in", SideIn, "--fence-uid", strconv.Itoa(FenceUID),
 		"--sid", i.Sid, "--gen", strconv.Itoa(i.Gen), "--label", i.Label, "--full-id", i.FullID,
 		"--machine", i.Machine, "--scope", scope}
+	args = append(args, "--git-repo", i.GitRepo, "--git-url", fmt.Sprintf("http://127.0.0.1:%d/egress/git", SidePort))
+	if i.GitBase != "" {
+		args = append(args, "--git-base", i.GitBase)
+	}
+	if i.GitBranch != "" {
+		args = append(args, "--git-branch", i.GitBranch)
+	}
 	if i.HubURL != "" {
 		if err := checkHTTPURL(i.HubURL); err != nil {
 			return nil, fmt.Errorf("sidecar: hub url: %v", err)

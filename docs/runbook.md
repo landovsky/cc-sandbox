@@ -743,3 +743,10 @@ the delete does), and `pod-load` revokes it when the load or the mint fails afte
 fatal: a failure is an audit line `token-revoke ... FAILED, revoke by hand` with the sid and generation (the token
 expires within `k8s_token_hours` anyway). With no `revoke_doors` the line says so. The docker generation's revoke from
 hostd (`OnGenerationEnd`) is not wired yet.
+
+**F3c in the pod spec.** `pod-create` also gives the sidecar `--git-repo owner/name` (the record's `workdir.repo`),
+`--git-base` and `--git-branch` (the record's `workdir.base` / `.branch`, left out when empty; plain branch names only)
+and `--git-url http://127.0.0.1:8080/egress/git`. The sidecar clones into the empty `/work` after the load and writes
+`/run/ccsbx/in/worktree-ready` (or `worktree-failed` with a reason); the fence's default command waits for the first
+(10 minutes at most), shows the reason and exits on the second, and only then starts tmux and claude. The snapshot and
+git directories are the sidecar's defaults (`/run/ccsbx/side/snapshot/s`, `/run/ccsbx/side/git`).

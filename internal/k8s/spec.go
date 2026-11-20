@@ -134,7 +134,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 	}
 	fenceCmd := s.FenceCmd
 	if len(fenceCmd) == 0 {
-		fenceCmd = []string{"tmux", "-f", "/dev/null", "new-session", "-s", s.Sid, "claude"}
+		fenceCmd = FenceEntry(s.Sid)
 	}
 	sec := func(uid int64) *ContainerSec {
 		return &ContainerSec{
@@ -539,4 +539,18 @@ func (c Config) repoAllowed(repo string) bool {
 		}
 	}
 	return false
+}
+
+// FenceEntry is the fence's default command: wait for the sidecar to finish cloning into /work (it writes
+// /run/ccsbx/in/worktree-ready, or worktree-failed with a reason) and only then start the session. The clone
+// is refused into a non-empty /work, so nothing may write there first. It gives up after ten minutes, and on
+// failure shows the sidecar's reason and exits.
+func FenceEntry(sid string) []string {
+	const script = `n=0; while [ ! -e /run/ccsbx/in/worktree-ready ]; do
+  if [ -e /run/ccsbx/in/worktree-failed ]; then echo "the worktree could not be made:" >&2; cat /run/ccsbx/in/worktree-failed >&2; exit 1; fi
+  n=$((n+1)); [ "$n" -gt 600 ] && { echo "the worktree was not ready after 10 minutes" >&2; exit 1; }
+  sleep 1
+done
+exec tmux -f /dev/null new-session -s "$1" claude`
+	return []string{"/bin/sh", "-c", script, "ccsbx-fence", sid}
 }

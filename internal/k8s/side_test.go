@@ -5,6 +5,10 @@ package k8s
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -12,7 +16,7 @@ import (
 func goodSide() SideInfo {
 	return SideInfo{Sid: "s0abcdefgh", Gen: 2, Label: "cc-sandbox:x", FullID: "tomas/future-two/s0abcdefgh/g2", Machine: "future-two",
 		Scope: json.RawMessage(`{ "manager": {"node": "cc-sandbox:#6b3s", "machine": "hp-ubuntu"}, "peers": [] }`), HubURL: "http://hub-egress.cc-sandbox.svc:4011",
-		Doors: []string{"model=http://ccsp-model.cc-sandbox-doors.svc:8080"}}
+		Doors: []string{"model=http://ccsp-model.cc-sandbox-doors.svc:8080"}, GitRepo: "landovsky/cc-sandbox", GitBase: "main", GitBranch: "work/s0abcdefgh"}
 }
 
 func TestSideArgvIsExactlyWhatTheSidecarsPathsAndRecordSay(t *testing.T) {
@@ -23,13 +27,14 @@ func TestSideArgvIsExactlyWhatTheSidecarsPathsAndRecordSay(t *testing.T) {
 	want := "/usr/local/bin/ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
 		"--out /run/ccsbx/out --in /run/ccsbx/in --fence-uid 10001 --sid s0abcdefgh --gen 2 --label cc-sandbox:x --full-id tomas/future-two/s0abcdefgh/g2 " +
 		`--machine future-two --scope {"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":[]} ` +
+		"--git-repo landovsky/cc-sandbox --git-url http://127.0.0.1:8080/egress/git --git-base main --git-branch work/s0abcdefgh " +
 		"--hub-url http://hub-egress.cc-sandbox.svc:4011 --door model=http://ccsp-model.cc-sandbox-doors.svc:8080"
 	if strings.Join(got, " ") != want {
 		t.Errorf("got  %s\nwant %s", strings.Join(got, " "), want)
 	}
 	// no hub URL until the egress Service exists: the flag is left out, not empty
 	i := goodSide()
-	i.HubURL, i.Doors = "", nil
+	i.HubURL, i.Doors, i.GitBase, i.GitBranch = "", nil, "", ""
 	got, _ = SideArgv(i)
 	if strings.Contains(strings.Join(got, " "), "--hub-url") || strings.Contains(strings.Join(got, " "), "--door") {
 		t.Errorf("%v", got)
@@ -60,6 +65,13 @@ func TestSideArgvRefusesWhatItCannotVouchFor(t *testing.T) {
 		"a scope that is not an object":  func(i *SideInfo) { i.Scope = json.RawMessage(`["x"]`) },
 		"a scope that is not JSON":       func(i *SideInfo) { i.Scope = json.RawMessage(`{nope`) },
 		"a scope over the limit":         func(i *SideInfo) { i.Scope = json.RawMessage(big) },
+		"no repository":                  func(i *SideInfo) { i.GitRepo = "" },
+		"a repository that is a URL":     func(i *SideInfo) { i.GitRepo = "https://x/y" },
+		"a repository with a dot dot":    func(i *SideInfo) { i.GitRepo = "../x" },
+		"a base that is an option":       func(i *SideInfo) { i.GitBase = "--upload-pack=x" },
+		"a branch with dot dot":          func(i *SideInfo) { i.GitBranch = "a..b" },
+		"a branch ending in .lock":       func(i *SideInfo) { i.GitBranch = "x.lock" },
+		"a branch with a space":          func(i *SideInfo) { i.GitBranch = "a b" },
 		"a hub URL with credentials":     func(i *SideInfo) { i.HubURL = "http://u:p@hub:4011" },
 		"a hub URL with a path":          func(i *SideInfo) { i.HubURL = "http://hub:4011/x" },
 		"a hub URL that is ftp":          func(i *SideInfo) { i.HubURL = "ftp://hub" },
@@ -181,5 +193,44 @@ func TestADoorNameIsUsedOnce(t *testing.T) {
 	i.Doors = []string{"model=http://a:1", "egress=http://b:2"}
 	if _, err := SideArgv(i); err != nil {
 		t.Error(err)
+	}
+}
+
+// F3c: the sidecar clones into the EMPTY /work after the load, and refuses a non-empty one, so the fence must
+// not start (and write there) until the sidecar says the worktree is ready; a failure shows its reason.
+func TestTheFenceWaitsForTheWorktree(t *testing.T) {
+	cmd := FenceEntry("s0abcdefgh")
+	if len(cmd) != 5 || cmd[0] != "/bin/sh" || cmd[1] != "-c" || cmd[4] != "s0abcdefgh" || strings.Contains(cmd[2], "s0abcdefgh") {
+		t.Fatalf("%q (the sid is a positional argument, never part of the script)", cmd)
+	}
+	p, err := PodFor(goodSpec())
+	if err != nil || strings.Join(p.Spec.Containers[0].Command, "\x00") != strings.Join(cmd, "\x00") {
+		t.Errorf("the pod's fence command is not the waiting one: %v %v", p.Spec.Containers[0].Command, err)
+	}
+	// run the script for real with the in/ directory and tmux faked
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "bin")
+	os.MkdirAll(bin, 0o755)
+	os.WriteFile(filepath.Join(bin, "tmux"), []byte("#!/bin/sh\necho \"tmux $*\"\n"), 0o755)
+	script := strings.ReplaceAll(cmd[2], "/run/ccsbx/in", dir)
+	run := func() (string, int) {
+		c := exec.Command("/bin/sh", "-c", script, cmd[3], cmd[4])
+		c.Env = []string{"PATH=" + bin + ":/usr/bin:/bin"}
+		out, err := c.CombinedOutput()
+		code := 0
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			code = ee.ExitCode()
+		}
+		return string(out), code
+	}
+	os.WriteFile(filepath.Join(dir, "worktree-ready"), nil, 0o644)
+	if out, code := run(); code != 0 || !strings.Contains(out, "tmux -f /dev/null new-session -s s0abcdefgh claude") {
+		t.Errorf("ready: %d %q", code, out)
+	}
+	os.Remove(filepath.Join(dir, "worktree-ready"))
+	os.WriteFile(filepath.Join(dir, "worktree-failed"), []byte("clone refused: nothing to clone\n"), 0o644)
+	if out, code := run(); code != 1 || !strings.Contains(out, "could not be made") || !strings.Contains(out, "clone refused: nothing to clone") || strings.Contains(out, "tmux") {
+		t.Errorf("failed: %d %q", code, out)
 	}
 }

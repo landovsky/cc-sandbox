@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/start"
 	"io"
 	"net/http"
 	"os"
@@ -644,6 +645,7 @@ func TestPodCreateBuildsTheSidecarCommandFromTheRecordAndConfig(t *testing.T) {
 	pf.rec.Label = "cc-sandbox:x"
 	pf.rec.Spec.MsgScope = json.RawMessage(`{"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":["p1"],"peer_machines":{"p1":"mac"}}`)
 	pf.rec.Reply.ID = "tomas/future-two/" + sid + "/g2"
+	pf.rec.Spec.Workdir = start.Workdir{Repo: "landovsky/cc-sandbox", Base: "main", Branch: "work/" + sid}
 	pf.writeRecord()
 	pf.writeConfigPod(t, true, "k8s_hub_url = \"http://hub-egress.cc-sandbox.svc:4011\"\nk8s_doors = [\"model=http://ccsp-model.cc-sandbox-doors.svc:8080\"]\n")
 	pf.wire()
@@ -654,6 +656,7 @@ func TestPodCreateBuildsTheSidecarCommandFromTheRecordAndConfig(t *testing.T) {
 	want := "/usr/local/bin/ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
 		"--out /run/ccsbx/out --in /run/ccsbx/in --fence-uid 10001 --sid " + sid + " --gen 2 --label cc-sandbox:x --full-id tomas/future-two/" + sid + "/g2 --machine future-two " +
 		`--scope {"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":["p1"],"peer_machines":{"p1":"mac"}} ` +
+		"--git-repo landovsky/cc-sandbox --git-url http://127.0.0.1:8080/egress/git --git-base main --git-branch work/" + sid + " " +
 		"--hub-url http://hub-egress.cc-sandbox.svc:4011 --door model=http://ccsp-model.cc-sandbox-doors.svc:8080"
 	if got != want {
 		t.Errorf("got  %s\nwant %s", got, want)

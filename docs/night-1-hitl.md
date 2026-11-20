@@ -5,13 +5,13 @@ need a question back. Risk / blast radius: High, Medium, Low.
 
 | # | what you do | where | risk | blast |
 |---|---|---|---|---|
-| 1 | Push main (171 commits) and check the first fence-image Actions run | hp, GitHub | Low | Medium (public repo, first package) |
+| 1 | Push main (171 commits) and check the first fence-image and side-image Actions runs | hp, GitHub | Low | Medium (public repo, first package) |
 | 2 | Decide the 6 P15 questions so the root installer stops refusing | this doc | Low | Low |
 | 3 | Install the seccomp profile and run its docker test (Gate M) | hp, sudo | Medium | Medium |
 | 4 | Run Gate M #4x65 (root install + reboot), moved to 2026-11-22 | hp, sudo | High | High |
 | 5 | Say Arm! once Gate M passes | this tab | Low | Medium |
 
-## 1 · Push main, then the first fence-image run
+## 1 · Push main, then the first fence-image and side-image runs
 
 Why: local main has PRs #2, #8–#14 and the new fence-image workflow merged (each reviewed, tests
 green after every merge), 171 commits ahead. The workflow can only reach GitHub with your
@@ -21,19 +21,20 @@ adds a workflow file without it), and `git push … main` is on the builders' de
 ```
 git -C ~/git/cc-sandbox push origin main
 gh pr close 7 --comment "Merged into main in efa441e."
-# the push touches image/**, so the fence-image workflow starts; watch it:
+# the push touches image/** and the ccsbx sources, so BOTH workflows start (fence-image, side-image); watch each:
 gh run watch "$(gh run list --repo landovsky/cc-sandbox --workflow fence-image.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --repo landovsky/cc-sandbox
+gh run watch "$(gh run list --repo landovsky/cc-sandbox --workflow side-image.yml --limit 1 --json databaseId --jq '.[0].databaseId')" --repo landovsky/cc-sandbox
 ```
 
-Pass: the run is green and its summary shows `ghcr.io/landovsky/ccsbx-fence@sha256:…`. If it
+Pass: the fence-image run is green and its summary shows `ghcr.io/landovsky/ccsbx-fence@sha256:…`; the side-image run is green and its summary shows `ghcr.io/landovsky/ccsbx@sha256:…` (the sidecar image). If it
 fails at "Log in" or "Build and push" with a permission error: GitHub → landovsky/cc-sandbox →
 Settings → Actions → General → Workflow permissions → "Read and write permissions", then
-`gh workflow run fence-image.yml --repo landovsky/cc-sandbox`. Gate M step 0 reads the digest from
-this run; nothing to copy by hand.
+`gh workflow run fence-image.yml --repo landovsky/cc-sandbox` (and `side-image.yml`). Gate M steps 0 and 0b read the digests from
+these runs; nothing to copy by hand.
 
 Then one choice: hp must pull the image by digest at Gate M, and a new ghcr package is private.
 **Rec:** make it public (the repo is public and the image test proves it holds no secrets):
-GitHub → your profile → Packages → `ccsbx-fence` → Package settings → Change visibility → Public.
+GitHub → your profile → Packages → `ccsbx-fence` → Package settings → Change visibility → Public. The sidecar package `ccsbx` is a second new package: the k3s cluster pulls it, so it needs the same choice (public, or a pull secret on the k3s side).
 The alternative is a `read:packages` token on hp (`docker login ghcr.io -u landovsky --password-stdin`).
 
 ## 2 · P15 questions
@@ -87,6 +88,11 @@ could start a fence yet: the client that calls `ccsbx-root` (U1c) isn't built, a
 first would also cut every hp worker off from docker. A builds U1c by 11-21; D fixes two steps
 in the Gate M list (go under sudo; the seccomp step moves into the table as 8b, so §3 above
 becomes part of the gate). Merged and ready: the signer, `ccsbx-root`, the fence image.
+What you pass and run at Gate M, beyond the old steps (all in the step table): step 0 and **0b** read the two image digests from the Actions runs; step 8 is
+`sudo units/install-linux.sh install --yes --image "$DIGEST" --side-image "$SIDE" --hub-url http://100.101.219.96:4011 --hub-secret-from ~/.config/session-bus/secret`
+(`--hub-url` is where the native hub listens and is required; re-read it from `ss -ltnH 'sport = :4011'` first; `--hub-secret-from` defaults to that path; the install refuses while the hub is still the docker container,
+because its listener is root's, not yours); **8c** `sudo units/hub-probe --owner "$USER" --hub <the same url>` must print `POST 201`, `DELETE 200`, `hub secret OK` (401/403: stop and uninstall).
+Not passed at Gate M: `--revoke-doors` (no doors before M1). Merge order: A's `ccsbx-root` change first (it accepts the non-loopback `hub_url` and the new keys).
 Steps with commands: `docs/night-1-morning.md` (§ "Gate M, step by step"). The title of #4x65 says "ACL paste": that is step 11b there, a placeholder until the k3s PR number is known (`paste k3s PR <TBD>: steps follow`).
 
 ## 5 · Arm!

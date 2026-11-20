@@ -33,3 +33,5 @@
    -image
    -interval
    -once
+   -signer-socket
+   -revoke-door

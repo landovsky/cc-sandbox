@@ -36,6 +36,18 @@
 #   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
 #   --pairs P             what the signer may sign: exact profile:billing|billing,... (CCSBX_PAIRS; default: built from
 #                         <repo>/profiles/*.json that list this machine, e.g. dev-default:api|stub,e2e-default:stub)
+#   --side-image REF      the sidecar image of pod sessions, BY DIGEST: ghcr.io/landovsky/ccsbx@sha256:<64 hex> (CCSBX_SIDE_IMAGE, required;
+#                         written to ccsbx-root.toml as k8s_side_image). A tag is refused. The digest comes from the side-image Actions run (#3wsr)
+#   (rotating SB_SECRET: re-run `install --yes`: it copies the new first line again; the other steps are idempotent)
+#   --revoke-doors U,V    the doors' owner-listener base URLs that take a token revoke (F2x); written as revoke_doors in ccsbx-root.toml and as
+#                         hostd's --revoke-door (CCSBX_REVOKE_DOORS, default EMPTY: there are no doors before M1, and nothing is revoked without them)
+#   --hub-url URL         where the hub is: http://A.B.C.D:PORT, an IPv4 literal (CCSBX_HUB_URL, REQUIRED; written to ccsbx-root.toml as hub_url). On hp
+#                         today the hub listens on the tailnet address only (http://100.101.219.96:4011), not on loopback. The B9 gate checks the url
+#                         against the live listeners: every listener on the port must be the owner's, and one must have that address
+#   --hub-secret-from F   the owner's file holding the hub's shared secret (the hub's SB_SECRET), (CCSBX_HUB_SECRET_FROM, default
+#                         ~owner/.config/session-bus/secret). Its FIRST LINE is copied to /etc/ccsbx/hub-admin.secret, root 0600, for
+#                         ccsbx-root's relay mint; never printed. Must be a regular file (no symlink). Verify it at Gate M (night-1-morning.md, 8c)
+#   --k8s-machine NAME    the machine pod sessions run on; the signer's keys peer (ccsbx-launch) signs only for it  (CCSBX_K8S_MACHINE, default future-two)
 #   --with-deploy         also the ccsbx-deploy sudoers rule (Q12 = yes, R10c)  (CCSBX_WITH_DEPLOY=1)
 #   --backup DIR          uninstall from this backup (must be under /var/backups/ccsbx-install), not the first one
 #   --purge-keys          uninstall also deletes the keys and the ccsbx-keys user (rotate M9 first!)
@@ -56,7 +68,8 @@ case "${1:-}" in
   *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
-MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"
+MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"; SIDE_IMAGE="${CCSBX_SIDE_IMAGE:-}"; HUB_URL="${CCSBX_HUB_URL:-}"; REVOKE_DOORS="${CCSBX_REVOKE_DOORS:-}"
+HUB_SECRET_FROM="${CCSBX_HUB_SECRET_FROM:-}"; K8S_MACHINE="${CCSBX_K8S_MACHINE:-future-two}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -68,6 +81,11 @@ while [ $# -gt 0 ]; do
     --machine) MACHINE="${2:?--machine NAME}"; shift ;;
     --pairs) PAIRS="${2:?--pairs P}"; shift ;;
     --image) IMAGE="${2:?--image REF}"; shift ;;
+    --side-image) SIDE_IMAGE="${2:?--side-image REF}"; shift ;;
+    --revoke-doors) REVOKE_DOORS="${2:?--revoke-doors URL,URL}"; shift ;;
+    --hub-url) HUB_URL="${2:?--hub-url http://A.B.C.D:PORT}"; shift ;;
+    --hub-secret-from) HUB_SECRET_FROM="${2:?--hub-secret-from FILE}"; shift ;;
+    --k8s-machine) K8S_MACHINE="${2:?--k8s-machine NAME}"; shift ;;
     --with-deploy) WITH_DEPLOY=1 ;;
     --backup) RESTORE_OVERRIDE="${2:?--backup DIR}"; shift ;;
     --purge-keys) PURGE_KEYS=1 ;;
@@ -101,6 +119,9 @@ PY
 # the signer's pairs come from the repo's profiles at install (the repo is reviewed and merged; profiles are embedded elsewhere)
 [ -n "$PAIRS" ] || PAIRS="$(pairs_from "$REPO_DIR/profiles")"
 SCOPE_ERRORS=()
+[[ "$K8S_MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] && [ "$K8S_MACHINE" != "$MACHINE" ] || SCOPE_ERRORS+=("k8s machine '$K8S_MACHINE' must be a plain host name other than this machine (--k8s-machine)")
+SCOPE_MACHINES="$MACHINE,$K8S_MACHINE"
+[ -n "$HUB_SECRET_FROM" ] || HUB_SECRET_FROM="$OWNER_HOME/.config/session-bus/secret"
 [[ "$MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || SCOPE_ERRORS+=("machine name '$MACHINE' is not a plain host name (--machine)")
 _b='(api|subscription|stub)'
 [[ "$PAIRS" =~ ^[A-Za-z0-9._-]+:$_b(\|$_b)*(,[A-Za-z0-9._-]+:$_b(\|$_b)*)*$ ]] || SCOPE_ERRORS+=("pairs '$PAIRS' is empty or not name:billing|billing,... (--pairs; default: profiles/*.json that list machine $MACHINE)")
@@ -129,15 +150,54 @@ WORKTREE_ROOT="$(IFS=,; echo "${_roots[*]}")"
 if [ -z "$IMAGE" ]; then ROOT_ERRORS+=("no fence image: pass --image ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the CI-built candidate, U1a); a tag is refused")
 elif [[ "$IMAGE" != *@sha256:* ]]; then ROOT_ERRORS+=("image '$IMAGE' is a tag: hostd and ccsbx-root refuse every start of a tag (image_not_pinned); use ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex>")
 elif ! [[ "$IMAGE" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("image '$IMAGE' is not ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the only repo a candidate may come from)"); fi
+# the hub's address: an IPv4 literal, with a port (no host names: nothing to resolve or trick)
+[[ "$HUB_URL" =~ ^http://((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]):[1-9][0-9]{0,4}$ ]] || ROOT_ERRORS+=("no hub url: pass --hub-url http://A.B.C.D:PORT (a canonical IPv4 literal, no leading zeros; on hp today http://100.101.219.96:4011, the hub is on the tailnet address, not loopback); got '${HUB_URL}'")
+# the doors' revoke URLs: empty, or a comma list of plain base URLs (they land in a systemd ExecStart and a TOML list, so no quotes, spaces or paths)
+REVOKE_DOORS_TOML=""
+if [ -n "$REVOKE_DOORS" ]; then
+  IFS=, read -r -a _rd <<<"$REVOKE_DOORS"
+  for _u in "${_rd[@]}"; do
+    if [[ "$_u" =~ ^https?://[A-Za-z0-9._-]+(:[1-9][0-9]{0,4})?$ ]]; then REVOKE_DOORS_TOML+="\"$_u\", "
+    else ROOT_ERRORS+=("revoke door '$_u' is not a plain http(s)://host[:port] base URL (--revoke-doors)"); fi
+  done
+  REVOKE_DOORS_TOML="${REVOKE_DOORS_TOML%, }"
+fi
+# the sidecar image: by digest from our own repo only; ccsbx-root's pod-create refuses a config without it
+if [ -z "$SIDE_IMAGE" ]; then ROOT_ERRORS+=("no sidecar image: pass --side-image ghcr.io/landovsky/ccsbx@sha256:<64 hex> (the digest of the side-image Actions run, #3wsr); a tag is refused")
+elif ! [[ "$SIDE_IMAGE" =~ ^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("sidecar image '$SIDE_IMAGE' is not ghcr.io/landovsky/ccsbx@sha256:<64 hex> (a tag, or another repo, is refused)"); fi
 # the root-owned pins copy: ccsbx-root and hostd read it, never the owner-writable repo (profiles are embedded in the binaries)
 MANAGED_PATHS+=(/etc/ccsbx/pins.toml)
 [ -f "$REPO_DIR/pins.toml" ] || ROOT_ERRORS+=("no $REPO_DIR/pins.toml to install as /etc/ccsbx/pins.toml")
 RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
-export OWNER MACHINE PAIRS IMAGE WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+export OWNER MACHINE PAIRS IMAGE SIDE_IMAGE HUB_URL REVOKE_DOORS REVOKE_DOORS_TOML WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()
 gate() { GATE_MSGS+=("$1"); }                                  # an unmet gate
+# The hub secret is read ONCE, AS THE OWNER (so a root-only file is unreadable even through a swapped link), with O_NOFOLLOW on the
+# last component, regular files only, at most 4 KiB, and a first line ccsbx-root's own rule accepts (1..512 printable, no space).
+# That one buffer is validated and later written; root never opens the owner's path. A link in a parent directory is the owner's
+# to make and can only lead to what the owner can already read. In record mode the call is recorded and made as the current user.
+hub_secret_py='import os, re, stat, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+except OSError as e:
+    sys.stderr.write("cannot open it (a link in the last component is refused): %s\n" % e.strerror); sys.exit(3)
+st = os.fstat(fd)
+if not stat.S_ISREG(st.st_mode): sys.stderr.write("not a regular file\n"); sys.exit(3)
+if st.st_size > 4096: sys.stderr.write("larger than 4 KiB\n"); sys.exit(3)
+b = os.read(fd, 4097).split(b"\n", 1)[0].rstrip(b"\r")
+if not re.fullmatch(rb"[\x21-\x7e]{1,512}", b): sys.stderr.write("the first line is empty, longer than 512 bytes, or has a space or control character\n"); sys.exit(3)
+sys.stdout.write(b.decode("ascii"))'
+HUB_SECRET=""
+load_hub_secret() {
+  local out rc err
+  err="$(mktemp)" || die "cannot create a temp file"
+  out="$(as_owner python3 -I -c "$hub_secret_py" "$HUB_SECRET_FROM" 2>"$err")"; rc=$?
+  if [ "$rc" -ne 0 ]; then gate "hub secret file $HUB_SECRET_FROM: $(head -1 "$err") (pass --hub-secret-from FILE; ccsbx-root's relay mint needs the hub's secret)"; HUB_SECRET=""
+  else HUB_SECRET="$out"; fi
+  rm -f "$err"
+}
 as_owner() {                                                   # run a user-level command as the owner
   if [ "$(id -u)" = 0 ] && [ "$OWNER" != root ]; then runuser -u "$OWNER" -- env "XDG_RUNTIME_DIR=/run/user/$(id -u "$OWNER")" "$@"
   else "$@"; fi
@@ -152,12 +212,18 @@ default_b9() {
     ps="$(as_owner docker ps --filter name='^session-bus$' -q 2>&1)" || { echo "cannot ask docker whether session-bus runs (docker ps failed): $(head -1 <<<"$ps")"; return 1; }
     [ -z "$ps" ] || { echo "docker container session-bus is still running"; return 1; }
   fi
+  # the hub's address must be where the owner's hub really listens (every listener the owner's, one of them at HUB_URL's address)
+  if [[ "$HUB_URL" =~ ^http://((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]):[1-9][0-9]{0,4}$ ]]; then
+    local why; why="$(python3 -I "$UNITS_DIR/lib/hub_listen.py" "$HUB_URL" "$(id -u "$OWNER")")" || { echo "--hub-url $HUB_URL does not match the live hub: $why"; return 1; }
+  fi
   return 0
 }
 P15_FILE="${CCSBX_P15_FILE:-$OWNER_HOME/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv}"   # never $HOME: under sudo that is /root
 default_p15() { as_owner env CCSBX_P15_FILE="$P15_FILE" "$UNITS_DIR/p15" check; }
 eval_gates() {
   local m f missing="" e unlisted
+  load_hub_secret
+  local sp; while IFS= read -r sp; do [ -z "$sp" ] || gate "$sp"; done < <(svc_users_check)
   if [ -z "$PREFIX" ] && [ -n "${CCSBX_B9_CMD:-}${CCSBX_P15_CMD:-}" ]; then
     refuse "CCSBX_B9_CMD / CCSBX_P15_CMD are test overrides and are set: unset them (sudo -E would pass them to root)"
   fi
@@ -222,12 +288,12 @@ EOT
 post_install_check() {
   step "post-install check: hostd and the signer must be up before DONE"
   local i ready=1
-  if [ "$MODE" = plan ]; then note "waits up to 10 s for ccsbx-hostd and ccsbx-signer.socket to be active and their sockets to exist; otherwise install stops, no DONE"; return 0; fi
+  if [ "$MODE" = plan ]; then note "waits up to 10 s for ccsbx-hostd, ccsbx-signer.socket and ccsbx-signer-launch.socket to be active and their sockets to exist; otherwise install stops, no DONE"; return 0; fi
   if [ "${EXEC%%:*}" = record ]; then rec post-install-check; ready="${CCSBX_TEST_POSTCHECK_RC:-0}"
   else
     for i in 1 2 3 4 5 6 7 8 9 10; do
       if systemctl is-active --quiet ccsbx-tmux.service && systemctl is-active --quiet ccsbx-hostd.service && systemctl is-active --quiet ccsbx-signer.socket \
-         && [ -S "$SIGNER_SOCK" ] && [ -S "$HOSTD_SOCK" ]; then ready=0; break; fi
+         && systemctl is-active --quiet ccsbx-signer-launch.socket && [ -S "$SIGNER_SOCK" ] && [ -S "$LAUNCH_SOCK" ] && [ -S "$HOSTD_SOCK" ]; then ready=0; break; fi
       sleep 1
     done
   fi
@@ -242,6 +308,8 @@ post_install_check() {
 }
 steps_install() {
   if [ "$MODE" = install ]; then step "back up every file the install replaces (once; never overwritten)"; backup_originals; fi
+  # the read happened in eval_gates (as the owner); in record mode it is logged here, once the gates and the backup have passed, so a refusal records nothing
+  if [ "$MODE" = install ] && [ "${EXEC%%:*}" = record ]; then rec runuser -u "$OWNER" -- python3 -I -c "$hub_secret_py" "$HUB_SECRET_FROM"; fi
   # everything that can fail for a machine-specific reason comes BEFORE sudoers is changed
   u0b_users; u0_binaries; u0b_keys; u0b_signer; u0_hostd
   if [ "$WITH_DEPLOY" = 1 ]; then u0_deploy_rule; fi
@@ -257,7 +325,7 @@ case "$MODE" in
     echo "Nothing below is run by 'plan'. The same steps run under 'install --yes' as root."
     eval_gates; print_gates
     echo "  P15 status file: $P15_FILE"; echo "  allowed roots:   ${ALLOWED_ROOTS_TOML:-(none)}"
-    echo "  signer scope:    owners=$OWNER machines=$MACHINE pairs=$PAIRS"
+    echo "  signer scope:    owners=$OWNER machines=$SCOPE_MACHINES pairs=$PAIRS"
     steps_install
     echo; echo "AFTER: reboot, then units/install-linux.sh check  and  bin/ccsbx-preflight --morning --post-M1"
     echo "UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the first backup, $BACKUP_DIR; a failed install is undone the same way)"

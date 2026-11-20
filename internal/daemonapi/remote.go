@@ -19,7 +19,7 @@ var labelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_./-]{0,79}$`)
 // createSession: POST /v1/sessions. Owner class only (the route table already refuses a peer; this is the second
 // lock), on the tailnet only: the local unix socket starts sessions through /v1/start, as the caller's own uid.
 func (s *Server) createSession(w http.ResponseWriter, r *http.Request) {
-	if s.Remote == nil {
+	if s.Remote == nil || !s.Remote.Enabled() {
 		refuse(w, 404, "not_found", "this daemon does not serve remote starts")
 		return
 	}
@@ -61,5 +61,10 @@ func (s *Server) resolveV2(w http.ResponseWriter, r *http.Request) {
 		refuse(w, 400, start.BadSpec, "label is not valid")
 		return
 	}
-	writeJSON(w, 200, s.Remote.Answer(label))
+	a, err := s.Remote.Answer(label)
+	if err != nil { // could not tell: never "free"
+		refuse(w, 500, remotestart.Internal, "this machine cannot tell whether the label is live")
+		return
+	}
+	writeJSON(w, 200, a)
 }

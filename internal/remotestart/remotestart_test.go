@@ -28,6 +28,7 @@ type rig struct {
 	starts  atomic.Int32
 	lastBy  string
 	live    []View
+	liveErr error
 	asks    func(ctx context.Context, p Peer, label string) (Answer, error)
 	startFn func() (*start.StartReply, error)
 	now     time.Time
@@ -64,7 +65,7 @@ func newRig(t *testing.T, peers ...string) *rig {
 			}
 			return &start.StartReply{V: 1, Sid: "s0abc123", Gen: 1}, nil
 		},
-		Live:    func(label string) []View { r.mu.Lock(); defer r.mu.Unlock(); return r.live },
+		Live:    func(label string) ([]View, error) { r.mu.Lock(); defer r.mu.Unlock(); return r.live, r.liveErr },
 		AskPeer: func(ctx context.Context, p Peer, label string) (Answer, error) { return r.asks(ctx, p, label) },
 		Now:     func() time.Time { r.mu.Lock(); defer r.mu.Unlock(); return r.now },
 		Rand:    func(n int) int { return 0 },
@@ -88,6 +89,8 @@ func spec(m map[string]any) []byte {
 	b, _ := json.Marshal(base)
 	return b
 }
+
+func answerOf(s *Service, label string) Answer { a, _ := s.Answer(label); return a }
 
 func code(r *start.Refusal) string {
 	if r == nil {
@@ -305,8 +308,8 @@ func TestTwoMachinesStartingTheSameLabelAtOnceNeverBothLaunch(t *testing.T) {
 		set := PeerSetHash([]string{"hp-ubuntu", "a", "b"})
 		_ = set
 		a.s.c.PeerSet, b.s.c.PeerSet = "S", "S"
-		a.s.c.AskPeer = func(ctx context.Context, p Peer, label string) (Answer, error) { return b.s.Answer(label), nil }
-		b.s.c.AskPeer = func(ctx context.Context, p Peer, label string) (Answer, error) { return a.s.Answer(label), nil }
+		a.s.c.AskPeer = func(ctx context.Context, p Peer, label string) (Answer, error) { return answerOf(b.s, label), nil }
+		b.s.c.AskPeer = func(ctx context.Context, p Peer, label string) (Answer, error) { return answerOf(a.s, label), nil }
 		hold := make(chan struct{})
 		// once launched, the session is live on that machine: what its own answer to a peer then says
 		for _, r := range []*rig{a, b} {
@@ -339,7 +342,7 @@ func TestTheReservationLivesUntilTheLaunchOutcomeIsKnown(t *testing.T) {
 	seen := make(chan bool, 1)
 	r.startFn = func() (*start.StartReply, error) {
 		time.Sleep(250 * time.Millisecond) // longer than the TTL: only renewal keeps it
-		seen <- r.s.Answer("cc-sandbox:w1").Reserved != nil
+		seen <- answerOf(r.s, "cc-sandbox:w1").Reserved != nil
 		return &start.StartReply{V: 1, Sid: "s0abc123"}, nil
 	}
 	r.advanceTicker()
@@ -349,7 +352,7 @@ func TestTheReservationLivesUntilTheLaunchOutcomeIsKnown(t *testing.T) {
 	if !<-seen {
 		t.Fatal("the reservation lapsed during a long launch")
 	}
-	if r.s.Answer("cc-sandbox:w1").Reserved != nil {
+	if answerOf(r.s, "cc-sandbox:w1").Reserved != nil {
 		t.Fatal("the reservation outlived the launch")
 	}
 }

@@ -323,8 +323,13 @@ func startHandlerBy(sd *start.Daemon, p startPolicy, guard *remotestart.Service)
 		d.PinsFile, d.WorktreeRoot = p.Pins, p.WorktreeRoots
 		d.Image, d.CCVersion, d.Socket = p.Image, p.CCVersion, p.TmuxSocket
 		d.MaxLive, d.MaxPerHour, d.RemoteMaxPerHour, d.StartedBy = p.MaxLive, p.MaxPerHour, p.RemoteMaxPerHour, startedBy
-		if guard != nil && startedBy == "" && !d.Seen(spec.RequestID) {
-			rep, ref := guard.Guard(context.Background(), spec.Label, spec.RequestID, "local:"+strconv.Itoa(uid), func() (*start.StartReply, error) { return d.Start(spec) })
+		// A retry already recorded is answered from the record, read-only. Anything else goes through the Guard even
+		// if a record vanishes meanwhile (a failed launch rolls its record back): Start's own idempotency is inside it.
+		if guard != nil && startedBy == "" {
+			if rep := d.Recorded(uid, "", spec.RequestID); rep != nil {
+				return rep, nil
+			}
+			rep, ref := guard.Guard(context.Background(), spec.Label, "local:"+strconv.Itoa(uid), func() (*start.StartReply, error) { return d.Start(spec) })
 			if ref != nil {
 				return nil, ref
 			}
@@ -447,13 +452,35 @@ func remoteService(get func(string) string, num func(string) int, sd *start.Daem
 		fmt.Fprintf(stderr, "ccsbx-hostd: --peer-ask-timeout %q: want a duration up to 1m\n", get("peer-ask-timeout"))
 		return nil, cli.ExitUsage
 	}
+	remoteOn := false
 	if owner != "" {
-		if _, err := user.Lookup(owner); err != nil {
+		u, err := user.Lookup(owner)
+		if err != nil {
 			fmt.Fprintf(stderr, "ccsbx-hostd: --owner-user %q: no such user\n", owner)
 			return nil, cli.ExitUsage
 		}
+		ouid, _ := strconv.Atoi(u.Uid)
+		switch {
+		case sd.Root == "helper" && ouid == os.Getuid():
+			fmt.Fprintln(stderr, "ccsbx-hostd: --owner-user is hostd's own user, which in helper mode is the service user: the owner must be someone else")
+			return nil, cli.ExitUsage
+		case sd.Root != "helper" && ouid != os.Getuid():
+			fmt.Fprintln(stderr, "ccsbx-hostd: in direct mode --owner-user must be the user hostd runs as (the panes and docker are that user's)")
+			return nil, cli.ExitUsage
+		case sd.Root != "helper" && get("remote-start-direct") != "true":
+			fmt.Fprintln(stderr, "ccsbx-hostd: --owner-user in direct mode starts non-evidence fences for anyone on a listed owner device: add --remote-start-direct to say you mean it")
+			return nil, cli.ExitUsage
+		}
+		remoteOn = true
 	}
 	remoteStart := p
+	lookupUID := func(n string) (int, error) {
+		u, err := user.Lookup(n)
+		if err != nil {
+			return 0, err
+		}
+		return strconv.Atoi(u.Uid)
+	}
 	svc, err := remotestart.New(remotestart.Config{
 		Machine: machine, OwnerUser: owner, Peers: peers, PeerSet: remotestart.PeerSetHash(names), StateDir: filepath.Join(get("state"), "remote"),
 		Profiles: profiles.Load,
@@ -467,21 +494,33 @@ func remoteService(get func(string) string, num func(string) int, sd *start.Daem
 		Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
 			return startHandlerBy(sd, remoteStart, nil)(uid, spec, by)
 		},
-		Live: func(label string) []remotestart.View {
+		Live: func(label string) ([]remotestart.View, error) {
 			recs, err := sd.LiveByLabel(label)
 			if err != nil {
-				return nil
+				return nil, err // could not tell: the answer to a peer is an error, never "nothing live"
 			}
 			var out []remotestart.View
 			for _, r := range recs {
 				out = append(out, remotestart.View{Machine: machine, Sid: r.Sid, Gen: r.Gen, State: "running"})
 			}
-			return out
+			return out, nil
 		},
-		Logf: log.Printf, PerUserMinute: num("remote-per-user-minute"), PerMachineMinute: num("remote-per-machine-minute"), AskTimeout: timeout,
+		Recorded: func(by, rid string) *start.StartReply {
+			uid, err := lookupUID(owner)
+			if err != nil {
+				return nil
+			}
+			return sd.Recorded(uid, by, rid)
+		},
+		RemoteEnabled: remoteOn,
+		Logf:          log.Printf, PerUserMinute: num("remote-per-user-minute"), PerMachineMinute: num("remote-per-machine-minute"), AskTimeout: timeout,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "ccsbx-hostd: remote start: %v\n", err)
+		return nil, cli.ExitFail
+	}
+	if err := svc.Publish(); err != nil { // a direct-mode `ccsbx start` reads this and asks the same peers
+		fmt.Fprintf(stderr, "ccsbx-hostd: cannot publish the peer list for local starts: %v\n", err)
 		return nil, cli.ExitFail
 	}
 	return svc, 0

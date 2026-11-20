@@ -84,6 +84,7 @@ func app() *cli.App {
 				f.Int("max-live", 8, "session starts: machine_full above this many live sessions")
 				f.String("owner-user", "", "the local account sessions run as (e.g. tomas): a REMOTE start (POST /v1/sessions on the tailnet, owner class only) runs as this user and its spec's owner must equal it. Empty: remote start is off")
 				f.String("peers", "", "the OTHER machines of this deployment as name=url pairs (name = the hub machine id, url = its daemon's tailnet listener, e.g. hp-ubuntu=http://hp-ubuntu.<tailnet>.ts.net:7480). Every start, remote or local, asks each of them whether the label is live or being started, and refuses unless all answer: one peer down refuses every start on every machine. The list must be the same on every machine (each daemon checks its peers' set); empty: no cross-machine label check")
+				f.Bool("remote-start-direct", false, "allow --owner-user remote starts in DIRECT mode (docker access is root-equivalent and the fence is not evidence there: every process on a listed owner device could start one). Direct mode also requires --owner-user to be the user hostd runs as; helper mode requires it to be someone else")
 				f.Int("remote-max-per-hour", 10, "remote session starts per hour, counted apart from the local --max-per-hour")
 				f.Int("remote-per-user-minute", 3, "remote session starts a minute for one caller (started_by)")
 				f.Int("remote-per-machine-minute", 10, "remote session starts a minute from one calling machine")

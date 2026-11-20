@@ -167,11 +167,11 @@ func TestStart(t *testing.T) {
 		d, _ := newDaemon(t)
 		d.MaxLive = 2
 		for i, l := range []string{"a", "b"} {
-			if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = l; s.RequestID = "r" + string(rune('0'+i)) })); err != nil {
+			if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = l; s.RequestID = "r" + string(rune('0'+i)); s.Workdir.Path = sub(t, spec(nil).Workdir.Path, l) })); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "c"; s.RequestID = "r9" })); code(err) != MachineFull {
+		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "c"; s.RequestID = "r9"; s.Workdir.Path = sub(t, spec(nil).Workdir.Path, "c") })); code(err) != MachineFull {
 			t.Fatal(err)
 		}
 	})
@@ -182,7 +182,7 @@ func TestStart(t *testing.T) {
 		now := time.Now()
 		d.Now = func() time.Time { return now }
 		for i, l := range []string{"a", "b"} {
-			d.Start(spec(func(s *LaunchSpec) { s.Label = l; s.RequestID = "r" + string(rune('0'+i)) }))
+			d.Start(spec(func(s *LaunchSpec) { s.Label = l; s.RequestID = "r" + string(rune('0'+i)); s.Workdir.Path = sub(t, spec(nil).Workdir.Path, l) }))
 		}
 		for sid := range fl.alive {
 			fl.alive[sid] = false
@@ -625,5 +625,34 @@ func TestTheRepoFormIsValidatedAtParseTimeBlock(t *testing.T) {
 		if _, err := ParseSpec(spec(c[0], c[1], c[2])); err == nil {
 			t.Errorf("%s was accepted", name)
 		}
+	}
+}
+
+// sub makes (and returns) a sibling workdir under base: sessions that are live at once need workdirs that do not overlap.
+func sub(t *testing.T, base, name string) string {
+	t.Helper()
+	p := filepath.Join(base, name)
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// context (one workdir, one live session): an outer tree's agent could swap an inner directory for a link between the
+// check and the mount, so a workdir that equals, contains or sits inside another live session's is refused.
+func TestOverlappingWorkdirsOfLiveSessionsAreRefused(t *testing.T) {
+	d, _ := newDaemon(t)
+	base := spec(nil).Workdir.Path
+	a := sub(t, base, "outer")
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "a"; s.RequestID = "r1"; s.Workdir.Path = a })); err != nil {
+		t.Fatal(err)
+	}
+	for name, p := range map[string]string{"the same directory": a, "inside it": sub(t, a, "inner"), "containing it": base} {
+		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "b"; s.RequestID = "r2" + name; s.Workdir.Path = p })); code(err) != BadSpec {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "c"; s.RequestID = "r3"; s.Workdir.Path = sub(t, base, "sibling") })); err != nil {
+		t.Errorf("a sibling was refused: %v", err)
 	}
 }

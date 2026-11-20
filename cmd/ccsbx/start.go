@@ -4,15 +4,18 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/profile"
+	"github.com/landovsky/cc-sandbox/internal/remotestart"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/profiles"
 )
@@ -145,7 +148,7 @@ func runStart(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	spec, err := start.ParseSpec(in)
 	var rep *start.StartReply
 	if err == nil {
-		rep, err = d.Start(spec)
+		rep, err = guardedStart(d, spec)
 	}
 	if err != nil {
 		if r, ok := err.(*start.Refusal); ok {
@@ -175,4 +178,37 @@ func runtimeFor(mode string) start.Runtime {
 		return start.HelperRuntime{}
 	}
 	return start.DockerRuntime{Docker: "docker"}
+}
+
+// guardedStart is the direct-mode start: when hostd published a peer list, this start reserves the label and asks
+// every peer first, exactly as a start through hostd does (one live generation per label across machines, whichever
+// way the start arrives). A peers file that exists but cannot be read refuses the start: never "no check".
+func guardedStart(d *start.Daemon, spec *start.LaunchSpec) (*start.StartReply, error) {
+	pub, err := remotestart.LoadPublished(d.StateDir)
+	if err != nil {
+		return nil, &start.Refusal{Code: remotestart.Internal, Msg: "the cross-machine peer list cannot be read: refusing to start without the label check"}
+	}
+	if pub == nil || len(pub.Peers) == 0 || d.Recorded(d.Uid, "", spec.RequestID) != nil {
+		return d.Start(spec) // no peers configured, or a retry of a start already recorded (answered by Start itself)
+	}
+	svc, err := remotestart.New(remotestart.Config{
+		Machine: pub.Machine, Peers: pub.Peers, PeerSet: pub.PeerSet, StateDir: filepath.Join(d.StateDir, "remote"),
+		AskTimeout: time.Duration(pub.AskTimeoutMs) * time.Millisecond,
+		Live: func(label string) ([]remotestart.View, error) {
+			recs, err := d.LiveByLabel(label)
+			var out []remotestart.View
+			for _, r := range recs {
+				out = append(out, remotestart.View{Machine: pub.Machine, Sid: r.Sid, Gen: r.Gen, State: "running"})
+			}
+			return out, err
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	rep, ref := svc.Guard(context.Background(), spec.Label, "local:cli", func() (*start.StartReply, error) { return d.Start(spec) })
+	if ref != nil {
+		return nil, ref
+	}
+	return rep, nil
 }

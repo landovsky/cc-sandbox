@@ -32,7 +32,8 @@ func remoteRig(t *testing.T, starter func() (*start.StartReply, error), live []r
 		Profiles:      func(string) (*profile.Profile, error) { return prof, nil },
 		LookupUID:     func(string) (int, error) { return 1000, nil },
 		Starter:       func(int, []byte, string) (*start.StartReply, error) { return starter() },
-		Live:          func(string) []remotestart.View { return live },
+		Live:          func(string) ([]remotestart.View, error) { return live, nil },
+		RemoteEnabled: true,
 		PerUserMinute: 3,
 	})
 	if err != nil {

@@ -13,6 +13,7 @@ package remotestart
 import (
 	"bytes"
 	"context"
+	crand "crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -75,8 +76,14 @@ type Config struct {
 	LookupUID func(user string) (int, error)
 	// Starter is the local start with the stamped caller: start.Daemon.Start for the owner's uid.
 	Starter func(uid int, spec []byte, startedBy string) (*start.StartReply, error)
-	// Live lists this machine's live sessions of a label (the local record's view).
-	Live func(label string) []View
+	// Live lists this machine's live sessions of a label (the local record's view). An error means "could not
+	// tell": it is never read as "nothing live" (the answer to a peer is then an error and the start refuses).
+	Live func(label string) ([]View, error)
+	// Recorded is the reply of a start this caller already made with this request_id (nil: none), read from the
+	// session records: it recovers a reply the idempotency store lost (a crash between the launch and its write).
+	Recorded func(startedBy, requestID string) *start.StartReply
+	// RemoteEnabled: false = this daemon only runs the label check for starts (no POST /v1/sessions).
+	RemoteEnabled bool
 
 	AskPeer func(ctx context.Context, p Peer, label string) (Answer, error) // default: HTTP GET /v1/resolve?v=2
 
@@ -95,6 +102,10 @@ type Config struct {
 type Service struct {
 	c Config
 
+	// in-flight starts of THIS process, by label: authoritative for Answer whatever the clock says (the disk copy
+	// and its TTL are only for crash recovery), and by idempotency key
+	flight  map[string]string // label -> token
+	keys    map[string]string // idempotency key -> token
 	mu      sync.Mutex
 	userWin map[string][]time.Time
 	machWin map[string][]time.Time
@@ -126,7 +137,7 @@ func New(c Config) (*Service, error) {
 	if c.HTTP == nil {
 		c.HTTP = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	}
-	s := &Service{c: c, userWin: map[string][]time.Time{}, machWin: map[string][]time.Time{}}
+	s := &Service{c: c, flight: map[string]string{}, keys: map[string]string{}, userWin: map[string][]time.Time{}, machWin: map[string][]time.Time{}}
 	if c.AskPeer == nil {
 		s.c.AskPeer = s.askHTTP
 	}
@@ -138,6 +149,9 @@ func New(c Config) (*Service, error) {
 	s.reconcile()
 	return s, nil
 }
+
+// Enabled reports whether POST /v1/sessions is served (the label check always is).
+func (s *Service) Enabled() bool { return s.c.RemoteEnabled }
 
 // PeerSet is the hash of the set of machines this daemon is configured with (every daemon must agree).
 func (s *Service) PeerSet() string { return s.c.PeerSet }
@@ -193,7 +207,7 @@ func (s *Service) Start(ctx context.Context, caller Caller, body []byte) (*start
 		return nil, asRefusal(err)
 	}
 	if spec.Machine != s.c.Machine {
-		return nil, refusal(start.WrongMachine, "spec is for %s, this is %s", spec.Machine, s.c.Machine)
+		return nil, refusal(start.WrongMachine, "spec is for another machine")
 	}
 	if spec.GitDir != "" {
 		return nil, refusal(start.BadSpec, "a remote start carries no gitdir")
@@ -207,10 +221,10 @@ func (s *Service) Start(ctx context.Context, caller Caller, body []byte) (*start
 	}
 	p, perr := s.c.Profiles(spec.Profile)
 	if perr != nil {
-		return nil, refusal(start.ProfileNotApproved, "profile %q is not approved in this build", spec.Profile)
+		return nil, refusal(start.ProfileNotApproved, "this profile is not approved in this build")
 	}
 	if m, _ := p.Allows(s.c.Machine, spec.Billing); !m {
-		return nil, refusal(start.ProfileNotApproved, "profile %s is not approved for %s", p.Name, s.c.Machine)
+		return nil, refusal(start.ProfileNotApproved, "this profile is not approved for this machine")
 	}
 	if r := s.policy(spec, p); r != nil {
 		return nil, r
@@ -219,14 +233,22 @@ func (s *Service) Start(ctx context.Context, caller Caller, body []byte) (*start
 	// Idempotency first: a retry of an answered request is answered again, even when this caller is capped now.
 	hash := specHash(body)
 	key := idemKey(caller.StartedBy, spec.RequestID)
-	switch st, rep, r := s.idemBegin(key, hash); {
+	token := newToken()
+	switch st, rep, r := s.idemBegin(key, hash, token); {
 	case r != nil:
 		return nil, r
 	case st == "done":
 		return rep, nil
 	}
+	// a reply the store lost (a crash between the launch and its write) is recovered from the session record
+	if s.c.Recorded != nil {
+		if rep := s.c.Recorded(caller.StartedBy, spec.RequestID); rep != nil {
+			s.idemEnd(key, hash, token, rep, nil)
+			return rep, nil
+		}
+	}
 	rep, ref := s.run(ctx, caller, spec, uid, body)
-	s.idemEnd(key, hash, rep, ref)
+	s.idemEnd(key, hash, token, rep, ref)
 	return rep, ref
 }
 
@@ -234,9 +256,35 @@ func (s *Service) run(ctx context.Context, caller Caller, spec *start.LaunchSpec
 	if r := s.rate(caller); r != nil {
 		return nil, r
 	}
-	return s.Guard(ctx, spec.Label, spec.RequestID, caller.StartedBy, func() (*start.StartReply, error) {
+	rep, ref := s.Guard(ctx, spec.Label, caller.StartedBy, func() (*start.StartReply, error) {
 		return s.c.Starter(uid, body, caller.StartedBy)
 	})
+	if ref != nil {
+		switch ref.Code { // an attempt that never reached the launch does not use up the caller's minute
+		case start.StartInProgress, start.PeerUnreachable, start.AlreadyRunning, start.PeerSetMismatch:
+			s.unrate(caller)
+		}
+	}
+	return rep, ref
+}
+
+func (s *Service) unrate(c Caller) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, m := range []map[string][]time.Time{s.userWin} {
+		if w := m[c.StartedBy]; len(w) > 0 {
+			m[c.StartedBy] = w[:len(w)-1]
+		}
+	}
+	if w := s.machWin[c.Machine]; len(w) > 0 {
+		s.machWin[c.Machine] = w[:len(w)-1]
+	}
+}
+
+func newToken() string {
+	var b [12]byte
+	crand.Read(b[:])
+	return hex.EncodeToString(b[:])
 }
 
 // policy is what a REMOTE caller may ask for beyond the local start's own checks (C2).
@@ -246,7 +294,7 @@ func (s *Service) policy(spec *start.LaunchSpec, p *profile.Profile) *start.Refu
 	}
 	for _, g := range spec.Grants {
 		if !p.GrantAllowed(g) {
-			return refusal(start.GrantNotAllowed, "grant %q is not allowed for profile %s on %s", g, p.Name, s.c.Machine)
+			return refusal(start.GrantNotAllowed, "a requested grant is not allowed for this profile on this machine")
 		}
 	}
 	args := spec.HarnessArgs
@@ -254,14 +302,14 @@ func (s *Service) policy(spec *start.LaunchSpec, p *profile.Profile) *start.Refu
 		a := args[i]
 		name, val, hasVal := strings.Cut(a, "=")
 		if !flagNameRe.MatchString(name) || !p.HarnessArgAllowed(name) {
-			return refusal(start.BadSpec, "harness_args: %q is not allowed for profile %s", name, p.Name)
+			return refusal(start.BadSpec, "harness_args: a flag is not allowed for this profile")
 		}
 		if !hasVal && i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 			i++
 			val, hasVal = args[i], true
 		}
 		if hasVal && !harnessValRe.MatchString(val) {
-			return refusal(start.BadSpec, "harness_args: the value of %s is not acceptable", name)
+			return refusal(start.BadSpec, "harness_args: a flag value is not acceptable")
 		}
 	}
 	return nil
@@ -373,9 +421,12 @@ func (s *Service) writeIdem(key string, r idemRec) {
 
 // idemBegin: "" (go on, marked in flight), "done" with the first reply, or a refusal (in flight: retry later;
 // the same request_id with a different request: request_id_reused).
-func (s *Service) idemBegin(key, hash string) (string, *start.StartReply, *start.Refusal) {
+func (s *Service) idemBegin(key, hash, token string) (string, *start.StartReply, *start.Refusal) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if _, mine := s.keys[key]; mine { // an attempt of THIS process is still running: authoritative, whatever the clock says
+		return "", nil, s.retry(refusal(start.StartInProgress, "this request is still being started: retry"))
+	}
 	if r := s.readIdem(key); r != nil {
 		switch {
 		case r.Hash != hash:
@@ -386,20 +437,27 @@ func (s *Service) idemBegin(key, hash string) (string, *start.StartReply, *start
 			return "", nil, s.retry(refusal(start.StartInProgress, "this request is still being started: retry"))
 		}
 	}
+	s.keys[key] = token
 	s.writeIdem(key, idemRec{Hash: hash, State: "inflight", At: s.c.Now().Unix()})
 	return "", nil, nil
 }
 
 // idemEnd keeps the reply of a start that happened; a refused or failed attempt created nothing, so it leaves
 // no trace and a retry is a fresh attempt.
-func (s *Service) idemEnd(key, hash string, rep *start.StartReply, ref *start.Refusal) {
+func (s *Service) idemEnd(key, hash, token string, rep *start.StartReply, ref *start.Refusal) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.keys[key] == token {
+		delete(s.keys, key)
+	}
 	if rep != nil && ref == nil {
 		s.writeIdem(key, idemRec{Hash: hash, State: "done", Reply: rep, At: s.c.Now().Unix()})
 		return
 	}
-	os.Remove(s.idemPath(key))
+	// a refused attempt removes only its OWN in-flight marker, never a stored reply of a start that happened
+	if r := s.readIdem(key); r != nil && r.State != "done" {
+		os.Remove(s.idemPath(key))
+	}
 }
 
 // ---- one live generation per label, across machines ----
@@ -407,7 +465,8 @@ func (s *Service) idemEnd(key, hash string, rep *start.StartReply, ref *start.Re
 type resFile struct {
 	Label     string `json:"label"`
 	Machine   string `json:"machine"`
-	RequestID string `json:"request_id"`
+	Token     string `json:"token"`
+	RequestID string `json:"request_id,omitempty"`
 	StartedBy string `json:"started_by"`
 	TS        int64  `json:"ts"`      // seconds
 	Renewed   int64  `json:"renewed"` // milliseconds: a reservation lives for ReserveTTL after its last renewal
@@ -416,6 +475,19 @@ type resFile struct {
 func (s *Service) resPath(label string) string {
 	h := sha256.Sum256([]byte(label))
 	return filepath.Join(s.c.StateDir, "res", hex.EncodeToString(h[:12])+".json")
+}
+
+// readResRaw reads a reservation file whatever its age.
+func (s *Service) readResRaw(label string) *resFile {
+	b, err := os.ReadFile(s.resPath(label))
+	if err != nil {
+		return nil
+	}
+	var r resFile
+	if json.Unmarshal(b, &r) != nil {
+		return nil
+	}
+	return &r
 }
 
 func (s *Service) readRes(label string) *resFile {
@@ -470,42 +542,65 @@ func (s *Service) reconcile() {
 	}
 }
 
-// Answer is this machine's view of a label, for GET /v1/resolve?v=2 (a peer asking, or this daemon's own check).
-func (s *Service) Answer(label string) Answer {
-	a := Answer{Live: s.c.Live(label), PeerSet: s.c.PeerSet}
+// Answer is this machine's view of a label, for GET /v1/resolve?v=2 (a peer asking, or this daemon's own check). An
+// error means "could not tell": the caller answers an error, never an empty list (that would read as "free").
+func (s *Service) Answer(label string) (Answer, error) {
+	live, err := s.c.Live(label)
+	if err != nil {
+		if s.c.Logf != nil {
+			s.c.Logf("label check for %s: cannot read the session records: %v", label, err)
+		}
+		return Answer{}, err
+	}
+	a := Answer{Live: live, PeerSet: s.c.PeerSet}
 	if a.Live == nil {
 		a.Live = []View{}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if r := s.readRes(label); r != nil {
+	if _, ok := s.flight[label]; ok { // this process is starting it: true whatever the timestamps say
+		a.Reserved = &Reservation{Machine: s.c.Machine, TS: s.c.Now().Unix()}
+	} else if r := s.readRes(label); r != nil { // another life of this daemon left it (crash recovery, by TTL)
 		a.Reserved = &Reservation{Machine: r.Machine, TS: r.TS}
 	}
-	return a
+	return a, nil
 }
 
 // Guard runs launch only if no machine has the label live or reserved (whatever the machines' names: no
-// tie-break is trusted). It reserves the label here (on disk, renewed until the launch is over), asks every
-// listed peer in parallel under one deadline, and drops the reservation on any doubt. Both sides refusing and
-// retrying is safe; neither can start two generations. The daemon's lock is NOT held while peers are asked.
-func (s *Service) Guard(ctx context.Context, label, requestID, startedBy string, launch func() (*start.StartReply, error)) (*start.StartReply, *start.Refusal) {
+// tie-break is trusted). It reserves the label here (in memory and on disk, renewed until the launch is over), asks
+// every listed peer in parallel under one deadline, and drops the reservation on any doubt. Both sides refusing
+// and retrying is safe; neither can start two generations. The daemon's lock is NOT held while peers are asked.
+// Each call holds its own random token: a reservation is never "ours" because a request_id matches.
+func (s *Service) Guard(ctx context.Context, label, startedBy string, launch func() (*start.StartReply, error)) (*start.StartReply, *start.Refusal) {
 	// 1. here: live or reserved by someone else? then reserve (briefly under the service lock)
-	if live := s.c.Live(label); len(live) > 0 {
-		r := refusal(start.AlreadyRunning, "%s is already running on %s", label, live[0].Machine)
+	live, err := s.c.Live(label)
+	if err != nil {
+		if s.c.Logf != nil {
+			s.c.Logf("start of %s refused: cannot read the session records: %v", label, err)
+		}
+		return nil, refusal(Internal, "the start cannot be checked on this machine (see the daemon's log)")
+	}
+	if len(live) > 0 {
+		r := refusal(start.AlreadyRunning, "the label is already running")
 		r.Machine, r.Sid, r.State = live[0].Machine, live[0].Sid, live[0].State
 		return nil, r
 	}
+	token := newToken()
 	s.mu.Lock()
-	if r := s.readRes(label); r != nil && r.RequestID != requestID {
+	if _, busy := s.flight[label]; busy || s.readRes(label) != nil {
 		s.mu.Unlock()
-		return nil, s.retry(refusal(start.StartInProgress, "%s is being started here", label))
+		return nil, s.retry(refusal(start.StartInProgress, "the label is being started here"))
 	}
+	s.flight[label] = token
 	now := s.c.Now()
-	s.writeRes(resFile{Label: label, Machine: s.c.Machine, RequestID: requestID, StartedBy: startedBy, TS: now.Unix(), Renewed: now.UnixMilli()})
+	s.writeRes(resFile{Label: label, Machine: s.c.Machine, Token: token, StartedBy: startedBy, TS: now.Unix(), Renewed: now.UnixMilli()})
 	s.mu.Unlock()
 	release := func() {
 		s.mu.Lock()
-		if r := s.readRes(label); r != nil && r.RequestID == requestID {
+		if s.flight[label] == token {
+			delete(s.flight, label)
+		}
+		if r := s.readResRaw(label); r != nil && r.Token == token {
 			os.Remove(s.resPath(label))
 		}
 		s.mu.Unlock()
@@ -517,7 +612,8 @@ func (s *Service) Guard(ctx context.Context, label, requestID, startedBy string,
 		return nil, r
 	}
 
-	// 3. launch, renewing the reservation until the outcome is known
+	// 3. launch, renewing the reservation until the outcome is known. The renewer rewrites by token and does not ask
+	// whether the old stamp is still "live": a late tick (a sleeping laptop, a clock step) must not end the renewals.
 	stop := make(chan struct{})
 	renewed := make(chan struct{})
 	go func() {
@@ -530,9 +626,9 @@ func (s *Service) Guard(ctx context.Context, label, requestID, startedBy string,
 				return
 			case <-t.C:
 				s.mu.Lock()
-				if r := s.readRes(label); r != nil && r.RequestID == requestID {
-					r.Renewed = s.c.Now().UnixMilli()
-					s.writeRes(*r)
+				if s.flight[label] == token {
+					n := s.c.Now()
+					s.writeRes(resFile{Label: label, Machine: s.c.Machine, Token: token, StartedBy: startedBy, TS: n.Unix(), Renewed: n.UnixMilli()})
 				}
 				s.mu.Unlock()
 			}
@@ -543,7 +639,7 @@ func (s *Service) Guard(ctx context.Context, label, requestID, startedBy string,
 	<-renewed
 	if err != nil {
 		if _, ok := err.(*start.Refusal); !ok && s.c.Logf != nil {
-			s.c.Logf("remote start of %s failed: %v", label, err)
+			s.c.Logf("start of %s failed: %v", label, err)
 		}
 		return nil, asRefusal(err)
 	}
@@ -618,4 +714,41 @@ func (s *Service) askHTTP(ctx context.Context, p Peer, label string) (Answer, er
 		return Answer{}, fmt.Errorf("unreadable answer")
 	}
 	return a, nil
+}
+
+// Published is what hostd writes to <state>/remote/peers.json so that a start made WITHOUT hostd in the loop (a
+// direct-mode `ccsbx start` runs the start in its own process) asks the same peers, reserves in the same place and
+// refuses on the same doubts: one rule for every start path.
+type Published struct {
+	Machine      string `json:"machine"`
+	Peers        []Peer `json:"peers"`
+	PeerSet      string `json:"peer_set"`
+	AskTimeoutMs int    `json:"ask_timeout_ms"`
+}
+
+// Publish writes the file (0644: a start by the same owner reads it).
+func (s *Service) Publish() error {
+	b, _ := json.Marshal(Published{Machine: s.c.Machine, Peers: s.c.Peers, PeerSet: s.c.PeerSet, AskTimeoutMs: int(s.c.AskTimeout / time.Millisecond)})
+	p := filepath.Join(s.c.StateDir, "peers.json")
+	if err := os.WriteFile(p+".tmp", b, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(p+".tmp", p)
+}
+
+// LoadPublished reads it: (nil, nil) when hostd never published one (no cross-machine check configured), an
+// error when the file exists and cannot be read (fail closed: the caller must refuse, not skip the check).
+func LoadPublished(stateDir string) (*Published, error) {
+	b, err := os.ReadFile(filepath.Join(stateDir, "remote", "peers.json"))
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var p Published
+	if err := json.Unmarshal(b, &p); err != nil || p.Machine == "" {
+		return nil, fmt.Errorf("peers.json is not readable")
+	}
+	return &p, nil
 }

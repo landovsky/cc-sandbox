@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -228,6 +229,16 @@ func wdir(t *testing.T) string {
 	return d
 }
 
+// gitwdir is wdir plus `git init`: a remote start must name a git worktree root.
+func gitwdir(t *testing.T) string {
+	t.Helper()
+	d := wdir(t)
+	if out, err := exec.Command("git", "init", "-q", d).CombinedOutput(); err != nil {
+		t.Skipf("git init: %v %s", err, out)
+	}
+	return d
+}
+
 func policyFor(t *testing.T, lookup string) (*start.Daemon, startPolicy) {
 	t.Helper()
 	sd := &start.Daemon{StateDir: t.TempDir(), Machine: "hp-ubuntu", Root: "direct", Exe: "ccsbx", Backend: "docker", Launcher: start.NoLauncher{}, ProfileLoader: profiles.Load}
@@ -336,9 +347,9 @@ func TestALocalStartAsksThePeersToo(t *testing.T) {
 	svc, err := remotestart.New(remotestart.Config{
 		Machine: "hp-ubuntu", OwnerUser: "tomas", PeerSet: "S", StateDir: t.TempDir(),
 		Peers:    []remotestart.Peer{{Name: "mac-tomas", URL: "http://mac"}},
-		Profiles: profiles.Load, LookupUID: func(string) (int, error) { return 4000, nil },
+		Profiles: profiles.Load, LookupUID: func(string) (int, error) { return os.Getuid(), nil },
 		Starter: func(int, []byte, string) (*start.StartReply, error) { return nil, errors.New("unused") },
-		Live:    func(string) []remotestart.View { return nil },
+		Live:    func(string) ([]remotestart.View, error) { return nil, nil },
 		AskPeer: func(_ context.Context, pe remotestart.Peer, label string) (remotestart.Answer, error) {
 			asked = append(asked, pe.Name+" "+label)
 			return remotestart.Answer{Live: []remotestart.View{{Machine: "mac-tomas", Sid: "s0there", State: "running"}}, PeerSet: "S"}, nil
@@ -367,17 +378,17 @@ func remoteRig(t *testing.T) (*start.Daemon, startPolicy, *remotestart.Service) 
 	p.RemoteMaxPerHour = 2
 	svc, err := remotestart.New(remotestart.Config{
 		Machine: "hp-ubuntu", OwnerUser: "tomas", PeerSet: "S", StateDir: t.TempDir(),
-		Profiles: profiles.Load, LookupUID: func(string) (int, error) { return 4000, nil },
+		Profiles: profiles.Load, LookupUID: func(string) (int, error) { return os.Getuid(), nil },
 		Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
 			return startHandlerBy(sd, p, nil)(uid, spec, by)
 		},
-		Live: func(label string) []remotestart.View {
+		Live: func(label string) ([]remotestart.View, error) {
 			recs, _ := sd.LiveByLabel(label)
 			var out []remotestart.View
 			for _, r := range recs {
 				out = append(out, remotestart.View{Machine: "hp-ubuntu", Sid: r.Sid, Gen: r.Gen, State: "running"})
 			}
-			return out
+			return out, nil
 		},
 		PerUserMinute: 100, PerMachineMinute: 100,
 	})
@@ -391,7 +402,7 @@ func remoteRig(t *testing.T) (*start.Daemon, startPolicy, *remotestart.Service) 
 // start as a local one (profile, worktree root, pins), is recorded with who asked, and a retry after a lost answer
 // is the same session.
 func TestARemoteStartIsRecordedWithWhoAskedAndRetriesAreIdempotent(t *testing.T) {
-	w := wdir(t)
+	w := gitwdir(t)
 	sd, _, svc := remoteRig(t)
 	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac-tomas.example.ts.net"}
 	body := []byte(fmt.Sprintf(specOf, "tomas", w))
@@ -419,7 +430,7 @@ func TestARemoteStartIsRecordedWithWhoAskedAndRetriesAreIdempotent(t *testing.T)
 // context (C2): a remote caller may resume only a session it started; the owner's local sessions, and another
 // device's, are not its to take over.
 func TestARemoteCallerCannotResumeASessionItDidNotStart(t *testing.T) {
-	w := wdir(t)
+	w := gitwdir(t)
 	sd, _, svc := remoteRig(t)
 	a := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
 	b := remotestart.Caller{StartedBy: "owner:tomas@example.com@old-laptop", Machine: "laptop"}
@@ -437,7 +448,7 @@ func TestARemoteCallerCannotResumeASessionItDidNotStart(t *testing.T) {
 // context (C8): the remote hourly budget is its own: using it up leaves the owner's local starts alone, and the
 // other way round.
 func TestTheRemoteHourlyBudgetIsSeparateFromTheLocalOne(t *testing.T) {
-	w := wdir(t)
+	w := gitwdir(t)
 	sd, p, svc := remoteRig(t)
 	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
 	label := func(i int) string {
@@ -451,7 +462,8 @@ func TestTheRemoteHourlyBudgetIsSeparateFromTheLocalOne(t *testing.T) {
 	if _, ref := svc.Start(context.Background(), me, []byte(label(3))); ref == nil || ref.Code != start.RateCapped {
 		t.Fatalf("the 3rd remote start in the hour: %v", ref)
 	}
-	if _, err := startHandler(sd, p)(4000, []byte(label(4))); err != nil {
+	local := strings.Replace(label(4), w, wdir(t), 1) // a local start needs no git worktree: its own plain directory
+	if _, err := startHandler(sd, p)(4000, []byte(local)); err != nil {
 		t.Fatalf("a LOCAL start was refused because remote starts used up the remote budget: %v", err)
 	}
 }
@@ -464,7 +476,7 @@ func TestARemoteWorkdirIsHeldToTheWorktreeRootBlock(t *testing.T) {
 	_, _, svc := remoteRig(t)
 	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
 	root := "/var/tmp"
-	inside := wdir(t) // a real directory under the root
+	inside := gitwdir(t) // a real directory under the root
 	outside, _ := os.MkdirTemp(os.TempDir(), "ccsbx-outside-")
 	t.Cleanup(func() { os.RemoveAll(outside) })
 	link := filepath.Join(inside, "escape")
@@ -476,6 +488,9 @@ func TestARemoteWorkdirIsHeldToTheWorktreeRootBlock(t *testing.T) {
 	t.Cleanup(func() { os.RemoveAll(sibling) })
 	home, _ := os.UserHomeDir()
 	hidden := filepath.Join(home, ".ssh") // outside the root, as a hidden home directory is
+	plain := wdir(t)                      // a real directory under the root that is NOT a git worktree
+	repoSub := filepath.Join(inside, "sub")
+	os.MkdirAll(repoSub, 0o755)
 	n := 0
 	try := func(path string) *start.Refusal {
 		n++
@@ -484,12 +499,15 @@ func TestARemoteWorkdirIsHeldToTheWorktreeRootBlock(t *testing.T) {
 		return ref
 	}
 	for name, p := range map[string]string{
-		"a symlink out of the root":           link,
-		"a sibling that starts with the root": sibling,
-		"a hidden directory (~/.ssh-like)":    hidden,
-		"the root itself":                     root,
-		"a path with ..":                      inside + "/../../etc",
-		"a relative path":                     "tmp/x",
+		"a symlink out of the root":                                   link,
+		"a sibling that starts with the root":                         sibling,
+		"a hidden directory (~/.ssh-like)":                            hidden,
+		"the root itself":                                             root,
+		"a path with ..":                                              inside + "/../../etc",
+		"a relative path":                                             "tmp/x",
+		"a plain directory (not a worktree)":                          plain,
+		"a subdirectory of a repo":                                    repoSub,
+		"the parent of repos (the root's own child that holds repos)": filepath.Dir(plain),
 	} {
 		if ref := try(p); ref == nil || ref.Code != start.BadSpec {
 			t.Errorf("%s: %v", name, ref)
@@ -559,17 +577,17 @@ func TestTwoDaemonsAskingEachOtherOverHTTPNeverStartTheSameLabelTwice(t *testing
 			Machine: n, OwnerUser: "tomas", PeerSet: set, StateDir: t.TempDir(),
 			Peers:     []remotestart.Peer{{Name: other, URL: ms[other].ts.URL}},
 			Profiles:  bothMachines,
-			LookupUID: func(string) (int, error) { return 4000, nil },
+			LookupUID: func(string) (int, error) { return os.Getuid(), nil },
 			Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
 				return startHandlerBy(sd, p, nil)(uid, spec, by)
 			},
-			Live: func(label string) []remotestart.View {
+			Live: func(label string) ([]remotestart.View, error) {
 				recs, _ := sd.LiveByLabel(label)
 				var out []remotestart.View
 				for _, r := range recs {
 					out = append(out, remotestart.View{Machine: nn, Sid: r.Sid, Gen: r.Gen, State: "running"})
 				}
-				return out
+				return out, nil
 			},
 		})
 		if err != nil {
@@ -578,7 +596,7 @@ func TestTwoDaemonsAskingEachOtherOverHTTPNeverStartTheSameLabelTwice(t *testing
 		m.svc = svc
 		srvOf[n].Remote = svc
 	}
-	w := wdir(t)
+	w := gitwdir(t)
 	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
 	body := func(machine, rid string) []byte {
 		return []byte(strings.NewReplacer(`"r1"`, `"`+rid+`"`, "hp-ubuntu", machine).Replace(fmt.Sprintf(specOf, "tomas", w)))

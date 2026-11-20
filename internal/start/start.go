@@ -184,12 +184,16 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		return nil, err
 	}
 
-	// Idempotent per (caller, request_id): a retry gets the same reply and starts nothing.
+	// Idempotent per (uid, caller identity, request_id): a retry gets the same reply and starts nothing. A request_id
+	// another caller used is not this one's; the same caller reusing it for ANOTHER label is request_id_reused.
 	for _, r := range recs {
-		if r.Uid == d.Uid && (r.RequestID == s.RequestID || contains(r.RequestIDs, s.RequestID)) {
+		if r.Uid == d.Uid && r.StartedBy == d.StartedBy && (r.RequestID == s.RequestID || contains(r.RequestIDs, s.RequestID)) {
 			rep := r.Reply
 			if r.RequestID != s.RequestID { // an older generation's request: its own reply is not kept
 				return nil, refuse(BadSpec, "request_id %s was already used for an earlier generation of %s", s.RequestID, r.Sid)
+			}
+			if r.Label != s.Label {
+				return nil, refuse(RequestIDReused, "request_id was already used for another session")
 			}
 			return &rep, nil
 		}
@@ -205,6 +209,19 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		return nil, refuse(NotBuilt, "only workdir.path is supported (repo/base/branch needs the git route, H1)")
 	}
 	var rw string
+	remote := d.StartedBy != ""
+	// A REMOTE caller's refusal text is fixed: an OS error would carry paths and let the caller probe what exists.
+	wdErr := func(what string, err error) *Refusal {
+		if remote {
+			return refuse(BadSpec, "%s is not acceptable", what)
+		}
+		return refuse(BadSpec, "%s: %v", what, err)
+	}
+	if remote && d.Root == "helper" {
+		// The owner's home is unreadable to hostd here, so "is this directory a git worktree root" cannot be
+		// checked, and without it any directory under the worktree root (all of ~/git) would mount read-write.
+		return nil, refuse(NotBuilt, "a remote start needs the worktree check that helper mode cannot make yet")
+	}
 	if d.Root == "helper" {
 		// hostd runs as the service uid and cannot enter the owner's home (0750): it never touches the
 		// filesystem here. The CLIENT resolved the workdir and the gitdir as the owner (ResolveClientPaths);
@@ -212,10 +229,10 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		var err error
 		rw, err = backend.CheckWorkdirLexical(s.Workdir.Path, d.WorktreeRoot, d.StateDir, d.RunDir)
 		if err != nil {
-			return nil, refuse(BadSpec, "workdir: %v", err)
+			return nil, wdErr("workdir", err)
 		}
 		if err := backend.CheckGitDirLexical(s.GitDir, rw, d.WorktreeRoot); err != nil {
-			return nil, refuse(BadSpec, "gitdir: %v", err)
+			return nil, wdErr("gitdir", err)
 		}
 	} else {
 		if s.GitDir != "" {
@@ -224,10 +241,17 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		var err error
 		rw, err = backend.CheckWorkdir(s.Workdir.Path, d.WorktreeRoot, d.StateDir)
 		if err != nil {
-			return nil, refuse(BadSpec, "workdir: %v", err)
+			return nil, wdErr("workdir", err)
 		}
 		if st, err := os.Stat(rw); err != nil || !st.IsDir() {
-			return nil, refuse(BadSpec, "workdir.path %s is not a directory", s.Workdir.Path)
+			return nil, wdErr("workdir", err)
+		}
+		if remote {
+			// a remote start must name a git WORKTREE ROOT (its own .git at exactly this path): not a parent of
+			// repos, not a subdirectory of one, not a plain directory under the root
+			if gd, err := backend.ResolveGitDir(rw, d.Uid); err != nil || gd == "" {
+				return nil, refuse(BadSpec, "workdir is not a git worktree root")
+			}
 		}
 	}
 	s.Workdir.Path = rw // the resolved path is what gets mounted and recorded
@@ -271,6 +295,12 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 				ref := refuse(AlreadyRunning, "%s already_running on %s (sid %s)", s.Label, d.Machine, r.Sid)
 				ref.Machine, ref.Sid, ref.State = d.Machine, r.Sid, "running"
 				return nil, ref
+			}
+			// one workdir, one live session: a workdir equal to, containing or inside another live session's is
+			// refused (the agent that owns the outer tree could swap the inner directory for a link between the
+			// check and the mount). A resume of that very session is exempt.
+			if (s.Resume == nil || s.Resume.Sid != r.Sid) && overlaps(r.Spec.Workdir.Path, rw) {
+				return nil, refuse(BadSpec, "the workdir overlaps another live session's")
 			}
 		} else if r.Ended == nil {
 			d.markEnded(r) // the pane is gone: a stale record must not block the label
@@ -381,6 +411,22 @@ func (d *Daemon) LiveByLabel(label string) ([]*Record, error) {
 	return out, nil
 }
 
+// Recorded is the reply of the start this caller already made with this request_id, or nil: read-only, so a caller can
+// answer a retry from the record without launching anything.
+func (d *Daemon) Recorded(uid int, startedBy, requestID string) *StartReply {
+	recs, err := d.records()
+	if err != nil {
+		return nil
+	}
+	for _, r := range recs {
+		if r.Uid == uid && r.StartedBy == startedBy && r.RequestID == requestID {
+			rep := r.Reply
+			return &rep
+		}
+	}
+	return nil
+}
+
 // Seen reports whether this caller already started a session with this request_id (so a retry is answered by
 // Start's own idempotency, not refused because the label it started is now live).
 func (d *Daemon) Seen(requestID string) bool {
@@ -407,6 +453,15 @@ func (d *Daemon) Load(sid string) (*Record, error) {
 	}
 	var r Record
 	return &r, json.Unmarshal(b, &r)
+}
+
+// overlaps: a and b are the same directory, or one is inside the other.
+func overlaps(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if a == "." || b == "." || a == "" || b == "" {
+		return false
+	}
+	return a == b || strings.HasPrefix(a, b+string(filepath.Separator)) || strings.HasPrefix(b, a+string(filepath.Separator))
 }
 
 func contains(l []string, s string) bool {
@@ -451,8 +506,11 @@ func (d *Daemon) records() ([]*Record, error) {
 			continue
 		}
 		r, err := d.Load(strings.TrimSuffix(e.Name(), ".json"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue // removed since the listing (a failed launch rolls its record back): not a read failure
+		}
 		if err != nil {
-			return nil, err
+			return nil, err // any other doubt is an error, never "no such session": callers refuse on it
 		}
 		out = append(out, r)
 	}

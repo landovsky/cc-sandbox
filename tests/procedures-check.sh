@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# procedures-check.sh — O7's gate (`make procedures` once P1's Makefile exists): every piece the
+# procedures-check.sh — Why: a procedure nobody wrote down is not repeatable at 3am. O7's gate (`make procedures` once P1's Makefile exists): every piece the
 # build plan marks "+O7" has a section in docs/runbook.md, and every section has the five fields
 # When, Who, Steps, Check, Rollback. A section names the pieces it covers in a
 # <!-- procedure: ID ... --> comment under its "## " heading.

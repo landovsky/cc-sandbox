@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """ccsbx-night-report: the morning report as ONE Telegram --pre table (plan §7.2, NB3).
 
+Why it exists: Tomas wakes up to one message that says which night pieces passed, which are
+parked and why, and what the night cost, instead of reading the whole tree to find out.
+
 Rows are the night's pieces (the children of every "N1-<letter>" stream node in the tree, and
 streams that have no children), with: state, test, why.  Below the table: the window and the
 spend (7-day subscription window used, and the change since the night's baseline).  Read-only:

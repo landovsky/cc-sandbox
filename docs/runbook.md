@@ -99,11 +99,14 @@
      owner, the machine name and the exact profile:billing pairs from `profiles/*.json` (a profile is signed
      only with a billing in its own list). Rerun `install --yes` with `--machine/--pairs` to change it.
      `check` (as root) proves it by getting a token for one in-scope test claim (api + dev-default).
-     **Attach:** `/run/ccsbx` (hostd's tmux socket, 0600) is `ccsbx`-only, mode 0700, with no group: a
-     group-writable tmux socket would let any process of the owner's uid type into fenced panes. The owner
-     attaches with `sudo ccsbx-root attach <sid>`; the installer's one rule for `ccsbx-root` already covers
-     that verb, so no separate attach line is added (narrowing it to `attach *` is G's call). hostd's API
-     socket is `/run/ccsbx-api/hostd.sock`, `ccsbx:ccsbx-clients` 0660, in a 0755 directory.
+     **tmux and attach:** the ccsbx tmux server runs in its own unit, `ccsbx-tmux.service` (uid `ccsbx`, no
+     sandbox, so it shares the host mount namespace: its panes run `sudo ccsbx-root run`, whose binds must reach
+     dockerd). hostd `Requires=` it and only connects to `/run/ccsbx/tmux.sock`; it never starts the server.
+     `/run/ccsbx` is `ccsbx`-only, 0700, with the socket 0600: a group-writable tmux socket would let any process
+     of the owner's uid type into fenced panes. The owner attaches with `sudo ccsbx-root attach <sid>`; the
+     installer's one rule for `ccsbx-root` already covers that verb, so no separate attach line is added.
+     hostd's API socket is `/run/ccsbx-api/hostd.sock`, `ccsbx:ccsbx-clients` 0660, in a 0755 directory.
+     `check` (as root) confirms `ccsbx-tmux`'s mount namespace equals PID 1's and that the socket is `ccsbx:600`.
      **Known limit after Gate M:** hostd runs as uid `ccsbx` (no `--ccmsg-bin`), so it cannot use the
      owner's bus sockets. Messages from a fenced session to an unfenced manager wait for the hub
      spoke over :4011 (B10/B11/M2b). Until then only ccsbx sessions are reachable by hostd.
@@ -122,6 +125,26 @@
   `ccsbx-clients`, `/var/lib/ccsbx` (the journal) and the keys directory (`--purge-keys` deletes the
   keys and `ccsbx-keys`: rotate M9 first). `--backup DIR` must be under `/var/backups/ccsbx-install/`,
   root-owned and not group- or world-writable.
+- **Seccomp profile for `ccsbx-root run` (Gate M step; fails closed without it).** `ccsbx-root run`
+  refuses to start a fence unless `/etc/ccsbx/seccomp.json` is root-owned and verified. It is Docker's
+  default profile with `chmod`, `fchmod`, `fchmodat`, `fchmodat2`, `open`, `openat`, `creat`, `mknod`
+  and `mknodat` allowed only when the mode has no setuid or setgid bit (a setid mode falls to the
+  profile's EPERM default) and `openat2` and `io_uring_*` refused. Nobody can fetch the base on the night; at the gate:
+  ```
+  V=$(docker version --format '{{.Server.Version}}')
+  curl -fsSL -o default.json https://raw.githubusercontent.com/moby/moby/v$V/profiles/seccomp/default.json
+  ccsbx seccomp-profile --base default.json --out /tmp/seccomp.json
+  sudo install -o root -g root -m 0644 /tmp/seccomp.json /etc/ccsbx/seccomp.json
+  ccsbx seccomp-profile --verify /etc/ccsbx/seccomp.json
+  tests/seccomp-setuid-test.sh --base default.json --image <pinned fence image>     # needs docker
+  ```
+  The base must be the file of the installed engine's version tag (the URL above). The last command
+  is the docker twin: it tries `chmod 4755`, `2755`, `u+s` and creating a file with mode 4755 inside
+  a fence, and checks that `chmod 755` still works; it is not part of `make test`.
+- **Real bind-mount test (Gate M).** `sudo unshare -m go test -tags rootmount -run TestRealMounter ./internal/rootcmd`.
+- **Known: orphaned direct-mode homes.** The node home is now keyed by owner, class and label, so
+  homes made by direct mode before this change are not found again: `--resume` of such a session
+  starts without its old transcript. Nothing important lives there yet; they can be deleted by hand.
 
 ## 4. Night auto-start and stop
 <!-- procedure: NB4 -->

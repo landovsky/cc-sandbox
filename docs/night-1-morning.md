@@ -75,6 +75,12 @@ Step 8 in detail (changed after the PR #2 review):
 - `install` prints `DONE` only after hostd and the signer are really up (it waits up to 10 s). A
   crash-looping hostd gives `NOT DONE` and the undo hint, not a false DONE;
 - known limit after the gate: hostd has no `--ccmsg-bin` (uid `ccsbx` cannot use the owner's bus sockets), so fenced to unfenced-manager messages wait for the hub spoke (B10/B11/M2b);
+- the signer will not start without its scope file; the install has `ccsbx-signer --write-scope` write
+  `/var/lib/ccsbx-keys/signer.scope` (owners = the owner, machines = `hostname -s`, **pairs** built from
+  `profiles/*.json`: each profile's own billings, today `dev-default:api|stub,e2e-default:stub`, so no
+  `subscription` until a profile allows it; override with `--machine` and `--pairs`; `plan` prints it).
+  Only the signer opens `machine.key`. `check` asks the signer, as uid `ccsbx`, for a token for one in-scope
+  test claim (api + dev-default), so it needs root;
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
@@ -138,7 +144,7 @@ After the group change only password sudo can start them (`sudo docker start <na
   The installer parses it as root and refuses if a NOPASSWD line isn't one of docker, apt-get,
   dokku, sops (it won't guess).
 
-## `units/install-linux.sh plan` as of 2026-11-20 (owner tomas, after the PR #2 re-check)
+## `units/install-linux.sh plan` as of 2026-11-20 (owner tomas, after the signer alignment)
 
 ```
 install-linux plan  (owner=tomas, bin-dir=<repo>/dist)
@@ -151,11 +157,13 @@ GATES (install refuses while any is unmet)
   note: sudoers.d/README not readable without root: verified at install
   P15 status file: /home/tomas/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv
   allowed roots:   "/home/tomas/git", "/home/tomas/wt"
+  signer scope:    owners=tomas machines=hp-ubuntu pairs=dev-default:api|stub,e2e-default:stub
 
 [01] U0b users and directories: ccsbx (hostd), ccsbx-keys (keys), group ccsbx-clients
      # ccsbx-keys may already exist (R10b creates it and the age key during the day): reused, never recreated
      # user ccsbx-keys exists
-     $ useradd --system --home-dir /var/lib/ccsbx --create-home --shell /usr/sbin/nologin ccsbx
+     $ groupadd --system ccsbx
+     $ useradd --system --gid ccsbx --home-dir /var/lib/ccsbx --create-home --shell /usr/sbin/nologin ccsbx
      $ groupadd --system ccsbx-clients
      # ccsbx-clients may talk to hostd's local socket; it grants no root path
      $ gpasswd -a tomas ccsbx-clients
@@ -185,17 +193,20 @@ GATES (install refuses while any is unmet)
      $ chmod 0600 /var/lib/ccsbx-keys/age.key
      # machine key: made by the signer itself (--init), so no other process ever sees it
      $ runuser -u ccsbx-keys -- /usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --init
+     # the signer will not serve without its scope (owners, machines, profile:billing pairs). The signer writes it itself
+     #   (--write-scope: atomic, 0600): only that binary ever opens machine.key. Rewritten on every run to match the options
+     $ runuser -u ccsbx-keys -- /usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --write-scope --owners tomas --machines hp-ubuntu --pairs dev-default:api\|stub\,e2e-default:stub
      # the printed PUBLIC key goes into config/machines/<machine>.json (M9); nothing secret is printed
      # the K8 kubeconfig arrives SOPS-encrypted to the age key; it is decrypted only by ccsbx-keys
 
 [04] U0b signer socket + service (sign(token_claims) only; the socket is activated by systemd)
-     write /etc/systemd/system/ccsbx-signer.service  (mode 0644, root:root, 34 lines)
+     write /etc/systemd/system/ccsbx-signer.service  (mode 0644, root:root, 38 lines)
      write /etc/systemd/system/ccsbx-signer.socket  (mode 0644, root:root, 16 lines)
      $ systemctl daemon-reload
      $ systemctl enable --now ccsbx-signer.socket
 
 [05] U0 hostd unit
-     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 52 lines)
+     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 54 lines)
      # the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced
      $ runuser -u ccsbx -- sh -c umask\ 077\;\ head\ -c\ 32\ /dev/urandom\ \|\ base64\ \>\ /var/lib/ccsbx/listen.token
      $ systemctl daemon-reload

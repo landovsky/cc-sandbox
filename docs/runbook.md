@@ -94,6 +94,11 @@
      It prints `DONE` only after hostd and the signer are up. hostd listens on loopback only
      (`127.0.0.1:7480`, with a token file), so the firewall question (S11) does not arise.
      Before step 2 do the manual checks listed in `docs/night-1-morning.md` (S5, S9, S14, S15).
+     **Signer scope:** before it enables the signer socket the install has `ccsbx-signer --write-scope` write
+     `/var/lib/ccsbx-keys/signer.scope` (0600, `ccsbx-keys`); without it the signer exits 2. The scope lists the
+     owner, the machine name and the exact profile:billing pairs from `profiles/*.json` (a profile is signed
+     only with a billing in its own list). Rerun `install --yes` with `--machine/--pairs` to change it.
+     `check` (as root) proves it by getting a token for one in-scope test claim (api + dev-default).
      **Attach:** `/run/ccsbx` (hostd's tmux socket, 0600) is `ccsbx`-only, mode 0700, with no group: a
      group-writable tmux socket would let any process of the owner's uid type into fenced panes. The owner
      attaches with `sudo ccsbx-root attach <sid>`; the installer's one rule for `ccsbx-root` already covers
@@ -161,8 +166,12 @@
 - **Steps:**
   1. If the old cockpit is alive: on it, `cc-tree cockpit down`.
   2. On the new machine: `cc-tree cockpit up`. It runs `cc-tree sync --pull`, checks that the last
-     cursor-ack commit is an ancestor of HEAD (else it refuses with "N commits not pushed": push
-     them on the old machine first), takes the daemon snapshot, then tails from the cursor.
+     cursor-ack commit of every daemon is an ancestor of HEAD (else it refuses, naming the machine
+     and the commit: "that machine's last commits are not pushed". Push them there first, or
+     `--wait 60` to keep pulling), takes the lease on every daemon (all or none), takes the
+     daemon snapshot, then tails from the old cockpit's cursor and applies the gap at once.
+     The daemons are the ones in `machines.json` at the root of the tree repo
+     (`{"machines": ["hp-ubuntu", "mac"]}`), else the hosts fenced nodes ran on.
   3. If the old machine is dead and holds the lease: `cc-tree cockpit up --steal`. Use it only
      when the old cockpit really is down, since two writers means duplicate verbs.
 - **Check:** `cc-tree cockpit status` on the new machine shows the lease held on every daemon

@@ -36,6 +36,9 @@ type Command struct {
 	Raw bool
 	// Run gets the parsed flags and the remaining args.
 	Run func(fs *Flags, args []string, stdout, stderr io.Writer) int
+	// Interleave lets flags follow positional arguments (`cursor get NAME --json`). Off by
+	// default: after the first positional (or "--") everything is the command's own (run -- cmd).
+	Interleave bool
 }
 
 // Flags wraps flag.FlagSet and gives every flag an env-var default.
@@ -147,9 +150,20 @@ func (a *App) Main(args []string, stdout, stderr io.Writer) int {
 			return ExitOK
 		}
 	}
-	if err := fs.Parse(args[1:]); err != nil {
-		fmt.Fprintf(stderr, "%s %s: %v\n", a.Name, c.Name, err)
-		return ExitUsage
+	rest, pos := args[1:], []string(nil)
+	for {
+		if err := fs.Parse(rest); err != nil {
+			fmt.Fprintf(stderr, "%s %s: %v\n", a.Name, c.Name, err)
+			return ExitUsage
+		}
+		if !c.Interleave || fs.NArg() == 0 {
+			break
+		}
+		pos = append(pos, fs.Arg(0))
+		rest = fs.Args()[1:]
+	}
+	if c.Interleave {
+		return c.Run(fs, append(pos, fs.Args()...), stdout, stderr)
 	}
 	return c.Run(fs, fs.Args(), stdout, stderr)
 }

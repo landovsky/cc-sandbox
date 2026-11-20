@@ -130,70 +130,76 @@ where = "hp"
 
 [[rule]]
 id = "outbox-symlink"
-title = "a symlink in the outbox is refused, never followed"
+title = "a symlink in the outbox (to a host file, or inside it) is never followed or read"
 suite = "outbox"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxSymlinkAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxSymlinkBlock"
 invariants = [10]
-backends = ["docker"]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "outbox-fifo"
-title = "a fifo in the outbox is refused"
+title = "a FIFO in the outbox cannot hang the daemon"
 suite = "outbox"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxFifoAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxFifoBlock"
 invariants = [10]
-backends = ["docker"]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "outbox-hardlink"
-title = "a hardlink out of the outbox is refused"
+title = "a hard-linked file (nlink != 1) in the outbox is refused"
 suite = "outbox"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxHardlinkAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxHardlinkBlock"
 invariants = [10]
-backends = ["docker"]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "outbox-sparse"
-title = "a sparse file in the outbox is refused or bounded"
+title = "a sparse file bigger than the cap is refused by its apparent size, unread"
 suite = "outbox"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxSparseAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxSparseBlock"
 invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+# RED in direct mode by design: tomas can write the outbox until the privilege split (gate M).
+# (It is red because the write succeeds, not because Prepare refused the setup.)
+[[rule]]
+id = "outbox-host-write-refused"
+title = "the host user cannot write into an outbox (only the fence uid can; the daemon only reads)"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxHostWriteRefusedAllow"
+block = "CCSBX_TWIN=1 tests/twin-go.sh ./internal/hostd TestOutboxHostWriteRefusedBlock"
+invariants = [10, 14]
 backends = ["docker"]
 where = "hp"
 
-[[rule]]
-id = "outbox-host-write-refused"
-title = "the fence cannot write to the host side of the outbox (red until gate M)"
-suite = "outbox"
-allow = "pending"
-block = "pending"
-invariants = [10, 11]
-backends = ["docker"]
-where = "hp"
+# ---- U3a: flood bound. Direct mode: not evidence. ----
 
 [[rule]]
 id = "outbox-flood"
-title = "an outbox flood hits the size and count caps"
+title = "thousands of request files cost bounded work: a burst is served, the rest is shed"
 suite = "outbox"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxFloodAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxFloodBlock"
 invariants = [10]
-backends = ["docker"]
+backends = ["unit"]
 where = "hp"
+
+# ---- daemon rules (plan §6). Direct mode: not evidence. ----
 
 [[rule]]
 id = "daemon-authz"
 title = "the daemon refuses a caller that is not the owner"
 suite = "outbox"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/daemonapi TestOwnerDeliverToAnIdlePaneLands"
+block = "tests/twin-go.sh ./internal/daemonapi TestTCPListenerNeedsTheTokenAndNeverServesOwnerOperations"
 invariants = [5]
 backends = ["unit"]
 where = "any"
@@ -232,31 +238,33 @@ where = "any"
 id = "one-cockpit-per-realm"
 title = "a second cockpit in one realm is refused"
 suite = "outbox"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/daemonapi TestCockpitLeaseAndQueueOverHTTP"
+block = "tests/twin-go.sh ./internal/verbq TestSecondLeaseInTheSameRealmIsRefused"
 invariants = [11]
 backends = ["unit"]
 where = "any"
 
 [[rule]]
 id = "journal-durable"
-title = "the daemon journal survives a kill -9"
-suite = "outbox"
-allow = "pending"
-block = "pending"
-invariants = [11]
+title = "an acknowledged journal event survives a crash; a torn tail leaves no gap and no duplicate"
+suite = "verbs"
+allow = "tests/twin-go.sh ./internal/journal TestJournalDurableAllow"
+block = "tests/twin-go.sh ./internal/journal TestJournalDurableBlock"
+invariants = [28]
 backends = ["unit"]
-where = "any"
+where = "hp"
 
 [[rule]]
 id = "epoch-reset-reingest"
-title = "after an epoch reset the journal is re-ingested without duplicates"
-suite = "outbox"
-allow = "pending"
-block = "pending"
-invariants = [11]
+title = "after a journal wipe (new epoch) outboxes are re-read: events, lifecycle and unreplied requests come back, answered ones don't run twice"
+suite = "verbs"
+allow = "tests/twin-go.sh ./internal/hostd TestEpochResetReingestAllow"
+block = "tests/twin-go.sh ./internal/hostd TestEpochResetReingestBlock"
+invariants = [28]
 backends = ["unit"]
-where = "any"
+where = "hp"
+
+# ---- keys, git, doors, approvals: other streams ----
 
 [[rule]]
 id = "keys-unreadable"
@@ -710,33 +718,35 @@ where = "any"
 
 [[rule]]
 id = "msg-in-scope"
-title = "a message to a peer in scope is delivered"
+title = "a worker's message to its manager lands stamped 'fenced', identity from the daemon's record"
 suite = "msg"
-allow = "pending"
-block = "pending"
-invariants = [13]
-backends = ["docker", "k8s"]
+allow = "tests/twin-go.sh ./internal/msg TestMsgInScopeAllow"
+block = "tests/twin-go.sh ./internal/msg TestMsgInScopeBlock"
+invariants = [6, 10, 22]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "msg-out-of-scope"
-title = "a message outside the session's scope is refused"
+title = "a message to a session outside manager/peers/reply-to-sender is refused: scope, nothing delivered"
 suite = "msg"
-allow = "pending"
-block = "pending"
-invariants = [13]
-backends = ["docker", "k8s"]
+allow = "tests/twin-go.sh ./internal/msg TestMsgOutOfScopeAllow"
+block = "tests/twin-go.sh ./internal/msg TestMsgOutOfScopeBlock"
+invariants = [6, 10, 22]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "msg-no-cockpit"
-title = "a fenced session cannot message the cockpit directly"
+title = "with cc-tree and the hub unreachable a same-machine message still lands in the pane (real tmux)"
 suite = "msg"
-allow = "pending"
-block = "pending"
-invariants = [13]
-backends = ["docker", "k8s"]
+allow = "tests/twin-go.sh ./internal/msg TestMsgNoCockpitAllow"
+block = "tests/twin-go.sh ./internal/msg TestMsgNoCockpitBlock"
+invariants = [6, 10, 22]
+backends = ["unit"]
 where = "hp"
+
+# ---- cross-machine messaging (B-pieces, not built here) ----
 
 [[rule]]
 id = "msg-cross-machine"
@@ -1128,5 +1138,239 @@ suite = "git"
 allow = "tests/twin-go.sh ./internal/gitroute TestArgsAllowlistAllow"
 block = "tests/twin-go.sh ./internal/gitroute TestArgsAllowlistBlock"
 invariants = [24, 25]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-refuses-unscoped-claims"
+title = "the signer signs nothing outside its key's scope: owner, machine, exact profile-billing pairs, audience"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesUnscopedClaims$|TestPairsPairProfileWithBilling$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "stamp-from-outbox"
+title = "a request's identity comes from the outbox path and the session record, never from the file's bytes"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestStampFromOutboxAllow"
+block = "tests/twin-go.sh ./internal/hostd TestStampFromOutboxBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "outbox-stale-generation"
+title = "a request from an old or ended generation is answered stale and never stamped with the live generation's identity"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestOutboxStaleGenerationAllow"
+block = "tests/twin-go.sh ./internal/hostd TestOutboxStaleGenerationBlock"
+invariants = [1, 9, 15]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "ledger-fail-closed"
+title = "if the request ledger can't be written the handler does not run, so a restart can't replay under a new ULID"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestLedgerFailClosedAllow"
+block = "tests/twin-go.sh ./internal/hostd TestLedgerFailClosedBlock"
+invariants = [20]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "msg-not-into-menu"
+title = "a message is typed only into a pane at its input prompt; a menu (permission prompt, question) is never answered by a stamp's keystrokes"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestMsgNotIntoMenuAllow"
+block = "tests/twin-go.sh ./internal/msg TestMsgNotIntoMenuBlock"
+invariants = [5, 6]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "idle-per-generation"
+title = "a resumed session's new generation is idle only after ITS OWN Stop, never on the old generation's"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/journal TestIdleIsPerGenerationAllow"
+block = "tests/twin-go.sh ./internal/journal TestIdleIsPerGenerationBlock"
+invariants = [5, 6]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "idle-notification-type"
+title = "after a Stop, a Notification of type idle_prompt stays idle; permission_prompt and any other (or untyped) one means a menu is up"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/journal TestIdleNotificationTypeAllow"
+block = "tests/twin-go.sh ./internal/journal TestIdleNotificationTypeBlock"
+invariants = [5, 6]
+backends = ["unit"]
+where = "hp"
+
+# ---- review of PR #4 (n1-g): twins for what the independent review found. Direct mode: not evidence. ----
+
+[[rule]]
+id = "journal-write-failure"
+title = "a failed journal write or fsync is cut back (or the journal refuses appends): no half line, no reused seq, acknowledged records survive a restart"
+suite = "verbs"
+allow = "tests/twin-go.sh ./internal/journal TestFailedWriteRollbackAllow"
+block = "tests/twin-go.sh ./internal/journal TestFailedWriteIsRolledBackAndNoSeqIsReusedBlock"
+invariants = [28]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "idle-restart-midnight"
+title = "after a restart across UTC midnight a pane's idle state is today's last hook, not yesterday's (a menu is never taken for idle)"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/journal TestIdleAfterRestartAcrossMidnightAllow"
+block = "tests/twin-go.sh ./internal/journal TestIdleAfterRestartAcrossMidnightUsesTheNewestEventBlock"
+invariants = [6, 10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "fence-event-budget"
+title = "one outbox can journal only a bounded rate of events; the rest is dropped and counted"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestFenceEventsWithinTheBudgetAreAllJournaledAllow"
+block = "tests/twin-go.sh ./internal/hostd TestFenceEventsHaveABudgetBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "ended-generation-last-words"
+title = "an ended generation's final ccf.* requests and hook events are kept; it cannot send messages, push or grant"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestEndedGenerationsLastWordsAreKeptButItCannotActAllow"
+block = "tests/twin-go.sh ./internal/hostd TestRequestsOfAnEndedSessionAreStale"
+invariants = [28, 11]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "replace-atomic"
+title = "session.replace touches nothing mid-turn, and a failed stop, wait or launch leaves a record that says what is true"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/start TestReplaceStartsTheNextGenerationAfterTheOldOneClosed"
+block = "tests/twin-go.sh ./internal/daemonapi TestReplaceMidTurnIs409AndTouchesNothing"
+invariants = [11]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "hub-fallback-realm"
+title = "the bus fallback never covers a label some ccsbx record holds (another realm, or between generations)"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestHubFallbackReachesAnUnfencedManagerAllow"
+block = "tests/twin-go.sh ./internal/msg TestHubFallbackNeverCoversALabelACcsbxRecordHoldsBlock"
+invariants = [6, 22]
+backends = ["unit"]
+where = "hp"
+
+# The entry point exists and is scoped; the downlink READER (B10/B11/M2b) is not built, so a row
+# for "the reader uses DeliverRelayed, never DeliverOwner" stays pending until it is.
+[[rule]]
+id = "relay-downlink-scope"
+title = "a relayed message goes through the scope rule and is stamped fenced, never 'owner device'"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestRelayedMessageInScopeAllow"
+block = "tests/twin-go.sh ./internal/msg TestRelayedMessageIsScopedAndNeverStampedOwnerBlock"
+invariants = [6, 13, 22]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "relay-reader-uses-relayed-entry"
+title = "the hub downlink reader delivers only through DeliverRelayed (B10/B11/M2b: not built)"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-caps-lifetime"
+title = "the signer refuses a token lifetime over its cap"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesOverLongExpiry$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-peer-is-hostd"
+title = "the signer answers only the allowed uid, from SO_PEERCRED"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesPeerThatIsNotTheAllowedUser$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-request-cap"
+title = "an oversized or stalled signer request is refused, and a client need not half-close"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestClientThatDoesNotHalfClose$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesOversizedRequest$|TestStalledClientTimesOut$|TestRefusesDataAfterTheRequest$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-key-checked"
+title = "the signer refuses a key or key directory with a loose mode, another owner or a symlink"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestKeyFileAccepted$'"
+block = "tests/go-test.sh ./internal/signer 'TestKeyFileIsChecked$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-scope-required"
+title = "the signer will not serve without a valid scope file it can trust"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestKeyFileAccepted$'"
+block = "tests/go-test.sh ./internal/signer 'TestWontServeWithoutAScope$|TestScopeFileIsChecked$|TestOversizedScopeIsRefused$|TestScopeNamesAreChecked$|TestWriteScopeDestinationMustBeExplicit$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-socket-from-systemd"
+title = "the signer serves only on a socket systemd handed it (LISTEN_PID, LISTEN_FDS)"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSystemdSocketAccepted$'"
+block = "tests/go-test.sh ./internal/signer 'TestSystemdSocketRefusals$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-env-is-strict"
+title = "a CCSBX_SIGNER_ value that does not parse stops the signer, never a default"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestWriteScopeCommand$'"
+block = "tests/go-test.sh ./internal/signer 'TestHelpAndEnv$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-accept-failure-exits"
+title = "a permanent Accept error ends the signer non-zero instead of looping"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestPermanentAcceptErrorEndsServe$'"
+invariants = [12, 27]
 backends = ["unit"]
 where = "any"

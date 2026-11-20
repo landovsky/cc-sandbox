@@ -26,6 +26,7 @@ type LaunchSpec struct {
 	Workdir     Workdir         `json:"workdir"`
 	Profile     string          `json:"profile"`
 	Billing     string          `json:"billing"`
+	Grants      []string        `json:"grants"` // the grant names the node's Grants: line asks for (decided at the doors, M1)
 	MsgScope    json.RawMessage `json:"msg_scope"`
 	Client      json.RawMessage `json:"client"`
 	Brief       *Brief          `json:"brief"`
@@ -91,6 +92,7 @@ const (
 	BadSpec            = "bad_spec"
 	WrongMachine       = "wrong_machine"
 	NotBuilt           = "not_built"
+	NotRunning         = "not_running"
 	ImageNotPinned     = "image_not_pinned"
 )
 
@@ -107,6 +109,7 @@ func refuse(code, format string, a ...any) *Refusal {
 }
 
 var (
+	realmRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
 	labelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_./-]{0,79}$`)
 	ridRe   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9:_.-]{0,99}$`)
 	sidRe   = regexp.MustCompile(`^s[0-9a-z]{6,16}$`)
@@ -136,6 +139,14 @@ func ParseSpec(b []byte) (*LaunchSpec, error) {
 		return nil, refuse(BadSpec, "harness must be claude, got %q", s.Harness)
 	case s.Profile == "":
 		return nil, refuse(BadSpec, "profile is required")
+	}
+	// One normalised realm everywhere (journal, verb queue, directory): an empty one is the
+	// production realm, and anything the verb queue would refuse is refused here, at start.
+	if s.Realm == "" {
+		s.Realm = "production"
+	}
+	if !realmRe.MatchString(s.Realm) {
+		return nil, refuse(BadSpec, "realm %q is not valid (lowercase letters, digits, dash)", s.Realm)
 	}
 	return &s, nil
 }

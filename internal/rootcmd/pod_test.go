@@ -147,8 +147,8 @@ func (f *fx) writeConfigPod(t *testing.T, side bool, extra string) {
 	if side {
 		img = fmt.Sprintf("k8s_side_image = %q\n", sideImg)
 	}
-	f.writeConfig(fmt.Sprintf("kubectl = %q\nkubeconfig = %q\nk8s_conn = %q\nkeys_user = \"ccsbx-keys\"\nk8s_namespace = \"cc-sandbox\"\n%s%shub_secret = %q\nverbs = [\"run\", \"stop\", \"attach\", \"pod-create\", \"pod-load\", \"pod-stop\", \"pod-status\"]\n",
-		f.dir+"/bin/kubectl", f.dir+"/keys/launcher.kubeconfig", f.dir+"/etc/k8s-conn.json", img, extra, f.dir+"/etc/hub.secret"))
+	f.writeConfig(fmt.Sprintf("kubectl = %q\nkubeconfig = %q\nk8s_conn = %q\nlaunch_user = \"ccsbx-launch\"\nk8s_namespace = \"cc-sandbox\"\n%s%shub_secret = %q\nverbs = [\"run\", \"stop\", \"attach\", \"pod-create\", \"pod-load\", \"pod-stop\", \"pod-status\"]\n",
+		f.dir+"/bin/kubectl", f.dir+"/launch/launcher.kubeconfig", f.dir+"/etc/k8s-conn.json", img, extra, f.dir+"/etc/hub.secret"))
 	// the config rewrite made a fresh Deps: carry over the k8s fakes of newK8sFx
 	f.d.LookupUser, f.d.LivePodUID, f.d.DropPrivs, f.d.Exec = old.LookupUser, old.LivePodUID, old.DropPrivs, old.Exec
 }
@@ -191,7 +191,7 @@ func (pf *podFx) refused(why, verb, msg string) {
 
 // ---- pod-create ----
 
-func TestPodCreateMakesOnePodAsTheKeysUserAndPrintsItsUID(t *testing.T) {
+func TestPodCreateMakesOnePodAsTheLaunchUserAndPrintsItsUID(t *testing.T) {
 	pf := newPodFx(t)
 	pf.rec.PodUID = ""
 	pf.writeRecord()
@@ -206,7 +206,7 @@ func TestPodCreateMakesOnePodAsTheKeysUserAndPrintsItsUID(t *testing.T) {
 	if s.Sid != sid || s.Gen != 2 || s.FenceImage != goodImage || s.SideImage != sideImg || s.KnownUID != "" || !s.HostUsersFalse || s.MemoryMB != 4096 || s.CPU != 2 {
 		t.Errorf("spec %+v", s)
 	}
-	if len(pf.dropped) != 1 || pf.dropped[0] != [2]int{keysUID, keysGID} {
+	if len(pf.dropped) != 1 || pf.dropped[0] != [2]int{launchUID, launchGID} {
 		t.Errorf("dropped %v", pf.dropped)
 	}
 }
@@ -243,7 +243,7 @@ func TestPodCreateRefusals(t *testing.T) {
 		{"a kubeconfig others can write", "kubeconfig", func(pf *podFx) {
 			pf.rec.PodUID = ""
 			pf.writeRecord()
-			os.Chmod(pf.dir+"/keys/launcher.kubeconfig", 0o666)
+			os.Chmod(pf.dir+"/launch/launcher.kubeconfig", 0o666)
 		}},
 	} {
 		pf := newPodFx(t)
@@ -267,7 +267,7 @@ func TestPodLoadWaitsThenMintsThenLoadsWithTheRecordedUID(t *testing.T) {
 	pf := newPodFx(t)
 	pf.pod.phases = []k8s.Status{{Phase: "Pending"}, {Phase: "Running", FenceReady: true}, ready}
 	start0 := pf.clock
-	// once privileges are dropped the keys user cannot read root's 0600 secret: simulate that, so a
+	// once privileges are dropped the launch user cannot read root's 0600 secret: simulate that, so a
 	// read of it after the drop would fail the verb
 	dp := pf.d.DropPrivs
 	pf.d.DropPrivs = func(u, g int) error { os.Chmod(pf.dir+"/etc/hub.secret", 0); return dp(u, g) }
@@ -304,22 +304,13 @@ func TestPodLoadRefusesWithoutTheRecordedUIDAndMintsNothing(t *testing.T) {
 	pf.rec.PodUID = ""
 	pf.writeRecord()
 	pf.refused("no UID recorded", "pod-load", "no pod UID recorded")
-	pf = newPodFx(t)
-	pf.pod.liveUID = "a-planted-pod"
-	pf.refused("another pod under the name", "pod-load", "pod_conflict")
-	pf = newPodFx(t)
-	pf.pod.liveUID = ""
-	pf.refused("a pod with no UID", "pod-load", "pod_conflict")
-	for _, p := range []*podFx{pf} {
-		if len(p.minted) != 0 || len(p.pod.loads) != 0 {
-			t.Error("a token was minted or sent for a pod that is not the recorded one")
+	for why, uid := range map[string]string{"another pod under the name": "a-planted-pod", "a pod with no UID": ""} {
+		pf = newPodFx(t)
+		pf.pod.liveUID = uid
+		pf.refused(why, "pod-load", "pod_conflict")
+		if len(pf.minted) != 0 || len(pf.pod.loads) != 0 || strings.Contains(pf.seq(), "mint") || len(pf.hub) != 0 {
+			t.Errorf("%s: a token was minted, a relay registered or a load sent (order %s)", why, pf.seq())
 		}
-	}
-	pf = newPodFx(t)
-	pf.pod.liveUID = "a-planted-pod"
-	pf.call("pod-load", sid)
-	if len(pf.minted) != 0 || len(pf.pod.loads) != 0 || strings.Contains(pf.seq(), "mint") {
-		t.Errorf("order %s", pf.seq())
 	}
 }
 

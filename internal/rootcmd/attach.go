@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
+	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
 var termRe = regexp.MustCompile(`^[A-Za-z0-9._+-]{1,40}$`)
@@ -24,32 +25,38 @@ func (e *env) attachCmd() *cli.Command {
   Takes only the sid; --read-only and every other flag are refused (exit 64). The caller must own
   the session (or be the service user). Detach with the outer tmux's own controls.
   A session whose record says backend "k8s" (a pod) is attached with kubectl exec instead, as the
-  keys user; config keys kubectl, kubeconfig, k8s_conn, keys_user, k8s_namespace (see the runbook).`,
+  launch user; config keys kubectl, kubeconfig, k8s_conn, launch_user, k8s_namespace (see the runbook).`,
 		Run: func(_ *cli.Flags, args []string, _, stderr io.Writer) int {
 			sid, ok := oneSid("attach", args, stderr)
 			if !ok {
 				return cli.ExitUsage
 			}
-			if err := e.attach(sid); err != nil {
+			code, err := e.attach(sid)
+			if err != nil {
 				return fail(stderr, "attach", err)
 			}
-			return cli.ExitOK // not reached when Exec succeeds
+			return code // docker: not reached when Exec succeeds; a pod: the session's exit status
 		},
 	}
 }
 
-func (e *env) attach(sid string) error {
+func (e *env) attach(sid string) (int, error) {
 	w, err := e.prelude("attach")
 	if err != nil {
-		return err
+		return 0, err
 	}
 	rec, err := e.sessionAny(w, sid)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if rec.Backend == "k8s" {
 		return e.attachK8s(w, rec)
 	}
+	return 0, e.attachDocker(w, rec)
+}
+
+func (e *env) attachDocker(w who, rec *start.Record) error {
+	sid := rec.Sid
 	tmux, err := e.cfg.binary(e.cfg.Tmux)
 	if err != nil {
 		return err

@@ -135,6 +135,9 @@ type fx struct {
 	execs             []execCall
 	dropped           [][2]int
 	dropErr           error
+	sessions          []AttachSpec
+	sessionCode       int
+	sessionErr        error
 }
 
 // vtmp is a directory under /var/tmp: /tmp is a fixed mount point of the fence, so a worktree

@@ -1,6 +1,6 @@
 // pod_real.go wires the pod verbs to the real cluster and the real signer: a CA-pinned REST client for
-// create/get/delete, kubectl exec (as the keys user) for the sidecar load, and the signer client for
-// the token. Only reached after the drop to the keys user; the tests replace all of it.
+// create/get/delete, kubectl exec (as the launch user) for the sidecar load, and the signer client for
+// the token. Only reached after the drop to the launch user; the tests replace all of it.
 package rootcmd
 
 import (

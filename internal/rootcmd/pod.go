@@ -1,7 +1,7 @@
 // pod.go: the pod launcher's verbs (F2w): `pod-create`, `pod-load` and `pod-stop`, each taking one
 // session id. They are what lets hostd (uid ccsbx, no kubeconfig, no secrets) start, load and end a
-// session that runs as a pod on future-two: root validates the record and every file the keys user will
-// read, becomes the keys user (ccsbx-keys, who holds the launcher kubeconfig and token and may ask the
+// session that runs as a pod on future-two: root validates the record and every file the launch user will
+// read, becomes the launch user (ccsbx-launch, who holds the launcher kubeconfig and token and may ask the
 // signer), and does the cluster work in that process.
 //
 // Why the record is believed. hostd writes `pod_uid` into the record (the helper-mode rule: hostd
@@ -94,7 +94,7 @@ func (e *env) podCreateCmd() *cli.Command {
 		Recipes: `  sudo -n /usr/local/sbin/ccsbx-root pod-create s0k1dry66qg
   Takes only the sid. Refuses a record that already has a pod_uid (one pod per generation), a profile
   or image that is not approved, and a pod already under the name (pod_conflict, naming it). Creates
-  the pod as the keys user and sends nothing secret; hostd records the UID, then runs pod-load.`,
+  the pod as the launch user and sends nothing secret; hostd records the UID, then runs pod-load.`,
 		Run: func(_ *cli.Flags, args []string, stdout, stderr io.Writer) int {
 			sid, ok := oneSid("pod-create", args, stderr)
 			if !ok {
@@ -153,8 +153,8 @@ func (e *env) podCreate(sid string, stdout io.Writer) error {
 	if _, err := k8s.DefaultConfig().PodFor(spec); err != nil {
 		return refuse("the pod would break the cluster's contract: %v", err)
 	}
-	if err := e.d.DropPrivs(kc.keysUID, kc.keysGID); err != nil {
-		return fmt.Errorf("cannot become %s: %v", e.cfg.KeysUser, err)
+	if err := e.d.DropPrivs(kc.launchUID, kc.launchGID); err != nil {
+		return fmt.Errorf("cannot become %s: %v", e.cfg.LaunchUser, err)
 	}
 	api, err := e.d.NewPod(e.cfg, kc)
 	if err != nil {
@@ -175,7 +175,7 @@ func (e *env) podLoadCmd() *cli.Command {
 		Summary: "wait for the pod, then mint the session token in-process and load it into the sidecar",
 		Recipes: `  sudo -n /usr/local/sbin/ccsbx-root pod-load s0k1dry66qg
   Takes only the sid; the record must hold the pod_uid pod-create printed. Waits up to k8s_ready_seconds
-  (default 120, max 600) for both containers, then asks the signer for the token as the keys user and
+  (default 120, max 600) for both containers, then asks the signer for the token as the launch user and
   sends it to the sidecar on exec stdin. Exit 4: the pod did not come up (nothing was minted; delete it
   with pod-stop). Exit 2: the live pod's UID is not the recorded one (pod_conflict).`,
 		Run: func(_ *cli.Flags, args []string, stdout, stderr io.Writer) int {
@@ -220,7 +220,7 @@ func (e *env) podLoad(sid string, stdout io.Writer) error {
 		return err
 	}
 	// The hub's admin secret is root's (0600): it is read here, before the drop, into memory, and used
-	// below, in this process as the keys user, to register the relay for the generation key made there.
+	// below, in this process as the launch user, to register the relay for the generation key made there.
 	// Neither the secret nor the relay token is ever printed, and hostd sees neither.
 	gdir := filepath.Join(e.cfg.RunDir, "s", sid, "g"+strconv.Itoa(rec.Gen))
 	if err := e.ensureRunDir(); err != nil {
@@ -237,8 +237,8 @@ func (e *env) podLoad(sid string, stdout io.Writer) error {
 		e.audit("relay-mint", sid, rec.Gen, "", "no secret")
 		return &codeError{exitHub, "the hub admin secret is not usable: " + err.Error()}
 	}
-	if err := e.d.DropPrivs(kc.keysUID, kc.keysGID); err != nil {
-		return fmt.Errorf("cannot become %s: %v", e.cfg.KeysUser, err)
+	if err := e.d.DropPrivs(kc.launchUID, kc.launchGID); err != nil {
+		return fmt.Errorf("cannot become %s: %v", e.cfg.LaunchUser, err)
 	}
 	api, err := e.d.NewPod(e.cfg, kc)
 	if err != nil {
@@ -380,8 +380,8 @@ func (e *env) podStop(sid string, stdout io.Writer) error {
 		return err
 	}
 	e.revokeRelay(rec.Sid, rec.Gen) // as root, before the drop: the hub secret is root's; best effort
-	if err := e.d.DropPrivs(kc.keysUID, kc.keysGID); err != nil {
-		return fmt.Errorf("cannot become %s: %v", e.cfg.KeysUser, err)
+	if err := e.d.DropPrivs(kc.launchUID, kc.launchGID); err != nil {
+		return fmt.Errorf("cannot become %s: %v", e.cfg.LaunchUser, err)
 	}
 	api, err := e.d.NewPod(e.cfg, kc)
 	if err != nil {
@@ -439,8 +439,8 @@ func (e *env) podStatus(sid string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	if err := e.d.DropPrivs(kc.keysUID, kc.keysGID); err != nil {
-		return fmt.Errorf("cannot become %s: %v", e.cfg.KeysUser, err)
+	if err := e.d.DropPrivs(kc.launchUID, kc.launchGID); err != nil {
+		return fmt.Errorf("cannot become %s: %v", e.cfg.LaunchUser, err)
 	}
 	api, err := e.d.NewPod(e.cfg, kc)
 	if err != nil {

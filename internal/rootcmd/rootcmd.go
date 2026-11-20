@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -78,10 +79,10 @@ type Deps struct {
 	Mounter Mounter
 	HomeOf  func(uid int) (string, error)
 	// LivePodUID reads the UID of a session's pod from the API server (called after the drop to the
-	// keys user, who alone can read the launcher token).
+	// launch user, who alone can read the launcher token).
 	LivePodUID func(conn *k8s.ConnConfig, namespace, sid string, gen int) (string, error)
 	// NewPod builds the pod API (REST + kubectl) and Mint the sidecar's secrets; both are used only
-	// after the drop to the keys user, who holds the token, the kubeconfig and the signer socket.
+	// after the drop to the launch user, who holds the token, the kubeconfig and the signer socket.
 	NewPod func(cfg *Config, kc *k8sCtx) (PodAPI, error)
 	// Mint makes the sidecar's one payload: the session token and its generation key (made here), and the
 	// relay token, which register(pub) obtains from the hub for that key's public half.
@@ -92,6 +93,11 @@ type Deps struct {
 	// revoke (never a token or secret). nil: production defaults.
 	Hub   *http.Client
 	Audit io.Writer
+	// SelfPath is this binary's own path (re-executed as the launch user for a pod attach); AttachSession
+	// runs a pod attach: the launch user's kubectl on a pty, the owner's terminal served by a credential-
+	// less process through the terminal filter. It returns the session's exit status.
+	SelfPath      func() (string, error)
+	AttachSession func(AttachSpec) (int, error)
 }
 
 // App builds the command table for a loaded config.
@@ -101,7 +107,7 @@ func App(cfg *Config, d *Deps, getenv func(string) string) *cli.App {
 		Name: "ccsbx-root", Summary: "the fixed-verb root door for the fence (U0): run stop renew gc attach exec-token pod-create pod-load pod-stop pod-status relay-mint",
 		Version: "dev", Getenv: getenv, EnvPrefix: "CCSBX_ROOT_",
 		Cmds: []*cli.Command{
-			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(), e.relayMintCmd(), e.podCreateCmd(), e.podLoadCmd(), e.podStopCmd(), e.podStatusCmd(),
+			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(), e.relayMintCmd(), e.attachExecCmd(), e.podCreateCmd(), e.podLoadCmd(), e.podStopCmd(), e.podStatusCmd(),
 			e.notWired("renew", "renew the machine's credentials (needs the signer, U0b)"),
 			e.notWired("exec-token", "mint an exec token for one session (needs the signer, U0b)"),
 		},
@@ -226,7 +232,7 @@ func Real(getenv func(string) string) *Deps {
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
 		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
-		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, Sleep: time.Sleep, Now: time.Now,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, Sleep: time.Sleep, Now: time.Now, SelfPath: selfPath, AttachSession: realAttachSession,
 	}
 }
 
@@ -264,4 +270,12 @@ func sameNS(a, b string) (bool, error) {
 		return false, err
 	}
 	return la == lb, nil
+}
+
+func selfPath() (string, error) {
+	p, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(p)
 }

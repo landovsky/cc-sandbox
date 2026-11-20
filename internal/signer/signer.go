@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -41,12 +42,15 @@ type Config struct {
 	// no token it could hold together with a key for a pod session.
 	KeysUID      *uint32
 	KeysMachines []string
-	MaxRequest   int // bytes
-	ReadTimeout  time.Duration
-	MaxConns     int           // concurrent connections (default 64)
-	AcceptPause  time.Duration // wait after a failed Accept (default 100ms; tests shorten it)
-	Now          func() time.Time
-	Logf         func(format string, a ...any)
+	// OwnUID is the signer's own uid (the machine key's owner); nil means os.Getuid(). The keys peer
+	// must be someone else: a peer that can read the key file is not constrained by any rule here.
+	OwnUID      *uint32
+	MaxRequest  int // bytes
+	ReadTimeout time.Duration
+	MaxConns    int           // concurrent connections (default 64)
+	AcceptPause time.Duration // wait after a failed Accept (default 100ms; tests shorten it)
+	Now         func() time.Time
+	Logf        func(format string, a ...any)
 }
 
 // maxAcceptFailures consecutive Accept errors end Serve (about two seconds at the default pause).
@@ -86,6 +90,13 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.KeysUID != nil && (len(cfg.KeysMachines) == 0 || *cfg.KeysUID == cfg.AllowUID) {
 		return nil, errors.New("signer: --keys-peer-user needs --keys-peer-machines and a uid other than --allow-user")
+	}
+	own := uint32(os.Getuid())
+	if cfg.OwnUID != nil {
+		own = *cfg.OwnUID
+	}
+	if cfg.KeysUID != nil && *cfg.KeysUID == own {
+		return nil, errors.New("signer: --keys-peer-user is the signer's own uid: that user can read the machine key, so no rule here can bind it; give the pod launcher a uid of its own")
 	}
 	if cfg.KeysUID == nil && len(cfg.KeysMachines) > 0 {
 		return nil, errors.New("signer: --keys-peer-machines without --keys-peer-user")

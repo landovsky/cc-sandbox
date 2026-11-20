@@ -39,15 +39,16 @@ type Config struct {
 	BaseURL      string // the forwarder's model route written into managed settings
 	FetchURL     string
 	StatusOff    bool // `status = "off"` in the file: the read-only status verb is disabled by itself
-	// k8s sessions (F5): kubectl and the launcher's kubeconfig, run as KeysUser (who holds the token).
+	// k8s sessions (F5): kubectl and the launcher's kubeconfig, run as LaunchUser (who holds the token).
 	Kubectl      string // absolute kubectl binary, root-owned
-	Kubeconfig   string // the launcher kubeconfig under ccsbx-keys: owned by KeysUser or root, not writable by others
+	Kubeconfig   string // the launcher kubeconfig under ccsbx-launch: owned by LaunchUser or root, not writable by others
 	K8sConn      string // root-owned JSON {server, ca_file, token_file}; the server and CA are passed to kubectl on its command line
-	KeysUser     string // the user that holds the kubeconfig and the launcher token
+	LaunchUser   string // the user that holds the kubeconfig and the launcher token
 	K8sNamespace string
 	HubURL       string // the session-bus hub, loopback only (relay-mint, relay revoke)
 	HubSecret    string // the hub admin secret file: root-owned, 0600
-	KeysRunDir   string // keys-user-owned 0700 directory for the host-side tmux sockets of pod attaches
+	TermUser     string // the credential-less user the owner-terminal side of a pod attach runs as (ccsbx-term)
+	SignerUser   string // the signer's own user (ccsbx-keys): holds the machine key; the launch user must not be it
 	// the pod launcher (F2w)
 	K8sMachine      string // the machine name pod sessions are placed on (their record's spec.machine)
 	K8sReadySeconds int    // how long pod-load waits for both containers (1..600)
@@ -57,7 +58,7 @@ type Config struct {
 	K8sWorktreeMB   int
 	K8sTokenHours   int      // lifetime of the pod session's token (1..12)
 	K8sAudiences    []string // the token's audiences
-	SignerSocket    string   // the signer's unix socket, asked as the keys user
+	SignerSocket    string   // the signer's unix socket, asked as the launch user
 	MinUID          int      // a session record must belong to a uid at least this large (never root or a system user)
 	TrustedUID      int
 }
@@ -71,7 +72,7 @@ func Defaults() Config {
 		Verbs:    append([]string(nil), Verbs...),
 		StateDir: "/var/lib/ccsbx", RunDir: "/var/lib/ccsbx-run",
 		Docker: "/usr/bin/docker", Tmux: "/usr/bin/tmux", TmuxSocket: "/run/ccsbx/tmux.sock",
-		PinsFile: "/etc/ccsbx/pins.toml", SeccompFile: "/etc/ccsbx/seccomp.json", Kubectl: "/usr/local/bin/kubectl", Kubeconfig: "/var/lib/ccsbx-keys/launcher.kubeconfig", K8sConn: "/etc/ccsbx/k8s-conn.json", KeysUser: "ccsbx-keys", K8sNamespace: "cc-sandbox", HubURL: "http://127.0.0.1:4011", HubSecret: "/etc/ccsbx/hub-admin.secret", KeysRunDir: "/run/ccsbx-keys",
+		PinsFile: "/etc/ccsbx/pins.toml", SeccompFile: "/etc/ccsbx/seccomp.json", Kubectl: "/usr/local/bin/kubectl", Kubeconfig: "/var/lib/ccsbx-launch/launcher.kubeconfig", K8sConn: "/etc/ccsbx/k8s-conn.json", LaunchUser: "ccsbx-launch", K8sNamespace: "cc-sandbox", HubURL: "http://127.0.0.1:4011", HubSecret: "/etc/ccsbx/hub-admin.secret", TermUser: "ccsbx-term", SignerUser: "ccsbx-keys",
 		K8sMachine: "future-two", K8sReadySeconds: 120, K8sCPU: 2, K8sEphemeralMB: 20480, K8sWorktreeMB: 10240, K8sTokenHours: 8,
 		K8sAudiences: []string{"ccsbx-model", "ccsbx-egress"}, SignerSocket: "/run/ccsbx-signer/sign.sock",
 		ServiceUser: "ccsbx", BaseURL: "http://fwd:8080", MinUID: 1000,
@@ -81,8 +82,8 @@ func Defaults() Config {
 var configKeys = map[string]bool{
 	"allowed_roots": true, "verbs": true, "state_dir": true, "run_dir": true, "docker": true, "tmux": true,
 	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true, "min_uid": true, "seccomp_profile": true, "status": true,
-	"kubectl": true, "kubeconfig": true, "k8s_conn": true, "keys_user": true, "k8s_namespace": true,
-	"k8s_machine": true, "hub_url": true, "hub_secret": true, "keys_run_dir": true, "k8s_ready_seconds": true, "k8s_side_image": true, "k8s_cpu": true, "k8s_ephemeral_mb": true, "k8s_worktree_mb": true,
+	"kubectl": true, "kubeconfig": true, "k8s_conn": true, "launch_user": true, "k8s_namespace": true,
+	"k8s_machine": true, "hub_url": true, "hub_secret": true, "term_user": true, "signer_user": true, "k8s_ready_seconds": true, "k8s_side_image": true, "k8s_cpu": true, "k8s_ephemeral_mb": true, "k8s_worktree_mb": true,
 	"k8s_token_hours": true, "k8s_audiences": true, "signer_socket": true,
 }
 
@@ -145,7 +146,7 @@ func LoadConfig(path string, trustedUID int) (*Config, error) {
 		return out, true, nil
 	}
 	for k, dst := range map[string]*string{"state_dir": &c.StateDir, "run_dir": &c.RunDir, "docker": &c.Docker, "tmux": &c.Tmux,
-		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "seccomp_profile": &c.SeccompFile, "service_user": &c.ServiceUser, "kubectl": &c.Kubectl, "kubeconfig": &c.Kubeconfig, "k8s_conn": &c.K8sConn, "keys_user": &c.KeysUser, "k8s_namespace": &c.K8sNamespace, "k8s_machine": &c.K8sMachine, "hub_url": &c.HubURL, "hub_secret": &c.HubSecret, "keys_run_dir": &c.KeysRunDir, "k8s_side_image": &c.K8sSideImage, "signer_socket": &c.SignerSocket, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
+		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "seccomp_profile": &c.SeccompFile, "service_user": &c.ServiceUser, "kubectl": &c.Kubectl, "kubeconfig": &c.Kubeconfig, "k8s_conn": &c.K8sConn, "launch_user": &c.LaunchUser, "k8s_namespace": &c.K8sNamespace, "k8s_machine": &c.K8sMachine, "hub_url": &c.HubURL, "hub_secret": &c.HubSecret, "term_user": &c.TermUser, "signer_user": &c.SignerUser, "k8s_side_image": &c.K8sSideImage, "signer_socket": &c.SignerSocket, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
 		if err := str(k, dst); err != nil {
 			return nil, err
 		}
@@ -232,7 +233,7 @@ func (c *Config) validate(roots []string) error {
 			return fmt.Errorf("unknown verb %q", v)
 		}
 	}
-	for name, p := range map[string]string{"state_dir": c.StateDir, "run_dir": c.RunDir, "docker": c.Docker, "tmux": c.Tmux, "tmux_socket": c.TmuxSocket, "pins_file": c.PinsFile, "seccomp_profile": c.SeccompFile, "signer_socket": c.SignerSocket, "hub_secret": c.HubSecret, "keys_run_dir": c.KeysRunDir, "kubectl": c.Kubectl, "kubeconfig": c.Kubeconfig, "k8s_conn": c.K8sConn} {
+	for name, p := range map[string]string{"state_dir": c.StateDir, "run_dir": c.RunDir, "docker": c.Docker, "tmux": c.Tmux, "tmux_socket": c.TmuxSocket, "pins_file": c.PinsFile, "seccomp_profile": c.SeccompFile, "signer_socket": c.SignerSocket, "hub_secret": c.HubSecret, "kubectl": c.Kubectl, "kubeconfig": c.Kubeconfig, "k8s_conn": c.K8sConn} {
 		if err := backend.CheckPath(p); err != nil {
 			return fmt.Errorf("%s: %w", name, err)
 		}
@@ -246,8 +247,8 @@ func (c *Config) validate(roots []string) error {
 	if c.ServiceUser == "" || strings.ContainsAny(c.ServiceUser, ":/ \n") {
 		return fmt.Errorf("service_user %q", c.ServiceUser)
 	}
-	if c.KeysUser == "" || strings.ContainsAny(c.KeysUser, ":/ \n") || c.KeysUser == c.ServiceUser {
-		return fmt.Errorf("keys_user %q must be a user name other than the service user", c.KeysUser)
+	if c.LaunchUser == "" || strings.ContainsAny(c.LaunchUser, ":/ \n") || c.LaunchUser == c.ServiceUser {
+		return fmt.Errorf("launch_user %q must be a user name other than the service user", c.LaunchUser)
 	}
 	if !nsRe.MatchString(c.K8sNamespace) {
 		return fmt.Errorf("k8s_namespace %q is not a DNS label", c.K8sNamespace)

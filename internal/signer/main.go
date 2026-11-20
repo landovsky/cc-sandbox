@@ -58,7 +58,7 @@ Flags: (each also CCSBX_SIGNER_<NAME>, e.g. CCSBX_SIGNER_KEYS; a value that does
   --max-ttl D         longest token lifetime, at most 12h                          (default 12h)
   --allow-user U      user name or numeric uid allowed to ask: the exact uid, not group membership (default ccsbx)
   --allow-group G     optional: the caller's primary gid must ALSO be this group (name or gid)  (default: not checked)
-  --keys-peer-user U  a second allowed caller (name or uid): the pod launcher, ccsbx-keys. It may sign ONLY for
+  --keys-peer-user U  a second allowed caller (name or uid): the pod launcher, ccsbx-launch (never the signer's own user, which can read the machine key; refused). It may sign ONLY for
                       --keys-peer-machines and only tokens with a cnf (a generation key it holds itself, so
                       hostd never sees a pod session's token and key). Those machines are then closed to
                       --allow-user. Off by default; needs --keys-peer-machines, and a uid other than --allow-user.

@@ -687,6 +687,8 @@ func peers(t *testing.T, asHostd bool) *rig {
 	return newRig(t, func(c *Config) {
 		c.Scope.Machines = append(c.Scope.Machines, "future-two")
 		c.KeysMachines = []string{"future-two"}
+		sign := other + 100 // the signer's own uid: neither caller (the test process plays one of the two)
+		c.OwnUID = &sign
 		if asHostd {
 			c.AllowUID, c.KeysUID = me, &other
 		} else {
@@ -742,6 +744,8 @@ func TestThePodLauncherSignsOnlyPodSessionsBoundToAKey(t *testing.T) {
 func TestAThirdUIDIsRefusedEvenWithTheKeysPeerConfigured(t *testing.T) {
 	r := newRig(t, func(c *Config) {
 		a, b := uint32(os.Getuid())+1, uint32(os.Getuid())+2
+		own := uint32(os.Getuid()) + 100
+		c.OwnUID = &own
 		c.Scope.Machines = append(c.Scope.Machines, "future-two")
 		c.AllowUID, c.KeysUID, c.KeysMachines = a, &b, []string{"future-two"}
 	})
@@ -756,7 +760,8 @@ func TestKeysPeerConfigurationIsChecked(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	base := Config{Key: k, Audiences: []string{"a"}, MaxTTL: time.Hour, MaxRequest: 10, ReadTimeout: time.Second, AllowUID: me}
+	own := me + 100
+	base := Config{OwnUID: &own, Key: k, Audiences: []string{"a"}, MaxTTL: time.Hour, MaxRequest: 10, ReadTimeout: time.Second, AllowUID: me}
 	other := me + 1
 	for why, mod := range map[string]func(*Config){
 		"a keys peer with no machines":   func(c *Config) { c.KeysUID = &other },

@@ -5,18 +5,22 @@
 // directory, the worktree's own .git derived through a pinned descriptor), plus one `run` cannot see by itself:
 // the directory does not equal, contain or sit inside another live session's workdir.
 //
-// It writes nothing, takes no lock, reads no stdin and no environment. stdout is one line, the resolved absolute
-// path, on success only; stderr is one fixed line per refusal, with no path and no OS text (the path came
+// It writes nothing, takes no lock, reads no stdin and no environment. stdout is TWO lines on success, nothing
+// otherwise: the resolved absolute path, and the gitdir `ccsbx-root run` will derive for it (hostd records it:
+// run refuses a record whose gitdir is not the one it derives, so a path that passes here must come with it); stderr is one fixed line per refusal, with no path and no OS text (the path came
 // from a remote caller and root's errors name files). Exit 0: a worktree root; 2: refused; 3: could not tell
 // (a read error; hostd treats it as a refusal, never as "ok").
 package rootcmd
 
 import (
+	"errors"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/backend"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/start"
@@ -63,7 +67,7 @@ func (e *env) worktreeCheckCmd() *cli.Command {
 				fmt.Fprintln(stderr, "ccsbx-root worktree-check:", wcUsage.line)
 				return wcUsage.code
 			}
-			path, err := e.worktreeCheck(args[1])
+			path, gitdir, err := e.worktreeCheck(args[1])
 			if err != nil {
 				we, ok := err.(*wcErr)
 				if !ok {
@@ -73,75 +77,103 @@ func (e *env) worktreeCheckCmd() *cli.Command {
 				return we.code
 			}
 			fmt.Fprintln(stdout, path)
+			fmt.Fprintln(stdout, gitdir) // exactly what `run` derives from <path>/.git (empty: nothing to mount)
 			return cli.ExitOK
 		},
 	}
 }
 
-// worktreeCheck returns the resolved path of a worktree root, or the *wcErr that says why not.
-func (e *env) worktreeCheck(p string) (string, error) {
-	w, err := e.prelude("worktree-check")
-	if err != nil {
-		if _, ok := err.(*Refusal); ok {
-			return "", wcDisabled
+// worktreeCheck returns the resolved path of a worktree root and the gitdir `run` will derive from it ("" when
+// there is none to mount), or the *wcErr that says why not.
+//
+// The order is the point. First, rules that read nothing from the disk: the caller, the shape of the path, the
+// allowed root, no hidden component. A path that fails them is refused without a single stat, so the service
+// user (hostd) cannot use this verb to ask whether a file exists in the owner's ~/.ssh. Then everything that
+// depends on the disk (absent, not a directory, another user's, no .git, a symlink) is ONE answer: "not a git
+// worktree root". Only a lexical refusal and an overlap with a live session are told apart.
+func (e *env) worktreeCheck(p string) (path, gitdir string, err error) {
+	w, perr := e.prelude("worktree-check")
+	if perr != nil {
+		if _, ok := perr.(*Refusal); ok {
+			return "", "", wcDisabled
 		}
-		return "", wcCannot
+		return "", "", wcCannot
 	}
 	if w.uid != w.service && w.uid != 0 {
-		return "", wcCaller
+		return "", "", wcCaller
 	}
-	rp, err := cleanPath(p) // clean, absolute, no mount-spec character, no symlink anywhere in it
-	if err != nil {
-		return "", wcRoot
+	// lexical: no stat
+	if backend.CheckPath(p) != nil || !filepath.IsAbs(p) || filepath.Clean(p) != p {
+		return "", "", wcRoot
 	}
-	if e.cfg.insideRoot(rp) == "" {
-		return "", wcRoot
+	root := e.cfg.insideRoot(p)
+	if root == "" {
+		return "", "", wcRoot
 	}
-	st, err := os.Lstat(rp)
-	if err != nil {
-		return "", wcCannot
+	for _, c := range strings.Split(strings.TrimPrefix(p, root+string(filepath.Separator)), string(filepath.Separator)) {
+		if strings.HasPrefix(c, ".") {
+			return "", "", wcRoot // a hidden directory under a root (.ssh, .config, .git itself ...) is never a workdir
+		}
+	}
+	// from here the disk decides, and every "no" is the same line
+	rp, cerr := cleanPath(p) // no symlink anywhere in it
+	if cerr != nil {
+		return "", "", fsRefusal(cerr)
+	}
+	st, serr := os.Lstat(rp)
+	if serr != nil {
+		return "", "", fsRefusal(serr)
 	}
 	if !st.IsDir() {
-		return "", wcNotDir
+		return "", "", wcNoGit
 	}
-	owner, err := ownerUID(rp)
-	if err != nil {
-		return "", wcCannot
+	owner, oerr := ownerUID(rp)
+	if oerr != nil {
+		return "", "", fsRefusal(oerr)
 	}
-	if owner < e.cfg.MinUID || owner == w.service {
-		return "", wcOwner // a worktree belongs to a login user, never to root or a system user
+	// the worktree belongs to a login user and lies in that user's own home: run will ask for the session's
+	// owner, and that is the user whose home it is in, so "passes here" means "run accepts"
+	home, herr := e.d.HomeOf(owner)
+	if !loginUID(owner, e.cfg.MinUID, w.service) || herr != nil || home == "" ||
+		!strings.HasPrefix(rp, filepath.Clean(home)+string(filepath.Separator)) {
+		return "", "", wcNoGit
 	}
-	home, err := e.d.HomeOf(owner)
-	if err != nil {
-		return "", wcOwner
+	wd, _, werr := e.cfg.workdir(rp, owner, home) // the rules run applies: roots, owner, hidden home dirs, state and run dirs, fixed mounts
+	if werr != nil {
+		return "", "", fsRefusal(werr)
 	}
-	wd, _, err := e.cfg.workdir(rp, owner, home) // the rules run applies: roots, owner, hidden home dirs, state and run dirs, fixed mounts
-	if err != nil {
-		return "", wcRoot
-	}
-	wpin, err := pin(e.d.OpenDir, wd, owner) // held open: what is checked is what is looked at
-	if err != nil {
-		return "", wcNoGit
+	wpin, perr2 := pin(e.d.OpenDir, wd, owner) // held open: what is checked is what is looked at
+	if perr2 != nil {
+		return "", "", fsRefusal(perr2)
 	}
 	defer wpin.close()
-	gd, gp, err := e.gitdirOf(owner, wd, wpin, home)
-	if err != nil {
-		return "", wcNoGit // a .git that is a symlink, not host-owned, or a linked worktree that points elsewhere
+	gd, gp, gerr := e.gitdirOf(owner, wd, wpin, home)
+	if gerr != nil {
+		return "", "", fsRefusal(gerr) // a .git that is a symlink, not host-owned, not a git directory, or a linked worktree that points elsewhere
 	}
 	gp.close()
 	if gd == "" {
-		return "", wcNoGit // no .git of its own: a plain directory, a subdirectory of a repository, a parent of repositories
+		return "", "", wcNoGit // no .git of its own: a plain directory, a subdirectory of a repository, a parent of repositories
 	}
-	live, err := e.liveWorkdirs(w)
-	if err != nil {
-		return "", wcCannot
+	live, lerr := e.liveWorkdirs(w)
+	if lerr != nil {
+		return "", "", wcCannot
 	}
 	for _, o := range live {
 		if wd == o || strings.HasPrefix(wd, o+string(filepath.Separator)) || strings.HasPrefix(o, wd+string(filepath.Separator)) {
-			return "", wcOverlap
+			return "", "", wcOverlap
 		}
 	}
-	return wd, nil
+	return wd, gd, nil
+}
+
+// fsRefusal turns an error from looking at the disk into the one answer for "it is not a worktree root"; only an
+// error that is not a plain "no" (an I/O error) is "could not tell".
+func fsRefusal(err error) *wcErr {
+	if _, ok := err.(*Refusal); ok || os.IsNotExist(err) || errors.Is(err, syscall.ENOTDIR) || errors.Is(err, syscall.ELOOP) || errors.Is(err, syscall.EACCES) {
+		return wcNoGit
+	}
+	return wcCannot
 }
 
 // liveWorkdirs are the workdirs of the sessions that have not ended (root reads the daemon's records, as it does
@@ -171,3 +203,7 @@ func (e *env) liveWorkdirs(w who) ([]string, error) {
 	}
 	return out, nil
 }
+
+// loginUID: a worktree belongs to a login user: at or above min_uid, never the service user, never nobody (65534)
+// or anything above it.
+func loginUID(owner, min, service int) bool { return owner >= min && owner < 65534 && owner != service }

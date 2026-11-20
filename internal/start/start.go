@@ -100,7 +100,10 @@ type Daemon struct {
 	// own audit lines report a revoke that failed.
 	PodVerbsRevoke bool
 	// StartLimit bounds how long a pod start may be in flight (see startingLimit); 0: 15 minutes.
-	StartLimit  time.Duration
+	StartLimit time.Duration
+	// PodMaxLive caps the live pod sessions on their own (a pod holds up to 32 GiB of ephemeral storage and 4 GiB of memory on the shared
+	// node, far more than a docker session): machine_full above this many. 0: only MaxLive applies.
+	PodMaxLive  int
 	ReplaceWait time.Duration // how long Replace waits for the old fence to shut down (default 15s)
 	Now         func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").

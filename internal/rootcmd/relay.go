@@ -130,7 +130,10 @@ func (e *env) relayMint(sid, genS, pub string, after401 bool, stdout io.Writer) 
 	if err != nil {
 		return refuse("msg_scope of %s is not well formed: %v", sid, err)
 	}
-	// everything checked: only now is the secret read
+	// everything checked: only now is the secret read. A host with no hub refuses here, and what makes it refuse is
+	// the secret file being ABSENT (the no-hub installer deletes /etc/ccsbx/hub-admin.secret and writes no hub keys),
+	// not hub_url's default (http://127.0.0.1:4011): the secret is read, and its absence ends the verb, BEFORE
+	// anything is connected to.
 	secret, err := e.hubSecret()
 	if err != nil {
 		e.audit("relay-mint", sid, gen, pub, "no secret")

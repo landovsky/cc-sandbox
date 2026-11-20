@@ -23,6 +23,7 @@ type fakeRoot struct {
 	stopEr          error
 	uidOnDiskAtLoad string
 	gone            bool
+	stopGens        []int
 	goneEr          error
 }
 
@@ -37,7 +38,10 @@ func (f *fakeRoot) Load(sid string) error {
 	}
 	return f.loadEr
 }
-func (f *fakeRoot) Stop(sid string) error { f.calls = append(f.calls, "stop"); return f.stopEr }
+func (f *fakeRoot) Stop(sid string, gen int) error {
+	f.calls, f.stopGens = append(f.calls, "stop"), append(f.stopGens, gen)
+	return f.stopEr
+}
 func (f *fakeRoot) Gone(sid string) (bool, error) {
 	f.calls = append(f.calls, "gone")
 	return f.gone, f.goneEr
@@ -836,4 +840,64 @@ type stopHook struct {
 	during func()
 }
 
-func (s *stopHook) Stop(sid string) error { s.during(); return s.fakeRoot.Stop(sid) }
+func (s *stopHook) Stop(sid string, gen int) error { s.during(); return s.fakeRoot.Stop(sid, gen) }
+
+// Gate M: pods are far heavier than docker sessions, so they have a cap of their own
+func TestPodSessionsHaveACapOfTheirOwn(t *testing.T) {
+	d, _, _ := podDaemon(t)
+	d.PodMaxLive = 2
+	for i := 0; i < 2; i++ {
+		if _, err := d.Start(podSpec(func(s *LaunchSpec) {
+			s.RequestID, s.Label = "rid-p"+string(rune('a'+i)), "cc-sandbox:p"+string(rune('a'+i))
+		})); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := d.Start(podSpec(func(s *LaunchSpec) { s.RequestID, s.Label = "rid-pz", "cc-sandbox:pz" })); code(err) != MachineFull {
+		t.Errorf("a third pod: %v", err)
+	}
+	// docker sessions are not held to it
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID, s.Label = "rid-d", "cc-sandbox:docker" })); err != nil {
+		t.Errorf("a docker session: %v", err)
+	}
+}
+
+// N6: the unlocked cleanup tells pod-stop which generation it means: every pod-stop of a start names its own
+func TestEveryPodStopNamesItsGeneration(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	fr.loadEr = ErrPodNotReady
+	d.Start(podSpec(nil))
+	if len(fr.stopGens) != 1 || fr.stopGens[0] != 1 {
+		t.Errorf("the cleanup's pod-stop named generations %v", fr.stopGens)
+	}
+	d2, fr2, _ := podDaemon(t)
+	first, _ := d2.Start(podSpec(nil))
+	fr2.stopGens = nil
+	fr2.uid = "pod-uid-2"
+	d2.Start(resumeSpec(first.Sid, nil))
+	d2.StopPod(first.Sid)
+	if len(fr2.stopGens) != 2 || fr2.stopGens[0] != 1 || fr2.stopGens[1] != 2 {
+		t.Errorf("a resume stops generation 1, a stop generation 2: %v", fr2.stopGens)
+	}
+}
+
+// root refused because the session moved on (another_generation): the cleanup touches nothing
+func TestACleanupRefusedBecauseTheSessionMovedOnChangesNothing(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	l := logs(d)
+	fr.loadEr = errors.New("side load refused: bad key")
+	fr.stopEr = fmt.Errorf("%w: refused", ErrPodStale)
+	if _, err := d.Start(podSpec(nil)); err == nil {
+		t.Fatal("the start should fail")
+	}
+	files := d.recordFiles(t)
+	if len(files) != 1 {
+		t.Fatalf("records %v", files)
+	}
+	if rec, _ := d.Load(strings.TrimSuffix(files[0], ".json")); rec.Ended != nil || !rec.Starting {
+		t.Errorf("the record was changed by a cleanup that root refused as stale: %+v", rec)
+	}
+	if !strings.Contains(strings.Join(*l, "\n"), "moved on") {
+		t.Errorf("not said: %v", *l)
+	}
+}

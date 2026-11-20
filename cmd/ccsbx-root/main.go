@@ -41,7 +41,7 @@ func realMain(args []string) int {
 	cfg, err := rootcmd.LoadConfig(configPath, 0)
 	if err != nil {
 		// --help and version run nothing, so they need no config; everything else refuses
-		if len(args) > 0 && args[0] == "worktree-check" {
+		if len(args) > 0 && args[0] == "worktree-check" && !runsNothing(args) {
 			// hostd treats anything but 0 as a refusal; a root config that cannot be believed is "could not tell"
 			fmt.Fprintln(os.Stderr, "ccsbx-root worktree-check: cannot tell")
 			return 3

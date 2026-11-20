@@ -367,15 +367,26 @@ func (e *env) podStopCmd() *cli.Command {
 	return &cli.Command{
 		Name:    "pod-stop",
 		Summary: "delete the pod of a pod session by exact name and recorded UID (absent is fine)",
-		Recipes: `  sudo -n /usr/local/sbin/ccsbx-root pod-stop s0k1dry66qg
-  Takes only the sid. Works on an ended record too. A pod with another UID is left alone: pod_conflict
-  names it, and only its owner deletes it.`,
+		Recipes: `  sudo -n /usr/local/sbin/ccsbx-root pod-stop s0k1dry66qg [GEN]
+  Takes the sid and, optionally, the generation the caller means: if the session has moved on to another one
+  the verb refuses and touches nothing (hostd's unlocked cleanup of a failed start passes it, so it can never
+  delete the next generation's pod). Works on an ended record too. A pod with another UID is left alone:
+  pod_conflict names it, and only its owner deletes it.`,
 		Run: func(_ *cli.Flags, args []string, stdout, stderr io.Writer) int {
+			gen := 0
+			if len(args) == 2 {
+				if !genRe.MatchString(args[1]) {
+					fmt.Fprintln(stderr, "usage: ccsbx-root pod-stop <sid> [<gen>]")
+					return cli.ExitUsage
+				}
+				gen, _ = strconv.Atoi(args[1])
+				args = args[:1]
+			}
 			sid, ok := oneSid("pod-stop", args, stderr)
 			if !ok {
 				return cli.ExitUsage
 			}
-			if err := e.podStop(sid, stdout); err != nil {
+			if err := e.podStop(sid, gen, stdout); err != nil {
 				return fail(stderr, "pod-stop", err)
 			}
 			return cli.ExitOK
@@ -383,10 +394,13 @@ func (e *env) podStopCmd() *cli.Command {
 	}
 }
 
-func (e *env) podStop(sid string, stdout io.Writer) error {
+func (e *env) podStop(sid string, gen int, stdout io.Writer) error {
 	w, rec, err := e.podSession("pod-stop", sid)
 	if err != nil {
 		return err
+	}
+	if gen > 0 && rec.Gen != gen {
+		return refuse("session %s is at generation %d, not %d: nothing was stopped (another_generation)", sid, rec.Gen, gen)
 	}
 	if rec.PodUID == "" {
 		return refuse("session %s has no pod UID recorded, so no pod can be shown to be its own: if one exists, the owner deletes %s/%s",

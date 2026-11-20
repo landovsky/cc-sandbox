@@ -80,6 +80,7 @@ func app() *cli.App {
 				f.String("pod-machines", "", "session starts: comma-separated machine names whose sessions run as pods (e.g. future-two): a spec for one is started through `sudo -n ccsbx-root pod-create` then `pod-load` (helper mode only); hostd holds no kubeconfig and never sees the pod's token or key. Empty: no pod placement")
 				f.String("signer-socket", "", "docker sessions: the signer's socket (hostd's own); with --revoke-door, the token of every generation that ends is revoked at the doors (the signer signs, hostd posts). Empty: no revoke (log only)")
 				f.String("revoke-door", "", "docker sessions: comma-separated base URLs of the doors' owner listeners that take the signed revoke at the end of a generation")
+				f.Int("pod-max-live", 4, "pod sessions: machine_full above this many live pod sessions; each Guaranteed pod holds up to 32 GiB of ephemeral storage (about 264 GiB at 8): set it to what future-two's allocatable ephemeral storage divided by that allows (a Gate M check). 0: only --max-live applies")
 				f.Duration("pod-ttl", 8*time.Hour, "pod sessions: a pod session older than this is stopped by the sweep (the pod deleted by UID); keep it at the root config's k8s_token_hours")
 				f.Duration("pod-sweep", time.Minute, "pod sessions: how often the sweep looks for expired pods and pods the owner already stopped (0 turns it off)")
 				f.Duration("pod-load-wait", 0, "pod sessions: how long hostd waits for `ccsbx-root pod-load` (0: its worst case, 600 s ready deadline plus load and API time, plus 30 s)")
@@ -247,6 +248,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		}
 		sd.PodRoot = start.SudoPodRoot{LoadWait: dur("pod-load-wait")}
 		sd.PodVerbsRevoke = true
+		sd.PodMaxLive = num("pod-max-live")
 		// a start may be in flight as long as the create (90 s) and the load can take, plus a margin: after
 		// that a resume is no longer refused and the sweep stops what is left
 		lw := dur("pod-load-wait")

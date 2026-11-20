@@ -32,6 +32,10 @@ func TestWorktreeCheckWithoutABelievableConfigIsCouldNotTell(t *testing.T) {
 	if c := realMain([]string{"worktree-check", "--", "/home/x/git/p"}); c != 3 {
 		t.Errorf("exit %d, want 3", c)
 	}
+	// N3: --help runs nothing, so it works without a config for this verb as for every other
+	if c := realMain([]string{"worktree-check", "--help"}); c != 0 {
+		t.Errorf("worktree-check --help without a config: exit %d, want 0", c)
+	}
 	if c := realMain([]string{"run", "s0abcdefgh"}); c != 2 {
 		t.Errorf("another verb: exit %d, want 2", c)
 	}

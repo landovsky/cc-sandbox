@@ -802,3 +802,26 @@ func TestTheEphemeralBudgetIsCheckedAtConfigLoad(t *testing.T) {
 		t.Error("the defaults do not fit each other")
 	}
 }
+
+// N6: pod-stop with a generation refuses, touching nothing, when the session is at another one
+func TestPodStopWithAGenerationRefusesAStaleOne(t *testing.T) {
+	pf := newPodFx(t)
+	code, out := pf.call("pod-stop", sid, "1") // the record is at generation 2
+	if code != 2 || !strings.Contains(out, "another_generation") || len(pf.pod.deleted) != 0 || len(pf.hub) != 0 || len(pf.revoked) != 0 || len(pf.dropped) != 0 {
+		t.Errorf("exit %d deleted=%d hub=%d revoked=%d dropped=%d: %s", code, len(pf.pod.deleted), len(pf.hub), len(pf.revoked), len(pf.dropped), out)
+	}
+	pf = newPodFx(t)
+	if code, out := pf.call("pod-stop", sid, "2"); code != 0 || len(pf.pod.deleted) != 1 {
+		t.Errorf("the right generation: %d %s", code, out)
+	}
+	for _, bad := range []string{"0", "x", "02", "-1", "99999"} {
+		pf = newPodFx(t)
+		if code, _ := pf.call("pod-stop", sid, bad); code == 0 || len(pf.pod.deleted) != 0 {
+			t.Errorf("generation %q was taken", bad)
+		}
+	}
+	pf = newPodFx(t)
+	if code, _ := pf.call("pod-stop", sid, "2", "3"); code == 0 || len(pf.pod.deleted) != 0 {
+		t.Error("a third argument was taken")
+	}
+}

@@ -672,3 +672,26 @@ func TestOnlyAddressesOfInterfacesThatAreUpCount(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// D's no-hub installer: no hub keys in the config and no secret file. relay-mint refuses because the secret is
+// absent, before any connect, whatever hub_url's default says.
+func TestWithNoHubConfiguredRelayMintRefusesOnTheAbsentSecretBeforeAnyConnect(t *testing.T) {
+	r := newRelayFx(t)
+	r.writeConfig("") // no hub_url, no hub_secret, no hub_user: the defaults
+	r.d.Audit = r.audit
+	r.env["SUDO_UID"] = fmt.Sprint(svcUID)
+	r.d.Hub = &http.Client{Transport: failTransport{}} // any connect would be an error: count it instead
+	connects := 0
+	r.d.Hub = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { connects++; return nil, errors.New("must not connect") })}
+	if _, err := os.Stat(r.cfg.HubSecret); err == nil {
+		t.Skip("this machine has a real hub secret")
+	}
+	code, out := r.mint("--", sid, "2", relayPub)
+	if code != 3 || connects != 0 || !strings.Contains(out, "secret") {
+		t.Errorf("exit %d connects %d: %s", code, connects, out)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(q *http.Request) (*http.Response, error) { return f(q) }

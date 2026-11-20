@@ -50,6 +50,9 @@ func (e *env) gitdirOf(uid int, wd string, wpin *pinned, home string) (string, *
 			}
 		}()
 		derived := filepath.Join(wd, ".git")
+		if !hasRegularChild(child, "HEAD") {
+			return "", nil, refuse("%s is not a git directory (no HEAD)", derived)
+		}
 		p, err := pinFile(child, derived, uid)
 		if err != nil {
 			return "", nil, err
@@ -69,6 +72,9 @@ func (e *env) gitdirOf(uid int, wd string, wpin *pinned, home string) (string, *
 	if !filepath.IsAbs(target) {
 		target = filepath.Join(wd, target)
 	}
+	// (a linked worktree's gitdir also has a `commondir` file naming the main repository's directory; it is
+	// deliberately NOT followed or mounted: only this worktree's own gitdir is, read-only, so it cannot widen
+	// the fence. Do not "fix" that into a second mount.)
 	derived, err := e.cfg.gitdir(filepath.Clean(target), uid, home)
 	if err != nil {
 		return "", nil, err

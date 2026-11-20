@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +20,7 @@ func wcFx(t *testing.T) *fx {
 	t.Helper()
 	f := newFx(t)
 	f.env["SUDO_UID"] = fmt.Sprint(svcUID)
+	f.d.HomeOf = func(int) (string, error) { return f.roots, nil } // the allowed root is the owner's home
 	now := time.Now()
 	f.rec.Ended = &now // the fixture's own session is over: the worktree is free
 	f.writeRecord()
@@ -51,14 +53,14 @@ func (f *fx) refusedWC(why string, path string) {
 func TestAGoodWorktreeRootIsAnsweredWithItsPathAndNothingElse(t *testing.T) {
 	f := wcFx(t)
 	code, out, errb := f.check("--", f.wd)
-	if code != 0 || out != f.wd+"\n" || errb != "" {
-		t.Fatalf("exit %d stdout %q stderr %q", code, out, errb)
+	if code != 0 || out != f.wd+"\n"+filepath.Join(f.wd, ".git")+"\n" || errb != "" {
+		t.Fatalf("exit %d stdout %q stderr %q (the path, then the gitdir run will derive)", code, out, errb)
 	}
 	// a linked worktree (.git is a file naming a host-owned gitdir inside a root) is a worktree root too
 	g := wcFx(t)
 	os.RemoveAll(filepath.Join(g.wd, ".git"))
 	g.linkGitdir()
-	if code, out, errb := g.check("--", g.wd); code != 0 || out != g.wd+"\n" || errb != "" {
+	if code, out, errb := g.check("--", g.wd); code != 0 || out != g.wd+"\n"+g.rec.GitDir+"\n" || errb != "" {
 		t.Errorf("a linked worktree: exit %d stdout %q stderr %q", code, out, errb)
 	}
 	// root by login may ask too
@@ -210,3 +212,110 @@ func TestWorktreeCheckWritesNothing(t *testing.T) {
 }
 
 var _ = start.ValidSid
+
+// M1: a path that passes worktree-check is one `run` accepts: a record built from the two lines of the answer
+// (the path, and the gitdir to record) gets through run's gitdir derivation and starts
+func TestWhatPassesWorktreeCheckIsWhatRunAccepts(t *testing.T) {
+	for _, linked := range []bool{false, true} {
+		f := wcFx(t)
+		if linked {
+			os.RemoveAll(filepath.Join(f.wd, ".git"))
+			f.linkGitdir()
+		}
+		code, out, errb := f.check("--", f.wd)
+		lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+		if code != 0 || len(lines) != 2 || errb != "" || lines[0] != f.wd || !filepath.IsAbs(lines[1]) {
+			t.Fatalf("linked=%v: %d %q %q", linked, code, out, errb)
+		}
+		// hostd records the path and the gitdir it was given (a remote start carries none of its own)
+		f.rec.Ended, f.rec.Spec.Workdir.Path, f.rec.GitDir = nil, lines[0], lines[1]
+		f.env["SUDO_UID"] = fmt.Sprint(os.Getuid())
+		f.writeRecord()
+		if c, o := f.call("run", sid); c != 7 {
+			t.Errorf("linked=%v: run refused what worktree-check passed: %d %s", linked, c, o)
+		}
+		// and a record that kept GitDir "" (the old gap) is refused by run, which is why the second line exists
+		f.rec.GitDir = ""
+		f.writeRecord()
+		if c, _ := f.call("run", sid); c == 7 {
+			t.Errorf("linked=%v: run accepted an empty gitdir", linked)
+		}
+	}
+}
+
+// S1: the service user cannot use the verb to ask what exists in the owner's hidden directories or anywhere else:
+// the lexical rules run before any stat, and everything that depends on the disk is one answer
+func TestWorktreeCheckGivesTheSameAnswerWhateverTheDiskHolds(t *testing.T) {
+	f := wcFx(t)
+	mk(t, filepath.Join(f.roots, ".ssh"), 0o700)
+	put(t, filepath.Join(f.roots, ".ssh", "id_ed25519"), "k", 0o600)
+	mk(t, filepath.Join(f.roots, "git", "nogit", "sub"), 0o755)
+	mk(t, filepath.Join(f.roots, "git", "emptygit", ".git"), 0o755) // N1: not a git directory
+	put(t, filepath.Join(f.roots, "git", "afile"), "x", 0o644)
+	mk(t, filepath.Join(f.wd, "pkg"), 0o755)
+	// lexical: a hidden component, present or absent, is one refusal that touched nothing
+	var hidden []string
+	for _, p := range []string{".ssh/id_ed25519", ".ssh/nothing", ".config/x", "git/.hidden", "git/wt/.git"} {
+		_, _, errb := f.check("--", filepath.Join(f.roots, p))
+		hidden = append(hidden, errb)
+	}
+	for i, e := range hidden {
+		if e != hidden[0] || !strings.Contains(e, "not a path inside an allowed root") {
+			t.Errorf("hidden case %d answered %q, case 0 %q", i, e, hidden[0])
+		}
+	}
+	// disk: absent, a file, a directory with no .git, an empty .git, a subdirectory of a repository, a symlink:
+	// the same line, whichever it is
+	os.Symlink(f.wd, filepath.Join(f.roots, "git", "link"))
+	var disk []string
+	for _, p := range []string{"git/ghost", "git/afile", "git/nogit", "git/emptygit", "git/wt/pkg", "git/link", "git/nogit/sub"} {
+		code, out, errb := f.check("--", filepath.Join(f.roots, p))
+		if code != 2 || out != "" {
+			t.Errorf("%s: exit %d %q", p, code, out)
+		}
+		disk = append(disk, errb)
+	}
+	for i, e := range disk {
+		if e != disk[0] || !strings.Contains(e, "not a git worktree root") {
+			t.Errorf("disk case %d answered %q, case 0 %q", i, e, disk[0])
+		}
+	}
+}
+
+// S2: the worktree must lie in its owner's own home, so the user it belongs to is the session's owner for run
+func TestAWorktreeOutsideItsOwnersHomeIsRefused(t *testing.T) {
+	f := wcFx(t)
+	f.d.HomeOf = func(int) (string, error) { return filepath.Join(f.dir, "home", "someone"), nil }
+	f.refusedWC("a worktree not under the owner's home", f.wd)
+	f.d.HomeOf = func(int) (string, error) { return "", fmt.Errorf("no such user") }
+	f.refusedWC("an owner with no home", f.wd)
+	f.d.HomeOf = func(int) (string, error) { return "", nil }
+	f.refusedWC("an owner with an empty home", f.wd)
+}
+
+func TestWorktreeCheckReadErrorsAreCouldNotTellAndNoIsNo(t *testing.T) {
+	if fsRefusal(syscall.EIO) != wcCannot || fsRefusal(&Refusal{"x"}) != wcNoGit || fsRefusal(os.ErrNotExist) != wcNoGit || fsRefusal(syscall.ELOOP) != wcNoGit {
+		t.Error("an I/O error is 'could not tell'; a refusal, absence and a loop are 'no'")
+	}
+}
+
+// N1 for run too: a .git directory with no HEAD is not a git directory
+func TestRunRefusesAnEmptyDotGitDirectory(t *testing.T) {
+	f := newFx(t)
+	dg := filepath.Join(f.wd, ".git")
+	mk(t, dg, 0o755)
+	f.rec.GitDir = dg
+	f.writeRecord()
+	f.wantRefusedMsg("an empty .git", "no HEAD", "run", sid)
+}
+
+func TestOnlyALoginUsersDirectoryCounts(t *testing.T) {
+	for _, c := range []struct {
+		uid, min, svc int
+		ok            bool
+	}{{1000, 1000, 4242, true}, {999, 1000, 4242, false}, {0, 1, 4242, false}, {4242, 1000, 4242, false}, {65534, 1000, 4242, false}, {70000, 1000, 4242, false}, {65533, 1000, 4242, true}} {
+		if loginUID(c.uid, c.min, c.svc) != c.ok {
+			t.Errorf("uid %d (min %d, service %d): %v", c.uid, c.min, c.svc, !c.ok)
+		}
+	}
+}

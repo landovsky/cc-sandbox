@@ -42,7 +42,10 @@ type relayFx struct {
 	clock  time.Time
 	hang   chan struct{}
 	redir  bool
+	lis    func(port int) []TCPListener // who listens on the hub's port; default: the hub's user
 }
+
+const hubUID = 8181
 
 func newRelayFx(t *testing.T) *relayFx {
 	t.Helper()
@@ -79,9 +82,22 @@ func newRelayFx(t *testing.T) *relayFx {
 }
 
 func (r *relayFx) reconfig(extra string) {
-	r.writeConfig(fmt.Sprintf("hub_url = %q\nhub_secret = %q\n%s", r.hub.URL, filepath.Join(r.dir, "etc", "hub.secret"), extra))
+	r.writeConfig(fmt.Sprintf("hub_url = %q\nhub_secret = %q\nhub_user = \"hubuser\"\n%s", r.hub.URL, filepath.Join(r.dir, "etc", "hub.secret"), extra))
 	r.d.Audit = r.audit
 	r.d.Now = func() time.Time { return r.clock }
+	l := r.d.LookupUser
+	r.d.LookupUser = func(n string) (int, int, error) {
+		if n == "hubuser" {
+			return hubUID, hubUID, nil
+		}
+		return l(n)
+	}
+	r.d.HubListeners = func(port int) ([]TCPListener, error) {
+		if r.lis != nil {
+			return r.lis(port), nil
+		}
+		return []TCPListener{{IP: "0100007F", Port: port, UID: hubUID}}, nil
+	}
 }
 
 func (r *relayFx) running(gen int) {
@@ -413,3 +429,62 @@ func TestARevokeThatCannotBeMadeNeverFailsTheVerb(t *testing.T) {
 }
 
 var _ = start.ValidSid
+
+// ---- the listener check (R2-S3) ----
+
+// The hub is plain HTTP on loopback: with it down, any local user could bind its port and be handed the
+// admin bearer. The secret is sent only if every LISTEN socket on that port belongs to the hub's user.
+func TestTheAdminSecretGoesOnlyToTheHubsUser(t *testing.T) {
+	cases := map[string]func(port int) []TCPListener{
+		"another uid listens (a squatter)":  func(p int) []TCPListener { return []TCPListener{{Port: p, UID: os.Getuid() + 7}} },
+		"hostd's uid listens":               func(p int) []TCPListener { return []TCPListener{{Port: p, UID: svcUID}} },
+		"root listens (not the hub's user)": func(p int) []TCPListener { return []TCPListener{{Port: p, UID: 0}} },
+		"the hub and a squatter both listen": func(p int) []TCPListener {
+			return []TCPListener{{Port: p, UID: hubUID}, {IP: "00000000", Port: p, UID: svcUID}}
+		},
+		"nothing listens (the hub is down)": func(p int) []TCPListener { return nil },
+	}
+	for why, lis := range cases {
+		r := newRelayFx(t)
+		r.lis = lis
+		code, out := r.mint("--", sid, "2", relayPub)
+		if code != 3 || len(r.hubCalls()) != 0 || strings.Contains(out, hubSecretText) || !strings.Contains(r.audit.String(), "refused") && !strings.Contains(out, "refusing") {
+			t.Errorf("%s: exit %d hub calls %d: %s", why, code, len(r.hubCalls()), out)
+		}
+	}
+	// the revoke at the end of a generation is held to the same rule: no request, and the verb still succeeds
+	r := newRelayFx(t)
+	r.lis = cases["another uid listens (a squatter)"]
+	if code, out := r.call("stop", sid); code != 0 || len(r.hubCalls()) != 0 || !strings.Contains(r.audit.String(), "relay-revoke") {
+		t.Errorf("stop with a squatter: %d %s (hub calls %d)", code, out, len(r.hubCalls()))
+	}
+	// no hub_user in the config: nothing is sent either
+	r = newRelayFx(t)
+	r.writeConfig(fmt.Sprintf("hub_url = %q\nhub_secret = %q\n", r.hub.URL, filepath.Join(r.dir, "etc", "hub.secret")))
+	r.env["SUDO_UID"] = fmt.Sprint(svcUID)
+	if code, _ := r.mint("--", sid, "2", relayPub); code != 3 || len(r.hubCalls()) != 0 {
+		t.Errorf("no hub_user: exit %d hub calls %d", code, len(r.hubCalls()))
+	}
+	// the hub's own user, alone on the port: allowed (the allow twin of every case above)
+	r = newRelayFx(t)
+	if code, out := r.mint("--", sid, "2", relayPub); code != 0 {
+		t.Errorf("the hub's user: %d %s", code, out)
+	}
+}
+
+func TestProcNetParsing(t *testing.T) {
+	tcp := `  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode
+   0: 0100007F:0FAB 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1000        0 11111 1 0000000000000000 100 0 0 10 0
+   1: 0100007F:0FAB 0100007F:9C40 01 00000000:00000000 00:00000000 00000000  1000        0 22222 1 0000000000000000 100 0 0 10 0
+   2: 00000000:0FAB 00000000:0000 0A 00000000:00000000 00:00000000 00000000  1234        0 33333 1 0000000000000000 100 0 0 10 0
+   3: 0100007F:1F90 00000000:0000 0A 00000000:00000000 00:00000000 00000000  7777        0 44444 1 0000000000000000 100 0 0 10 0
+   4: garbage
+`
+	got := parseProcNet(strings.NewReader(tcp), 0x0FAB) // 4011
+	if len(got) != 2 || got[0].UID != 1000 || got[1].UID != 1234 || got[1].IP != "00000000" {
+		t.Errorf("%+v (only LISTEN sockets on the port: an established connection and another port are not listeners)", got)
+	}
+	if len(parseProcNet(strings.NewReader(""), 80)) != 0 || len(parseProcNet(strings.NewReader(tcp), 1)) != 0 {
+		t.Error("nothing was expected")
+	}
+}

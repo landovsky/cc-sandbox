@@ -47,6 +47,7 @@ type Config struct {
 	K8sNamespace string
 	HubURL       string // the session-bus hub, loopback only (relay-mint, relay revoke)
 	HubSecret    string // the hub admin secret file: root-owned, 0600
+	HubUser      string // the user the hub runs as: the process listening on hub_url's port must be theirs, or the admin secret is not sent
 	TermUser     string // the credential-less user the owner-terminal side of a pod attach runs as (ccsbx-term)
 	SignerUser   string // the signer's own user (ccsbx-keys): holds the machine key; the launch user must not be it
 	// the pod launcher (F2w)
@@ -74,7 +75,7 @@ func Defaults() Config {
 		Docker: "/usr/bin/docker", Tmux: "/usr/bin/tmux", TmuxSocket: "/run/ccsbx/tmux.sock",
 		PinsFile: "/etc/ccsbx/pins.toml", SeccompFile: "/etc/ccsbx/seccomp.json", Kubectl: "/usr/local/bin/kubectl", Kubeconfig: "/var/lib/ccsbx-launch/launcher.kubeconfig", K8sConn: "/etc/ccsbx/k8s-conn.json", LaunchUser: "ccsbx-launch", K8sNamespace: "cc-sandbox", HubURL: "http://127.0.0.1:4011", HubSecret: "/etc/ccsbx/hub-admin.secret", TermUser: "ccsbx-term", SignerUser: "ccsbx-keys",
 		K8sMachine: "future-two", K8sReadySeconds: 120, K8sCPU: 2, K8sEphemeralMB: 20480, K8sWorktreeMB: 10240, K8sTokenHours: 8,
-		K8sAudiences: []string{"ccsbx-model", "ccsbx-egress"}, SignerSocket: "/run/ccsbx-signer/sign.sock",
+		K8sAudiences: []string{"ccsbx-model", "ccsbx-egress"}, SignerSocket: "/run/ccsbx-signer/launch.sock",
 		ServiceUser: "ccsbx", BaseURL: "http://fwd:8080", MinUID: 1000,
 	}
 }
@@ -83,7 +84,7 @@ var configKeys = map[string]bool{
 	"allowed_roots": true, "verbs": true, "state_dir": true, "run_dir": true, "docker": true, "tmux": true,
 	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true, "min_uid": true, "seccomp_profile": true, "status": true,
 	"kubectl": true, "kubeconfig": true, "k8s_conn": true, "launch_user": true, "k8s_namespace": true,
-	"k8s_machine": true, "hub_url": true, "hub_secret": true, "term_user": true, "signer_user": true, "k8s_ready_seconds": true, "k8s_side_image": true, "k8s_cpu": true, "k8s_ephemeral_mb": true, "k8s_worktree_mb": true,
+	"k8s_machine": true, "hub_url": true, "hub_secret": true, "hub_user": true, "term_user": true, "signer_user": true, "k8s_ready_seconds": true, "k8s_side_image": true, "k8s_cpu": true, "k8s_ephemeral_mb": true, "k8s_worktree_mb": true,
 	"k8s_token_hours": true, "k8s_audiences": true, "signer_socket": true,
 }
 
@@ -146,7 +147,7 @@ func LoadConfig(path string, trustedUID int) (*Config, error) {
 		return out, true, nil
 	}
 	for k, dst := range map[string]*string{"state_dir": &c.StateDir, "run_dir": &c.RunDir, "docker": &c.Docker, "tmux": &c.Tmux,
-		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "seccomp_profile": &c.SeccompFile, "service_user": &c.ServiceUser, "kubectl": &c.Kubectl, "kubeconfig": &c.Kubeconfig, "k8s_conn": &c.K8sConn, "launch_user": &c.LaunchUser, "k8s_namespace": &c.K8sNamespace, "k8s_machine": &c.K8sMachine, "hub_url": &c.HubURL, "hub_secret": &c.HubSecret, "term_user": &c.TermUser, "signer_user": &c.SignerUser, "k8s_side_image": &c.K8sSideImage, "signer_socket": &c.SignerSocket, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
+		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "seccomp_profile": &c.SeccompFile, "service_user": &c.ServiceUser, "kubectl": &c.Kubectl, "kubeconfig": &c.Kubeconfig, "k8s_conn": &c.K8sConn, "launch_user": &c.LaunchUser, "k8s_namespace": &c.K8sNamespace, "k8s_machine": &c.K8sMachine, "hub_url": &c.HubURL, "hub_secret": &c.HubSecret, "hub_user": &c.HubUser, "term_user": &c.TermUser, "signer_user": &c.SignerUser, "k8s_side_image": &c.K8sSideImage, "signer_socket": &c.SignerSocket, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
 		if err := str(k, dst); err != nil {
 			return nil, err
 		}
@@ -255,6 +256,9 @@ func (c *Config) validate(roots []string) error {
 	}
 	if err := checkHubURL(c.HubURL); err != nil {
 		return err
+	}
+	if c.HubUser != "" && (strings.ContainsAny(c.HubUser, ":/ \n") || len(c.HubUser) > 64) {
+		return fmt.Errorf("hub_user %q", c.HubUser)
 	}
 	if c.K8sReadySeconds < 1 || c.K8sReadySeconds > 600 {
 		return fmt.Errorf("k8s_ready_seconds %d must be 1..600", c.K8sReadySeconds)

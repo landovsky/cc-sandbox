@@ -316,14 +316,17 @@ func Load(control string, in io.Reader) error {
 	}
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(10 * time.Second))
-	if _, err := c.Write(b); err != nil {
-		return err
-	}
-	if uc, ok := c.(*net.UnixConn); ok {
+	// A server that refuses the peer answers and closes at once, so the write can fail with a broken pipe
+	// while the answer is already waiting: the answer is read either way.
+	_, werr := c.Write(b)
+	if uc, ok := c.(*net.UnixConn); ok && werr == nil {
 		uc.CloseWrite() // the server reads exactly one JSON object and then wants to see the end
 	}
 	var r reply
 	if err := json.NewDecoder(c).Decode(&r); err != nil {
+		if werr != nil {
+			return werr
+		}
 		return fmt.Errorf("side load: no answer: %w", err)
 	}
 	if !r.OK {

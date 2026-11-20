@@ -508,7 +508,7 @@ func TestHelpAndEnv(t *testing.T) {
 		t.Fatal("help")
 	}
 	for _, fl := range []string{"--keys", "--systemd-socket", "--socket", "--init", "--write-scope", "--owners", "--machines",
-		"--pairs", "--scope", "--audiences", "--max-ttl", "--allow-user", "--allow-group", "--keys-peer-user", "--keys-peer-machines", "--max-request", "--timeout", "CCSBX_SIGNER_"} {
+		"--pairs", "--scope", "--audiences", "--max-ttl", "--allow-user", "--allow-group", "--keys-peer-user", "--keys-peer-socket", "--keys-peer-machines", "--max-request", "--timeout", "CCSBX_SIGNER_"} {
 		if !strings.Contains(out.String(), fl) {
 			t.Errorf("--help lacks %s", fl)
 		}
@@ -828,5 +828,105 @@ func TestMintPodSecretsRegistersTheRelayForTheTokensOwnKey(t *testing.T) {
 	if _, err := MintPodSecrets(context.Background(), sign, token.Claims{Sub: "tomas/future-two/sSIGN/g1", Billing: "api", Profile: "dev-default", Aud: []string{"ccsbx-model"}},
 		func(string) (string, error) { return "", errors.New("hub refused") }); err == nil {
 		t.Error("a payload was made without a relay token")
+	}
+}
+
+// ---- the keys peer's own socket (R2-S2) ----
+
+// twoSockets serves a signer on two unix sockets, the way ccsbx-signer does with a keys peer: the main
+// socket takes hostd only, the other takes the keys peer only. The test process plays hostd or the keys peer.
+func twoSockets(t *testing.T, asHostd bool) (r *rig, main, keys string) {
+	t.Helper()
+	r = peers(t, asHostd)
+	sd, _ := os.MkdirTemp("", "sg")
+	t.Cleanup(func() { os.RemoveAll(sd) })
+	main, keys = filepath.Join(sd, "m"), filepath.Join(sd, "k")
+	l1, err := net.Listen("unix", main)
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2, err := net.Listen("unix", keys)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l1.Close(); l2.Close() })
+	go r.srv.ServeHostd(l1)
+	go r.srv.ServeKeysPeer(l2)
+	return r, main, keys
+}
+
+func askOn(t *testing.T, r *rig, sock string, body []byte) reply {
+	t.Helper()
+	r.sock = sock
+	return r.ask(t, body)
+}
+
+// context "the launch user reaches the signer on a socket of its own, and each socket takes its own class":
+// hostd's socket (group ccsbx) is not reachable by ccsbx-launch, so the keys peer has another; and a
+// mode that is later widened on one of them still lets in only the class that socket is for.
+func TestEachSocketTakesItsOwnClassOnly(t *testing.T) {
+	r, main, keys := twoSockets(t, true) // this process is hostd
+	if out := askOn(t, r, main, r.onMachine("hp-ubuntu")); out.Token == "" {
+		t.Fatalf("hostd on its own socket: %+v", out)
+	}
+	if out := askOn(t, r, keys, r.onMachine("hp-ubuntu")); out.Token != "" || !strings.Contains(r.log(), "other caller's socket") {
+		t.Errorf("hostd got a token on the keys peer's socket: %+v\n%s", out, r.log())
+	}
+	r, main, keys = twoSockets(t, false) // this process is the keys peer
+	if out := askOn(t, r, keys, r.onMachine("future-two")); out.Token == "" {
+		t.Fatalf("the keys peer on its own socket: %+v", out)
+	}
+	if out := askOn(t, r, main, r.onMachine("future-two")); out.Token != "" || !strings.Contains(r.log(), "other caller's socket") {
+		t.Errorf("the keys peer got a token on hostd's socket: %+v", out)
+	}
+}
+
+func TestTwoSystemdSocketsAreTakenExactly(t *testing.T) {
+	fd1, c1 := listeningFD(t)
+	fd2, c2 := listeningFD(t)
+	defer c1()
+	defer c2()
+	pid := os.Getpid()
+	first := dupFD(t, fd1)
+	if dupFD(t, fd2) != first+1 {
+		t.Skip("could not get two consecutive descriptors")
+	}
+	ls, err := SystemdListeners(envOf(map[string]string{"LISTEN_PID": itoa(pid), "LISTEN_FDS": "2"}), pid, first, 2)
+	if err != nil || len(ls) != 2 {
+		t.Fatalf("%v %v", ls, err)
+	}
+	for _, o := range ls {
+		o.Close()
+	}
+	// a count that does not match what the caller expects is refused (one socket where two are wanted, and the reverse)
+	for _, n := range []string{"1", "3", "0", ""} {
+		if _, err := SystemdListeners(envOf(map[string]string{"LISTEN_PID": itoa(pid), "LISTEN_FDS": n}), pid, first, 2); err == nil {
+			t.Errorf("LISTEN_FDS=%q accepted for two sockets", n)
+		}
+	}
+}
+
+func TestTheKeysPeerNeedsASocketOfItsOwn(t *testing.T) {
+	dir := keyDir(t)
+	var out, errb bytes.Buffer
+	Main([]string{"--keys", dir, "--init"}, &out, &errb)
+	writeScope(t, dir)
+	sd, _ := os.MkdirTemp("", "sg")
+	defer os.RemoveAll(sd)
+	for why, args := range map[string][]string{
+		"a keys peer and no socket for it":     {"--keys", dir, "--allow-user", "2", "--socket", filepath.Join(sd, "a"), "--keys-peer-user", "1", "--keys-peer-machines", "future-two"},
+		"a keys-peer socket with no keys peer": {"--keys", dir, "--allow-user", "2", "--socket", filepath.Join(sd, "b"), "--keys-peer-socket", filepath.Join(sd, "c")},
+	} {
+		var eb bytes.Buffer
+		done := make(chan int, 1)
+		go func() { done <- Main(args, &bytes.Buffer{}, &eb) }() // a signer that wrongly starts would serve for ever
+		select {
+		case c := <-done:
+			if c != 2 {
+				t.Errorf("%s: exit %d: %s", why, c, eb.String())
+			}
+		case <-time.After(3 * time.Second):
+			t.Errorf("%s: the signer started serving", why)
+		}
 	}
 }

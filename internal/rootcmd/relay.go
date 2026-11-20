@@ -7,11 +7,13 @@
 package rootcmd
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -141,6 +143,10 @@ func (e *env) relayMint(sid, genS, pub string, after401 bool, stdout io.Writer) 
 func (e *env) registerRelay(ctx context.Context, secret string, scope json.RawMessage, sid string, gen int, pub string) (string, error) {
 	body, _ := json.Marshal(map[string]any{"role": "relay", "sid": sid, "gen": strconv.Itoa(gen), "pub": pub, "may_reach": mayReach(scope)})
 	code, resp, err := e.hubCall(ctx, "POST", "/v1/principals", secret, body)
+	if errors.Is(err, errHubUntrusted) {
+		e.audit("relay-mint", sid, gen, pub, "refused: "+err.Error())
+		return "", &codeError{exitHub, "refusing to send the hub admin secret: " + err.Error()}
+	}
 	if err != nil {
 		e.audit("relay-mint", sid, gen, pub, "unreachable")
 		return "", &codeError{exitHub, "the hub is not reachable"}
@@ -236,6 +242,9 @@ func (e *env) hubClient() *http.Client {
 
 // hubCall makes one request with the admin secret as bearer and returns the status and a bounded body.
 func (e *env) hubCall(ctx context.Context, method, path, secret string, body []byte) (int, []byte, error) {
+	if err := e.checkHubListener(); err != nil {
+		return 0, nil, err
+	}
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
@@ -274,6 +283,8 @@ func (e *env) revokeWith(secret, sid string, gen int) {
 	id := url.PathEscape("relay:" + sid + "/" + strconv.Itoa(gen)) // one path segment
 	code, _, err := e.hubCall(context.Background(), "DELETE", "/v1/principals/"+id, secret, nil)
 	switch {
+	case errors.Is(err, errHubUntrusted):
+		e.audit("relay-revoke", sid, gen, "", "refused: "+err.Error())
 	case err != nil:
 		e.audit("relay-revoke", sid, gen, "", "unreachable")
 	case code/100 == 2 || code == http.StatusNotFound:
@@ -281,4 +292,93 @@ func (e *env) revokeWith(secret, sid string, gen int) {
 	default:
 		e.audit("relay-revoke", sid, gen, "", "hub "+strconv.Itoa(code))
 	}
+}
+
+// errHubUntrusted: whatever listens on the hub's address is not the hub's user.
+var errHubUntrusted = errors.New("the process listening on the hub's address is not the hub's user")
+
+// TCPListener is one LISTENing socket: its address, port and the uid that owns it.
+type TCPListener struct {
+	IP   string // hex, as /proc/net/tcp writes it
+	Port int
+	UID  int
+}
+
+// checkHubListener refuses to send the admin secret unless every LISTEN socket on the hub's port belongs
+// to hub_user. The hub is plain HTTP on loopback: when it is down, any local user could bind its port and
+// be handed the bearer. This does not stop the hub's own user (whose processes can read the hub's
+// environment, and so the secret, anyway): the admin secret's trust boundary is the hub's user. What it
+// stops is hostd and every other uid. There is a window between this check and the connect (a listener
+// that appears and disappears); it is no wider than the hub's own restart.
+func (e *env) checkHubListener() error {
+	if e.cfg.HubUser == "" {
+		return fmt.Errorf("%w: hub_user is not set in the root config", errHubUntrusted)
+	}
+	uid, _, err := e.d.LookupUser(e.cfg.HubUser)
+	if err != nil {
+		return fmt.Errorf("%w: hub_user %s: %v", errHubUntrusted, e.cfg.HubUser, err)
+	}
+	u, err := url.Parse(e.cfg.HubURL)
+	if err != nil {
+		return err
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil {
+		return fmt.Errorf("hub_url has no port")
+	}
+	ls, err := e.d.HubListeners(port)
+	if err != nil {
+		return fmt.Errorf("%w: cannot tell who listens on port %d: %v", errHubUntrusted, port, err)
+	}
+	if len(ls) == 0 {
+		return fmt.Errorf("%w: nothing listens on port %d", errHubUntrusted, port)
+	}
+	for _, l := range ls {
+		if l.UID != uid {
+			return fmt.Errorf("%w: uid %d listens on port %d", errHubUntrusted, l.UID, port)
+		}
+	}
+	return nil
+}
+
+// parseProcNet reads /proc/net/tcp or tcp6 and returns the LISTEN sockets on port.
+func parseProcNet(r io.Reader, port int) []TCPListener {
+	var out []TCPListener
+	sc := bufio.NewScanner(r)
+	sc.Scan() // the header
+	for sc.Scan() {
+		f := strings.Fields(sc.Text())
+		if len(f) < 8 || f[3] != "0A" { // 0A is TCP_LISTEN
+			continue
+		}
+		addr, hexPort, ok := strings.Cut(f[1], ":")
+		if !ok {
+			continue
+		}
+		p, err := strconv.ParseInt(hexPort, 16, 32)
+		uid, err2 := strconv.Atoi(f[7])
+		if err != nil || err2 != nil || int(p) != port {
+			continue
+		}
+		out = append(out, TCPListener{IP: addr, Port: port, UID: uid})
+	}
+	return out
+}
+
+func procListeners(port int) ([]TCPListener, error) {
+	var out []TCPListener
+	found := false
+	for _, p := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+		f, err := os.Open(p)
+		if err != nil {
+			continue
+		}
+		found = true
+		out = append(out, parseProcNet(f, port)...)
+		f.Close()
+	}
+	if !found {
+		return nil, fmt.Errorf("neither /proc/net/tcp nor /proc/net/tcp6 can be read")
+	}
+	return out, nil
 }

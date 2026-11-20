@@ -147,10 +147,18 @@ func (f *fx) writeConfigPod(t *testing.T, side bool, extra string) {
 	if side {
 		img = fmt.Sprintf("k8s_side_image = %q\n", sideImg)
 	}
-	f.writeConfig(fmt.Sprintf("kubectl = %q\nkubeconfig = %q\nk8s_conn = %q\nlaunch_user = \"ccsbx-launch\"\nk8s_namespace = \"cc-sandbox\"\n%s%shub_secret = %q\nverbs = [\"run\", \"stop\", \"attach\", \"pod-create\", \"pod-load\", \"pod-stop\", \"pod-status\"]\n",
+	f.writeConfig(fmt.Sprintf("kubectl = %q\nkubeconfig = %q\nk8s_conn = %q\nlaunch_user = \"ccsbx-launch\"\nk8s_namespace = \"cc-sandbox\"\n%s%shub_secret = %q\nhub_user = \"hubuser\"\nverbs = [\"run\", \"stop\", \"attach\", \"pod-create\", \"pod-load\", \"pod-stop\", \"pod-status\"]\n",
 		f.dir+"/bin/kubectl", f.dir+"/launch/launcher.kubeconfig", f.dir+"/etc/k8s-conn.json", img, extra, f.dir+"/etc/hub.secret"))
 	// the config rewrite made a fresh Deps: carry over the k8s fakes of newK8sFx
 	f.d.LookupUser, f.d.LivePodUID, f.d.DropPrivs, f.d.Exec = old.LookupUser, old.LivePodUID, old.DropPrivs, old.Exec
+	lookup := f.d.LookupUser
+	f.d.LookupUser = func(n string) (int, int, error) {
+		if n == "hubuser" {
+			return hubUID, hubUID, nil
+		}
+		return lookup(n)
+	}
+	f.d.HubListeners = func(port int) ([]TCPListener, error) { return []TCPListener{{Port: port, UID: hubUID}}, nil }
 }
 
 func (pf *podFx) wire() {
@@ -471,7 +479,7 @@ func TestPodConfigKeysAreValidated(t *testing.T) {
 	if c, err := LoadConfig(p, os.Getuid()); err != nil || c.K8sReadySeconds != 600 {
 		t.Errorf("the maximum was refused: %v", err)
 	}
-	if d := Defaults(); d.K8sReadySeconds != 120 || d.K8sMachine != "future-two" || d.SignerSocket != "/run/ccsbx-signer/sign.sock" {
+	if d := Defaults(); d.K8sReadySeconds != 120 || d.K8sMachine != "future-two" || d.SignerSocket != "/run/ccsbx-signer/launch.sock" {
 		t.Errorf("defaults moved: %+v", d)
 	}
 }

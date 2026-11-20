@@ -661,3 +661,17 @@ already stopped) and `ccsbx stop` works on them (root's `stop` deletes the pod b
 `--pod-ttl` (8h: a pod session older than this is stopped by the sweep), `--pod-sweep` (1m), `--pod-load-wait`.
 Installer: two new users (`ccsbx-launch` with `/var/lib/ccsbx-launch` 0700 holding the kubeconfig and token;
 `ccsbx-term` with no home), signer unit `--keys-peer-user ccsbx-launch --keys-peer-machines future-two`.
+
+**Round 4 (names for the installer).** The signer's second socket for the launch user: `--keys-peer-socket PATH`
+(env `CCSBX_SIGNER_KEYS_PEER_SOCKET`; no default in the signer; the installer passes `/run/ccsbx-signer/launch.sock`,
+and under systemd a second socket unit with `SocketUser=ccsbx-keys SocketGroup=ccsbx-launch SocketMode=0660`
+gives `LISTEN_FDS=2`, the main socket first). Each socket takes its own class only (SO_PEERCRED still exact).
+`ccsbx-root.toml` `signer_socket` (what `pod-load` connects to as the launch user) now defaults to that path.
+The hub listener check: `hub_user` (the user the hub runs as; no default, the installer writes it): before the
+hub admin secret is sent (relay-mint, pod-load, the revokes), every LISTEN socket on `hub_url`'s port
+(`/proc/net/tcp` and `tcp6`) must be that user's, else exit 3 and nothing is sent. Residual: the hub runs as
+the owner's uid, whose processes can read the hub's environment (and the secret) anyway, so the admin secret's
+trust boundary is that uid; this stops hostd and every other uid from catching it on a port the hub does not
+hold; a listener that appears between the check and the connect is possible and no wider than a hub restart.
+The terminal filter is sound for UTF-8 terminals only (it emits only complete, valid UTF-8 without C1
+controls); the session runs with `LANG=C.UTF-8`.

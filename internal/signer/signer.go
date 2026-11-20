@@ -131,7 +131,22 @@ func (s *Server) logJSON(kv ...any) {
 // Serve accepts connections until the listener closes. Each is handled on its own goroutine, at most
 // MaxConns at a time. A failing Accept (for example no free descriptors) is retried after a pause
 // instead of ending the signer.
-func (s *Server) Serve(l net.Listener) error {
+func (s *Server) Serve(l net.Listener) error { return s.serve(l, nil) }
+
+// ServeHostd and ServeKeysPeer serve a listener for one caller class only. The socket's own owner, group
+// and mode already decide who can connect; this makes the uid check agree with it, so a mode that is later
+// widened on one socket still lets in only the class that socket is for.
+func (s *Server) ServeHostd(l net.Listener) error {
+	p := PeerHostd
+	return s.serve(l, &p)
+}
+
+func (s *Server) ServeKeysPeer(l net.Listener) error {
+	p := PeerKeys
+	return s.serve(l, &p)
+}
+
+func (s *Server) serve(l net.Listener, only *Peer) error {
 	failures := 0
 	for {
 		c, err := l.Accept()
@@ -153,7 +168,7 @@ func (s *Server) Serve(l net.Listener) error {
 		s.sem <- struct{}{}
 		go func() {
 			defer func() { <-s.sem }()
-			s.handle(c)
+			s.handle(c, only)
 		}()
 	}
 }
@@ -170,7 +185,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *Server) handle(c net.Conn) {
+func (s *Server) handle(c net.Conn, only *Peer) {
 	defer c.Close()
 	// Deadlines use the real clock (cfg.Now is for claims only), and reading and writing have their own.
 	c.SetReadDeadline(time.Now().Add(s.cfg.ReadTimeout))
@@ -186,6 +201,11 @@ func (s *Server) handle(c net.Conn) {
 	} else if uid != s.cfg.AllowUID || (s.cfg.AllowGID != nil && gid != *s.cfg.AllowGID) {
 		s.logJSON("signer", "refused", "why", "peer is not the allowed caller", "peer_uid", uid, "peer_gid", gid)
 		s.send(c, reply{Error: "refused"}) // no detail to a peer that shouldn't be here
+		return
+	}
+	if only != nil && peer != *only {
+		s.logJSON("signer", "refused", "why", "peer is on the other caller's socket", "peer_uid", uid)
+		s.send(c, reply{Error: "refused"})
 		return
 	}
 	// Read exactly one JSON value, at most MaxRequest bytes (one more is read to notice an excess).

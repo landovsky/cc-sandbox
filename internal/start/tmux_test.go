@@ -21,7 +21,8 @@ func TestTmuxHardeningIsInTheSameInvocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	line := strings.Join(got, " ")
-	for _, want := range []string{"tmux -L ccsbx new-session -d -s sabc123", "; set-option -g set-clipboard off", "; set-option -g allow-passthrough off", "run --sid sabc123 --gen 1"} {
+	for _, want := range []string{"tmux -L ccsbx -f /dev/null new-session -d -s sabc123", "; set-option -g set-clipboard off", "; set-option -g allow-passthrough off", "run --sid sabc123 --gen 1",
+		"tmux -L ccsbx -f /dev/null new-session", "; set-option -g status off", "; set-option -g prefix None", "; set-option -g escape-time 0"} {
 		if !strings.Contains(line, want) {
 			t.Errorf("missing %q in %s", want, line)
 		}

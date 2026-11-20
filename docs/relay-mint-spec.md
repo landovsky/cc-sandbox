@@ -60,26 +60,16 @@ sudo -n /usr/local/sbin/ccsbx-root relay-mint -- <sid> <gen> <pub>
   followed by every placed peer (the record does not say which are fenced): the hub lets a relay reach a FENCED target only if it is in
   `may_reach` (no more "any fenced session"), an unfenced one only if it equals `manager` and a spoke principal tracked it. A relay also
   reads `GET /sessions` filtered to those entries and its own session, and is rate-limited at the hub (`SB_RELAY_RATE_PER_MIN`, 429).
-  (Older text below that says the list is the manager only is superseded by this.)
-- **`may_reach` (history):** For now it is the session's MANAGER node only
-  (`msg_scope.manager.node`) together with the MACHINE the record binds it to (`msg_scope.manager.machine`, written
-  from the owner's start spec, never from the fence), as the one entry `<machine>/<node>`, read by root from the
-  SAME record it just validated: machine `[A-Za-z0-9._-]{1,64}`, node `[A-Za-z0-9._#:/-]{1,128}`. A record that
-  names no manager machine yields an EMPTY list (a new start refuses such a scope, `bad_spec`; an old record that has
-  one reaches nobody: the sender, hostd or a pod's sidecar, refuses to address a node the record places on no machine,
-  fenced or not, and the receiver refuses it as `unplaced`): a node belongs to the machine its
-  record names, so an owner token of any other machine that publishes the same node is never reachable by the
-  relay, and the hub matches machine AND node (a bare node is refused at mint, 422). Peers are not in it: whether a relay may type into an UNFENCED peer is Tomas's
-  open question (#3cy2); peers that are fenced stay reachable over the signed fenced path. The hub's list
-  format already holds up to 32 nodes, so adding peers later is a change to this one derivation. The verb has no argument for it: a `--may-reach` option, or
-  any argument other than `--after-401` and `-- <sid> <gen> <pub>`, is refused with exit 2 before anything is
-  read or sent. The hub lets a relay deliver to an UNFENCED target only when that target's node is in the
-  relay's `may_reach` (typed there with the fenced stamp); everything else is 403. The hub itself still lets a
-  relay deliver to ANY fenced session (the receiving hostd verifies the stamp and re-checks scope against ITS record),
-  so who a daemon or sidecar addresses is decided by `internal/hubsend.Resolve` from the sender's own record: the
-  manager's `<machine>/<node>`, never a fenced entry that merely carries the label. A relay addresses its target by
-  the full uid (an address that names more than one session is a 409, never a fan-out), and may read the session
-  list (`GET /sessions`) filtered to its `may_reach` entries and its own session. (Hub side: dotfiles `n1-g-hub2`, `Principals` and `scope!`.) The reply's `token` is printed. A hub that
+  The machine in each entry is the one the record binds the node to (`msg_scope.manager.machine`, `peer_machines`: written from the
+  owner's start spec, never from the fence), read by root from the SAME record it just validated: machine `[A-Za-z0-9._-]{1,64}`, node
+  `[A-Za-z0-9._#:/-]{1,128}`, at most 32 entries, a bare node is refused at mint (422). A node the record places on no machine is left out (a
+  new start refuses such a scope, `bad_spec`; for an old record the sender, hostd or a pod's sidecar, refuses to address it and the receiver
+  refuses it as `unplaced`): a node belongs to the machine its record names, so an owner token of another machine that publishes the same node
+  is never reachable. The verb has no argument for any of this: a `--may-reach` or `--manager` option, or any argument other than `--after-401`
+  and `-- <sid> <gen> <pub>`, is refused with exit 2 before anything is read or sent. Who a daemon or sidecar addresses is decided by
+  `internal/hubsend.Resolve` from the sender's own record, never a fenced entry that merely carries the label; a relay addresses its target by the
+  full uid (an address that names more than one session is a 409, never a fan-out). (Hub side: dotfiles `n1-g-hub2`, `Principals` and
+  `scope!`.) The reply's `token` is printed. A hub that
   answers anything but 201 with a token: exit 3, the status code (not the body) on stderr.
 
 ## Revoke

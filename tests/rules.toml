@@ -370,11 +370,71 @@ where = "hp"
 
 [[rule]]
 id = "git-steering-flag"
-title = "a steering flag (-c, --exec-path) from the fence is refused"
+title = "a commit that touches steering files (also via symlinks, ignored or uncommitted files) names them in a trailer the agent cannot forge"
 suite = "git"
 allow = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagAllow"
 block = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagBlock"
 invariants = [24, 25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-nested-repo"
+title = "host git never runs inside an agent-made nested repo, and never records one"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestNestedRepoAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestNestedRepoStatusBlock"
+invariants = [24, 25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-version-and-probe"
+title = "git older than 2.41, or one that ignores GIT_ATTR_SOURCE, is refused with the remedy"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestVersionGate"
+block = "tests/twin-go.sh ./internal/gitroute TestOldGitIsRefused"
+invariants = [24]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-commit-scan"
+title = "a commit is refused for symlinks out of the worktree, special files and oversized trees (the live-fence race blocks F3/C22)"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestCommitScanRefusals"
+block = "tests/twin-go.sh ./internal/gitroute TestEmbeddedRepoIsNotRecorded"
+invariants = [24]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-steering-links-ignored"
+title = "steering symlinks, edits behind them, and ignored or uncommitted steering files are reported"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestIsSteeringSegments"
+block = "tests/twin-go.sh ./internal/gitroute TestSteeringSymlinks"
+invariants = [25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-trailer-injection"
+title = "file names and messages cannot forge trailers or write to the terminal"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestTrailerAndTerminalInjection"
+invariants = [25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-config-gpg-timeout"
+title = "gpg placeholders, config includes and hung git processes are stopped"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestHooksOffAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestConfigIncludesRefused"
+invariants = [24]
 backends = ["unit"]
 where = "hp"
 

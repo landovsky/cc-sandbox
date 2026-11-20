@@ -1,3 +1,7 @@
+// Tests for H1 end to end: a real repo with a host-owned gitdir outside the worktree, then hooks,
+// a redirected .git, attribute drivers, submodule URLs and steering files planted the way an agent
+// could, and a marker command that proves whether anything ran on the host. They exist so each
+// protection has an allow twin (the normal case still works) and a block twin (invariant 23).
 package gitroute
 
 import (
@@ -74,7 +78,11 @@ func TestHooksOffBlock(t *testing.T) {
 	cmd, ran := marker(t)
 	write(t, gd, "hooks/pre-commit", "#!/bin/sh\n"+cmd+"\n")
 	write(t, gd, "hooks/post-commit", "#!/bin/sh\n"+cmd+"\n")
-	write(t, wt, "myhooks/pre-commit", "#!/bin/sh\n"+cmd+"\n")
+	// the repo config's hooksPath wins over the gitdir's hooks/, and --no-verify skips only
+	// pre-commit and commit-msg, so the other hooks are what prove the core.hooksPath override
+	for _, h := range []string{"pre-commit", "post-commit", "post-index-change", "post-checkout", "reference-transaction"} {
+		write(t, wt, "myhooks/"+h, "#!/bin/sh\n"+cmd+"\n")
+	}
 	sh(t, wt, "git", "--git-dir", gd, "config", "core.hooksPath", filepath.Join(wt, "myhooks"))
 	sh(t, wt, "git", "--git-dir", gd, "config", "core.fsmonitor", cmd)
 	write(t, wt, "b.txt", "y\n")

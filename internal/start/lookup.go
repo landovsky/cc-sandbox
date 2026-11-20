@@ -1,3 +1,6 @@
+// Which session, if any, owns a worktree path. Tools that read git metadata from a worktree ask
+// here first, because a fenced session's worktree must never be read through its own `.git` (the
+// agent can rewrite it). The answer comes from the daemon's session records, not from the worktree.
 package start
 
 import (

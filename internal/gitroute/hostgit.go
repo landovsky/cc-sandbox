@@ -286,6 +286,10 @@ func (r *Runner) checkRepo() error {
 	if !filepath.IsAbs(r.GitDir) || !filepath.IsAbs(r.Worktree) {
 		return fmt.Errorf("%w: gitdir and worktree must be absolute", ErrRefused)
 	}
+	// first: every later check shells out to this git
+	if err := r.checkGitVersion(); err != nil {
+		return err
+	}
 	gd, err := filepath.EvalSymlinks(r.GitDir)
 	if err != nil {
 		return err
@@ -335,7 +339,7 @@ func (r *Runner) checkRepo() error {
 			return fmt.Errorf("%w: %s exists; info/attributes can select filter drivers", ErrRefused, a)
 		}
 	}
-	return r.checkGitVersion()
+	return nil
 }
 
 // noIncludes refuses a config file with any include.* or includeIf.* key.

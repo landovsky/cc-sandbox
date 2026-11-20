@@ -1,3 +1,7 @@
+// Tests for the hardened host git: the argument allowlist (what a caller of Run can ask for), the
+// worktree-bounded paths and symlink cases, SHA-256 repos, and the steering-file matcher. They
+// exist because the worktree is hostile input (invariants 24 and 25) and each refusal needs a
+// block twin that goes red when the refusal is removed.
 package gitroute
 
 import (
@@ -148,7 +152,18 @@ func TestSymlinksInWorktreeDoNotLeakHostFiles(t *testing.T) {
 			t.Errorf("git %v returned host file content: %q", args, out)
 		}
 	}
-	// and a commit stores the LINK, never the target's bytes
+	// a commit refuses links that leave the worktree (and leaves nothing staged) ...
+	if _, err := r.Commit("s", "links"); err == nil {
+		t.Fatal("a commit with symlinks to host files was made")
+	}
+	if out, _ := r.Run("diff", "--cached", "--name-only"); strings.TrimSpace(out) != "" {
+		t.Fatalf("a refused commit left %q staged", out)
+	}
+	// ... and one with links that stay inside stores the LINK, never the target's bytes
+	os.Remove(filepath.Join(wt, "leakfile"))
+	os.Remove(filepath.Join(wt, "leakdir"))
+	os.Remove(filepath.Join(wt, "nulllink"))
+	os.Symlink("README.md", filepath.Join(wt, "innerlink"))
 	if _, err := r.Commit("s", "links"); err != nil {
 		t.Fatal(err)
 	}

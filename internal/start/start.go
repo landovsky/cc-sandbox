@@ -413,18 +413,18 @@ func (d *Daemon) LiveByLabel(label string) ([]*Record, error) {
 
 // Recorded is the reply of the start this caller already made with this request_id, or nil: read-only, so a caller can
 // answer a retry from the record without launching anything.
-func (d *Daemon) Recorded(uid int, startedBy, requestID string) *StartReply {
+func (d *Daemon) Recorded(uid int, startedBy, requestID, label string) (*StartReply, bool) {
 	recs, err := d.records()
 	if err != nil {
-		return nil
+		return nil, false
 	}
 	for _, r := range recs {
 		if r.Uid == uid && r.StartedBy == startedBy && r.RequestID == requestID {
 			rep := r.Reply
-			return &rep
+			return &rep, r.Label == label
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // Seen reports whether this caller already started a session with this request_id (so a retry is answered by

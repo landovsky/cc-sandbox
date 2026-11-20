@@ -188,7 +188,7 @@ func guardedStart(d *start.Daemon, spec *start.LaunchSpec) (*start.StartReply, e
 	if err != nil {
 		return nil, &start.Refusal{Code: remotestart.Internal, Msg: "the cross-machine peer list cannot be read: refusing to start without the label check"}
 	}
-	if pub == nil || len(pub.Peers) == 0 || d.Recorded(d.Uid, "", spec.RequestID) != nil {
+	if pub == nil || len(pub.Peers) == 0 || recordedFor(d, spec) {
 		return d.Start(spec) // no peers configured, or a retry of a start already recorded (answered by Start itself)
 	}
 	svc, err := remotestart.New(remotestart.Config{
@@ -211,4 +211,10 @@ func guardedStart(d *start.Daemon, spec *start.LaunchSpec) (*start.StartReply, e
 		return nil, ref
 	}
 	return rep, nil
+}
+
+// recordedFor: this caller already started this request_id (so Start answers it, or refuses a reuse for another label).
+func recordedFor(d *start.Daemon, spec *start.LaunchSpec) bool {
+	rep, _ := d.Recorded(d.Uid, "", spec.RequestID, spec.Label)
+	return rep != nil
 }

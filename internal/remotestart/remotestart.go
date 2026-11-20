@@ -28,6 +28,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/profile"
@@ -81,7 +82,7 @@ type Config struct {
 	Live func(label string) ([]View, error)
 	// Recorded is the reply of a start this caller already made with this request_id (nil: none), read from the
 	// session records: it recovers a reply the idempotency store lost (a crash between the launch and its write).
-	Recorded func(startedBy, requestID string) *start.StartReply
+	Recorded func(startedBy, requestID, label string) (rep *start.StartReply, sameLabel bool)
 	// RemoteEnabled: false = this daemon only runs the label check for starts (no POST /v1/sessions).
 	RemoteEnabled bool
 
@@ -242,7 +243,11 @@ func (s *Service) Start(ctx context.Context, caller Caller, body []byte) (*start
 	}
 	// a reply the store lost (a crash between the launch and its write) is recovered from the session record
 	if s.c.Recorded != nil {
-		if rep := s.c.Recorded(caller.StartedBy, spec.RequestID); rep != nil {
+		if rep, same := s.c.Recorded(caller.StartedBy, spec.RequestID, spec.Label); rep != nil {
+			if !same { // the same caller reusing a request_id for ANOTHER session: not the old reply
+				s.idemEnd(key, hash, token, nil, refusal(start.RequestIDReused, "request_id was already used for another session"))
+				return nil, refusal(start.RequestIDReused, "request_id was already used for another session")
+			}
 			s.idemEnd(key, hash, token, rep, nil)
 			return rep, nil
 		}
@@ -502,12 +507,39 @@ func (s *Service) readRes(label string) *resFile {
 	return &r
 }
 
-func (s *Service) writeRes(r resFile) {
+// writeRes writes a reservation through a temp name of its own (process and token), O_EXCL, then renames; an error means
+// the reservation does NOT exist and the caller must refuse.
+func (s *Service) writeRes(r resFile) error {
 	b, _ := json.Marshal(r)
-	tmp := s.resPath(r.Label) + ".tmp"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		os.Rename(tmp, s.resPath(r.Label))
+	tmp := fmt.Sprintf("%s.%d.%s.tmp", s.resPath(r.Label), os.Getpid(), r.Token)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
 	}
+	_, err = f.Write(b)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, s.resPath(r.Label)); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+// fileLock serialises the reservation check/create/renew/release across PROCESSES (hostd and a direct-mode CLI share the
+// directory): without it two of them could both see "free" and both reserve.
+func (s *Service) fileLock() func() {
+	f, err := os.OpenFile(filepath.Join(s.c.StateDir, "res.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return func() {}
+	}
+	syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }
 }
 
 // reconcile drops what a previous daemon run left that is past its time. A reservation still inside its time
@@ -587,22 +619,34 @@ func (s *Service) Guard(ctx context.Context, label, startedBy string, launch fun
 	}
 	token := newToken()
 	s.mu.Lock()
+	unlock := s.fileLock()
 	if _, busy := s.flight[label]; busy || s.readRes(label) != nil {
+		unlock()
 		s.mu.Unlock()
 		return nil, s.retry(refusal(start.StartInProgress, "the label is being started here"))
 	}
-	s.flight[label] = token
 	now := s.c.Now()
-	s.writeRes(resFile{Label: label, Machine: s.c.Machine, Token: token, StartedBy: startedBy, TS: now.Unix(), Renewed: now.UnixMilli()})
+	if err := s.writeRes(resFile{Label: label, Machine: s.c.Machine, Token: token, StartedBy: startedBy, TS: now.Unix(), Renewed: now.UnixMilli()}); err != nil {
+		unlock()
+		s.mu.Unlock()
+		if s.c.Logf != nil {
+			s.c.Logf("start of %s refused: the reservation cannot be written: %v", label, err)
+		}
+		return nil, refusal(Internal, "the start cannot be reserved on this machine (see the daemon's log)")
+	}
+	s.flight[label] = token
+	unlock()
 	s.mu.Unlock()
 	release := func() {
 		s.mu.Lock()
+		unlock := s.fileLock()
 		if s.flight[label] == token {
 			delete(s.flight, label)
 		}
 		if r := s.readResRaw(label); r != nil && r.Token == token {
 			os.Remove(s.resPath(label))
 		}
+		unlock()
 		s.mu.Unlock()
 	}
 	defer release()
@@ -626,10 +670,12 @@ func (s *Service) Guard(ctx context.Context, label, startedBy string, launch fun
 				return
 			case <-t.C:
 				s.mu.Lock()
+				unlock := s.fileLock()
 				if s.flight[label] == token {
 					n := s.c.Now()
 					s.writeRes(resFile{Label: label, Machine: s.c.Machine, Token: token, StartedBy: startedBy, TS: n.Unix(), Renewed: n.UnixMilli()})
 				}
+				unlock()
 				s.mu.Unlock()
 			}
 		}
@@ -736,6 +782,9 @@ func (s *Service) Publish() error {
 	return os.Rename(p+".tmp", p)
 }
 
+// Unpublish removes a stale peers.json (this daemon runs without a peer list now).
+func Unpublish(stateDir string) { os.Remove(filepath.Join(stateDir, "remote", "peers.json")) }
+
 // LoadPublished reads it: (nil, nil) when hostd never published one (no cross-machine check configured), an
 // error when the file exists and cannot be read (fail closed: the caller must refuse, not skip the check).
 func LoadPublished(stateDir string) (*Published, error) {
@@ -750,5 +799,11 @@ func LoadPublished(stateDir string) (*Published, error) {
 	if err := json.Unmarshal(b, &p); err != nil || p.Machine == "" {
 		return nil, fmt.Errorf("peers.json is not readable")
 	}
+	// the peer-set hash is recomputed from the names, never taken from the file
+	names := []string{p.Machine}
+	for _, q := range p.Peers {
+		names = append(names, q.Name)
+	}
+	p.PeerSet = PeerSetHash(names)
 	return &p, nil
 }

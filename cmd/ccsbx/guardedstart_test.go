@@ -18,7 +18,7 @@ import (
 func TestADirectModeStartAsksThePeersAndRefusesWhatLivesElsewhere(t *testing.T) {
 	state := t.TempDir()
 	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(remotestart.Answer{PeerSet: "S", Live: []remotestart.View{{Machine: "hp-ubuntu", Sid: "s0there", State: "running"}}})
+		json.NewEncoder(w).Encode(remotestart.Answer{PeerSet: remotestart.PeerSetHash([]string{"mac-tomas", "hp-ubuntu"}), Live: []remotestart.View{{Machine: "hp-ubuntu", Sid: "s0there", State: "running"}}})
 	}))
 	defer peer.Close()
 	pub, _ := json.Marshal(remotestart.Published{Machine: "mac-tomas", Peers: []remotestart.Peer{{Name: "hp-ubuntu", URL: peer.URL}}, PeerSet: "S", AskTimeoutMs: 2000})
@@ -32,10 +32,18 @@ func TestADirectModeStartAsksThePeersAndRefusesWhatLivesElsewhere(t *testing.T) 
 	}
 	// a peers file that exists but cannot be read must refuse, not skip the check
 	os.WriteFile(filepath.Join(state, "remote", "peers.json"), []byte("{broken"), 0o644)
-	if _, err := guardedStart(d, spec); err == nil {
+	_, err = guardedStart(d, spec)
+	if err == nil {
 		t.Fatal("an unreadable peer list was treated as no check")
 	}
 	if _, ok := err.(*start.Refusal); !ok {
 		t.Fatalf("%T", err)
+	}
+	// the peer-set hash is recomputed from the names, whatever the file claims
+	pub2, _ := json.Marshal(remotestart.Published{Machine: "mac-tomas", Peers: []remotestart.Peer{{Name: "hp-ubuntu", URL: peer.URL}}, PeerSet: "FORGED"})
+	os.WriteFile(filepath.Join(state, "remote", "peers.json"), pub2, 0o644)
+	got, err := remotestart.LoadPublished(state)
+	if err != nil || got.PeerSet != remotestart.PeerSetHash([]string{"mac-tomas", "hp-ubuntu"}) {
+		t.Fatalf("the file's peer_set was believed: %v %v", got, err)
 	}
 }

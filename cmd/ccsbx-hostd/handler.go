@@ -326,7 +326,10 @@ func startHandlerBy(sd *start.Daemon, p startPolicy, guard *remotestart.Service)
 		// A retry already recorded is answered from the record, read-only. Anything else goes through the Guard even
 		// if a record vanishes meanwhile (a failed launch rolls its record back): Start's own idempotency is inside it.
 		if guard != nil && startedBy == "" {
-			if rep := d.Recorded(uid, "", spec.RequestID); rep != nil {
+			if rep, same := d.Recorded(uid, "", spec.RequestID, spec.Label); rep != nil {
+				if !same {
+					return nil, &start.Refusal{Code: start.RequestIDReused, Msg: "request_id was already used for another session"}
+				}
 				return rep, nil
 			}
 			rep, ref := guard.Guard(context.Background(), spec.Label, "local:"+strconv.Itoa(uid), func() (*start.StartReply, error) { return d.Start(spec) })
@@ -430,6 +433,7 @@ func startHandlerBy2(sd *start.Daemon, p startPolicy, guard *remotestart.Service
 func remoteService(get func(string) string, num func(string) int, sd *start.Daemon, p startPolicy, stderr io.Writer) (*remotestart.Service, int) {
 	owner, peerList := get("owner-user"), splitList(get("peers"))
 	if owner == "" && len(peerList) == 0 {
+		remotestart.Unpublish(get("state")) // a stale list must not outlive a config that dropped it
 		return nil, 0
 	}
 	machine := get("machine")
@@ -505,12 +509,12 @@ func remoteService(get func(string) string, num func(string) int, sd *start.Daem
 			}
 			return out, nil
 		},
-		Recorded: func(by, rid string) *start.StartReply {
+		Recorded: func(by, rid, label string) (*start.StartReply, bool) {
 			uid, err := lookupUID(owner)
 			if err != nil {
-				return nil
+				return nil, false
 			}
-			return sd.Recorded(uid, by, rid)
+			return sd.Recorded(uid, by, rid, label)
 		},
 		RemoteEnabled: remoteOn,
 		Logf:          log.Printf, PerUserMinute: num("remote-per-user-minute"), PerMachineMinute: num("remote-per-machine-minute"), AskTimeout: timeout,

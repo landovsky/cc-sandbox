@@ -701,3 +701,22 @@ func TestRemoteStartOwnerUserRulesAreCheckedAtStartup(t *testing.T) {
 		}
 	}
 }
+
+// context (R3-S2, review): the same caller reusing a request_id for ANOTHER label must not be handed the first start's reply.
+func TestAReusedRequestIDForAnotherLabelIsRefusedNotReplayed(t *testing.T) {
+	w := wdir(t)
+	sd, p := policyFor(t, "tomas")
+	svc, _ := remotestart.New(remotestart.Config{Machine: "hp-ubuntu", PeerSet: "S", StateDir: t.TempDir(),
+		Live: func(string) ([]remotestart.View, error) { return nil, nil }, Profiles: profiles.Load,
+		Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
+			return startHandlerBy(sd, p, nil)(uid, spec, by)
+		}})
+	h := startHandlerBy(sd, p, svc)
+	if _, err := h(4000, []byte(fmt.Sprintf(specOf, "tomas", w)), ""); err != nil {
+		t.Fatal(err)
+	}
+	other := strings.Replace(fmt.Sprintf(specOf, "tomas", w), "cc-sandbox:x", "cc-sandbox:y", 1)
+	if _, err := h(4000, []byte(other), ""); err == nil || !strings.Contains(err.Error(), start.RequestIDReused) {
+		t.Fatalf("the old reply was replayed for another label: %v", err)
+	}
+}

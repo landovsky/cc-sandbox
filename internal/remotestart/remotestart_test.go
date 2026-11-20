@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -446,5 +447,30 @@ func TestARefusedRetryNeverDeletesTheStoredReply(t *testing.T) {
 	again, ref := r.s.Start(context.Background(), by, spec(nil))
 	if ref != nil || again.Sid != first.Sid {
 		t.Fatalf("the stored reply was lost: %v %v", again, ref)
+	}
+}
+
+// context (R3-S1, review): hostd and a direct-mode CLI share the reservation directory, so a reservation that cannot be
+// WRITTEN must refuse the start (an unreserved launch would be invisible to every peer), and a start must never
+// proceed on a reservation another process wrote.
+func TestAReservationThatCannotBeWrittenRefusesTheStart(t *testing.T) {
+	r := newRig(t)
+	os.Chmod(filepath.Join(r.s.c.StateDir, "res"), 0o500)
+	defer os.Chmod(filepath.Join(r.s.c.StateDir, "res"), 0o700)
+	if os.Geteuid() == 0 {
+		t.Skip("root writes anywhere")
+	}
+	if _, ref := r.s.Start(context.Background(), by, spec(nil)); ref == nil || ref.Code != Internal || r.starts.Load() != 0 {
+		t.Fatalf("%v starts=%d", ref, r.starts.Load())
+	}
+}
+
+// context: another PROCESS (the CLI) holding a live reservation for the label makes this daemon's start wait its turn.
+func TestAReservationAnotherProcessHoldsRefusesTheStart(t *testing.T) {
+	r := newRig(t)
+	now := r.s.c.Now()
+	r.s.writeRes(resFile{Label: "cc-sandbox:w1", Machine: "hp-ubuntu", Token: "other-process", TS: now.Unix(), Renewed: now.UnixMilli()})
+	if _, ref := r.s.Start(context.Background(), by, spec(nil)); code(ref) != start.StartInProgress {
+		t.Fatalf("%v", ref)
 	}
 }

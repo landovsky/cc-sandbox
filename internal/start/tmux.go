@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 )
 
 // TmuxLauncher runs the pane in `tmux -L ccsbx` as the calling user (direct mode). On Linux with
@@ -98,6 +99,12 @@ func (t *TmuxLauncher) Stop(sid string) error {
 
 // Alive reports whether the session's tmux session exists.
 func (t *TmuxLauncher) Alive(sid string) bool {
-	_, err := tmuxsock.Run(t.cmd("has-session", "-t", "="+sid))
-	return err == nil
+	out, err := tmuxsock.Run(t.cmd("has-session", "-t", "="+sid))
+	if err == nil {
+		return true
+	}
+	// Only tmux saying the session (or its server) is NOT there means "not alive". A timeout or any other failure is
+	// "cannot tell", which counts as alive: the label check must fail closed, never read a hiccup as a free label.
+	o := string(out)
+	return !(strings.Contains(o, "can't find session") || strings.Contains(o, "no server running") || strings.Contains(o, "No such file or directory") || strings.Contains(o, "error connecting"))
 }

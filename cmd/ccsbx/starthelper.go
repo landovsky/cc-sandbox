@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
@@ -27,9 +28,25 @@ func startViaHostd(f *cli.Flags, spec []byte, asJSON bool, stdout, stderr io.Wri
 		fmt.Fprintln(stderr, "ccsbx start: --launcher and --run-cmd are direct-mode dev flags: in helper mode hostd decides the launcher and the command")
 		return cli.ExitUsage
 	}
-	if _, err := start.ParseSpec(spec); err != nil {
+	ls, err := start.ParseSpec(spec)
+	if err != nil {
 		fmt.Fprintln(stderr, "ccsbx start:", err)
 		return cli.ExitRefused
+	}
+	// hostd (another uid) cannot enter the owner's home: resolve the workdir and the gitdir HERE, as the
+	// owner, and send the resolved paths; hostd checks their shape and ccsbx-root validates them for real.
+	if ls.GitDir != "" {
+		fmt.Fprintln(stderr, "ccsbx start: the spec must not carry a gitdir: the client computes it")
+		return cli.ExitRefused
+	}
+	if err := start.ResolveClientPaths(ls, os.Getuid()); err != nil {
+		fmt.Fprintln(stderr, "ccsbx start:", err)
+		return cli.ExitRefused
+	}
+	spec, err = json.Marshal(ls)
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx start:", err)
+		return cli.ExitFail
 	}
 	sock := get("socket")
 	c := unixClient(sock)

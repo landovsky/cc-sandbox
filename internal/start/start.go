@@ -49,20 +49,24 @@ type Record struct {
 
 // Daemon holds the policy knobs and the state directory.
 type Daemon struct {
-	StateDir     string
-	RunDir       string // where generations' s/<sid>/g<n>/CLOSED live; empty: StateDir (helper mode: ccsbx-root's run dir)
-	ProfilesDir  string
-	Machine      string // this machine's name; a spec for another machine is refused
-	Uid          int    // the caller's uid (from the OS, never from the spec)
-	Image        string // fence image reference recorded in the pin
-	PinsFile     string // pins.toml; missing means no production pins
-	WorktreeRoot string // every worktree must be inside this directory (CCSBX_WORKTREE_ROOT)
-	CCVersion    string
-	MaxLive      int // machine_full above this many live sessions
-	MaxPerHour   int // rate_capped above this many starts by one caller in an hour
-	Backend      string
-	Socket       string // tmux -L name for the attach command; default ccsbx
-	Root         string // "direct" or "helper"
+	StateDir    string
+	RunDir      string // where generations' s/<sid>/g<n>/CLOSED live; empty: StateDir (helper mode: ccsbx-root's run dir)
+	ProfilesDir string
+	// ProfileLoader, when set, loads an approved profile instead of reading ProfilesDir. hostd sets
+	// it to the profiles compiled into the binary, the same copy ccsbx-root uses, so the two can
+	// never disagree about what a profile allows.
+	ProfileLoader func(name string) (*profile.Profile, error)
+	Machine       string // this machine's name; a spec for another machine is refused
+	Uid           int    // the caller's uid (from the OS, never from the spec)
+	Image         string // fence image reference recorded in the pin
+	PinsFile      string // pins.toml; missing means no production pins
+	WorktreeRoot  string // every worktree must be inside this directory (CCSBX_WORKTREE_ROOT)
+	CCVersion     string
+	MaxLive       int // machine_full above this many live sessions
+	MaxPerHour    int // rate_capped above this many starts by one caller in an hour
+	Backend       string
+	Socket        string // tmux -L name for the attach command; default ccsbx
+	Root          string // "direct" or "helper"
 	// HelperProven: the helper has actually run on this machine and the docker group is gone. Only
 	// then does a reply claim evidence; the mere presence of ccsbx-root proves nothing (invariants 12, 14).
 	HelperProven bool
@@ -78,6 +82,30 @@ func (d *Daemon) now() time.Time {
 		return d.Now()
 	}
 	return time.Now()
+}
+
+// ResolveClientPaths is what `ccsbx start` does as the OWNER, before it sends a spec to hostd in
+// helper mode: resolve workdir.path through symlinks and compute the gitdir exactly as the direct-mode
+// daemon would (backend.ResolveGitDir, checked against uid), and put both into the spec. hostd, a
+// different uid that cannot enter the owner's home, only checks their shape; ccsbx-root re-validates
+// them for real at run time. A failure is a refusal the owner can act on.
+func ResolveClientPaths(s *LaunchSpec, uid int) error {
+	if s.Workdir.Path == "" {
+		return refuse(BadSpec, "workdir.path is required")
+	}
+	rw, err := filepath.EvalSymlinks(s.Workdir.Path)
+	if err != nil {
+		return refuse(BadSpec, "workdir %s: %v", s.Workdir.Path, err)
+	}
+	if st, err := os.Stat(rw); err != nil || !st.IsDir() {
+		return refuse(BadSpec, "workdir.path %s is not a directory", s.Workdir.Path)
+	}
+	gd, err := backend.ResolveGitDir(rw, uid)
+	if err != nil {
+		return refuse(BadSpec, "workdir git metadata: %v", err)
+	}
+	s.Workdir.Path, s.GitDir = rw, gd
+	return nil
 }
 
 // AbsRoots makes every entry of a comma-separated worktree-root list absolute (a relative entry is
@@ -138,16 +166,39 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	if s.Workdir.Path == "" || s.Workdir.Repo != "" {
 		return nil, refuse(NotBuilt, "only workdir.path is supported (repo/base/branch needs the git route, H1)")
 	}
-	rw, err := backend.CheckWorkdir(s.Workdir.Path, d.WorktreeRoot, d.StateDir)
-	if err != nil {
-		return nil, refuse(BadSpec, "workdir: %v", err)
-	}
-	if st, err := os.Stat(rw); err != nil || !st.IsDir() {
-		return nil, refuse(BadSpec, "workdir.path %s is not a directory", s.Workdir.Path)
+	var rw string
+	if d.Root == "helper" {
+		// hostd runs as the service uid and cannot enter the owner's home (0750): it never touches the
+		// filesystem here. The CLIENT resolved the workdir and the gitdir as the owner (ResolveClientPaths);
+		// this checks their shape, and ccsbx-root, as root, does the real validation at run time.
+		var err error
+		rw, err = backend.CheckWorkdirLexical(s.Workdir.Path, d.WorktreeRoot, d.StateDir, d.RunDir)
+		if err != nil {
+			return nil, refuse(BadSpec, "workdir: %v", err)
+		}
+		if err := backend.CheckGitDirLexical(s.GitDir, rw); err != nil {
+			return nil, refuse(BadSpec, "gitdir: %v", err)
+		}
+	} else {
+		if s.GitDir != "" {
+			return nil, refuse(BadSpec, "gitdir is only accepted in helper mode (here the daemon resolves it itself)")
+		}
+		var err error
+		rw, err = backend.CheckWorkdir(s.Workdir.Path, d.WorktreeRoot, d.StateDir)
+		if err != nil {
+			return nil, refuse(BadSpec, "workdir: %v", err)
+		}
+		if st, err := os.Stat(rw); err != nil || !st.IsDir() {
+			return nil, refuse(BadSpec, "workdir.path %s is not a directory", s.Workdir.Path)
+		}
 	}
 	s.Workdir.Path = rw // the resolved path is what gets mounted and recorded
 
-	p, err := profile.Load(d.ProfilesDir, s.Profile)
+	loadProfile := func(name string) (*profile.Profile, error) { return profile.Load(d.ProfilesDir, name) }
+	if d.ProfileLoader != nil {
+		loadProfile = d.ProfileLoader
+	}
+	p, err := loadProfile(s.Profile)
 	if err != nil {
 		return nil, refuse(ProfileNotApproved, "profile %q: %v", s.Profile, err)
 	}
@@ -220,9 +271,13 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 			return nil, err
 		}
 		// First start only: the worktree has not been written by an agent of this session yet.
-		gd, err := backend.ResolveGitDir(rw, d.Uid)
-		if err != nil {
-			return nil, refuse(BadSpec, "workdir git metadata: %v", err)
+		gd := s.GitDir // helper mode: resolved by the client as the owner, shape-checked above
+		if d.Root != "helper" {
+			var err error
+			gd, err = backend.ResolveGitDir(rw, d.Uid)
+			if err != nil {
+				return nil, refuse(BadSpec, "workdir git metadata: %v", err)
+			}
 		}
 		rec = &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s, GitDir: gd}
 	}

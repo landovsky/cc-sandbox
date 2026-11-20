@@ -1476,3 +1476,25 @@ block = "tests/twin-go.sh ./internal/hostd TestFailedReplyWriteIsLoggedAndCounte
 invariants = [10, 28]
 backends = ["unit"]
 where = "hp"
+
+# ---- helper start: the client resolves paths, hostd checks their shape (n1-g-helper2). Direct mode: not evidence. ----
+
+[[rule]]
+id = "helper-paths-lexical"
+title = "in helper mode hostd checks the client-resolved workdir and gitdir by shape only (it cannot enter the owner's home) and refuses a gitdir in direct mode; the client resolves symlinks and computes the gitdir"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/start TestHelperModeNeverStatsTheWorkdir"
+block = "tests/twin-go.sh ./internal/start TestHelperModeRefusesAnOutOfShapeGitdir"
+invariants = [3, 10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-file-read-bounded"
+title = "the .git file, gitdir back-reference and commondir are read with O_NOFOLLOW|O_NONBLOCK, one link, regular, at most 4 KiB: a FIFO, a symlink or a huge file planted by an agent cannot hang or exhaust the start path"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/backend TestReadSmallReadsAnOrdinaryGitFileAllow"
+block = "tests/twin-go.sh ./internal/backend TestReadSmallRefusesWhatAnAgentCouldPlant"
+invariants = [10]
+backends = ["unit"]
+where = "hp"

@@ -201,9 +201,9 @@ const hearEvery = 30 * time.Second
 
 // startPolicy is hostd's start configuration (its flags), apart from who is asking.
 type startPolicy struct {
-	Profiles, Pins, WorktreeRoots, Image, CCVersion, TmuxSocket, RunDir string
-	MaxLive, MaxPerHour, MinUID                                         int
-	LookupID                                                            func(string) (*user.User, error)
+	Pins, WorktreeRoots, Image, CCVersion, TmuxSocket, RunDir string
+	MaxLive, MaxPerHour, MinUID                               int
+	LookupID                                                  func(string) (*user.User, error)
 }
 
 // startHandler is the daemon API's session start: the caller is the socket peer (uid), the spec is
@@ -227,7 +227,7 @@ func startHandler(sd *start.Daemon, p startPolicy) func(uid int, spec []byte) (*
 		d.Uid, d.RunDir = uid, p.RunDir
 		// The roots are passed through unchanged: hostd is a service, a relative entry means nothing to
 		// it, and CheckWorkdir refuses exactly what ccsbx-root's allowed_roots refuses.
-		d.ProfilesDir, d.PinsFile, d.WorktreeRoot = p.Profiles, p.Pins, p.WorktreeRoots
+		d.PinsFile, d.WorktreeRoot = p.Pins, p.WorktreeRoots
 		d.Image, d.CCVersion, d.Socket = p.Image, p.CCVersion, p.TmuxSocket
 		d.MaxLive, d.MaxPerHour = p.MaxLive, p.MaxPerHour
 		return d.Start(spec)

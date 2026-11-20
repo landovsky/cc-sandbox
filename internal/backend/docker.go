@@ -17,6 +17,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/user"
@@ -324,7 +325,7 @@ func ResolveGitDir(workdir string, uid int) (string, error) {
 		}
 		return p, nil
 	}
-	b, err := os.ReadFile(p)
+	b, err := readSmall(p, maxGitFile)
 	if err != nil {
 		return "", err
 	}
@@ -343,7 +344,7 @@ func ResolveGitDir(workdir string, uid int) (string, error) {
 	if !isGitDir(t) {
 		return "", fmt.Errorf("gitdir target %s is not a git directory", t)
 	}
-	back, err := os.ReadFile(filepath.Join(t, "gitdir"))
+	back, err := readSmall(filepath.Join(t, "gitdir"), maxGitFile)
 	if err != nil {
 		return "", fmt.Errorf("gitdir target %s has no back-reference to a worktree", t)
 	}
@@ -360,6 +361,44 @@ func ResolveGitDir(workdir string, uid int) (string, error) {
 	return t, nil
 }
 
+// maxGitFile bounds what is read from a `.git` file, a `gitdir` back-reference or a `commondir`: each
+// is one short path. Nothing larger is a real git file, and an agent that left a huge or special file
+// there must not make the daemon block or read gigabytes while it holds the start lock.
+const maxGitFile = 4096
+
+// readSmall reads a small regular file the way a daemon should read one an agent could have
+// replaced: no symlink followed (O_NOFOLLOW), no blocking on a FIFO (O_NONBLOCK), judged on the
+// opened descriptor (a regular file with one link, at most max bytes) and read with a hard cap.
+func readSmall(path string, max int64) ([]byte, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, &os.PathError{Op: "open", Path: path, Err: err}
+	}
+	f := os.NewFile(uintptr(fd), path)
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		return nil, fmt.Errorf("%s is not a regular file", path)
+	}
+	if sys, ok := st.Sys().(*syscall.Stat_t); !ok || sys.Nlink != 1 {
+		return nil, fmt.Errorf("%s has more than one link", path)
+	}
+	if st.Size() > max {
+		return nil, fmt.Errorf("%s is larger than %d bytes: not a git file", path, max)
+	}
+	b, err := io.ReadAll(io.LimitReader(f, max+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > max {
+		return nil, fmt.Errorf("%s grew past %d bytes while being read", path, max)
+	}
+	return b, nil
+}
+
 // hostOwnedGitDir applies, for a gitdir about to be mounted, the same rule host git applies before
 // it runs (internal/gitroute): the gitdir and what git reads from it are owned by the calling host
 // user (uid, never the uid of this process: in helper mode that is root) and are not writable by
@@ -374,7 +413,7 @@ func hostOwnedGitDir(gd string, uid int) error {
 		return err
 	}
 	roots := []string{gd}
-	switch cd, err := os.ReadFile(filepath.Join(gd, "commondir")); {
+	switch cd, err := readSmall(filepath.Join(gd, "commondir"), maxGitFile); {
 	case err == nil: // a linked worktree
 		c := strings.TrimSpace(string(cd))
 		if !filepath.IsAbs(c) {
@@ -499,6 +538,79 @@ func CheckPath(p string) error {
 // reserved are paths the fence mounts or needs itself; a worktree on or above one would shadow
 // it (or be shadowed by it) and the mounts would fail or, worse, silently mask each other.
 var reserved = []string{"/tmp", "/run", "/etc", "/home/agent", "/proc", "/sys", "/dev"}
+
+// CheckWorkdirLexical is CheckWorkdir for a daemon that cannot see inside the owner's home (hostd as
+// the service uid: /home/<owner> is 0750): it never touches the filesystem. The CLIENT resolved the
+// path (no symlinks, absolute, clean) and the daemon only checks its SHAPE: clean and absolute, free
+// of the characters CheckPath refuses, strictly inside one root of the comma-separated list (each a
+// clean absolute entry, not "/"), not overlapping the state dir, the run dir or a fixed fence mount.
+// ccsbx-root, as root, does the real validation at run time (an fd walk, owners, symlinks), and the
+// roots it is given are real paths, so a lexical match here is never looser than the walk there.
+func CheckWorkdirLexical(w, roots, stateDir, runDir string) (string, error) {
+	if err := CheckPath(w); err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(w) || filepath.Clean(w) != w {
+		return "", fmt.Errorf("workdir %q must be a clean absolute path", w)
+	}
+	if roots == "" {
+		return "", fmt.Errorf("no worktree root is configured (set --worktree-root)")
+	}
+	inside := false
+	for _, r := range strings.Split(roots, ",") {
+		if err := CheckPath(r); err != nil {
+			return "", fmt.Errorf("worktree root %q: %w", r, err)
+		}
+		if !filepath.IsAbs(r) || filepath.Clean(r) != r || r == "/" {
+			return "", fmt.Errorf("worktree root %q must be a clean absolute path and not /", r)
+		}
+		if strings.HasPrefix(w, r+string(filepath.Separator)) {
+			inside = true
+		}
+	}
+	if !inside {
+		return "", fmt.Errorf("workdir %s is not inside the worktree root(s) %s", w, roots)
+	}
+	overlap := func(a, b string) bool {
+		return a == b || strings.HasPrefix(a, b+"/") || strings.HasPrefix(b, a+"/")
+	}
+	for _, d := range []string{stateDir, runDir} {
+		if d != "" && overlap(w, filepath.Clean(d)) {
+			return "", fmt.Errorf("workdir %s overlaps the daemon's state or run dir", w)
+		}
+	}
+	for _, r := range reserved {
+		if overlap(w, r) {
+			return "", fmt.Errorf("workdir %s overlaps %s, which the fence mounts itself", w, r)
+		}
+	}
+	return w, nil
+}
+
+// CheckGitDirLexical checks the SHAPE of a client-resolved gitdir without touching the filesystem:
+// empty (no .git), exactly <workdir>/.git, or a clean absolute path whose last two segments are
+// worktrees/<name> inside a .git directory (a linked worktree's gitdir). ccsbx-root verifies the real
+// thing (the back-reference, the owners) at run time.
+func CheckGitDirLexical(gd, workdir string) error {
+	if gd == "" {
+		return nil
+	}
+	if err := CheckPath(gd); err != nil {
+		return err
+	}
+	if !filepath.IsAbs(gd) || filepath.Clean(gd) != gd {
+		return fmt.Errorf("gitdir %q must be a clean absolute path", gd)
+	}
+	if gd == filepath.Join(workdir, ".git") {
+		return nil
+	}
+	parent, name := filepath.Split(gd)
+	parent = filepath.Clean(parent)
+	if name == "" || filepath.Base(parent) != "worktrees" || filepath.Base(filepath.Dir(parent)) != ".git" {
+		return fmt.Errorf("gitdir %s is neither <workdir>/.git nor <repo>/.git/worktrees/<name>", gd)
+	}
+	return nil
+}
 
 // CheckWorkdir decides whether a worktree path may be mounted rw into a fence. The path is
 // resolved through symlinks first (a link `/x/wt -> /run` would otherwise pass a textual check)

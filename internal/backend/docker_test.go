@@ -16,6 +16,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
 
 // vt is a temp dir under /var/tmp: /tmp is a fixed mount point of the fence, so a worktree there
@@ -1102,5 +1103,98 @@ func TestCheckWorkdirTakesACommaSeparatedListOfRoots(t *testing.T) {
 		if _, err := CheckWorkdir(inA, bad, state); err == nil {
 			t.Errorf("%s: accepted (%q)", name, bad)
 		}
+	}
+}
+
+// ---- helper mode: the daemon cannot enter the owner's home, so it checks paths by SHAPE only ------
+
+// context: hostd (uid ccsbx) cannot stat anything under /home/<owner> (0750). Nothing in these paths
+// exists here, and that is the point: a lexical check never touches the filesystem, the client has
+// already resolved the paths and ccsbx-root validates the real thing at run time.
+func TestCheckWorkdirLexicalNeverTouchesTheFilesystemAllow(t *testing.T) {
+	got, err := CheckWorkdirLexical("/nonexistent-home/u/git/proj/wt", "/nonexistent-home/u/git,/nonexistent-home/u/wt", "/var/lib/ccsbx", "/var/lib/ccsbx-run")
+	if err != nil || got != "/nonexistent-home/u/git/proj/wt" {
+		t.Fatalf("%q %v", got, err)
+	}
+	if _, err := CheckWorkdirLexical("/nonexistent-home/u/wt/x", "/nonexistent-home/u/git,/nonexistent-home/u/wt", "", ""); err != nil {
+		t.Fatalf("the second root: %v", err)
+	}
+}
+
+func TestCheckWorkdirLexicalRefusesWhatCcsbxRootWouldBlock(t *testing.T) {
+	roots := "/home/u/git"
+	for name, c := range map[string][3]string{
+		"outside every root":    {"/home/u/other/wt", roots, ""},
+		"the root itself":       {"/home/u/git", roots, ""},
+		"relative":              {"git/wt", roots, ""},
+		"unclean (..)":          {"/home/u/git/a/../b", roots, ""},
+		"trailing slash":        {"/home/u/git/wt/", roots, ""},
+		"a sibling by prefix":   {"/home/u/gitx/wt", roots, ""},
+		"the state dir":         {"/var/lib/ccsbx/x", "/var/lib", "/var/lib/ccsbx"},
+		"the run dir":           {"/var/lib/ccsbx-run/s/x", "/var/lib", "/var/lib/ccsbx"},
+		"a fixed fence mount":   {"/run/x", "/run", ""},
+		"a bad root (relative)": {"/home/u/git/wt", "git", ""},
+		"a bad root (/)":        {"/home/u/git/wt", "/home/u/git,/", ""},
+		"no roots":              {"/home/u/git/wt", "", ""},
+	} {
+		run := ""
+		if name == "the run dir" {
+			run = "/var/lib/ccsbx-run"
+		}
+		if _, err := CheckWorkdirLexical(c[0], c[1], c[2], run); err == nil {
+			t.Errorf("%s: accepted %v", name, c)
+		}
+	}
+}
+
+func TestCheckGitDirLexicalShapes(t *testing.T) {
+	wd := "/home/u/git/proj"
+	for _, ok := range []string{"", wd + "/.git", "/home/u/git/main/.git/worktrees/proj"} {
+		if err := CheckGitDirLexical(ok, wd); err != nil {
+			t.Errorf("%q refused: %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"/etc", "/var/run/x", "/home/u/git/main/.git", "/home/u/git/main/.git/worktrees/", "/home/u/git/main/.git/worktrees/a/b", ".git", "/home/u/git/proj/../.git", wd + "/.git/"} {
+		if err := CheckGitDirLexical(bad, wd); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+// ---- SHOULD 7: small git files are read without following, blocking or reading without limit ----
+
+func TestReadSmallRefusesWhatAnAgentCouldPlant(t *testing.T) {
+	d := t.TempDir()
+	good := filepath.Join(d, "gitdir")
+	os.WriteFile(good, []byte("gitdir: /x\n"), 0o644)
+	if b, err := readSmall(good, 4096); err != nil || string(b) != "gitdir: /x\n" {
+		t.Fatalf("a normal file: %q %v", b, err)
+	}
+	os.Symlink(good, filepath.Join(d, "link"))
+	os.WriteFile(filepath.Join(d, "big"), make([]byte, 5000), 0o644)
+	os.Link(good, filepath.Join(d, "hard"))
+	syscall.Mkfifo(filepath.Join(d, "fifo"), 0o644)
+	for _, n := range []string{"link", "big", "hard", "fifo", "dir", "missing"} {
+		if n == "dir" {
+			os.Mkdir(filepath.Join(d, n), 0o755)
+		}
+		done := make(chan error, 1)
+		go func(n string) { _, err := readSmall(filepath.Join(d, n), 4096); done <- err }(n)
+		select {
+		case err := <-done:
+			if err == nil {
+				t.Errorf("%s was read", n)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("%s: readSmall blocked (a FIFO must not hang the start path)", n)
+		}
+	}
+}
+
+func TestReadSmallReadsAnOrdinaryGitFileAllow(t *testing.T) {
+	p := filepath.Join(t.TempDir(), ".git")
+	os.WriteFile(p, []byte("gitdir: /repo/.git/worktrees/w\n"), 0o644)
+	if b, err := readSmall(p, 4096); err != nil || !strings.HasPrefix(string(b), "gitdir:") {
+		t.Fatalf("%q %v", b, err)
 	}
 }

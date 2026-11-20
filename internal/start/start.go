@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
 	"os"
@@ -70,9 +71,11 @@ type Daemon struct {
 	// HelperProven: the helper has actually run on this machine and the docker group is gone. Only
 	// then does a reply claim evidence; the mere presence of ccsbx-root proves nothing (invariants 12, 14).
 	HelperProven bool
-	Launcher     Launcher
-	ReplaceWait  time.Duration // how long Replace waits for the old fence to shut down (default 15s)
-	Now          func() time.Time
+	// Runtime says whether a generation's container is running (the stopped proof asks it).
+	Runtime     Runtime
+	Launcher    Launcher
+	ReplaceWait time.Duration // how long Replace waits for the old fence to shut down (default 15s)
+	Now         func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
 	Exe string
 }
@@ -263,6 +266,16 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 			return nil, refuse(BadSpec, "resume: session %s has label %q, not %q (a resume keeps its label)", old.Sid, old.Label, s.Label)
 		case old.Spec.Workdir.Path != rw:
 			return nil, refuse(BadSpec, "resume: workdir must be the same, the transcript is keyed by it")
+		}
+		// a commit (or a fence) holds the session: a new generation must not start now
+		// A missing lock file (helper mode) is "not held": nothing has ever run under ccsbx-root for
+		// this session, and the fence this start launches creates and takes the lock itself.
+		if rel, err := d.TrySessionLock(old.Sid); errors.Is(err, ErrNoLockFile) {
+			// not busy
+		} else if err != nil {
+			return nil, refuse(SessionBusy, "resume: %v", err)
+		} else {
+			rel()
 		}
 		cp := *old
 		prev = &cp

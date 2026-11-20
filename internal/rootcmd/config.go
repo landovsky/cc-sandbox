@@ -16,8 +16,9 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/tomlmini"
 )
 
-// Verbs is every verb there is. The config's `verbs` can only switch some of them off.
-var Verbs = []string{"run", "stop", "renew", "gc", "attach", "exec-token"}
+// Verbs is every verb there is. The config's `verbs` lists the ones that are on (and `status = "off"`
+// turns that one off by itself); nothing outside this list can be switched on.
+var Verbs = []string{"run", "stop", "renew", "gc", "attach", "exec-token", "status"}
 
 // Config is the policy. TrustedUID is who must own the files root believes; it is 0 in production
 // and is never read from the file.
@@ -34,7 +35,8 @@ type Config struct {
 	Machine      string
 	BaseURL      string // the forwarder's model route written into managed settings
 	FetchURL     string
-	MinUID       int // a session record must belong to a uid at least this large (never root or a system user)
+	StatusOff    bool // `status = "off"` in the file: the read-only status verb is disabled by itself
+	MinUID       int  // a session record must belong to a uid at least this large (never root or a system user)
 	TrustedUID   int
 }
 
@@ -53,7 +55,7 @@ func Defaults() Config {
 
 var configKeys = map[string]bool{
 	"allowed_roots": true, "verbs": true, "state_dir": true, "run_dir": true, "docker": true, "tmux": true,
-	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true, "min_uid": true, "seccomp_profile": true,
+	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true, "min_uid": true, "seccomp_profile": true, "status": true,
 }
 
 // LoadConfig reads and validates the file. The file and its directory must be owned by trustedUID
@@ -119,6 +121,13 @@ func LoadConfig(path string, trustedUID int) (*Config, error) {
 		if err := str(k, dst); err != nil {
 			return nil, err
 		}
+	}
+	if v, ok := top["status"]; ok {
+		sv, _ := v.(string)
+		if sv != "off" && sv != "on" {
+			return nil, fmt.Errorf("config %s: status must be \"on\" or \"off\"", path)
+		}
+		c.StatusOff = sv == "off"
 	}
 	if v, ok := top["min_uid"]; ok {
 		n, isInt := v.(int64)
@@ -199,6 +208,16 @@ func (c *Config) validate(roots []string) error {
 
 // Enabled reports whether a verb is switched on.
 func (c *Config) Enabled(v string) bool {
+	if v == "status" {
+		// read-only. Listed explicitly, it is on; with `status = "off"` it is off whatever else is
+		// listed; otherwise it is on wherever stop is, so a config written before the verb existed
+		// (the installer's explicit list) keeps working.
+		return !c.StatusOff && (c.enabled("status") || c.enabled("stop"))
+	}
+	return c.enabled(v)
+}
+
+func (c *Config) enabled(v string) bool {
 	for _, x := range c.Verbs {
 		if x == v {
 			return true

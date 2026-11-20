@@ -76,6 +76,13 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ccsbx run:", err)
 		return cli.ExitFail
 	}
+	// a commit (or another run) of this session holds its lock: do not start a fence under it
+	unlock, err := d.TrySessionLock(get("sid"))
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx run:", err)
+		return cli.ExitRefused
+	}
+	defer unlock()
 	rec, err := d.Load(get("sid"))
 	if err != nil {
 		fmt.Fprintln(stderr, "ccsbx run:", err)

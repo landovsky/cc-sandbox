@@ -528,24 +528,84 @@ func (r *Runner) RunForFence(args ...string) (string, error) {
 	switch args[0] {
 	case "status", "ls-files":
 		return "", fmt.Errorf("%w: git %s reads the worktree; not for the fence", ErrRefused, args[0])
-	case "diff":
-		revs := 0
+	}
+	// Positionals before "--" must be revisions that exist, each one checked by git itself
+	// (rev-parse --verify --end-of-options <x>^{object}): a name that is not one (a file in the
+	// worktree, "README.md", "a") would be read by `git diff` as a PATH and diffed against the
+	// worktree. `a..b` and `a...b` are checked on each side.
+	revs := 0
+	switch args[0] {
+	case "diff", "show", "log", "rev-list", "merge-base":
 		for _, a := range args[1:] {
 			if a == "--" {
 				break
 			}
+			if strings.HasPrefix(a, "-") {
+				continue // a flag: checkArgs allowlisted it (--no-index and the like are not on the list)
+			}
+			sides, isRange := splitRange(a)
+			if isRange {
+				revs += 2
+			} else {
+				revs++
+			}
+			for _, x := range sides {
+				if x == "" {
+					continue // "a.." and "..b": the empty side is HEAD
+				}
+				if err := r.verifyRev(x); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+	switch args[0] {
+	case "diff":
+		for _, a := range args[1:] {
 			if a == "--cached" || a == "--staged" {
 				return "", fmt.Errorf("%w: git diff --cached reads the index; not for the fence", ErrRefused)
-			}
-			if !strings.HasPrefix(a, "-") {
-				revs += 1 + strings.Count(a, "..")
 			}
 		}
 		if revs < 2 {
 			return "", fmt.Errorf("%w: git diff needs two revisions here; one revision or none diffs the worktree", ErrRefused)
 		}
 	}
+	// "--" after the positionals, always: with it git takes every positional as a revision and dies
+	// on one that is not, instead of quietly reading it as a path of the worktree.
+	switch args[0] {
+	case "diff", "show", "log", "rev-list":
+		if !contains(args, "--") {
+			args = append(append([]string{}, args...), "--")
+		}
+	}
 	return r.exec(args...)
+}
+
+// splitRange splits `a...b` and `a..b` exactly as git does (the three-dot form first), so each
+// side is the string git will resolve; a name with other dots in it (v1.2, HEAD..main.HEAD's right
+// side "main.HEAD") stays whole.
+func splitRange(a string) ([]string, bool) {
+	if l, r, ok := strings.Cut(a, "..."); ok {
+		return []string{l, r}, true
+	}
+	if l, r, ok := strings.Cut(a, ".."); ok {
+		return []string{l, r}, true
+	}
+	return []string{a}, false
+}
+
+// verifyRev asks git (bounded, with the hardened environment) whether x names an object. A
+// `<rev>:<path>` is checked as written (checkArgs has already refused a leading ":" , so this never
+// names the index); anything else as `<x>^{object}`.
+func (r *Runner) verifyRev(x string) error {
+	spec := x + "^{object}"
+	if strings.Contains(x, ":") {
+		spec = x
+	}
+	if _, err := r.exec("rev-parse", "--verify", "--end-of-options", spec); err != nil {
+		return fmt.Errorf("%w: %q is not a revision (a path would be read from the worktree)", ErrRefused, x)
+	}
+	return nil
 }
 
 // exec runs without the allowlist: for the fixed argument lists of this package only.

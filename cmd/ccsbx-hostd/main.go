@@ -185,7 +185,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		}
 		return a
 	}
-	sd := &start.Daemon{StateDir: abs(get("state")), RunDir: runDir, ProfileLoader: profiles.Load, Machine: get("machine"), Root: mode, Exe: exe, Backend: "docker",
+	sd := &start.Daemon{StateDir: abs(get("state")), RunDir: runDir, ProfileLoader: profiles.Load, Machine: get("machine"), Root: mode, Exe: exe, Backend: "docker", Runtime: runtimeFor(mode),
 		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Helper: mode == "helper", Env: paneEnv(abs(get("state")), get("machine"), get("image"), mode)}}
 	var servers []*http.Server
 	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
@@ -319,3 +319,12 @@ func runDirOr(run, state string) string {
 func hostname() string { h, _ := os.Hostname(); return h }
 
 func main() { os.Exit(app().Main(os.Args[1:], os.Stdout, os.Stderr)) }
+
+// runtimeFor is how the stopped proof asks whether a container runs: docker in direct mode, the
+// read-only `ccsbx-root status` in helper mode (the caller has no docker there).
+func runtimeFor(mode string) start.Runtime {
+	if mode == "helper" {
+		return start.HelperRuntime{}
+	}
+	return start.DockerRuntime{Docker: "docker"}
+}

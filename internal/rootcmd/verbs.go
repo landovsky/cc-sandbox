@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/cli"
@@ -168,6 +169,16 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	if err := e.ensureRunDir(); err != nil {
 		return 0, err
 	}
+	// The session's lock, held for as long as the fence runs: a commit (which holds it while the host
+	// reads the worktree) and a fence exclude each other, and neither waits.
+	lf, err := e.lockFile(rec.Sid, w.serviceGid)
+	if err != nil {
+		return 0, err
+	}
+	defer lf.Close()
+	if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		return 0, refuse("session %s is busy: a commit is in progress or a generation is running", rec.Sid)
+	}
 	seccompFile, err := e.seccomp()
 	if err != nil {
 		return 0, err
@@ -278,6 +289,69 @@ func (e *env) stopCmd() *cli.Command {
 				fmt.Fprintf(stderr, "ccsbx-root stop: the container is gone, but the workdir was not cleaned of setid bits: %v\n", err)
 				return cli.ExitFail
 			}
+			return cli.ExitOK
+		},
+	}
+}
+
+func (e *env) statusCmd() *cli.Command {
+	return &cli.Command{
+		Name:    "status",
+		Summary: "print running or stopped for one session's current and previous generation (changes nothing but making the session's lock file)",
+		Recipes: `  sudo -n /usr/local/sbin/ccsbx-root status -- s0k1dry66qg
+  Takes only the sid. Prints "running" if the container of the record's generation, or of the one
+  before it, is running (or its session lock is held), else "stopped"; exit 1 (and no answer) if
+  docker cannot be asked. It stops, starts and removes nothing; the one thing it writes is the
+  session's empty lock file under the run dir, so the daemon (which may only open it read-only) can
+  take the lock. The daemon uses it before it lets the host read a worktree (the stopped proof).`,
+		Run: func(_ *cli.Flags, args []string, stdout, stderr io.Writer) int {
+			sid, ok := oneSid("status", args, stderr)
+			if !ok {
+				return cli.ExitUsage
+			}
+			w, err := e.prelude("status")
+			if err == nil {
+				err = e.hostNS()
+			}
+			if err != nil {
+				return fail(stderr, "status", err)
+			}
+			rec, err := e.session(w, sid)
+			if err != nil {
+				return fail(stderr, "status", err)
+			}
+			docker, err := e.cfg.binary(e.cfg.Docker)
+			if err != nil {
+				return fail(stderr, "status", err)
+			}
+			// the session's lock file is made here if it is not there yet (root's, in root's
+			// directory) so the daemon can take the lock on it without creating anything; a held
+			// lock (a fence, or a commit) is "running"
+			if err := e.ensureRunDir(); err != nil {
+				return fail(stderr, "status", err)
+			}
+			lf, err := e.lockFile(rec.Sid, w.serviceGid)
+			if err != nil {
+				return fail(stderr, "status", err)
+			}
+			defer lf.Close()
+			if err := syscall.Flock(int(lf.Fd()), syscall.LOCK_SH|syscall.LOCK_NB); err != nil {
+				fmt.Fprintln(stdout, "running")
+				return cli.ExitOK
+			}
+			syscall.Flock(int(lf.Fd()), syscall.LOCK_UN)
+			b := e.d.NewBackend(docker, e.d.Mounter)
+			for g := rec.Gen; g >= 1 && g >= rec.Gen-1; g-- {
+				running, err := b.Running(backend.Spec{Sid: rec.Sid, Gen: g})
+				if err != nil {
+					return fail(stderr, "status", err)
+				}
+				if running {
+					fmt.Fprintln(stdout, "running")
+					return cli.ExitOK
+				}
+			}
+			fmt.Fprintln(stdout, "stopped")
 			return cli.ExitOK
 		},
 	}
@@ -399,6 +473,9 @@ func (d *dockerBackend) Run(s backend.Spec, files map[string][]byte, stage Stage
 	return r.Run(s)
 }
 func (d *dockerBackend) Stop(s backend.Spec) error { return d.runner("").Stop(s) }
+func (d *dockerBackend) Running(s backend.Spec) (bool, error) {
+	return d.runner("").Running(s)
+}
 func (d *dockerBackend) Orphans(runDir, sessions string) ([]backend.Orphan, error) {
 	return d.runner(sessions).Orphans(runDir)
 }
@@ -457,4 +534,59 @@ func (e *env) hostNS() error {
 		return refuse("this process is not in the host's mount namespace (a sandboxed unit?): mounts and the workdir would not be the host's. Run ccsbx-root from the host's namespace")
 	}
 	return nil
+}
+
+// lockFile opens (creating it if needed) <RunDir>/locks/<sid>.lock: root's file in root's directory,
+// never a link, never anyone else's. The daemon only ever opens it read-only, which is enough for it
+// to take the lock.
+//
+// Only root and the service group may see them: a read-only descriptor is enough to hold a flock, so
+// a lock file any local user could open is a lock any local user could hold forever (blocking every
+// run, commit and resume of that session), and a listable directory would give away every sid. The
+// directory is root:<service group> 0710 (the group can open a name it knows, not list), the files
+// root:<service group> 0640.
+func (e *env) lockFile(sid string, gid int) (*os.File, error) {
+	if gid <= 0 {
+		return nil, refuse("lock files need the service user's gid")
+	}
+	dir := filepath.Join(e.cfg.RunDir, "locks")
+	if err := os.MkdirAll(dir, 0o710); err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(dir, 0o710); err != nil {
+		return nil, err
+	}
+	if err := e.chown(dir, 0, gid); err != nil {
+		return nil, err
+	}
+	if err := trustedFile(dir, e.cfg.TrustedUID, false); err != nil {
+		return nil, refuse("lock directory: %v", err)
+	}
+	f, err := os.OpenFile(filepath.Join(dir, sid+".lock"), os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW|syscall.O_CLOEXEC, 0o640)
+	if err != nil {
+		return nil, refuse("lock file: %v", err)
+	}
+	st, err := f.Stat()
+	sys, ok := st.Sys().(*syscall.Stat_t)
+	if err != nil || !st.Mode().IsRegular() || !ok || int(sys.Uid) != e.cfg.TrustedUID {
+		f.Close()
+		return nil, refuse("lock file for %s is not a regular file owned by root", sid)
+	}
+	if err := f.Chmod(0o640); err != nil {
+		f.Close()
+		return nil, err
+	}
+	if err := e.chown(f.Name(), 0, gid); err != nil {
+		f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
+// chown is the injectable chown (os.Lchown in production): it never follows a link.
+func (e *env) chown(path string, uid, gid int) error {
+	if e.d.Chown != nil {
+		return e.d.Chown(path, uid, gid)
+	}
+	return os.Lchown(path, uid, gid)
 }

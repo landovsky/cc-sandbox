@@ -11,6 +11,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // Runner runs a generation: prepare dirs, create the internal network, run the container in the
@@ -120,4 +121,29 @@ func (r *Runner) Stop(s Spec) error {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// Running asks docker whether this generation's container (the exact name derived from sid and
+// gen) is running. A container that does not exist is not running; any other failure is an error,
+// never "not running".
+func (r *Runner) Running(s Spec) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	c := exec.CommandContext(ctx, r.docker(), "inspect", "--type", "container", "--format", "{{.State.Running}}", s.Container())
+	c.WaitDelay = time.Second // do not wait for a child that keeps the pipe open past the kill
+	out, err := c.CombinedOutput()
+	o := strings.TrimSpace(string(out))
+	if err != nil {
+		if strings.Contains(o, "No such object") || strings.Contains(o, "No such container") {
+			return false, nil
+		}
+		return false, fmt.Errorf("docker inspect %s: %v: %s", s.Container(), err, o)
+	}
+	switch o {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("docker inspect %s: unexpected answer %q", s.Container(), o)
 }

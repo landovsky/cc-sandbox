@@ -96,6 +96,7 @@ const (
 	BillingUnavailable = "billing_unavailable"
 	MachineFull        = "machine_full"
 	AlreadyRunning     = "already_running"
+	SessionBusy        = "session_busy"
 	BadSpec            = "bad_spec"
 	WrongMachine       = "wrong_machine"
 	NotBuilt           = "not_built"

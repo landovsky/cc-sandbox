@@ -17,6 +17,9 @@ import (
 
 const maxRecord = 1 << 20
 
+// errNoRecord: no record file for the sid.
+var errNoRecord = fmt.Errorf("no record")
+
 // loadRecord reads <state>/sessions/<sid>.json. serviceUID is the only uid besides root that may
 // own it.
 func loadRecord(stateDir, sid string, serviceUID, trustedUID int) (*start.Record, error) {
@@ -29,7 +32,7 @@ func loadRecord(stateDir, sid string, serviceUID, trustedUID int) (*start.Record
 	}
 	f, err := os.OpenFile(filepath.Join(dir, sid+".json"), os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
-		return nil, fmt.Errorf("no record for %s", sid)
+		return nil, errNoRecord
 	}
 	defer f.Close()
 	st, err := f.Stat()

@@ -11,6 +11,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -25,6 +26,10 @@ import (
 type reply struct {
 	Token string `json:"token,omitempty"`
 	Error string `json:"error,omitempty"`
+	// Revoke is the X-Ccsbx-Revoke header value for Body, for a revoke request: the exact bytes to POST to a
+	// door's owner listener.
+	Revoke string `json:"revoke,omitempty"`
+	Body   string `json:"body,omitempty"`
 }
 
 // Config is everything a Server needs; Main fills it from flags and the environment.
@@ -233,6 +238,17 @@ func (s *Server) handle(c net.Conn, only *Peer) {
 		s.send(c, reply{Error: "bad request"})
 		return
 	}
+	if isRevoke(raw) {
+		hdr, body, err := s.SignRevokeFor(peer, raw)
+		if err != nil {
+			s.logJSON("signer", "refused", "why", err.Error(), "peer_uid", uid, "op", "revoke")
+			s.send(c, reply{Error: err.Error()})
+			return
+		}
+		s.logJSON("signer", "signed", "peer_uid", uid, "op", "revoke", "body", string(body))
+		s.send(c, reply{Revoke: hdr, Body: string(body)})
+		return
+	}
 	tok, cl, err := s.SignFor(peer, raw)
 	if err != nil {
 		s.logJSON("signer", "refused", "why", err.Error(), "peer_uid", uid, "sub", cl.Sub, "profile", cl.Profile, "billing", cl.Billing)
@@ -345,4 +361,57 @@ func contains(l []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// isRevoke: the request is a revoke when its one top-level key is "revoke". A claims request has no such key
+// (and its unknown-field rule would refuse one), so the two cannot be mistaken for each other.
+func isRevoke(raw []byte) bool {
+	var probe map[string]json.RawMessage
+	if json.Unmarshal(raw, &probe) != nil {
+		return false
+	}
+	_, ok := probe["revoke"]
+	return ok
+}
+
+var (
+	revOwnerRe   = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	revMachineRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+	revSidRe     = regexp.MustCompile(`^s[0-9a-z]{6,16}$`)
+)
+
+// SignRevokeFor signs the revoke of one generation (and the earlier ones) of a session, for the doors: the
+// request is {"revoke":{"owner","machine","sid","gen"}} and nothing else. The machine key must be scoped to the
+// owner and machine, and the caller class holds here as for a token: the keys peer revokes only for its
+// own machines, hostd only for the others. The signer's own clock stamps it.
+func (s *Server) SignRevokeFor(peer Peer, raw []byte) (header string, body []byte, err error) {
+	var req struct {
+		Revoke *token.RevokeBody `json:"revoke"`
+	}
+	dec := json.NewDecoder(strings.NewReader(string(raw)))
+	dec.DisallowUnknownFields()
+	if dec.Decode(&req) != nil || dec.More() || req.Revoke == nil {
+		return "", nil, errors.New("bad request")
+	}
+	b := *req.Revoke
+	if !revOwnerRe.MatchString(b.Owner) || !revMachineRe.MatchString(b.Machine) || !revSidRe.MatchString(b.Sid) || b.Gen < 1 || b.Gen > 9999 {
+		return "", nil, errors.New("bad request")
+	}
+	if s.cfg.KeysUID != nil {
+		for_keys := contains(s.cfg.KeysMachines, b.Machine)
+		switch {
+		case peer == PeerKeys && !for_keys:
+			return "", nil, fmt.Errorf("the pod launcher may revoke only for %s", strings.Join(s.cfg.KeysMachines, ","))
+		case peer == PeerHostd && for_keys:
+			return "", nil, fmt.Errorf("machine %s is placed through the pod launcher, not hostd", b.Machine)
+		}
+	}
+	if err := s.cfg.Scope.PermitsRevoke(b.Owner, b.Machine); err != nil {
+		return "", nil, err
+	}
+	body, err = json.Marshal(b)
+	if err != nil {
+		return "", nil, err
+	}
+	return token.SignRevoke(s.cfg.Key, body, s.cfg.Now()), body, nil
 }

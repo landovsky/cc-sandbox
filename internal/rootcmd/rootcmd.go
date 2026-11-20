@@ -86,9 +86,11 @@ type Deps struct {
 	NewPod func(cfg *Config, kc *k8sCtx) (PodAPI, error)
 	// Mint makes the sidecar's one payload: the session token and its generation key (made here), and the
 	// relay token, which register(pub) obtains from the hub for that key's public half.
-	Mint  func(ctx context.Context, cfg *Config, c token.Claims, register func(pub string) (string, error)) ([]byte, error)
-	Sleep func(time.Duration)
-	Now   func() time.Time
+	Mint func(ctx context.Context, cfg *Config, c token.Claims, register func(pub string) (string, error)) ([]byte, error)
+	// RevokeToken has the signer sign a revoke for the doors and posts it to revoke_doors.
+	RevokeToken func(ctx context.Context, cfg *Config, b token.RevokeBody) error
+	Sleep       func(time.Duration)
+	Now         func() time.Time
 	// Hub is the HTTP client for the hub (no redirects, 10 s); Audit takes one line per relay mint and
 	// revoke (never a token or secret). nil: production defaults.
 	Hub   *http.Client
@@ -234,7 +236,7 @@ func Real(getenv func(string) string) *Deps {
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
 		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
-		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, Sleep: time.Sleep, Now: time.Now, HubListeners: procListeners, SelfPath: selfPath, AttachSession: realAttachSession,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, RevokeToken: realRevokeToken, Sleep: time.Sleep, Now: time.Now, HubListeners: procListeners, SelfPath: selfPath, AttachSession: realAttachSession,
 	}
 }
 

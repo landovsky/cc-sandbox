@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -951,5 +953,95 @@ func TestTheKeysPeerNeedsASocketOfItsOwn(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Errorf("%s: the signer started serving", why)
 		}
+	}
+}
+
+// ---- revoke: the signer signs the doors' revoke{sid,gen} (F2x) ----
+
+// a door's own handler accepts what the signer signed: the real verifier over the signer's public key
+func doorFor(t *testing.T, r *rig) (*token.Verifier, http.Handler) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "ring")
+	os.WriteFile(p, []byte(r.key.KeyringLineScoped([]string{"tomas"}, []string{"hp-ubuntu", "future-two"}, []string{"*"}, []string{"api", "stub"})+"\n"), 0o600)
+	ring, err := token.LoadPublicKeyring(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := token.NewVerifier(ring, "ccsbx-model")
+	return v, v.RevokeHandler(nil)
+}
+
+func (r *rig) askRevoke(t *testing.T, owner, machine, sid string, gen int) reply {
+	t.Helper()
+	b, _ := json.Marshal(map[string]any{"revoke": token.RevokeBody{Owner: owner, Machine: machine, Sid: sid, Gen: gen}})
+	return r.ask(t, b)
+}
+
+func TestTheSignerSignsARevokeTheDoorAccepts(t *testing.T) {
+	r := peers(t, true) // this process is hostd: it revokes for hp-ubuntu
+	out := r.askRevoke(t, "tomas", "hp-ubuntu", "s0signxx1", 3)
+	if out.Revoke == "" || out.Body == "" || out.Error != "" {
+		t.Fatalf("%+v", out)
+	}
+	v, h := doorFor(t, r)
+	rq := httptest.NewRequest("POST", token.RevokePath, strings.NewReader(out.Body))
+	rq.Header.Set(token.RevokeHeader, out.Revoke)
+	rw := httptest.NewRecorder()
+	h.ServeHTTP(rw, rq)
+	if rw.Code != 204 && rw.Code != 503 { // 503: no state file to persist to in this test; the signature was accepted
+		t.Fatalf("the door answered %d", rw.Code)
+	}
+	if v.MaxGen("tomas", "hp-ubuntu", "s0signxx1") != 3 {
+		t.Error("the door did not record the revoke")
+	}
+	if !strings.Contains(r.log(), `"op":"revoke"`) || strings.Contains(r.log(), out.Revoke) {
+		t.Errorf("log: %s", r.log())
+	}
+}
+
+func TestARevokeIsHeldToTheSameClassesAndScopeAsAToken(t *testing.T) {
+	r := peers(t, true) // hostd
+	for why, c := range map[string]struct {
+		owner, machine, sid string
+		gen                 int
+	}{
+		"the pod machine (closed to hostd)": {"tomas", "future-two", "s0signxx1", 1},
+		"another owner":                     {"mallory", "hp-ubuntu", "s0signxx1", 1},
+		"another machine":                   {"tomas", "mac", "s0signxx1", 1},
+		"generation 0":                      {"tomas", "hp-ubuntu", "s0signxx1", 0},
+		"a bad sid":                         {"tomas", "hp-ubuntu", "../x", 1},
+	} {
+		if out := r.askRevoke(t, c.owner, c.machine, c.sid, c.gen); out.Revoke != "" || out.Error == "" {
+			t.Errorf("%s was signed: %+v", why, out)
+		}
+	}
+	k := peers(t, false) // the keys peer
+	if out := k.askRevoke(t, "tomas", "future-two", "s0signxx1", 2); out.Revoke == "" {
+		t.Errorf("the pod launcher's own machine: %+v", out)
+	}
+	if out := k.askRevoke(t, "tomas", "hp-ubuntu", "s0signxx1", 2); out.Revoke != "" {
+		t.Errorf("the pod launcher revoked for hostd's machine: %+v", out)
+	}
+	// anything but exactly the revoke object is refused: extra keys, a second key beside it, a claims body
+	for why, body := range map[string]string{
+		"an extra field in the revoke": `{"revoke":{"owner":"tomas","machine":"hp-ubuntu","sid":"s0signxx1","gen":1,"x":1}}`,
+		"a second top-level key":       `{"revoke":{"owner":"tomas","machine":"hp-ubuntu","sid":"s0signxx1","gen":1},"sub":"a/b/c/g1"}`,
+		"revoke null":                  `{"revoke":null}`,
+		"trailing data":                `{"revoke":{"owner":"tomas","machine":"hp-ubuntu","sid":"s0signxx1","gen":1}} {}`,
+	} {
+		if out := r.ask(t, []byte(body)); out.Revoke != "" {
+			t.Errorf("%s was signed", why)
+		}
+	}
+}
+
+func TestTheClientAsksForARevoke(t *testing.T) {
+	r := peers(t, true)
+	h, b, err := Client{Socket: r.sock}.SignRevoke(context.Background(), token.RevokeBody{Owner: "tomas", Machine: "hp-ubuntu", Sid: "s0signxx1", Gen: 2})
+	if err != nil || h == "" || !strings.Contains(string(b), `"gen":2`) {
+		t.Fatalf("%q %s %v", h, b, err)
+	}
+	if _, _, err := (Client{Socket: r.sock}).SignRevoke(context.Background(), token.RevokeBody{Owner: "mallory", Machine: "hp-ubuntu", Sid: "s0signxx1", Gen: 2}); err == nil {
+		t.Error("a revoke outside the scope was signed")
 	}
 }

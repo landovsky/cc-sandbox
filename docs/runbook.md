@@ -734,3 +734,12 @@ listens somewhere else, gets nothing.
 fails the resume is refused and nothing changes), then a new pod is created and loaded as for a first start. If the
 new generation fails, the record is put back to the previous generation, ended. It replaces a generation, so it does
 not count twice against `--max-live`.
+
+**Revoke at the end of a pod generation (F2x).** The signer signs a revoke on request (`{"revoke":{"owner","machine","sid","gen"}}`
+and nothing else; same caller classes and key scope as a token: the launch user only for the pod machine, hostd only
+for the others), and `internal/revoke` posts it exactly as signed to every door in root config `revoke_doors` (the
+doors' owner listeners, `/_ccsbx/revoke`; no redirects). `pod-stop` revokes the token before it deletes the pod (whatever
+the delete does), and `pod-load` revokes it when the load or the mint fails after the signer may have signed. Never
+fatal: a failure is an audit line `token-revoke ... FAILED, revoke by hand` with the sid and generation (the token
+expires within `k8s_token_hours` anyway). With no `revoke_doors` the line says so. The docker generation's revoke from
+hostd (`OnGenerationEnd`) is not wired yet.

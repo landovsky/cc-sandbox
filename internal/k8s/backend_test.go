@@ -103,8 +103,17 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		reply(404, map[string]string{"reason": "NotFound"})
 	case r.Method == "DELETE":
-		if _, ok := f.pods[name]; !ok {
+		cur, ok := f.pods[name]
+		if !ok {
 			reply(404, map[string]string{"reason": "NotFound"})
+			return
+		}
+		var opts struct {
+			Preconditions struct{ UID string }
+		}
+		json.NewDecoder(r.Body).Decode(&opts)
+		if opts.Preconditions.UID != "" && opts.Preconditions.UID != str(dig(cur, "metadata", "uid")) {
+			reply(409, map[string]string{"reason": "Conflict", "message": "Precondition failed: UID in precondition does not match"})
 			return
 		}
 		delete(f.pods, name)
@@ -265,10 +274,10 @@ func TestCreateGetListDeleteAgainstTheFakeAPI(t *testing.T) {
 	if l, err := b.List(ctx); err != nil || len(l) != 2 {
 		t.Errorf("list %v %v", l, err)
 	}
-	if err := b.Delete(ctx, "s0abcdefgh", 2); err != nil || len(f.pods) != 1 {
+	if err := b.Delete(ctx, "s0abcdefgh", 2, ref.UID); err != nil || len(f.pods) != 1 {
 		t.Errorf("delete: %v (%d pods)", err, len(f.pods))
 	}
-	if err := b.Delete(ctx, "s0abcdefgh", 2); err != nil {
+	if err := b.Delete(ctx, "s0abcdefgh", 2, ref.UID); err != nil {
 		t.Errorf("deleting an absent pod is not an error: %v", err)
 	}
 	if _, err := b.Get(ctx, "s0abcdefgh", 2); !errors.Is(err, ErrNotFound) {
@@ -303,7 +312,7 @@ func TestCreateNeverSendsAPodTheContractRefuses(t *testing.T) {
 func TestDeleteGraceNeverExceeds60(t *testing.T) {
 	b, f := newBackend(t)
 	b.Cfg.GraceSeconds = 600
-	b.Delete(context.Background(), "s0abcdefgh", 1)
+	b.Delete(context.Background(), "s0abcdefgh", 1, "uid-x")
 	ok := false
 	for _, l := range f.log {
 		ok = ok || strings.HasSuffix(l, "gracePeriodSeconds=60")
@@ -322,7 +331,7 @@ func TestBackendRefusesBadNamesAndForeignPods(t *testing.T) {
 		if _, err := b.Get(ctx, sid, 1); err == nil {
 			t.Errorf("get %q", sid)
 		}
-		if err := b.Delete(ctx, sid, 1); err == nil {
+		if err := b.Delete(ctx, sid, 1, "uid-x"); err == nil {
 			t.Errorf("delete %q", sid)
 		}
 	}
@@ -758,5 +767,27 @@ func TestExecRefusesADyingOrRelabelledPodEvenWithTheRightUID(t *testing.T) {
 			t.Errorf("%s: %v (calls %d)", why, err, fx.calls)
 		}
 		f.pods[name] = orig
+	}
+}
+
+// Generation expiry deletes the pod by exact name AND UID: a pod that took the name since (not ours) is
+// left alone, named in the error, and a delete with no UID never becomes a request.
+func TestDeleteIsPreconditionedOnTheUID(t *testing.T) {
+	ctx := context.Background()
+	b, f := newBackend(t)
+	ref, err := b.Create(ctx, goodSpec())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ce *ConflictError
+	if err := b.Delete(ctx, "s0abcdefgh", 2, "uid-planted"); !errors.As(err, &ce) || len(f.pods) != 1 {
+		t.Errorf("another UID: %v (%d pods)", err, len(f.pods))
+	}
+	n := len(f.log)
+	if err := b.Delete(ctx, "s0abcdefgh", 2, ""); err == nil || len(f.log) != n {
+		t.Errorf("no UID: %v (requests %d -> %d)", err, n, len(f.log))
+	}
+	if err := b.Delete(ctx, "s0abcdefgh", 2, ref.UID); err != nil || len(f.pods) != 0 {
+		t.Errorf("the right UID: %v (%d pods)", err, len(f.pods))
 	}
 }

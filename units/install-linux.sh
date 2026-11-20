@@ -168,7 +168,6 @@ HUB_SECRET=""
 load_hub_secret() {
   local out rc err
   err="$(mktemp)" || die "cannot create a temp file"
-  if [ "$MODE" = install ] && [ "${EXEC%%:*}" = record ]; then rec runuser -u "$OWNER" -- python3 -I -c "$hub_secret_py" "$HUB_SECRET_FROM"; fi
   out="$(as_owner python3 -I -c "$hub_secret_py" "$HUB_SECRET_FROM" 2>"$err")"; rc=$?
   if [ "$rc" -ne 0 ]; then gate "hub secret file $HUB_SECRET_FROM: $(head -1 "$err") (pass --hub-secret-from FILE; ccsbx-root's relay mint needs the hub's secret)"; HUB_SECRET=""
   else HUB_SECRET="$out"; fi
@@ -280,6 +279,8 @@ post_install_check() {
 }
 steps_install() {
   if [ "$MODE" = install ]; then step "back up every file the install replaces (once; never overwritten)"; backup_originals; fi
+  # the read happened in eval_gates (as the owner); in record mode it is logged here, once the gates and the backup have passed, so a refusal records nothing
+  if [ "$MODE" = install ] && [ "${EXEC%%:*}" = record ]; then rec runuser -u "$OWNER" -- python3 -I -c "$hub_secret_py" "$HUB_SECRET_FROM"; fi
   # everything that can fail for a machine-specific reason comes BEFORE sudoers is changed
   u0b_users; u0_binaries; u0b_keys; u0b_signer; u0_hostd
   if [ "$WITH_DEPLOY" = 1 ]; then u0_deploy_rule; fi

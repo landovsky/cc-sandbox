@@ -526,7 +526,7 @@ t "M1: a directory as the source is refused (exit 3)" test "$rc" -eq 3
 d="$(fx m1swap)"; echo "machine-key-line" > "$d/key"; ln -s "$d/key" "$d/swapped"; HUBSRC="$d/swapped" ins "$d" install --yes >/dev/null 2>&1; rc=$?
 t "M1: the link swap (the source became a link to another file) is refused, and that file is never copied" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/root/etc/ccsbx/hub-admin.secret" ]' _ "$rc" "$d"
 d="$(fx s1)"; ins "$d" install --yes --k8s-machine other-box >/dev/null 2>&1
-t "S1: --k8s-machine is the one source: the signer unit's keys-peer machines, the scope and ccsbx-root.toml agree" bash -c 'u="$1/root/etc/systemd/system/ccsbx-signer.service"; grep -q -- "--keys-peer-machines other-box " "$u" && ! grep -q future-two "$u" && grep -- "--write-scope" "$1/rec/cmds" | grep -q "other-box" && grep -qx "k8s_machine = \"other-box\"" "$1/root/etc/ccsbx/ccsbx-root.toml"' _ "$d"
+t "S1: --k8s-machine is the one source: the signer unit's keys-peer machines, the scope and ccsbx-root.toml agree" bash -c 'u="$1/root/etc/systemd/system/ccsbx-signer.service"; grep "^ExecStart=" "$u" | grep -q -- "--keys-peer-machines other-box " && ! grep "^ExecStart=" "$u" | grep -q future-two && grep -- "--write-scope" "$1/rec/cmds" | grep -q "other-box" && grep -qx "k8s_machine = \"other-box\"" "$1/root/etc/ccsbx/ccsbx-root.toml"' _ "$d"
 d="$(fx s3)"; ins "$d" install --yes >/dev/null 2>&1; ab="$d/root/var/backups/ccsbx-install/original/ABSENT"
 grep -vx -e /etc/ccsbx/hub-admin.secret -e /etc/systemd/system/ccsbx-signer-launch.socket "$ab" > "$ab.new"; mv "$ab.new" "$ab"
 : > "$d/rec/cmds"; ins "$d" uninstall --yes >/dev/null 2>&1

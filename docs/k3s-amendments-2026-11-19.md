@@ -249,6 +249,17 @@ dropped, given A1 (no door or hostd is left in `cc-sandbox` for the launcher to 
 
 Also, `kubectl exec` into the watchdog pod is refused. The F2 reference pod is admitted.
 
+**COMING: applies once k3s devops:#5dxt merges** (branch `ccsbx-vap-tighten`, 6802414; **not
+merged**, it waits for Tomas). A tightening of the rules above for launcher-created pods:
+
+| Change | Rule | Why |
+|---|---|---|
+| `priorityClassName: ccsbx-session` is **required** (new class, value 500, `preemptionPolicy: Never`, filled in from the class by the Priority plugin, so the pod doesn't set it); `default-priority` and `low-priority` are for non-launcher pods only | new | per #5dxt |
+| no `runtimeClassName`, no finalizers | new | per #5dxt |
+| `terminationGracePeriodSeconds` at most 60 (unset = 30 is fine) | new | per #5dxt |
+| ephemeral containers (`kubectl debug`) refused in **both namespaces, for everyone** | widens rule 8 | F5 attach and any debugging use `exec` |
+| `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | per #5dxt; Tomas's call |
+
 ---
 
 ## A3. K8 extension: the launcher renews its own token

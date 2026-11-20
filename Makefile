@@ -1,6 +1,6 @@
 # ccsbx build. Every tunable is a make variable: `make GO=/path/to/go test`.
 #   make vet     go vet + the zero-modules check (no go.sum allowed)
-#   make test    vet + unit tests (HOME is a tmpdir) + the fence-test cleanup guard (stub docker)
+#   make test    vet + unit tests (HOME is a tmpdir) + the fence-test cleanup guard and the e2e exit traps (stub docker)
 #   make build   static binary into bin/ccsbx for this machine, plus a cross-compile check
 #   make dist    linux/darwin x amd64/arm64 into dist/
 #   make dist-linux   the installer's binaries (ccsbx ccsbx-root ccsbx-hostd ccsbx-signer, those whose cmd/ exists) for
@@ -22,6 +22,7 @@ vet:
 test: vet
 	HOME=$$(mktemp -d) $(GO) test ./...
 	tests/fence-cleanup-test.sh
+	tests/e2e-lib-test.sh
 
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/ccsbx ./cmd/ccsbx

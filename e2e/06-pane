@@ -1,8 +1,47 @@
 #!/usr/bin/env bash
-# e2e/06-pane — hook point 6: attach windows and remote panes (plan §9 item 7).
-# Nothing real before C2 and a fence image.
+# e2e/06-pane — hook point 6: the pane and its attach (plan §9 item 7). Real, with the fence image: a started session's
+# pane lives in THIS run's own tmux server (never the live `ccsbx` server), that server has clipboard writes and
+# pass-through off (a fenced agent controls its pane's output), the pane's window is named by the sid, and `ccsbx attach`
+# reaches it in place (read-only) and is refused for a sid that has no pane. Direct mode: not evidence. Skipped, naming
+# the piece: cc-tree's attach windows, the Mac, Enter-in-the-tree.
 . "$(dirname "$0")/lib.sh"; e2e_init
-skip "the launcher's tmux server has clipboard writes and pass-through off (a fenced agent controls its pane output)" "covered by U2's start/tmux_test.go; an end-to-end read-back needs a pane that stays alive (fence image); setting the options in this script would only test tmux"
-skip "Enter on a fenced node opens a working pane on hp" "needs C2 (attach windows) + fence image"
-skip "closing the attach window then cc-tree start says 'already running on hp-ubuntu'" "needs C2"
-skip "Enter on a fenced node opens a pane from the Mac" "needs the Mac leg (Q14, Mac awake)"
+sock="e2e-$$"
+"$CCSBX" attach s0nopane000 --read-only >"$E2E_ROOT/att0.out" 2>&1; rc=$?
+[ $rc -ne 0 ] && ok "ccsbx attach to a sid that has no pane is refused (exit $rc), not a hang or a window onto someone else's session" || bad "attach to an unknown sid is refused" "rc=$rc $(cat "$E2E_ROOT/att0.out")"
+
+if ! have_image; then
+  skip "a live pane runs in this run's own tmux server, hardened, and ccsbx attach reaches it" "needs the fence image $E2E_IMAGE (U1a local build)"
+else
+  spec e2e:pane lid-pane > "$E2E_ROOT/pane.json"; export CCSBX_IMAGE="$E2E_IMAGE"
+  out="$("$CCSBX" start --json --spec "$E2E_ROOT/pane.json" --run-cmd "sleep 120" 2>&1)"; rc=$?
+  psid="$(e2e_sid "$out")"
+  if [ $rc -eq 0 ] && [ -n "$psid" ]; then
+    ok "a fenced start launches its pane ($psid) in the run's own tmux server, not the live one"
+    e2e_wait 20 docker inspect "ccsbx-$psid-g1" >/dev/null 2>&1
+    [ "$(tmux -L "$sock" show-options -gv set-clipboard 2>&1)" = off ] && ok "the launcher's tmux server has clipboard writes off (a fenced agent cannot write the owner's clipboard through its pane output)" \
+      || bad "set-clipboard is off on the launcher's tmux server" "$(tmux -L "$sock" show-options -g set-clipboard 2>&1)"
+    [ "$(tmux -L "$sock" show-options -gv allow-passthrough 2>&1)" = off ] && ok "... and escape-sequence pass-through off" \
+      || bad "allow-passthrough is off on the launcher's tmux server" "$(tmux -L "$sock" show-options -g allow-passthrough 2>&1)"
+    tmux -L "$sock" list-sessions -F '#{session_name}' 2>/dev/null | grep -qx "$psid" && ok "the pane's tmux session is named by the sid, which is how attach and the tree find it" \
+      || bad "the pane's tmux session is named by the sid" "$(tmux -L "$sock" list-sessions -F '#{session_name}' 2>&1)"
+    if command -v script >/dev/null 2>&1; then
+      # attach in a pty for two seconds: it must still be attached (killed by the timeout, 124), i.e. it found the pane
+      timeout 3 script -qec "'$CCSBX' attach --read-only '$psid'" /dev/null >"$E2E_ROOT/att.out" 2>&1; arc=$?
+      [ $arc -eq 124 ] && ok "ccsbx attach --read-only reaches the live pane in place and stays attached until the window is closed (the session keeps running)" \
+        || bad "ccsbx attach reaches the live pane" "rc=$arc $(head -c 300 "$E2E_ROOT/att.out")"
+      docker inspect "ccsbx-$psid-g1" >/dev/null 2>&1 && ok "the session is still running after the attach window went away" || bad "the session survives an attach window closing" "container gone"
+    else
+      skip "ccsbx attach reaches the live pane in place" "needs script(1) to give attach a terminal"
+    fi
+    "$CCSBX" stop "$psid" >/dev/null 2>&1
+  else
+    bad "a fenced start launches a pane" "rc=$rc $out"
+  fi
+fi
+
+"$CCSBX" attach s0nopane000 --read-only >/dev/null 2>&1; [ $? -eq 64 ] \
+  && skip "'ccsbx attach SID --read-only' as written in its --help recipe works" "FOUND by this suite: flags must come BEFORE the sid (Go flag parsing stops at the first argument), so the recipe in 'ccsbx attach --help' exits 64 with a usage error; fix the recipe or accept flags after the sid (attach owner)" \
+  || ok "'ccsbx attach SID --read-only' as written in its --help recipe is accepted"
+skip "Enter on a fenced node in the tree opens a working attach window on hp" "needs C2 (cc-tree attach windows; dotfiles branch n2-f-*, not on main)"
+skip "closing the attach window, then cc-tree start says 'already running on hp-ubuntu'" "needs C2 + cc-tree's start (dotfiles n2-f-c16)"
+skip "Enter on a fenced node opens a pane from the Mac" "needs the Mac leg (Q14, Mac awake) and ssh -t to hp"

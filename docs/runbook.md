@@ -643,3 +643,11 @@ the service user, stale or ended or not running or another machine's generation,
 8 hex of sha256(pub), never a token or the secret). The relay is revoked (`DELETE /v1/principals/relay:<sid>%2F<gen>`)
 at the end of `run`, in `stop` and in `gc` for each reaped generation, best effort; the hub's 6 h relay
 lifetime is the backstop. Not run against a real hub (Gate M).
+
+**Pod sessions and the relay.** `relay-mint` (the verb hostd calls) stays docker-only. For a pod session
+`pod-load` does it itself: as root it reads `hub_secret` into memory (before the drop; the file stays root
+0600), drops to the keys user, mints the session token and generation key, registers the relay for that
+key's public half (`may_reach` from the record), and sends `{"token","key","relay_token"}` in the one
+side-load payload. Nothing is printed and hostd sees none of it. A load that fails after the relay was
+registered revokes it at once; `pod-stop` revokes it as root before the drop. A missing or untrusted hub
+secret stops `pod-load` with exit 3 before anything is dropped or created in the pod.

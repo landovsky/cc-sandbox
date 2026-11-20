@@ -6,8 +6,11 @@ package rootcmd
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
@@ -18,7 +21,7 @@ import (
 )
 
 const (
-	fakeSecrets = `{"token":"TOPSECRET.jwt.value","key":"SEEDSEEDSEED"}`
+	fakeSecrets = `{"token":"TOPSECRET.jwt.value","key":"SEEDSEEDSEED"}` // the relay token is added by the fake Mint
 	sideImg     = "ghcr.io/landovsky/ccsbx@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 )
 
@@ -87,6 +90,29 @@ type podFx struct {
 	minted []token.Claims
 	mintEr error
 	clock  time.Time
+	hub    []hubReq // what the fake hub saw
+	hubSt  int      // its answer to POST (default 201)
+	audit  strings.Builder
+}
+
+// hubTransport is the hub: it records each request (and notes it in the order) and answers.
+type hubTransport struct{ pf *podFx }
+
+func (h hubTransport) RoundTrip(q *http.Request) (*http.Response, error) {
+	var b []byte
+	if q.Body != nil {
+		b, _ = io.ReadAll(q.Body)
+	}
+	h.pf.hub = append(h.pf.hub, hubReq{q.Method, q.URL.Path, q.URL.EscapedPath(), q.Header.Get("Authorization"), string(b)})
+	h.pf.order = append(h.pf.order, "hub:"+q.Method)
+	st, body := http.StatusNoContent, ""
+	if q.Method == "POST" {
+		st, body = h.pf.hubSt, `{"token":"sbp1.RELAYTOKEN"}`
+		if st != 201 {
+			body = `{"error":"BODY-OF-THE-REFUSAL"}`
+		}
+	}
+	return &http.Response{StatusCode: st, Body: io.NopCloser(strings.NewReader(body)), Header: http.Header{}}, nil
 }
 
 var ready = k8s.Status{Phase: "Running", FenceReady: true, SideReady: true}
@@ -95,7 +121,8 @@ func newPodFx(t *testing.T) *podFx {
 	t.Helper()
 	f, calls := newK8sFx(t)
 	_ = calls
-	pf := &podFx{fx: f, clock: time.Unix(1_800_000_000, 0)}
+	pf := &podFx{fx: f, clock: time.Unix(1_800_000_000, 0), hubSt: 201}
+	put(t, f.dir+"/etc/hub.secret", hubSecretText+"\n", 0o600)
 	f.writeConfigPod(t, true, "")
 	pf.pod = &fakePod{order: &pf.order, liveUID: podUID, uid: "new-uid-1", phases: []k8s.Status{ready}}
 	f.rec.PodUID, f.rec.Spec.Owner = podUID, "tomas"
@@ -113,8 +140,8 @@ func (f *fx) writeConfigPod(t *testing.T, side bool, extra string) {
 	if side {
 		img = fmt.Sprintf("k8s_side_image = %q\n", sideImg)
 	}
-	f.writeConfig(fmt.Sprintf("kubectl = %q\nkubeconfig = %q\nk8s_conn = %q\nkeys_user = \"ccsbx-keys\"\nk8s_namespace = \"cc-sandbox\"\n%s%sverbs = [\"run\", \"stop\", \"attach\", \"pod-create\", \"pod-load\", \"pod-stop\"]\n",
-		f.dir+"/bin/kubectl", f.dir+"/keys/launcher.kubeconfig", f.dir+"/etc/k8s-conn.json", img, extra))
+	f.writeConfig(fmt.Sprintf("kubectl = %q\nkubeconfig = %q\nk8s_conn = %q\nkeys_user = \"ccsbx-keys\"\nk8s_namespace = \"cc-sandbox\"\n%s%shub_secret = %q\nverbs = [\"run\", \"stop\", \"attach\", \"pod-create\", \"pod-load\", \"pod-stop\"]\n",
+		f.dir+"/bin/kubectl", f.dir+"/keys/launcher.kubeconfig", f.dir+"/etc/k8s-conn.json", img, extra, f.dir+"/etc/hub.secret"))
 	// the config rewrite made a fresh Deps: carry over the k8s fakes of newK8sFx
 	f.d.LookupUser, f.d.LivePodUID, f.d.DropPrivs, f.d.Exec = old.LookupUser, old.LivePodUID, old.DropPrivs, old.Exec
 }
@@ -124,13 +151,19 @@ func (pf *podFx) wire() {
 	dp := pf.d.DropPrivs
 	pf.d.DropPrivs = func(u, g int) error { *order = append(*order, "drop"); return dp(u, g) }
 	pf.d.NewPod = func(*Config, *k8sCtx) (PodAPI, error) { return pf.pod, nil }
-	pf.d.Mint = func(_ context.Context, _ *Config, c token.Claims) ([]byte, error) {
+	pf.d.Hub = &http.Client{Transport: hubTransport{pf}}
+	pf.d.Audit = &pf.audit
+	pf.d.Mint = func(_ context.Context, _ *Config, c token.Claims, register func(string) (string, error)) ([]byte, error) {
 		*order = append(*order, "mint")
 		pf.minted = append(pf.minted, c)
 		if pf.mintEr != nil {
 			return nil, pf.mintEr
 		}
-		return []byte(fakeSecrets), nil
+		rt, err := register(relayPub) // the pub of the generation key the real Mint makes
+		if err != nil {
+			return nil, err
+		}
+		return []byte(strings.Replace(fakeSecrets, "}", `,"relay_token":"`+rt+`"}`, 1)), nil
 	}
 	pf.d.Now = func() time.Time { return pf.clock }
 	pf.d.Sleep = func(d time.Duration) { pf.clock = pf.clock.Add(d) }
@@ -227,14 +260,29 @@ func TestPodLoadWaitsThenMintsThenLoadsWithTheRecordedUID(t *testing.T) {
 	pf := newPodFx(t)
 	pf.pod.phases = []k8s.Status{{Phase: "Pending"}, {Phase: "Running", FenceReady: true}, ready}
 	start0 := pf.clock
+	// once privileges are dropped the keys user cannot read root's 0600 secret: simulate that, so a
+	// read of it after the drop would fail the verb
+	dp := pf.d.DropPrivs
+	pf.d.DropPrivs = func(u, g int) error { os.Chmod(pf.dir+"/etc/hub.secret", 0); return dp(u, g) }
 	code, out := pf.call("pod-load", sid)
 	if code != 0 || strings.Contains(out, "TOPSECRET") || strings.Contains(out, "SEEDSEED") {
 		t.Fatalf("%d %s", code, out)
 	}
-	if pf.seq() != "drop,live,get,get,get,mint,load" {
-		t.Errorf("order %s: drop, check the UID, wait until both containers are ready, only then mint, then load", pf.seq())
+	if pf.seq() != "drop,live,get,get,get,mint,hub:POST,load" {
+		t.Errorf("order %s: drop, check the UID, wait until both containers are ready, only then mint (the relay is registered inside it), then load", pf.seq())
 	}
-	if len(pf.pod.loads) != 1 || pf.pod.loads[0].UID != podUID || pf.pod.loads[0].Name != "ccsbx-s-"+sid+"-g2" || string(pf.pod.loaded) != fakeSecrets {
+	if len(pf.hub) != 1 || pf.hub[0].method != "POST" || pf.hub[0].path != "/v1/principals" || pf.hub[0].auth != "Bearer "+hubSecretText {
+		t.Fatalf("hub %+v", pf.hub)
+	}
+	var rb map[string]any
+	json.Unmarshal([]byte(pf.hub[0].body), &rb)
+	if rb["role"] != "relay" || rb["sid"] != sid || rb["gen"] != "2" || rb["pub"] != relayPub || fmt.Sprint(rb["may_reach"]) != "[]" {
+		t.Errorf("relay request %s", pf.hub[0].body)
+	}
+	if !strings.Contains(string(pf.pod.loaded), `"relay_token":"sbp1.RELAYTOKEN"`) || strings.Contains(pf.audit.String(), "RELAYTOKEN") || strings.Contains(pf.audit.String(), hubSecretText) {
+		t.Errorf("payload %q, audit %q", pf.pod.loaded, pf.audit.String())
+	}
+	if len(pf.pod.loads) != 1 || pf.pod.loads[0].UID != podUID || pf.pod.loads[0].Name != "ccsbx-s-"+sid+"-g2" || !strings.HasPrefix(string(pf.pod.loaded), fakeSecrets[:len(fakeSecrets)-1]) {
 		t.Errorf("load %+v %q", pf.pod.loads, pf.pod.loaded)
 	}
 	c := pf.minted[0]
@@ -362,7 +410,7 @@ func TestPodStopDeletesByNameAndRecordedUID(t *testing.T) {
 	if code, out := pf.call("pod-stop", sid); code != 0 || !strings.Contains(out, "deleted") {
 		t.Fatalf("%d %s", code, out)
 	}
-	if pf.seq() != "drop,delete" || len(pf.pod.deleted) != 1 || pf.pod.deleted[0] != [3]string{sid, "2", podUID} {
+	if pf.seq() != "hub:DELETE,drop,delete" || len(pf.pod.deleted) != 1 || pf.pod.deleted[0] != [3]string{sid, "2", podUID} {
 		t.Errorf("order %s deleted %v", pf.seq(), pf.pod.deleted)
 	}
 }
@@ -413,3 +461,82 @@ func TestPodConfigKeysAreValidated(t *testing.T) {
 		t.Errorf("defaults moved: %+v", d)
 	}
 }
+
+// ---- the relay of a pod session (hub secret read as root before the drop, registered after it) ----
+
+func TestPodLoadNeedsTheHubSecretBeforeAnythingIsDropped(t *testing.T) {
+	for why, mod := range map[string]func(pf *podFx){
+		"missing":            func(pf *podFx) { os.Remove(pf.dir + "/etc/hub.secret") },
+		"readable by others": func(pf *podFx) { os.Chmod(pf.dir+"/etc/hub.secret", 0o644) },
+		"readable by group":  func(pf *podFx) { os.Chmod(pf.dir+"/etc/hub.secret", 0o640) },
+	} {
+		pf := newPodFx(t)
+		mod(pf)
+		code, out := pf.call("pod-load", sid)
+		if code != 3 || len(pf.dropped) != 0 || len(pf.minted) != 0 || len(pf.pod.loads) != 0 || strings.Contains(out, hubSecretText) {
+			t.Errorf("%s: exit %d dropped=%d minted=%d loads=%d: %s", why, code, len(pf.dropped), len(pf.minted), len(pf.pod.loads), out)
+		}
+	}
+}
+
+func TestPodLoadIsRateLimitedLikeRelayMint(t *testing.T) {
+	pf := newPodFx(t)
+	if c, out := pf.call("pod-load", sid); c != 0 {
+		t.Fatal(out)
+	}
+	pf.order = nil
+	pf.pod.loads = nil
+	pf.hub = nil
+	// the secret is read again by the second run; it was only unreadable inside the first (fake) drop
+	if c, out := pf.call("pod-load", sid); c != 2 || !strings.Contains(out, "rate") || len(pf.hub) != 0 || len(pf.pod.loads) != 0 {
+		t.Errorf("a second load inside the window: %d %s", c, out)
+	}
+}
+
+func TestAHubThatRefusesTheRelayStopsTheLoadAndLeaksNothing(t *testing.T) {
+	pf := newPodFx(t)
+	pf.hubSt = 500
+	code, out := pf.call("pod-load", sid)
+	if code != 3 || !strings.Contains(out, "500") || strings.Contains(out, "BODY-OF-THE-REFUSAL") || len(pf.pod.loads) != 0 {
+		t.Errorf("exit %d loads=%d: %s", code, len(pf.pod.loads), out)
+	}
+}
+
+// A relay that was registered but never delivered must not stay live.
+func TestARelayThatWasNeverDeliveredIsRevoked(t *testing.T) {
+	pf := newPodFx(t)
+	pf.pod.loadErrs = []error{errors.New("side load refused: bad key")}
+	if code, _ := pf.call("pod-load", sid); code != 1 {
+		t.Fatalf("exit %d", code)
+	}
+	var del []hubReq
+	for _, h := range pf.hub {
+		if h.method == "DELETE" {
+			del = append(del, h)
+		}
+	}
+	if len(del) != 1 || del[0].rawPath != "/v1/principals/relay:"+sid+"%2F2" || del[0].auth != "Bearer "+hubSecretText {
+		t.Errorf("revokes %+v", del)
+	}
+}
+
+// pod-stop revokes the relay as root, before the drop (the secret is root's), then deletes the pod.
+func TestPodStopRevokesTheRelayBeforeTheDrop(t *testing.T) {
+	pf := newPodFx(t)
+	if code, out := pf.call("pod-stop", sid); code != 0 {
+		t.Fatalf("%d %s", code, out)
+	}
+	if pf.seq() != "hub:DELETE,drop,delete" {
+		t.Errorf("order %s", pf.seq())
+	}
+	// a hub that is down never stops the pod's deletion
+	pf = newPodFx(t)
+	pf.d.Hub = &http.Client{Transport: failTransport{}}
+	if code, out := pf.call("pod-stop", sid); code != 0 || len(pf.pod.deleted) != 1 {
+		t.Errorf("hub down: %d %s deleted=%d", code, out, len(pf.pod.deleted))
+	}
+}
+
+type failTransport struct{}
+
+func (failTransport) RoundTrip(*http.Request) (*http.Response, error) { return nil, errors.New("down") }

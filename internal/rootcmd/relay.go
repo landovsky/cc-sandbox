@@ -128,19 +128,30 @@ func (e *env) relayMint(sid, genS, pub string, after401 bool, stdout io.Writer) 
 		e.audit("relay-mint", sid, gen, pub, "no secret")
 		return &codeError{exitHub, "the hub admin secret is not usable: " + err.Error()}
 	}
-	body, _ := json.Marshal(map[string]any{"role": "relay", "sid": sid, "gen": genS, "pub": pub, "may_reach": mayReach(rec.Spec.MsgScope)})
-	code, resp, err := e.hubCall(context.Background(), "POST", "/v1/principals", secret, body)
+	tok, err := e.registerRelay(context.Background(), secret, rec.Spec.MsgScope, sid, gen, pub)
+	if err != nil {
+		return err
+	}
+	return json.NewEncoder(stdout).Encode(map[string]string{"token": tok})
+}
+
+// registerRelay asks the hub for a relay principal for one generation: its public key, and what it may
+// reach from the record's scope. The secret is the caller's, already read from its trusted file. The
+// token comes back to the caller only (the verb prints it; pod-load puts it in the sidecar's payload).
+func (e *env) registerRelay(ctx context.Context, secret string, scope json.RawMessage, sid string, gen int, pub string) (string, error) {
+	body, _ := json.Marshal(map[string]any{"role": "relay", "sid": sid, "gen": strconv.Itoa(gen), "pub": pub, "may_reach": mayReach(scope)})
+	code, resp, err := e.hubCall(ctx, "POST", "/v1/principals", secret, body)
 	if err != nil {
 		e.audit("relay-mint", sid, gen, pub, "unreachable")
-		return &codeError{exitHub, "the hub is not reachable"}
+		return "", &codeError{exitHub, "the hub is not reachable"}
 	}
 	var out struct{ Token string }
 	if code != http.StatusCreated || json.Unmarshal(resp, &out) != nil || out.Token == "" {
 		e.audit("relay-mint", sid, gen, pub, "hub "+strconv.Itoa(code))
-		return &codeError{exitHub, "the hub answered " + strconv.Itoa(code)}
+		return "", &codeError{exitHub, "the hub answered " + strconv.Itoa(code)}
 	}
 	e.audit("relay-mint", sid, gen, pub, "ok")
-	return json.NewEncoder(stdout).Encode(map[string]string{"token": out.Token})
+	return out.Token, nil
 }
 
 var sidMintRe = regexp.MustCompile(`^s[0-9a-z]{4,32}$`)
@@ -254,6 +265,12 @@ func (e *env) revokeRelay(sid string, gen int) {
 		e.audit("relay-revoke", sid, gen, "", "skipped: "+err.Error())
 		return
 	}
+	e.revokeWith(secret, sid, gen)
+}
+
+// revokeWith is revokeRelay for a caller that already holds the secret in memory (pod-load, after the
+// drop, when its own load fails).
+func (e *env) revokeWith(secret, sid string, gen int) {
 	id := url.PathEscape("relay:" + sid + "/" + strconv.Itoa(gen)) // one path segment
 	code, _, err := e.hubCall(context.Background(), "DELETE", "/v1/principals/"+id, secret, nil)
 	switch {

@@ -23,7 +23,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -210,6 +213,24 @@ func (e *env) podLoad(sid string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	// The hub's admin secret is root's (0600): it is read here, before the drop, into memory, and used
+	// below, in this process as the keys user, to register the relay for the generation key made there.
+	// Neither the secret nor the relay token is ever printed, and hostd sees neither.
+	gdir := filepath.Join(e.cfg.RunDir, "s", sid, "g"+strconv.Itoa(rec.Gen))
+	if err := e.ensureRunDir(); err != nil {
+		return err
+	}
+	if err := os.MkdirAll(gdir, 0o711); err != nil {
+		return err
+	}
+	if err := e.rateLimit(filepath.Join(gdir, "relay-mint.stamp"), false); err != nil {
+		return err
+	}
+	hubSecret, err := e.hubSecret()
+	if err != nil {
+		e.audit("relay-mint", sid, rec.Gen, "", "no secret")
+		return &codeError{exitHub, "the hub admin secret is not usable: " + err.Error()}
+	}
 	if err := e.d.DropPrivs(kc.keysUID, kc.keysGID); err != nil {
 		return fmt.Errorf("cannot become %s: %v", e.cfg.KeysUser, err)
 	}
@@ -235,16 +256,24 @@ func (e *env) podLoad(sid string, stdout io.Writer) error {
 	}
 	// Only now does a token exist. The signer authorises this uid for pod machines alone, and the
 	// generation key is made here: hostd holds neither half.
+	registered := false
 	secrets, err := e.d.Mint(ctx, e.cfg, token.Claims{
 		Sub:   fmt.Sprintf("%s/%s/%s/g%d", rec.Spec.Owner, rec.Spec.Machine, rec.Sid, rec.Gen),
 		Label: rec.Label, Billing: rec.Spec.Billing, Profile: rec.Spec.Profile, Aud: e.cfg.K8sAudiences, PlacedBy: e.cfg.Machine,
 		Exp: e.d.Now().Add(time.Duration(e.cfg.K8sTokenHours) * time.Hour).Unix(),
+	}, func(pub string) (string, error) {
+		tok, err := e.registerRelay(ctx, hubSecret, rec.Spec.MsgScope, rec.Sid, rec.Gen, pub)
+		registered = err == nil
+		return tok, err
 	})
 	if err != nil {
-		return fmt.Errorf("mint: %v", err)
+		return podErr(fmt.Errorf("mint: %w", err))
 	}
 	ref := k8s.Ref{Namespace: e.cfg.K8sNamespace, Name: k8s.PodName(rec.Sid, rec.Gen), Sid: rec.Sid, Gen: rec.Gen, UID: rec.PodUID}
 	if err := e.loadWithRetry(ctx, api, ref, secrets); err != nil {
+		if registered {
+			e.revokeWith(hubSecret, rec.Sid, rec.Gen) // the relay was never delivered: do not leave it live
+		}
 		return podErr(err)
 	}
 	return json.NewEncoder(stdout).Encode(map[string]any{"loaded": true, "pod": ref.Name})
@@ -352,6 +381,7 @@ func (e *env) podStop(sid string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
+	e.revokeRelay(rec.Sid, rec.Gen) // as root, before the drop: the hub secret is root's; best effort
 	if err := e.d.DropPrivs(kc.keysUID, kc.keysGID); err != nil {
 		return fmt.Errorf("cannot become %s: %v", e.cfg.KeysUser, err)
 	}

@@ -68,3 +68,25 @@ func MintFwdSecrets(ctx context.Context, sign func(context.Context, token.Claims
 	}
 	return json.Marshal(map[string]string{"token": t, "key": base64.StdEncoding.EncodeToString(gk.Private.Seed())})
 }
+
+// MintPodSecrets is MintFwdSecrets plus a relay credential: the generation key is made here, the token
+// signed with its public half as cnf, and register(pub) (the hub's relay principal for that same public
+// key) supplies the third secret. The payload is {"token","key","relay_token"}, the one thing the pod's
+// sidecar is loaded with; none of the three leaves this process except on that stdin.
+func MintPodSecrets(ctx context.Context, sign func(context.Context, token.Claims) (string, error), cl token.Claims, register func(pub string) (string, error)) ([]byte, error) {
+	gk, err := token.NewGenKey()
+	if err != nil {
+		return nil, err
+	}
+	pub := token.CnfOf(gk.Public)
+	cl.Cnf = pub
+	t, err := sign(ctx, cl)
+	if err != nil {
+		return nil, err
+	}
+	rt, err := register(pub) // cnf equality with the relay's key holds by construction
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(map[string]string{"token": t, "key": base64.StdEncoding.EncodeToString(gk.Private.Seed()), "relay_token": rt})
+}

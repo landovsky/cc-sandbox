@@ -48,6 +48,6 @@ func (p *podImpl) Load(ctx context.Context, ref k8s.Ref, secrets []byte) error {
 	return side.LoadInto(ctx, p.b, ref, secrets)
 }
 
-func realMint(ctx context.Context, cfg *Config, c token.Claims) ([]byte, error) {
-	return signer.MintFwdSecrets(ctx, signer.Client{Socket: cfg.SignerSocket}.Sign, c)
+func realMint(ctx context.Context, cfg *Config, c token.Claims, register func(pub string) (string, error)) ([]byte, error) {
+	return signer.MintPodSecrets(ctx, signer.Client{Socket: cfg.SignerSocket}.Sign, c, register)
 }

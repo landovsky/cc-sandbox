@@ -83,9 +83,11 @@ type Deps struct {
 	// NewPod builds the pod API (REST + kubectl) and Mint the sidecar's secrets; both are used only
 	// after the drop to the keys user, who holds the token, the kubeconfig and the signer socket.
 	NewPod func(cfg *Config, kc *k8sCtx) (PodAPI, error)
-	Mint   func(ctx context.Context, cfg *Config, c token.Claims) ([]byte, error)
-	Sleep  func(time.Duration)
-	Now    func() time.Time
+	// Mint makes the sidecar's one payload: the session token and its generation key (made here), and the
+	// relay token, which register(pub) obtains from the hub for that key's public half.
+	Mint  func(ctx context.Context, cfg *Config, c token.Claims, register func(pub string) (string, error)) ([]byte, error)
+	Sleep func(time.Duration)
+	Now   func() time.Time
 	// Hub is the HTTP client for the hub (no redirects, 10 s); Audit takes one line per relay mint and
 	// revoke (never a token or secret). nil: production defaults.
 	Hub   *http.Client

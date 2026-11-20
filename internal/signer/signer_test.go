@@ -798,3 +798,30 @@ func TestMintFwdSecretsBindsTheTokenToAKeyTheClientHolds(t *testing.T) {
 		t.Error("a missing socket signed")
 	}
 }
+
+// The pod's one payload carries three secrets, and the relay is registered for the very key the token
+// is bound to (cnf equality holds by construction).
+func TestMintPodSecretsRegistersTheRelayForTheTokensOwnKey(t *testing.T) {
+	r := peers(t, false)
+	var signedCnf, relayPub string
+	sign := func(ctx context.Context, c token.Claims) (string, error) {
+		signedCnf = c.Cnf
+		return Client{Socket: r.sock}.Sign(ctx, c)
+	}
+	b, err := MintPodSecrets(context.Background(), sign, token.Claims{Sub: "tomas/future-two/sSIGN/g1", Billing: "api", Profile: "dev-default", Aud: []string{"ccsbx-model"}},
+		func(pub string) (string, error) { relayPub = pub; return "sbp1.RELAY", nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	var s map[string]string
+	if json.Unmarshal(b, &s) != nil || len(s) != 3 || s["token"] == "" || s["relay_token"] != "sbp1.RELAY" || s["key"] == "" {
+		t.Fatalf("%s", b)
+	}
+	if relayPub == "" || relayPub != signedCnf {
+		t.Errorf("relay registered for %q, token bound to %q", relayPub, signedCnf)
+	}
+	if _, err := MintPodSecrets(context.Background(), sign, token.Claims{Sub: "tomas/future-two/sSIGN/g1", Billing: "api", Profile: "dev-default", Aud: []string{"ccsbx-model"}},
+		func(string) (string, error) { return "", errors.New("hub refused") }); err == nil {
+		t.Error("a payload was made without a relay token")
+	}
+}

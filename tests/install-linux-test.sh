@@ -146,10 +146,10 @@ t "hostd waits for the signer socket" bash -c 'grep -q "^Requires=ccsbx-signer.s
 d="$(fx m1)"; ins "$d" install --yes >/dev/null 2>&1
 t "install writes the socket unit and enables the SOCKET (systemd creates it as root)" bash -c 'test -f "$1/root/etc/systemd/system/ccsbx-signer.socket" && grep -q "enable --now ccsbx-signer.socket" "$1/rec/cmds"' _ "$d"
 t "check does NOT call it ok when the sockets are not there (the old check only looked at is-active)" bash -c 'out="$(CCSBX_ROOT_PREFIX="$1/root" CCSBX_EXEC="record:$1/x" CCSBX_OWNER=tomas "$2" check 2>&1)"; grep -q "^FAIL  signer socket" <<<"$out" && grep -q "^FAIL  hostd socket" <<<"$out"' _ "$d" "$inst"
-me="$(id -un)"; mkdir -p "$d/root/run/ccsbx"
+me="$(id -un)"; mkdir -p "$d/root/run/ccsbx-api"
 python3 -I -c 'import socket,sys,time
-s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(30)' "$d/root/run/ccsbx/hostd.sock" & lpid=$!
-for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$d/root/run/ccsbx/hostd.sock" ] && break; sleep 0.2; done
+s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(30)' "$d/root/run/ccsbx-api/hostd.sock" & lpid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$d/root/run/ccsbx-api/hostd.sock" ] && break; sleep 0.2; done
 out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER="$me" "$inst" check 2>&1)"
 t "check actually CONNECTS to hostd's socket as the owner" grep -q "^ok    hostd socket: $me can connect" <<<"$out"
 kill "$lpid" 2>/dev/null; wait "$lpid" 2>/dev/null
@@ -296,7 +296,7 @@ refused "a continuation line" "tomas ALL=(ALL) $N /usr/bin/foo, \\"
 refused "no command at all" "tomas ALL=(ALL) $N "
 
 echo "# review R1/R3: hostd's real command line, DONE only when the services are up, undo order"
-t "R1: hostd is started as 'ccsbx-hostd run' with loopback-only --listen and a token file (no ':7480')" bash -c 'l="$(grep "^ExecStart=" "$1")"; grep -q "ccsbx-hostd run " <<<"$l" && grep -q -- "--listen 127.0.0.1:7480" <<<"$l" && grep -q -- "--listen-token-file " <<<"$l" && grep -q -- "--local-socket /run/ccsbx/hostd.sock" <<<"$l" && grep -q -- "--signer /run/ccsbx-signer/sign.sock" <<<"$l" && ! grep -q -- "--listen :7480" <<<"$l"' _ "$hd"
+t "R1: hostd is started as 'ccsbx-hostd run' with loopback-only --listen and a token file (no ':7480')" bash -c 'l="$(grep "^ExecStart=" "$1")"; grep -q "ccsbx-hostd run " <<<"$l" && grep -q -- "--listen 127.0.0.1:7480" <<<"$l" && grep -q -- "--listen-token-file " <<<"$l" && grep -q -- "--local-socket /run/ccsbx-api/hostd.sock" <<<"$l" && grep -q -- "--signer /run/ccsbx-signer/sign.sock" <<<"$l" && ! grep -q -- "--listen :7480" <<<"$l"' _ "$hd"
 d="$(fx r1)"; CCSBX_TEST_POSTCHECK_RC=1 ins "$d" install --yes >"$d/out" 2>"$d/err"; rc=$?
 t "R1: a crash-looping hostd (post-install check fails) means exit 1, NOT DONE, and no DONE line" bash -c '[ '"$rc"' -eq 1 ] && grep -q "NOT DONE" "$1" && ! grep -q "^DONE" "$2"' _ "$d/err" "$d/out"
 t "R1: …and the backup stays in-progress, so uninstall is still the documented way back" grep -qx in-progress "$d/root/var/backups/ccsbx-install/original/STATE"
@@ -315,7 +315,10 @@ echo "# (checked against: $src)"
 bad="$(grep '^ExecStart=' "$hd" | grep -o ' --[a-z-]*' | tr -d ' ' | sed 's/^--//' | while read -r f; do grep -qE "(^|[[:space:]])-{1,2}$f([[:space:]]|\$)" "$help" || echo "$f"; done)"
 t "R1: every flag in hostd's ExecStart is a flag 'ccsbx-hostd run' has ($src)${bad:+: unknown: $bad}" test -z "$bad"
 t "R1: the unit sets the tmux socket to an absolute path in /run/ccsbx and leaves --ccmsg-bin unset" bash -c 'grep -q -- "--tmux-socket /run/ccsbx/tmux.sock" "$1" && ! grep "^ExecStart=" "$1" | grep -q -- "--ccmsg-bin"' _ "$hd"
-t "R1: /run/ccsbx is 0750 and its group becomes ccsbx-clients, so the owner's attach reaches the sockets" bash -c 'grep -q "^RuntimeDirectoryMode=0750" "$1" && grep -q "^ExecStartPre=+/usr/bin/chgrp ccsbx-clients /run/ccsbx" "$1"' _ "$hd"
+t "R1b: /run/ccsbx is ccsbx-only 0700 with no group and no chgrp (a group-writable tmux socket lets any owner-uid process type into fenced panes)" bash -c 'grep -q "^RuntimeDirectoryMode=0700" "$1" && ! grep -q "chgrp" <(grep -v "^#" "$1") && ! grep -q "^SupplementaryGroups=.*ccsbx-clients.*tmux" "$1"' _ "$hd"
+t "R1b: the API socket lives in its own 0755 directory and keeps --socket-group ccsbx-clients (0660)" bash -c 'grep -q "^RuntimeDirectory=ccsbx ccsbx-api" "$1" && grep -q "ExecStartPre=+/usr/bin/chmod 0755 /run/ccsbx-api" "$1" && grep "^ExecStart=" "$1" | grep -q -- "--local-socket /run/ccsbx-api/hostd.sock --socket-group ccsbx-clients" && grep -q "^ReadWritePaths=.*/run/ccsbx-api" "$1"' _ "$hd"
+d="$(fx r1b)"; ins "$d" install --yes >/dev/null 2>&1
+t "R1b: no separate sudoers line for attach (the one ccsbx-root rule already covers the verb), and none for a group" bash -c 'f="$1/root/etc/sudoers.d/.90-ccsbx-root.new"; ! grep -q "attach" "$f" && ! grep -q "^%" "$f"' _ "$d"
 d="$(fx tok)"; ins "$d" install --yes >/dev/null 2>&1
 t "R1: the installer makes hostd's token file (0600, as ccsbx) before it starts hostd" bash -c 'a="$(grep -n "listen.token" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-hostd" "$1" | cut -d: -f1)"; grep -q "umask..077" "$1" && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
 

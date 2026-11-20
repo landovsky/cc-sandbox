@@ -10,7 +10,7 @@
 KEYS_DIR=/var/lib/ccsbx-keys
 STATE_DIR=/var/lib/ccsbx
 SIGNER_SOCK=/run/ccsbx-signer/sign.sock       # systemd creates it (ccsbx-signer.socket): ccsbx-keys:ccsbx 0660
-HOSTD_SOCK=/run/ccsbx/hostd.sock              # hostd makes it: ccsbx:ccsbx-clients 0660
+HOSTD_SOCK=/run/ccsbx-api/hostd.sock          # hostd makes it: ccsbx:ccsbx-clients 0660 (dir 0755)
 KEY_FILES="age.key machine.key"
 
 u0b_users() {

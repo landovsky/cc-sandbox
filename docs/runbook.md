@@ -487,7 +487,7 @@ hostd's rights (tracking a fenced identity, reading hostd's frames), and the rev
   BEFORE the manager's first track (nobody has claimed the node yet) is accepted, and a squatter that keeps renewing keeps
   the claim: an owner-uid process on any machine can lock a manager out that way (a DoS, no impersonation or leak: hostd
   hears and sends by the record's machine, and now also for FENCED senders: a fenced session labelled with a manager's node
-  on another machine is refused). The remedy is the one above: GET /v1/nodes, DELETE /v1/nodes/<node>. `--known-machines`
+  on another machine is refused). The remedy: `GET /v1/nodes` and `GET /v1/principals` to see who holds it, REVOKE the squatting machine's principal first (`DELETE /v1/principals/spoke:<machine>`, then re-mint that machine's own token: otherwise it re-claims at its next track), THEN `DELETE /v1/nodes/<node>`. A node whose record places it on no machine (an old record) reaches nobody: hostd refuses it as `unplaced`, and a new start refuses a `msg_scope` that lists a manager or peer without its machine (`bad_spec`). The hub's unit should set `SB_NODE_CLAIMS_FILE=$HOME/.local/state/session-bus/node-claims/claims.json` (a directory of its own, created 0700; the unit file is D's/the dev manager's to change) so a hub restart keeps the claims. `--known-machines`
   makes a start whose `msg_scope` names any other machine refuse (bad_spec) before anything is published. The claim
   table lives in memory unless `SB_NODE_CLAIMS_FILE` is set (a hub restart then reopens the first-publisher window
   until each hostd re-tracks, seconds); the file is written through an exclusive random temp, in a directory created 0700 if new (an existing directory is never chmod-ed: give the file one of its own)

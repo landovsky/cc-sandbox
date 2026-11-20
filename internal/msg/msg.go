@@ -363,6 +363,10 @@ func (r *Router) DeliverRemote(rs RemoteSender, targetSid, text string) Result {
 	if target == nil || strings.TrimSpace(text) == "" {
 		return r.receipt(from, 0, "", Result{Status: "error", Code: "no_live_session"})
 	}
+	if rs.Node != "" && nodeInScope(*target, rs.Node) && target.Scope.MachineOf(rs.Node) == "" {
+		// the record lists this node but places it on no machine: nobody on the hub can be told apart from a decoy
+		return r.receipt(from, 0, target.Sid, Result{Status: "refused", Code: "unplaced"})
+	}
 	if rs.Node == "" || !r.remoteInScope(rs, *target) {
 		return r.receipt(from, 0, target.Sid, Result{Status: "refused", Code: "scope"})
 	}
@@ -387,12 +391,11 @@ func (r *Router) remoteInScope(rs RemoteSender, target Session) bool {
 		// it is ON that machine, fenced or not. A fenced sender's signature proves who it is, but its NODE is only
 		// the label its starter gave it (an owner process on another machine can start a fenced session labelled
 		// with someone's manager node), so the signature alone must not make it that manager. Only when the
-		// record places the node nowhere does a fenced sender count by its signature (an unfenced one never does).
+		// record places the node nowhere does a sender reach nobody (a start refuses a scope that names a manager
+		// or peer without its machine, so this is an old or hand-made record): a decoy from another machine would
+		// otherwise count by its signature alone.
 		want := target.Scope.MachineOf(rs.Node)
-		if want != "" {
-			return rs.Machine == want
-		}
-		return rs.Fenced
+		return want != "" && rs.Machine == want
 	}
 	win := time.Duration(target.Scope.ReplyWindowS) * time.Second
 	if win <= 0 {

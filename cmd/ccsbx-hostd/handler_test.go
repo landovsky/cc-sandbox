@@ -289,6 +289,8 @@ func TestAScopeNamingAnUnknownMachineIsRefusedAtStart(t *testing.T) {
 		"an unknown manager machine": `{"manager":{"node":"cc-sandbox:m","machine":"x6"}}`,
 		"an unknown peer machine":    `{"peer_machines":{"cc-sandbox:p":"x6"}}`,
 		"a malformed machine":        `{"manager":{"node":"cc-sandbox:m","machine":"a b/c"}}`,
+		"a manager with no machine":  `{"manager":{"node":"cc-sandbox:m"}}`,
+		"a peer with no machine":     `{"manager":{"node":"cc-sandbox:m","machine":"mac-tomas"},"peers":["cc-sandbox:p"]}`,
 	} {
 		if checkScopeMachines([]byte(sc), known) == nil {
 			t.Errorf("%s was accepted", name)

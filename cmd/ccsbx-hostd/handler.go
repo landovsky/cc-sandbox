@@ -226,6 +226,16 @@ func checkScopeMachines(raw []byte, known []string) error {
 	if err := json.Unmarshal(raw, &sc); err != nil {
 		return &start.Refusal{Code: start.BadSpec, Msg: "msg_scope is not readable"}
 	}
+	// every node the scope lists must say where it lives: a node placed on no machine reaches nobody (it cannot
+	// be told from a decoy), so a spec that lists one is refused here rather than started and silent
+	if sc.Manager.Node != "" && sc.Manager.Machine == "" {
+		return &start.Refusal{Code: start.BadSpec, Msg: "msg_scope.manager needs its machine"}
+	}
+	for _, p := range sc.Peers {
+		if sc.MachineOf(p) == "" {
+			return &start.Refusal{Code: start.BadSpec, Msg: "msg_scope.peers: every peer needs its machine in peer_machines"}
+		}
+	}
 	names := []string{sc.Manager.Machine}
 	for _, m := range sc.PeerMachines {
 		names = append(names, m)

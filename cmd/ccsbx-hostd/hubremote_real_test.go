@@ -144,10 +144,11 @@ func TestRealHubTwoMachinesExchangeSignedMessagesAndRefuseForgeries(t *testing.T
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	worker := msg.Session{Sid: "s0worker01", Label: "cc-sandbox:worker", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
-	worker.Scope.Manager.Node = "cc-sandbox:mgr"
+	worker.Scope.Manager.Node, worker.Scope.Manager.Machine = "cc-sandbox:mgr", "mac"
 	worker.Scope.ReplyWindowS = 3600
 	mgr := msg.Session{Sid: "s0mgr00001", Label: "cc-sandbox:mgr", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
 	mgr.Scope.Peers = []string{"cc-sandbox:worker"}
+	mgr.Scope.PeerMachines = map[string]string{"cc-sandbox:worker": "hp"}
 	mgr.Scope.ReplyWindowS = 3600
 	hp := startMachine(t, ctx, url, admin, "hp", worker)
 	mac := startMachine(t, ctx, url, admin, "mac", mgr)
@@ -569,5 +570,27 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	hp.out.mu.Unlock()
 	if strings.Count(hp.j.types(), "hub.recv") <= refusedBefore {
 		t.Error("the receiver did not journal the delivery attempt (hub.recv, status refused/scope): the message may not have reached it at all")
+	}
+
+	// 12. (round 8) an OLD record that lists the manager but places it on no machine: a fenced decoy from another
+	// machine, labelled with that node, must not count by its signature alone either: unplaced reaches nobody.
+	w7 := msg.Session{Sid: "s0worker07", Label: "cc-sandbox:worker7", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	w7.Scope.Manager.Node, w7.Scope.ReplyWindowS = "cc-sandbox:umgr9", 3600 // no machine
+	hp7 := startMachine(t, ctx, url, admin, "hp7", w7)
+	decoy := msg.Session{Sid: "s0decoy08", Label: "cc-sandbox:umgr9", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	decoy.Scope.Manager.Node, decoy.Scope.Manager.Machine, decoy.Scope.ReplyWindowS = w7.Label, "hp7", 3600
+	hp8 := startMachine(t, ctx, url, admin, "hp8", decoy)
+	time.Sleep(500 * time.Millisecond)
+	if ok, _ := sendVia(hp8, decoy, w7.Label, "report", "decoy speaking as the unplaced manager"); ok {
+		t.Fatal("a decoy was accepted for a node the record places nowhere")
+	}
+	time.Sleep(500 * time.Millisecond)
+	hp7.out.mu.Lock()
+	if len(hp7.out.lines) != 0 {
+		t.Fatalf("something was typed into the worker whose record places its manager nowhere: %q", hp7.out.lines)
+	}
+	hp7.out.mu.Unlock()
+	if !strings.Contains(hp7.j.types(), "hub.recv") {
+		t.Error("the receiver did not journal the refused attempt (hub.recv, unplaced)")
 	}
 }

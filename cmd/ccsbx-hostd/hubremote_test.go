@@ -137,6 +137,7 @@ func newRig(t *testing.T, mint minter) *rig {
 	}
 	worker := msg.Session{Sid: targetSid, Label: "cc-sandbox:worker", BusID: "ccsbx:" + targetSid, Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
 	worker.Scope.Manager.Node = "cc-sandbox:mgr"
+	worker.Scope.Manager.Machine = "mac"
 	worker.Scope.Peers = []string{"cc-sandbox:peer"}
 	worker.Scope.PeerMachines = map[string]string{"cc-sandbox:peer": "mac"}
 	worker.Scope.ReplyWindowS = 3600
@@ -533,6 +534,7 @@ func TestUnreachableTargetsAreDroppedAndJournaledNeverSuccess(t *testing.T) {
 	rt.Pump(nil)
 	worker := w
 	worker.Scope.Manager.Node = "cc-sandbox:mgr"
+	worker.Scope.Manager.Machine = "mac"
 	rt.Dir.(*xDir).s = []msg.Session{worker}
 	for _, to := range []string{"cc-sandbox:mgr"} {
 		res := rt.Send(worker, []byte(`{"type":"msg.send","to":{"node":"`+to+`"},"kind":"report","text":"secret text"}`))
@@ -599,6 +601,7 @@ func TestAFencedNodeOfAnotherMachineTakesTheSignedPathEvenWithCcmsgConfigured(t 
 	r.hr.rt.Hub = spy
 	w := worker()
 	w.Scope.Manager.Node = "cc-sandbox:mgr"
+	w.Scope.Manager.Machine = "mac"
 	w.Scope.Peers = []string{"cc-sandbox:nobody"}
 	r.hr.rt.Dir.(*xDir).s = []msg.Session{w}
 	if res := r.hr.rt.Send(w, []byte(`{"type":"msg.send","to":{"node":"cc-sandbox:mgr"},"kind":"report","text":"hi"}`)); res.Status != "ok" || len(spy.sent) != 0 || len(r.hub.got) != 1 {
@@ -622,6 +625,7 @@ func TestASlowSendDoesNotBlockADeliveryOrALocalSend(t *testing.T) {
 	w := worker()
 	w.Live, w.Started = true, time.Now().Add(-time.Hour)
 	w.Scope.Manager.Node = "cc-sandbox:mgr"
+	w.Scope.Manager.Machine = "mac"
 	r.hr.rt.Dir.(*xDir).s = []msg.Session{w}
 	done := make(chan msg.Result, 1)
 	go func() {

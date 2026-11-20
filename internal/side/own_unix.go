@@ -9,7 +9,7 @@ import (
 	"syscall"
 )
 
-func ownedByMe(fi os.FileInfo) bool {
+func ownedBy(fi os.FileInfo, uid int) bool {
 	st, ok := fi.Sys().(*syscall.Stat_t)
-	return ok && int(st.Uid) == os.Getuid()
+	return ok && int(st.Uid) == uid
 }

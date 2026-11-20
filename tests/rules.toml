@@ -1657,3 +1657,23 @@ invariants = [5]
 backends = ["unit"]
 where = "hp"
 
+
+[[rule]]
+id = "side-secrets-only-over-exec-stdin"
+title = "the sidecar takes the session token and key once, over exec stdin, from its own uid only; the fence never sees them"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/side 'TestLoadThenForward$'"
+block = "tests/go-test.sh ./internal/side 'TestOnlyOneLoadPerProcess$|TestLoadRefusesWhatCannotWork$|TestControlSocketRefusesAnotherUID$|TestControlDirectoryOfAnotherOwnerIsRefused$|TestTheFenceNeverSeesTheSecrets$|TestLoadIntoSendsSecretsOnStdinOnly$|TestLoadIntoReportsARefusal$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "side-forwarder-ends-with-the-token"
+title = "the forwarder answers 503 until loaded, listens on one loopback port, and ends when the token expires"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/side 'TestLoadThenForward$'"
+block = "tests/go-test.sh ./internal/side 'TestRefusesAnAddressThatWidensWhatTheFenceSees$|TestEndsWhenTheTokenExpires$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"

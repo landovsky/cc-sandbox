@@ -157,7 +157,10 @@ func (s *Server) Serve(ctx context.Context) error {
 func (s *Server) Loaded() bool { return s.loaded.Load() }
 
 // checkControlDir refuses a directory the fence (or anyone else) could write a socket into or swap.
-func checkControlDir(dir string) error {
+func checkControlDir(dir string) error { return checkControlDirAs(dir, os.Getuid()) }
+
+// checkControlDirAs is checkControlDir for a given uid (a test passes another one).
+func checkControlDirAs(dir string, uid int) error {
 	fi, err := os.Lstat(dir)
 	if err != nil {
 		return fmt.Errorf("side: control directory: %w", err)
@@ -168,8 +171,8 @@ func checkControlDir(dir string) error {
 	if fi.Mode().Perm()&0o077 != 0 {
 		return fmt.Errorf("side: control directory %s has mode %o; it must be 0700", dir, fi.Mode().Perm())
 	}
-	if !ownedByMe(fi) {
-		return fmt.Errorf("side: control directory %s is not owned by uid %d", dir, os.Getuid())
+	if !ownedBy(fi, uid) {
+		return fmt.Errorf("side: control directory %s is not owned by uid %d", dir, uid)
 	}
 	return nil
 }

@@ -285,3 +285,18 @@ func TestHelpAndUsage(t *testing.T) {
 		t.Fatalf("load without --control: rc=%d", rc)
 	}
 }
+
+// context "the volume mount shows up owned by someone else": a control directory the sidecar's uid does
+// not own could let another uid swap the socket, so the sidecar refuses to start there.
+func TestControlDirectoryOfAnotherOwnerIsRefused(t *testing.T) {
+	d := t.TempDir()
+	if err := os.Chmod(d, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := checkControlDirAs(d, os.Getuid()); err != nil {
+		t.Fatalf("own 0700 directory refused: %v", err)
+	}
+	if err := checkControlDirAs(d, os.Getuid()+1); err == nil || !strings.Contains(err.Error(), "not owned") {
+		t.Fatalf("another uid's directory: %v, want refused", err)
+	}
+}

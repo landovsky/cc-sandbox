@@ -33,7 +33,7 @@ load    is what the launcher runs INSIDE the sidecar container through pods/exec
         spec, an argument or the environment. One load per process, only from the sidecar's own uid;
         the key must match the token's cnf, and the token must not be expired.
 
-Flags (each also CCSBX_SIDE_<NAME>):
+Flags: (each also CCSBX_SIDE_<NAME>)
   --listen ADDR     forwarder host:port, a loopback IP only        (default 127.0.0.1:8080)
   --control PATH    control socket path, in a sidecar-only volume   (required)
   --door NAME=URL   a door this session may reach; repeatable; CCSBX_SIDE_DOORS is a space-separated list

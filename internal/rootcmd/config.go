@@ -350,16 +350,20 @@ var nsRe = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$`)
 
 var sideImageRe = regexp.MustCompile(`^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$`)
 
-// checkHubURL: the hub's admin secret never leaves the machine that runs the hub, so the address is
-// plain HTTP to a loopback host, with no userinfo, path or query.
+// tailnetNet is Tailscale's address range (CGNAT): the hub on hp listens on hp's own tailnet address.
+var tailnetNet = func() *net.IPNet { _, n, _ := net.ParseCIDR("100.64.0.0/10"); return n }()
+
+// checkHubURL: the hub's admin secret never leaves the machine that runs the hub, so the address is plain
+// HTTP to an IP literal of this machine: loopback, or its own tailnet address (the hub may listen only on
+// that), with no userinfo, path or query. A name is refused: the listener check compares addresses.
 func checkHubURL(raw string) error {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "http" || u.Host == "" || u.User != nil || (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
-		return fmt.Errorf("hub_url %q must be http://127.0.0.1:PORT (loopback only)", raw)
+		return fmt.Errorf("hub_url %q must be http://IP:PORT (loopback or this machine's tailnet address)", raw)
 	}
-	h := u.Hostname()
-	if ip := net.ParseIP(h); h != "localhost" && (ip == nil || !ip.IsLoopback()) {
-		return fmt.Errorf("hub_url host %q is not loopback: the hub's admin secret never leaves its machine", h)
+	ip := net.ParseIP(u.Hostname())
+	if ip == nil || !(ip.IsLoopback() || tailnetNet.Contains(ip)) {
+		return fmt.Errorf("hub_url host %q must be an IP literal, loopback or in 100.64.0.0/10: the hub's admin secret never leaves its machine", u.Hostname())
 	}
 	return nil
 }

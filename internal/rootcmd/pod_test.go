@@ -158,7 +158,7 @@ func (f *fx) writeConfigPod(t *testing.T, side bool, extra string) {
 		}
 		return lookup(n)
 	}
-	f.d.HubListeners = func(port int) ([]TCPListener, error) { return []TCPListener{{Port: port, UID: hubUID}}, nil }
+	f.d.HubListeners = func(port int) ([]TCPListener, error) { return []TCPListener{{IP: "0100007F", Port: port, UID: hubUID}}, nil }
 }
 
 func (pf *podFx) wire() {

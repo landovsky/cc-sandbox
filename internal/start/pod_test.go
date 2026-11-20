@@ -410,3 +410,126 @@ func TestSweepPods(t *testing.T) {
 		t.Error("a start in flight was ended")
 	}
 }
+
+// ---- resume of a pod session (F2x) ----
+
+func resumeSpec(sid string, mod func(*LaunchSpec)) *LaunchSpec {
+	return podSpec(func(s *LaunchSpec) {
+		s.RequestID, s.Resume = "rid-resume", &Resume{Sid: sid}
+		if mod != nil {
+			mod(s)
+		}
+	})
+}
+
+// context "a pod session's next generation": the previous generation's pod is deleted first (by its UID),
+// then a new pod is made and loaded for generation+1 of the SAME session.
+func TestResumeOfAPodSessionIsTheNextGeneration(t *testing.T) {
+	d, fr, revoked := podDaemon(t)
+	first, err := d.Start(podSpec(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr.calls, fr.uid = nil, "pod-uid-2"
+	rep, err := d.Start(resumeSpec(first.Sid, nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(fr.calls, ",") != "stop,create,load" {
+		t.Errorf("calls %v: the old pod goes first", fr.calls)
+	}
+	rec, _ := d.Load(first.Sid)
+	if rep.Sid != first.Sid || rep.Gen != 2 || rep.ID != "tomas/future-two/"+first.Sid+"/g2" || rec.Gen != 2 || rec.PodUID != "pod-uid-2" || rec.Ended != nil ||
+		rec.RequestID != "rid-resume" || len(rec.RequestIDs) != 1 || rec.RequestIDs[0] != "rid-1" || fr.uidOnDiskAtLoad != "pod-uid-2" {
+		t.Errorf("%+v %+v", rep, rec)
+	}
+	if len(*revoked) != 1 {
+		t.Errorf("the old generation's token was not dealt with: %v", *revoked)
+	}
+	if len(d.recordFiles(t)) != 1 {
+		t.Errorf("a resume made a second record: %v", d.recordFiles(t))
+	}
+}
+
+func TestResumeRefusals(t *testing.T) {
+	for why, mod := range map[string]func(*LaunchSpec){
+		"another label":      func(s *LaunchSpec) { s.Label = "cc-sandbox:other" },
+		"another repository": func(s *LaunchSpec) { s.Workdir.Repo = "landovsky/other" },
+	} {
+		d, fr, _ := podDaemon(t)
+		first, _ := d.Start(podSpec(nil))
+		fr.calls = nil
+		if _, err := d.Start(resumeSpec(first.Sid, mod)); err == nil || len(fr.calls) != 0 {
+			t.Errorf("%s: %v calls %v (nothing may be touched)", why, err, fr.calls)
+		}
+		if rec, _ := d.Load(first.Sid); rec.Gen != 1 || rec.Ended != nil {
+			t.Errorf("%s changed the record: %+v", why, rec)
+		}
+	}
+	d, fr, _ := podDaemon(t)
+	if _, err := d.Start(resumeSpec("s0unknownxx", nil)); err == nil || len(fr.calls) != 0 {
+		t.Errorf("an unknown session: %v", err)
+	}
+	// a docker session is not resumed as a pod, and another caller's session is not resumed at all
+	d, fr, _ = podDaemon(t)
+	dock, _ := d.Start(spec(nil))
+	if _, err := d.Start(resumeSpec(dock.Sid, nil)); err == nil || len(fr.calls) != 0 {
+		t.Errorf("a docker session: %v", err)
+	}
+	d, fr, _ = podDaemon(t)
+	first, _ := d.Start(podSpec(nil))
+	d.Uid = 2000
+	fr.calls = nil
+	if _, err := d.Start(resumeSpec(first.Sid, nil)); err == nil || len(fr.calls) != 0 {
+		t.Errorf("another caller's session: %v", err)
+	}
+}
+
+// the old pod that cannot be deleted stops the resume with the session as it was
+func TestResumeWhenTheOldPodCannotBeDeletedChangesNothing(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	first, _ := d.Start(podSpec(nil))
+	fr.calls, fr.stopEr = nil, errors.New("api down")
+	_, err := d.Start(resumeSpec(first.Sid, nil))
+	if code(err) != SessionBusy || strings.Join(fr.calls, ",") != "stop" {
+		t.Errorf("%v calls %v", err, fr.calls)
+	}
+	if rec, _ := d.Load(first.Sid); rec.Gen != 1 || rec.Ended != nil || rec.PodUID != "pod-uid-1" {
+		t.Errorf("%+v", rec)
+	}
+}
+
+// a new generation that fails to come up leaves the session as it was: the previous generation, ended,
+// with its own UID; and the new pod that was made is deleted
+func TestAFailedResumePutsTheSessionBack(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	first, _ := d.Start(podSpec(nil))
+	fr.calls, fr.uid, fr.loadEr = nil, "pod-uid-2", ErrPodNotReady
+	_, err := d.Start(resumeSpec(first.Sid, nil))
+	if code(err) != PodNotReady || strings.Join(fr.calls, ",") != "stop,create,load,stop" {
+		t.Fatalf("%v calls %v", err, fr.calls)
+	}
+	rec, _ := d.Load(first.Sid)
+	if rec.Gen != 1 || rec.Ended == nil || rec.PodUID != "pod-uid-1" || rec.RequestID != "rid-1" {
+		t.Errorf("the session was not put back: %+v", rec)
+	}
+	// and it can be resumed again
+	fr.calls, fr.loadEr = nil, nil
+	if rep, err := d.Start(resumeSpec(first.Sid, func(s *LaunchSpec) { s.RequestID = "rid-resume-2" })); err != nil || rep.Gen != 2 {
+		t.Errorf("a second try: %+v %v", rep, err)
+	}
+}
+
+// a resume replaces a generation, it does not add a live session: MaxLive counts the session once
+func TestAResumeDoesNotCountTwiceAgainstMaxLive(t *testing.T) {
+	d, fr, _ := podDaemon(t)
+	d.MaxLive = 1
+	first, err := d.Start(podSpec(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fr.uid = "pod-uid-2"
+	if _, err := d.Start(resumeSpec(first.Sid, nil)); err != nil {
+		t.Errorf("the only live session could not be resumed: %v", err)
+	}
+}

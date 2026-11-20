@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -366,12 +367,38 @@ func (e *env) checkHubListener() error {
 	if len(ls) == 0 {
 		return fmt.Errorf("%w: nothing listens on port %d", errHubUntrusted, port)
 	}
+	hubIP := net.ParseIP(u.Hostname())
+	covered := false
 	for _, l := range ls {
 		if l.UID != uid {
 			return fmt.Errorf("%w: uid %d listens on port %d", errHubUntrusted, l.UID, port)
 		}
+		// the address the secret is sent to must be one the hub listens on, or one a wildcard listener covers:
+		// a hub on the tailnet address only does not answer on 127.0.0.1, and whoever binds that is not the hub
+		if lip := decodeProcIP(l.IP); lip != nil && (lip.IsUnspecified() || (hubIP != nil && lip.Equal(hubIP))) {
+			covered = true
+		}
+	}
+	if !covered {
+		return fmt.Errorf("%w: nobody of the hub's user listens on %s:%d (the hub's own listeners are elsewhere)", errHubUntrusted, u.Hostname(), port)
 	}
 	return nil
+}
+
+// decodeProcIP reads an address as /proc/net/tcp writes it: 8 hex digits (IPv4) or 32 (IPv6), each 32-bit
+// word in host (little-endian) byte order. nil if it is not one.
+func decodeProcIP(h string) net.IP {
+	if len(h) != 8 && len(h) != 32 {
+		return nil
+	}
+	raw, err := hex.DecodeString(h)
+	if err != nil {
+		return nil
+	}
+	for i := 0; i+4 <= len(raw); i += 4 {
+		raw[i], raw[i+1], raw[i+2], raw[i+3] = raw[i+3], raw[i+2], raw[i+1], raw[i]
+	}
+	return net.IP(raw)
 }
 
 // parseProcNet reads /proc/net/tcp or tcp6 and returns the LISTEN sockets on port.

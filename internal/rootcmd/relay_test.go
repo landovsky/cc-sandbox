@@ -363,6 +363,7 @@ func TestTheHubMustBeOnLoopback(t *testing.T) {
 	base := "allowed_roots = [\"" + r.roots + "\"]\nmachine = \"m\"\n"
 	for why, u := range map[string]string{
 		"a remote host": "http://10.0.0.5:4011", "a name": "http://hub.example:4011", "https": "https://127.0.0.1:4011",
+		"localhost by name": "http://localhost:4011", "a non-tailnet 100.x": "http://100.1.2.3:4011", "a public address": "http://8.8.8.8:4011",
 		"userinfo": "http://u:p@127.0.0.1:4011", "a path": "http://127.0.0.1:4011/x", "none": "",
 	} {
 		put(t, p, base+"hub_url = \""+u+"\"\n", 0o644)
@@ -370,7 +371,7 @@ func TestTheHubMustBeOnLoopback(t *testing.T) {
 			t.Errorf("%s was accepted as the hub", why)
 		}
 	}
-	for _, u := range []string{"http://127.0.0.1:4011", "http://localhost:4011", "http://[::1]:4011"} {
+	for _, u := range []string{"http://127.0.0.1:4011", "http://[::1]:4011", "http://100.101.219.96:4011", "http://100.64.0.1:4011", "http://100.127.255.254:4011"} {
 		put(t, p, base+"hub_url = \""+u+"\"\n", 0o644)
 		if _, err := LoadConfig(p, os.Getuid()); err != nil {
 			t.Errorf("%s: %v", u, err)
@@ -562,6 +563,65 @@ func TestRelayMintReadsTheScopeAsStrictlyAsPodCreate(t *testing.T) {
 		code, out := r.mint("--", sid, "2", relayPub)
 		if code != 2 || len(r.hubCalls()) != 0 || !strings.Contains(out, "not well formed") {
 			t.Errorf("%s: exit %d hub calls %d: %s", why, code, len(r.hubCalls()), out)
+		}
+	}
+}
+
+// ---- the address the secret goes to must be one the hub listens on (D's review: the hub on hp listens on the
+// tailnet address only, not on loopback) ----
+
+func TestTheSecretGoesOnlyToAnAddressTheHubListensOn(t *testing.T) {
+	const tailnet, loop, wild = "60DB6564", "0100007F", "00000000" // 100.101.219.96, 127.0.0.1, 0.0.0.0
+	const mapped, wild6 = "0000000000000000FFFF00000100007F", "00000000000000000000000000000000"
+	hub := hubUID
+	squat := os.Getuid() + 7
+	r := newRelayFx(t)
+	check := func(url string, ls []TCPListener) error {
+		cfg := *r.cfg
+		cfg.HubURL = url
+		r.d.HubListeners = func(port int) ([]TCPListener, error) {
+			for i := range ls {
+				ls[i].Port = port
+			}
+			return ls, nil
+		}
+		return (&env{cfg: &cfg, d: r.d}).checkHubListener()
+	}
+	for why, c := range map[string]struct {
+		url string
+		ls  []TCPListener
+		ok  bool
+	}{
+		"the hub on the tailnet address, url the tailnet address":                     {"http://100.101.219.96:4011", []TCPListener{{IP: tailnet, UID: hub}}, true},
+		"a squatter on 127.0.0.1 while the hub is on the tailnet IP":                  {"http://100.101.219.96:4011", []TCPListener{{IP: tailnet, UID: hub}, {IP: loop, UID: squat}}, false},
+		"the hub on loopback only, url the tailnet address":                           {"http://100.101.219.96:4011", []TCPListener{{IP: loop, UID: hub}}, false},
+		"the hub on the tailnet address only, url loopback":                           {"http://127.0.0.1:4011", []TCPListener{{IP: tailnet, UID: hub}}, false},
+		"the hub on a wildcard, url the tailnet address":                              {"http://100.101.219.96:4011", []TCPListener{{IP: wild, UID: hub}}, true},
+		"the hub on the IPv6 wildcard, url the tailnet address":                       {"http://100.101.219.96:4011", []TCPListener{{IP: wild6, UID: hub}}, true},
+		"the hub on loopback, url loopback":                                           {"http://127.0.0.1:4011", []TCPListener{{IP: loop, UID: hub}}, true},
+		"the hub on a v4-mapped loopback, url loopback":                               {"http://127.0.0.1:4011", []TCPListener{{IP: mapped, UID: hub}}, true},
+		"a wildcard listener of another uid":                                          {"http://127.0.0.1:4011", []TCPListener{{IP: wild, UID: squat}}, false},
+		"the hub's uid on an address that is not the url's, plus a wildcard squatter": {"http://100.101.219.96:4011", []TCPListener{{IP: loop, UID: hub}, {IP: wild, UID: squat}}, false},
+		"an address that is not an address":                                           {"http://127.0.0.1:4011", []TCPListener{{IP: "zz", UID: hub}}, false},
+	} {
+		if err := check(c.url, c.ls); (err == nil) != c.ok {
+			t.Errorf("%s: ok=%v want %v (%v)", why, err == nil, c.ok, err)
+		}
+	}
+}
+
+func TestProcAddressesDecode(t *testing.T) {
+	for in, want := range map[string]string{
+		"0100007F": "127.0.0.1", "60DB6564": "100.101.219.96", "00000000": "0.0.0.0",
+		"0000000000000000FFFF00000100007F": "127.0.0.1", "00000000000000000000000001000000": "::1", "00000000000000000000000000000000": "::",
+	} {
+		if got := decodeProcIP(in); got == nil || got.String() != want {
+			t.Errorf("%s decoded to %v, want %s", in, got, want)
+		}
+	}
+	for _, bad := range []string{"", "zz", "0100007", "0100007F00"} {
+		if decodeProcIP(bad) != nil {
+			t.Errorf("%q decoded", bad)
 		}
 	}
 }

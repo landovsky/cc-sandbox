@@ -131,9 +131,6 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 	if d.PodRoot == nil {
 		return nil, refuse(NotBuilt, "machine %s is a pod machine but this daemon has no pod launcher", s.Machine)
 	}
-	if s.Resume != nil {
-		return nil, refuse(NotBuilt, "resuming a pod session needs the sidecar's journal and clone (F3c)")
-	}
 	if s.Workdir.Path != "" || s.GitDir != "" {
 		return nil, refuse(BadSpec, "a pod has no host directory to mount: give workdir.repo, not workdir.path")
 	}
@@ -162,8 +159,34 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 	if err != nil {
 		return nil, refuse(ImageNotPinned, "%v", err)
 	}
+	// a resume is the next generation of an existing pod session: the same session, owner, label, machine and
+	// repository, a new pod (the old generation's pod is deleted first)
+	var old *Record
+	if s.Resume != nil {
+		var err error
+		if old, err = d.Load(s.Resume.Sid); err != nil {
+			return nil, refuse(BadSpec, "resume: no session %q", s.Resume.Sid)
+		}
+		switch {
+		case old.Backend != "k8s":
+			return nil, refuse(BadSpec, "resume: session %s is not a pod session", old.Sid)
+		case old.Uid != d.Uid:
+			return nil, refuse(BadSpec, "resume: session %s belongs to another caller", old.Sid)
+		case old.Label != s.Label:
+			return nil, refuse(BadSpec, "resume: session %s has label %q, not %q (a resume keeps its label)", old.Sid, old.Label, s.Label)
+		case old.Spec.Machine != s.Machine:
+			return nil, refuse(BadSpec, "resume: session %s is on %s, not %s", old.Sid, old.Spec.Machine, s.Machine)
+		case old.Spec.Workdir.Repo != s.Workdir.Repo:
+			return nil, refuse(BadSpec, "resume: the repository must be the same (%s)", old.Spec.Workdir.Repo)
+		case old.Gen >= 9999:
+			return nil, refuse(BadSpec, "resume: session %s is at its last generation", old.Sid)
+		}
+	}
 	live, started := 0, 0
 	for _, r := range recs {
+		if old != nil && r.Sid == old.Sid {
+			continue // the generation being resumed is replaced, not added to
+		}
 		if r.Backend == "k8s" && r.Ended == nil {
 			live++
 			if r.Spec.Label == s.Label {
@@ -180,13 +203,36 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 	if d.MaxLive > 0 && live >= d.MaxLive {
 		return nil, refuse(MachineFull, "%d live sessions (cap %d)", live, d.MaxLive)
 	}
-	sid, err := mintSid()
-	if err != nil {
-		return nil, err
+	var prev *Record // set on resume: what the session record is put back to if the new generation fails
+	var rec *Record
+	if old != nil {
+		// The previous generation goes first: its pod is deleted by name and UID, its token and relay dealt
+		// with. If that fails the resume is refused and nothing has changed.
+		if old.Ended == nil && old.PodUID != "" {
+			if err := d.PodRoot.Stop(old.Sid); err != nil {
+				return nil, refuse(SessionBusy, "resume: the previous generation's pod could not be deleted: %v", err)
+			}
+		}
+		d.revokeOrSay(old.Sid, old.Gen)
+		ended := d.now().UTC()
+		pv := *old
+		pv.Ended = &ended
+		prev = &pv
+		cp := *old
+		rec = &cp
+		rec.Gen++
+		rec.RequestIDs = append(append([]string(nil), old.RequestIDs...), old.RequestID)
+		rec.RequestID, rec.Started, rec.Ended, rec.Spec, rec.PodUID = s.RequestID, d.now().UTC(), nil, *s, ""
+	} else {
+		sid, err := mintSid()
+		if err != nil {
+			return nil, err
+		}
+		rec = &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s, Backend: "k8s"}
 	}
-	rec := &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s, Backend: "k8s"}
+	sid := rec.Sid
 	rec.Reply = StartReply{
-		V: 1, Sid: sid, Gen: 1, ID: fmt.Sprintf("%s/%s/%s/g%d", s.Owner, s.Machine, sid, 1), Backend: "k8s",
+		V: 1, Sid: sid, Gen: rec.Gen, ID: fmt.Sprintf("%s/%s/%s/g%d", s.Owner, s.Machine, sid, rec.Gen), Backend: "k8s",
 		Pin:     Pin{CC: orUnpinned(d.CCVersion), Image: orUnpinned(d.Image), Channel: channel},
 		Attach:  Attach{Local: []string{"ccsbx", "attach", sid}, Remote: []string{"ssh", "-t", d.Machine, "ccsbx", "attach", sid}},
 		Journal: Journal{Epoch: d.epoch(), Seq: len(recs)},
@@ -208,7 +254,11 @@ func (d *Daemon) startPod(s *LaunchSpec, recs []*Record, release func()) (*Start
 				return nil, fmt.Errorf("%s: %v (and the pod could not be deleted: %v; it is recorded as ended, retry `ccsbx-root pod-stop %s`)", code, cause, err, sid)
 			}
 		}
-		_ = os.Remove(d.path("sessions", sid+".json"))
+		if prev != nil {
+			_ = d.save(prev) // the session as it was: its previous generation, ended
+		} else {
+			_ = os.Remove(d.path("sessions", sid+".json"))
+		}
 		if errors.Is(cause, ErrPodConflict) {
 			return nil, refuse(PodConflict, "%v", cause)
 		}

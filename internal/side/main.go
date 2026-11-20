@@ -148,6 +148,12 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	if args[0] == "load" {
 		if err := Load(*control, stdin); err != nil {
 			fmt.Fprintln(stderr, err)
+			switch {
+			case errors.Is(err, ErrNoSocket):
+				return ExitNoSocket
+			case errors.Is(err, ErrAlreadyLoaded):
+				return ExitAlreadyLoaded
+			}
 			return 1
 		}
 		return 0

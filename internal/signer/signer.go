@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"time"
 
@@ -28,13 +29,23 @@ type reply struct {
 
 // Config is everything a Server needs; Main fills it from flags and the environment.
 type Config struct {
-	Key         *token.Key
-	Scope       token.KeyScope
-	Audiences   []string      // the only audiences a token may name
-	MaxTTL      time.Duration // longest exp-iat the signer will sign (at most token.MaxLifetime)
-	AllowUID    uint32        // the one caller: hostd's uid (exact, from SO_PEERCRED)
-	AllowGID    *uint32       // when set, the caller's primary gid must be this too
-	MaxRequest  int           // bytes
+	Key       *token.Key
+	Scope     token.KeyScope
+	Audiences []string      // the only audiences a token may name
+	MaxTTL    time.Duration // longest exp-iat the signer will sign (at most token.MaxLifetime)
+	AllowUID  uint32        // the one caller: hostd's uid (exact, from SO_PEERCRED)
+	AllowGID  *uint32       // when set, the caller's primary gid must be this too
+	// KeysUID, when set, is a second allowed caller: the pod launcher, which runs as ccsbx-keys and
+	// asks for the token of a pod session it will load into the pod's sidecar itself (so hostd never
+	// holds that token or its generation key). It may sign ONLY for the machines in KeysMachines, and
+	// only a token bound to a generation key (cnf). Those machines are closed to AllowUID: hostd gets
+	// no token it could hold together with a key for a pod session.
+	KeysUID      *uint32
+	KeysMachines []string
+	// OwnUID is the signer's own uid (the machine key's owner); nil means os.Getuid(). The keys peer
+	// must be someone else: a peer that can read the key file is not constrained by any rule here.
+	OwnUID      *uint32
+	MaxRequest  int // bytes
 	ReadTimeout time.Duration
 	MaxConns    int           // concurrent connections (default 64)
 	AcceptPause time.Duration // wait after a failed Accept (default 100ms; tests shorten it)
@@ -77,6 +88,19 @@ func New(cfg Config) (*Server, error) {
 	if cfg.ReadTimeout <= 0 {
 		return nil, errors.New("signer: --timeout must be positive")
 	}
+	if cfg.KeysUID != nil && (len(cfg.KeysMachines) == 0 || *cfg.KeysUID == cfg.AllowUID) {
+		return nil, errors.New("signer: --keys-peer-user needs --keys-peer-machines and a uid other than --allow-user")
+	}
+	own := uint32(os.Getuid())
+	if cfg.OwnUID != nil {
+		own = *cfg.OwnUID
+	}
+	if cfg.KeysUID != nil && *cfg.KeysUID == own {
+		return nil, errors.New("signer: --keys-peer-user is the signer's own uid: that user can read the machine key, so no rule here can bind it; give the pod launcher a uid of its own")
+	}
+	if cfg.KeysUID == nil && len(cfg.KeysMachines) > 0 {
+		return nil, errors.New("signer: --keys-peer-machines without --keys-peer-user")
+	}
 	if cfg.MaxConns <= 0 {
 		cfg.MaxConns = 64
 	}
@@ -107,7 +131,22 @@ func (s *Server) logJSON(kv ...any) {
 // Serve accepts connections until the listener closes. Each is handled on its own goroutine, at most
 // MaxConns at a time. A failing Accept (for example no free descriptors) is retried after a pause
 // instead of ending the signer.
-func (s *Server) Serve(l net.Listener) error {
+func (s *Server) Serve(l net.Listener) error { return s.serve(l, nil) }
+
+// ServeHostd and ServeKeysPeer serve a listener for one caller class only. The socket's own owner, group
+// and mode already decide who can connect; this makes the uid check agree with it, so a mode that is later
+// widened on one socket still lets in only the class that socket is for.
+func (s *Server) ServeHostd(l net.Listener) error {
+	p := PeerHostd
+	return s.serve(l, &p)
+}
+
+func (s *Server) ServeKeysPeer(l net.Listener) error {
+	p := PeerKeys
+	return s.serve(l, &p)
+}
+
+func (s *Server) serve(l net.Listener, only *Peer) error {
 	failures := 0
 	for {
 		c, err := l.Accept()
@@ -129,7 +168,7 @@ func (s *Server) Serve(l net.Listener) error {
 		s.sem <- struct{}{}
 		go func() {
 			defer func() { <-s.sem }()
-			s.handle(c)
+			s.handle(c, only)
 		}()
 	}
 }
@@ -146,7 +185,7 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (s *Server) handle(c net.Conn) {
+func (s *Server) handle(c net.Conn, only *Peer) {
 	defer c.Close()
 	// Deadlines use the real clock (cfg.Now is for claims only), and reading and writing have their own.
 	c.SetReadDeadline(time.Now().Add(s.cfg.ReadTimeout))
@@ -156,9 +195,17 @@ func (s *Server) handle(c net.Conn) {
 		s.send(c, reply{Error: "refused"})
 		return
 	}
-	if uid != s.cfg.AllowUID || (s.cfg.AllowGID != nil && gid != *s.cfg.AllowGID) {
+	peer := PeerHostd
+	if s.cfg.KeysUID != nil && uid == *s.cfg.KeysUID {
+		peer = PeerKeys
+	} else if uid != s.cfg.AllowUID || (s.cfg.AllowGID != nil && gid != *s.cfg.AllowGID) {
 		s.logJSON("signer", "refused", "why", "peer is not the allowed caller", "peer_uid", uid, "peer_gid", gid)
 		s.send(c, reply{Error: "refused"}) // no detail to a peer that shouldn't be here
+		return
+	}
+	if only != nil && peer != *only {
+		s.logJSON("signer", "refused", "why", "peer is on the other caller's socket", "peer_uid", uid)
+		s.send(c, reply{Error: "refused"})
 		return
 	}
 	// Read exactly one JSON value, at most MaxRequest bytes (one more is read to notice an excess).
@@ -186,7 +233,7 @@ func (s *Server) handle(c net.Conn) {
 		s.send(c, reply{Error: "bad request"})
 		return
 	}
-	tok, cl, err := s.Sign(raw)
+	tok, cl, err := s.SignFor(peer, raw)
 	if err != nil {
 		s.logJSON("signer", "refused", "why", err.Error(), "peer_uid", uid, "sub", cl.Sub, "profile", cl.Profile, "billing", cl.Billing)
 		s.send(c, reply{Error: err.Error()})
@@ -217,10 +264,43 @@ func (s *Server) send(c net.Conn, r reply) {
 	json.NewEncoder(c).Encode(r)
 }
 
-// Sign validates the claims in body and signs them. It is the whole policy: unknown fields, a sub
+// Peer is which allowed caller is asking.
+type Peer int
+
+const (
+	PeerHostd Peer = iota // AllowUID: hostd
+	PeerKeys              // KeysUID: the pod launcher (ccsbx-keys)
+)
+
+// checkPeer applies the per-caller rule on top of the key's scope: the keys peer signs for its own
+// machines only and only with a generation key bound (cnf); hostd signs nothing for those machines.
+func (s *Server) checkPeer(p Peer, c *token.Claims) error {
+	if s.cfg.KeysUID == nil {
+		return nil
+	}
+	_, machine, _, _, err := c.SubParts()
+	if err != nil {
+		return err
+	}
+	for_keys := contains(s.cfg.KeysMachines, machine)
+	switch {
+	case p == PeerKeys && !for_keys:
+		return fmt.Errorf("the pod launcher may sign only for %s", strings.Join(s.cfg.KeysMachines, ","))
+	case p == PeerKeys && c.Cnf == "":
+		return errors.New("the pod launcher signs only tokens bound to a generation key (cnf)")
+	case p == PeerHostd && for_keys:
+		return fmt.Errorf("machine %s is placed through the pod launcher, not hostd", machine)
+	}
+	return nil
+}
+
+// Sign signs as hostd (the in-process entry); SignFor names the caller.
+func (s *Server) Sign(body []byte) (string, token.Claims, error) { return s.SignFor(PeerHostd, body) }
+
+// SignFor validates the claims in body and signs them. It is the whole policy: unknown fields, a sub
 // or key scope that doesn't permit it, an audience off the list, or a lifetime over the cap are
 // all refused before the key is touched. The returned claims are what was asked for (for the log).
-func (s *Server) Sign(body []byte) (string, token.Claims, error) {
+func (s *Server) SignFor(peer Peer, body []byte) (string, token.Claims, error) {
 	var c token.Claims
 	dec := json.NewDecoder(strings.NewReader(string(body)))
 	dec.DisallowUnknownFields()
@@ -234,6 +314,9 @@ func (s *Server) Sign(body []byte) (string, token.Claims, error) {
 		return "", c, errors.New("iat is the signer's, not the caller's")
 	}
 	now := s.cfg.Now()
+	if err := s.checkPeer(peer, &c); err != nil {
+		return "", c, err
+	}
 	if err := s.cfg.Scope.Permits(&c); err != nil {
 		return "", c, err
 	}

@@ -102,6 +102,9 @@ const (
 	NotBuilt           = "not_built"
 	NotRunning         = "not_running"
 	ImageNotPinned     = "image_not_pinned"
+	PodConflict        = "pod_conflict"    // a pod is under the name that is not ours
+	PodNotReady        = "pod_not_ready"   // the pod did not come up in time; it was deleted
+	PodLoadFailed      = "pod_load_failed" // the sidecar could not be loaded; the pod was deleted
 )
 
 // Refusal is a policy refusal, not a failure.

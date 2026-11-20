@@ -11,18 +11,24 @@
 package rootcmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/k8s"
 	"github.com/landovsky/cc-sandbox/internal/start"
+	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
 // Backend is what run, stop and gc need from docker. Production wraps backend.Runner; tests pass a
@@ -73,18 +79,37 @@ type Deps struct {
 	Mounter Mounter
 	HomeOf  func(uid int) (string, error)
 	// LivePodUID reads the UID of a session's pod from the API server (called after the drop to the
-	// keys user, who alone can read the launcher token).
+	// launch user, who alone can read the launcher token).
 	LivePodUID func(conn *k8s.ConnConfig, namespace, sid string, gen int) (string, error)
+	// NewPod builds the pod API (REST + kubectl) and Mint the sidecar's secrets; both are used only
+	// after the drop to the launch user, who holds the token, the kubeconfig and the signer socket.
+	NewPod func(cfg *Config, kc *k8sCtx) (PodAPI, error)
+	// Mint makes the sidecar's one payload: the session token and its generation key (made here), and the
+	// relay token, which register(pub) obtains from the hub for that key's public half.
+	Mint  func(ctx context.Context, cfg *Config, c token.Claims, register func(pub string) (string, error)) ([]byte, error)
+	Sleep func(time.Duration)
+	Now   func() time.Time
+	// Hub is the HTTP client for the hub (no redirects, 10 s); Audit takes one line per relay mint and
+	// revoke (never a token or secret). nil: production defaults.
+	Hub   *http.Client
+	Audit io.Writer
+	// HubListeners reads who is LISTENing on a TCP port of this machine (/proc/net/tcp and tcp6).
+	HubListeners func(port int) ([]TCPListener, error)
+	// SelfPath is this binary's own path (re-executed as the launch user for a pod attach); AttachSession
+	// runs a pod attach: the launch user's kubectl on a pty, the owner's terminal served by a credential-
+	// less process through the terminal filter. It returns the session's exit status.
+	SelfPath      func() (string, error)
+	AttachSession func(AttachSpec) (int, error)
 }
 
 // App builds the command table for a loaded config.
 func App(cfg *Config, d *Deps, getenv func(string) string) *cli.App {
 	e := &env{cfg: cfg, d: d}
 	return &cli.App{
-		Name: "ccsbx-root", Summary: "the fixed-verb root door for the fence (U0): run stop renew gc attach exec-token",
+		Name: "ccsbx-root", Summary: "the fixed-verb root door for the fence (U0): run stop renew gc attach exec-token pod-create pod-load pod-stop pod-status relay-mint",
 		Version: "dev", Getenv: getenv, EnvPrefix: "CCSBX_ROOT_",
 		Cmds: []*cli.Command{
-			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(),
+			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(), e.relayMintCmd(), e.attachExecCmd(), e.podCreateCmd(), e.podLoadCmd(), e.podStopCmd(), e.podStatusCmd(),
 			e.notWired("renew", "renew the machine's credentials (needs the signer, U0b)"),
 			e.notWired("exec-token", "mint an exec token for one session (needs the signer, U0b)"),
 		},
@@ -163,14 +188,24 @@ func (e *env) sessionAny(w who, sid string) (*start.Record, error) {
 	if rec.Uid < e.cfg.MinUID || rec.Uid == w.service {
 		return nil, refuse("session %s belongs to uid %d, which is not a login user (min_uid %d, not the service user)", sid, rec.Uid, e.cfg.MinUID)
 	}
-	if rec.Spec.Machine != e.cfg.Machine {
-		return nil, refuse("session %s is for machine %q, this is %q", sid, rec.Spec.Machine, e.cfg.Machine)
+	// a pod session is placed on the pod machine (future-two), launched from this one
+	wantMachine := e.cfg.Machine
+	if rec.Backend == "k8s" {
+		wantMachine = e.cfg.K8sMachine
+	}
+	if rec.Spec.Machine != wantMachine {
+		return nil, refuse("session %s is for machine %q, this is %q", sid, rec.Spec.Machine, wantMachine)
 	}
 	return rec, nil
 }
 
 // fail turns an error into an exit code and a message.
 func fail(stderr io.Writer, verb string, err error) int {
+	var ce *codeError
+	if errors.As(err, &ce) {
+		fmt.Fprintf(stderr, "ccsbx-root %s: %s\n", verb, ce.msg)
+		return ce.code
+	}
 	if r, ok := err.(*Refusal); ok {
 		fmt.Fprintf(stderr, "ccsbx-root %s: refused: %s\n", verb, r.Msg)
 		return cli.ExitRefused
@@ -199,7 +234,7 @@ func Real(getenv func(string) string) *Deps {
 		Euid: os.Geteuid(), Getenv: getenv, LookupUser: lookupUser,
 		NewBackend: func(docker string, m Mounter) Backend { return &dockerBackend{docker: docker, mounter: m} },
 		DropPrivs:  dropPrivs, Exec: syscall.Exec, Stdin: os.Stdin,
-		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID,
+		OpenDir: OpenDir, Mounter: RealMounter(), HomeOf: homeOf, Strip: backend.StripSetid, SameMountNS: sameMountNS, LivePodUID: livePodUID, NewPod: realPod, Mint: realMint, Sleep: time.Sleep, Now: time.Now, HubListeners: procListeners, SelfPath: selfPath, AttachSession: realAttachSession,
 	}
 }
 
@@ -237,4 +272,12 @@ func sameNS(a, b string) (bool, error) {
 		return false, err
 	}
 	return la == lb, nil
+}
+
+func selfPath() (string, error) {
+	p, err := os.Executable()
+	if err != nil {
+		return "", err
+	}
+	return filepath.EvalSymlinks(p)
 }

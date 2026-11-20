@@ -17,7 +17,7 @@ import (
 // Kubectl is the production Execer.
 type Kubectl struct {
 	Bin        string // absolute path of kubectl
-	Kubeconfig string // the launcher kubeconfig (under ccsbx-keys): the credentials
+	Kubeconfig string // the launcher kubeconfig (under ccsbx-launch): the credentials
 	Server     string // https://host[:port] of the API server (from ConnConfig); overrides the kubeconfig's
 	CAFile     string // the CA file the server is verified against (from ConnConfig); overrides it too
 }

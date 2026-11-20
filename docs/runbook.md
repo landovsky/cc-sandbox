@@ -611,14 +611,91 @@ tmux, not an API route.) hostd also warns at start when `--owner-devices` lists 
 
 ## Attaching to a pod session (F5)
 
+(Round 3: three users, none able to do another's job. `ccsbx-keys` is the signer's alone (the machine key,
+the age key). `ccsbx-launch` (config `launch_user`) holds the launcher kubeconfig and token in its own 0700
+directory, is the signer's `--keys-peer-user`, and runs kubectl for pod-create, pod-load, pod-stop, pod-status
+and attach. `ccsbx-term` (`term_user`) has no credentials: after starting kubectl on a pty as the launch user,
+`ccsbx-root attach` drops to it and serves the owner's terminal through `internal/termfilter`, which drops
+OSC (titles, OSC 52 clipboard, hyperlinks), DCS/APC/PM/SOS, C1 controls and the queries that make a terminal
+answer, because the pod's tmux runs as the agent and its bytes must not act on the owner's terminal. No tmux
+on the host. The signer refuses a keys-peer equal to its own uid; ccsbx-root refuses a launch user that is the
+signer's user (`signer_user`), the caller, the owner or the service user, and a terminal user that is any of
+those. Only the owner, or root by login, may attach; the service user may not. The kubeconfig and token must
+be unreadable by group and others. The docker attach also sets `set-clipboard` and `allow-passthrough` off.)
+
 `ccsbx attach <sid>` is unchanged for the owner; `ccsbx-root attach` reads the session record, and when it
 says `backend: "k8s"` it execs `kubectl exec -it -c fence <pod> -- tmux attach-session -t =<sid>:` as the
-keys user (`ccsbx-keys`) instead of tmux as the service user. Config keys in `/etc/ccsbx/ccsbx-root.toml`
+launch user (`ccsbx-launch`, round 3 below) instead of tmux as the service user. Config keys in `/etc/ccsbx/ccsbx-root.toml`
 (defaults in brackets): `kubectl` [/usr/local/bin/kubectl, root-owned], `kubeconfig`
-[/var/lib/ccsbx-keys/launcher.kubeconfig, owned by the keys user or root, mode without group/other write,
+[/var/lib/ccsbx-launch/launcher.kubeconfig, owned by the launch user or root, mode without group/other write,
 in a directory likewise], `k8s_conn` [/etc/ccsbx/k8s-conn.json, root-owned JSON with `server`, `ca_file`,
 `token_file`; the server and CA are put on kubectl's command line, so the kubeconfig cannot redirect it],
-`keys_user` [ccsbx-keys, never the service user or the caller], `k8s_namespace` [cc-sandbox]. Before kubectl
+`launch_user` [ccsbx-launch, never the signer's user, the service user or the caller], `term_user` [ccsbx-term], `signer_user` [ccsbx-keys], `k8s_namespace` [cc-sandbox]. Before kubectl
 is exec'd the pod's live UID (read with the keys user's token) must equal the `pod_uid` the launcher recorded
 when it created the pod; otherwise: `pod_conflict`, and the owner deletes exactly the named pod. The launcher
 (not built yet) is what writes `backend` and `pod_uid`. Not run against a cluster (Gate M).
+
+## Starting a pod session (F2w)
+
+`ccsbx-hostd --root helper --pod-machines future-two` places specs for future-two as pods. hostd writes the
+record (`backend: k8s`), runs `sudo -n ccsbx-root pod-create <sid>` (one pod per generation; prints the pod's
+UID), writes `pod_uid` into the record, then `pod-load <sid>`: wait for both containers (config
+`k8s_ready_seconds`, default 120, max 600; exit 4 = never ready, nothing minted), mint the token in the
+keys-user process through the signer socket, send `{token,key}` to the sidecar on exec stdin (the live pod's
+UID must equal the recorded one first). A failed start deletes the pod by name and UID; a stop
+(`Daemon.StopPod`, generation expiry) does the same through `pod-stop`. Root config keys added: `k8s_machine`
+(future-two), `k8s_ready_seconds`, `k8s_side_image` (required), `k8s_cpu`, `k8s_ephemeral_mb`,
+`k8s_worktree_mb`, `k8s_token_hours` (8, max 12), `k8s_audiences`, `signer_socket`. The signer needs
+`--keys-peer-user ccsbx-launch --keys-peer-machines future-two`: that uid may sign only for those machines and
+only with a generation key, and they are closed to hostd's uid. Not built: resume of a pod session, the
+git clone inside the pod (F3c), a hostd revoke client (`Daemon.Revoke` is nil in hostd), a pod-aware
+`ccsbx stop`. Not run against a cluster (Gate M).
+
+The sidecar has a `journal` volume of its own (emptyDir, 16Mi, disk-backed, sidecar only, mounted at
+`/run/ccsbx/journal`), apart from the 8Mi `side-state` that holds the ledger.
+
+## relay-mint (M2b, D2)
+
+`sudo -n ccsbx-root relay-mint [--after-401] -- <sid> <gen> <pub>` (service user only; spec in
+`docs/relay-mint-spec.md`). Root config keys: `hub_url` (default `http://127.0.0.1:4011`, loopback only, refused
+otherwise) and `hub_secret` (default `/etc/ccsbx/hub-admin.secret`, root-owned, mode 0600, directory not
+group/other-writable; the installer creates it from the hub's admin secret, it is never copied off hp). The
+relay's `may_reach` is the record's `msg_scope.manager` as `<machine>/<node>`, empty when the record names no
+manager machine; there is no argument for it (peers are Tomas's open question #3cy2). Exit 2: refused (not
+the service user, stale or ended or not running or another machine's generation, rate, bad arguments), exit
+3: the hub or the secret (status code only on stderr). One audit line per mint and revoke on stderr (the first
+8 hex of sha256(pub), never a token or the secret). The relay is revoked (`DELETE /v1/principals/relay:<sid>%2F<gen>`)
+at the end of `run`, in `stop` and in `gc` for each reaped generation, best effort; the hub's 6 h relay
+lifetime is the backstop. Not run against a real hub (Gate M).
+
+**Pod sessions and the relay.** `relay-mint` (the verb hostd calls) stays docker-only. For a pod session
+`pod-load` does it itself: as root it reads `hub_secret` into memory (before the drop; the file stays root
+0600), drops to the keys user, mints the session token and generation key, registers the relay for that
+key's public half (`may_reach` from the record), and sends `{"token","key","relay_token"}` in the one
+side-load payload. Nothing is printed and hostd sees none of it. A load that fails after the relay was
+registered revokes it at once; `pod-stop` revokes it as root before the drop. A missing or untrusted hub
+secret stops `pod-load` with exit 3 before anything is dropped or created in the pod.
+
+Pod sessions also have `pod-status` (read-only; hostd's sweep asks it to end the record of a pod the owner
+already stopped) and `ccsbx stop` works on them (root's `stop` deletes the pod by name and UID). hostd flags:
+`--pod-ttl` (8h: a pod session older than this is stopped by the sweep), `--pod-sweep` (1m), `--pod-load-wait`.
+Installer: two new users (`ccsbx-launch` with `/var/lib/ccsbx-launch` 0700 holding the kubeconfig and token;
+`ccsbx-term` with no home), signer unit `--keys-peer-user ccsbx-launch --keys-peer-machines future-two`.
+
+**Round 4 (names for the installer).** The signer's second socket for the launch user: `--keys-peer-socket PATH`
+(env `CCSBX_SIGNER_KEYS_PEER_SOCKET`; no default in the signer; the installer passes `/run/ccsbx-signer/launch.sock`,
+and under systemd a second socket unit with `SocketUser=ccsbx-keys SocketGroup=ccsbx-launch SocketMode=0660`
+gives `LISTEN_FDS=2`, the main socket first). Each socket takes its own class only (SO_PEERCRED still exact).
+`ccsbx-root.toml` `signer_socket` (what `pod-load` connects to as the launch user) now defaults to that path.
+The hub listener check: `hub_user` (the user the hub runs as; no default, the installer writes it): before the
+hub admin secret is sent (relay-mint, pod-load, the revokes), every LISTEN socket on `hub_url`'s port
+(`/proc/net/tcp` and `tcp6`) must be that user's, else exit 3 and nothing is sent. Residual: the hub runs as
+the owner's uid, whose processes can read the hub's environment (and the secret) anyway, so the admin secret's
+trust boundary is that uid; this stops hostd and every other uid from catching it on a port the hub does not
+hold; a listener that appears between the check and the connect is possible and no wider than a hub restart.
+The terminal filter is sound for UTF-8 terminals only (it emits only complete, valid UTF-8 without C1
+controls); the session runs with `LANG=C.UTF-8`.
+
+Systemd sockets of the signer are picked **by name**, never by order: the main socket unit sets
+`FileDescriptorName=main`, the keys peer's `FileDescriptorName=launch`, and the signer refuses to start
+unless `LISTEN_FDNAMES` is exactly those two names (either order) with `LISTEN_FDS=2`.

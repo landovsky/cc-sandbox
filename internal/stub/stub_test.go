@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -242,27 +241,37 @@ func TestStubTakesExactlyOneKeySource(t *testing.T) {
 // working in a RUNNING stub, with no restart. This is the wiring test: delete the refresher goroutine or
 // the ring source and it goes red.
 func TestStubFollowsTheListAndDropsARemovedKey(t *testing.T) {
-	k, err := token.LoadOrCreateKeyFile(filepath.Join(t.TempDir(), "k"))
-	if err != nil {
-		t.Fatal(err)
-	}
 	dir := t.TempDir()
 	os.Chmod(dir, 0o700)
-	e := machines.Entry{Machine: "mac", Owners: []string{"tomas"}, MaySignMachines: []string{"mac"},
-		PublicKeys: []machines.KeyRef{{KID: k.KID, Key: base64.StdEncoding.EncodeToString(k.Public)}},
-		MaxProfile: []string{"e2e-*"}, MaxBilling: []string{"stub"}, Pairs: map[string][]string{"e2e-default": {"stub"}}}
-	file := filepath.Join(dir, "mac.json")
-	if err := os.WriteFile(file, []byte(machines.Canonical(&e)), 0o644); err != nil {
-		t.Fatal(err)
+	type mk struct {
+		k    *token.Key
+		m    string
+		file string
 	}
-	v, err := Verifier("", dir, DefaultAud, 20*time.Millisecond, time.Second, nil)
+	var ms []mk
+	for _, m := range []string{"mac", "hp-ubuntu"} {
+		k, err := token.LoadOrCreateKeyFile(filepath.Join(t.TempDir(), "k"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		e := machines.Entry{Machine: m, Owners: []string{"tomas"}, MaySignMachines: []string{m},
+			PublicKeys: []machines.KeyRef{{KID: k.KID, Key: base64.StdEncoding.EncodeToString(k.Public)}},
+			MaxProfile: []string{"e2e-*"}, MaxBilling: []string{"stub"}, Pairs: map[string][]string{"e2e-default": {"stub"}}}
+		f := filepath.Join(dir, m+".json")
+		if err := os.WriteFile(f, []byte(machines.Canonical(&e)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		ms = append(ms, mk{k, m, f})
+	}
+	const stale = 300 * time.Millisecond
+	v, err := Verifier("", dir, DefaultAud, 20*time.Millisecond, stale, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	g, _ := token.NewGenKey()
-	call := func(gen int) error {
+	call := func(x mk, gen int) error {
 		now := time.Now()
-		tok, err := token.Mint(k, token.Claims{Sub: fmt.Sprintf("tomas/mac/sS1/g%d", gen), Label: "l", Billing: "stub", Profile: "e2e-default",
+		tok, err := token.Mint(x.k, token.Claims{Sub: fmt.Sprintf("tomas/%s/sS1/g%d", x.m, gen), Label: "l", Billing: "stub", Profile: "e2e-default",
 			Aud: []string{DefaultAud}, Cnf: token.CnfOf(g.Public)}, now)
 		if err != nil {
 			t.Fatal(err)
@@ -271,18 +280,25 @@ func TestStubFollowsTheListAndDropsARemovedKey(t *testing.T) {
 		_, err = v.Verify(tok, p, "POST", "/x", nil, now)
 		return err
 	}
-	if err := call(1); err != nil {
-		t.Fatalf("allow twin: a listed key: %v", err)
+	for _, x := range ms {
+		if err := call(x, 1); err != nil {
+			t.Fatalf("allow twin: a listed key of %s: %v", x.m, err)
+		}
 	}
-	os.Remove(file)
-	for i := 2; ; i++ {
-		if err := call(i); errors.Is(err, token.ErrUnknownKID) {
-			return
-		}
-		if i > 400 {
-			t.Fatal("the removed key still verifies in the running stub")
-		}
+	os.Remove(ms[0].file) // one machine leaves; the other file is still there, so the load keeps succeeding
+	gone := false
+	for i := 2; i < 400 && !gone; i++ {
+		gone = errors.Is(call(ms[0], i), token.ErrUnknownKID)
 		time.Sleep(10 * time.Millisecond)
+	}
+	if !gone {
+		t.Fatal("the removed key still verifies in the running stub")
+	}
+	// Past the stale limit the other key must still verify: that only holds while the refresher
+	// goroutine keeps running (a stub that never refreshes would lose ALL keys at the stale limit).
+	time.Sleep(3 * stale)
+	if err := call(ms[1], 9); err != nil {
+		t.Fatalf("the remaining key stopped verifying past the stale limit: %v", err)
 	}
 }
 

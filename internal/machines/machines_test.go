@@ -518,3 +518,48 @@ func TestCommand(t *testing.T) {
 		t.Fatalf("unknown command: rc=%d", rc)
 	}
 }
+
+// context "someone who can create one entry in the list directory adds a ..data link": the link used to
+// switch every ownership and mode check off and could point anywhere. Now it is trusted only as the
+// kubelet makes it: a link to a ..snapshot directory inside the dir itself, with dir and snapshot owned
+// by root or us and not writable by others.
+func TestADataLinkCannotSwitchTheChecksOff(t *testing.T) {
+	hp := newKey(t)
+	src := listWith(t, hp, newKey(t))
+	files := []string{"hp-ubuntu.json", "mac.json"}
+	vol := func(link string, snapMode os.FileMode, dirMode os.FileMode) string {
+		v := t.TempDir()
+		os.Chmod(v, dirMode)
+		snap := filepath.Join(v, "..2026_11_20")
+		os.Mkdir(snap, 0o755)
+		os.Chmod(snap, snapMode)
+		for _, n := range files {
+			os.WriteFile(filepath.Join(snap, n), mustRead(t, filepath.Join(src, n)), 0o644)
+			os.Symlink(filepath.Join("..data", n), filepath.Join(v, n))
+		}
+		os.Symlink(link, filepath.Join(v, "..data"))
+		return v
+	}
+	if _, err := LoadDir(vol("..2026_11_20", 0o755, 0o755)); err != nil {
+		t.Fatalf("a kubelet-shaped volume refused: %v", err)
+	}
+	other := t.TempDir() // a directory elsewhere that holds the same files
+	for _, n := range files {
+		os.WriteFile(filepath.Join(other, n), mustRead(t, filepath.Join(src, n)), 0o666)
+	}
+	plain := vol("sub", 0o755, 0o755) // a link to an ordinary subdirectory, not a ..snapshot
+	os.Rename(filepath.Join(plain, "..2026_11_20"), filepath.Join(plain, "sub"))
+	for name, v := range map[string]string{
+		"link to a plain subdirectory": plain,
+		"absolute link elsewhere":      vol(other, 0o755, 0o755),
+		"link up and out":              vol("../"+filepath.Base(other), 0o755, 0o755),
+		"link through a subdirectory":  vol("..2026_11_20/.", 0o755, 0o755),
+		"link to ..data itself":        vol("..data", 0o755, 0o755),
+		"snapshot others can write":    vol("..2026_11_20", 0o777, 0o755),
+		"directory others can write":   vol("..2026_11_20", 0o755, 0o777),
+	} {
+		if _, err := LoadDir(v); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

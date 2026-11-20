@@ -215,22 +215,61 @@ func contains(l []string, s string) bool {
 	return false
 }
 
-// readDir resolves the directory to read from once: a ConfigMap volume's ..data link is followed a
-// single time so every file of one load comes from the same kubelet snapshot. The second result says
-// whether this is such a volume (kubelet-managed, so the ownership check does not apply).
+// readDir resolves the directory to read from once, and says whether the entries still need their own
+// ownership and mode check (strict).
+//
+// A kubelet ConfigMap volume keeps its files in a snapshot directory (..2026_11_20_...) and a ..data
+// link to it. That layout is trusted only when it is exactly that: ..data is a symlink to a plain
+// "..name" directory directly inside dir (no slash, so it cannot point anywhere else), and both dir and
+// the snapshot are owned by root or the running user. Anyone who could drop a ..data entry into a plain
+// directory must not switch the checks off. On a read-only mount nobody can edit the files, so the mode
+// checks are skipped there (kubelet makes the mode 0777 for the mount point itself); the owner checks
+// never are.
 func readDir(dir string) (string, bool, error) {
-	if _, err := os.Lstat(filepath.Join(dir, "..data")); err == nil {
-		real, err := filepath.EvalSymlinks(filepath.Join(dir, "..data"))
-		return real, true, err
+	ln := filepath.Join(dir, "..data")
+	li, err := os.Lstat(ln)
+	if err != nil { // no ..data: a plain directory, strict on everything
+		return dir, true, nil
 	}
-	return dir, false, nil
+	if li.Mode()&os.ModeSymlink == 0 {
+		return "", false, fmt.Errorf("machines: %s is not a symlink", ln)
+	}
+	name, err := os.Readlink(ln)
+	if err != nil {
+		return "", false, err
+	}
+	if !strings.HasPrefix(name, "..") || name == ".." || name == "..data" || strings.ContainsRune(name, '/') {
+		return "", false, fmt.Errorf("machines: %s points at %q; it must name a ..snapshot directory inside %s", ln, name, dir)
+	}
+	real := filepath.Join(dir, name)
+	ro := readOnlyMount(dir)
+	for _, p := range []string{dir, real} {
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return "", false, err
+		}
+		if !fi.IsDir() {
+			return "", false, fmt.Errorf("machines: %s is not a plain directory", p)
+		}
+		if ro {
+			err = ownedByRootOrMe(p, fi)
+		} else {
+			err = trustedPlace(p, fi)
+		}
+		if err != nil {
+			return "", false, fmt.Errorf("machines: %w", err)
+		}
+	}
+	return real, !ro, nil
 }
 
-// trustedPlace refuses a directory or file another local user could edit.
-func trustedPlace(p string, fi os.FileInfo) error {
-	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%s is group or other writable (mode %o)", p, fi.Mode().Perm())
-	}
+// readOnlyMount reports whether p is on a read-only filesystem.
+func readOnlyMount(p string) bool {
+	var st syscall.Statfs_t
+	return syscall.Statfs(p, &st) == nil && st.Flags&1 != 0 // ST_RDONLY
+}
+
+func ownedByRootOrMe(p string, fi os.FileInfo) error {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok || (st.Uid != 0 && int(st.Uid) != os.Getuid()) {
 		return fmt.Errorf("%s is not owned by root or uid %d", p, os.Getuid())
@@ -238,14 +277,22 @@ func trustedPlace(p string, fi os.FileInfo) error {
 	return nil
 }
 
+// trustedPlace refuses a directory or file another local user could edit.
+func trustedPlace(p string, fi os.FileInfo) error {
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("%s is group or other writable (mode %o)", p, fi.Mode().Perm())
+	}
+	return ownedByRootOrMe(p, fi)
+}
+
 // LoadDir reads every machine file in dir. Any bad file fails the whole load: a half-read list would
 // silently drop a machine's key, and a door must not run on a list nobody wrote.
 func LoadDir(dir string) ([]*Entry, error) {
-	real, volume, err := readDir(dir)
+	real, strict, err := readDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	if !volume {
+	if real == dir { // a plain directory
 		fi, err := os.Stat(real)
 		if err != nil {
 			return nil, err
@@ -273,7 +320,7 @@ func LoadDir(dir string) ([]*Entry, error) {
 	}
 	var out []*Entry
 	for _, n := range names {
-		b, err := readCapped(filepath.Join(real, n), !volume)
+		b, err := readCapped(filepath.Join(real, n), strict)
 		if err != nil {
 			return nil, fmt.Errorf("machines: %s: %w", n, err)
 		}

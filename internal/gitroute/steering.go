@@ -108,11 +108,20 @@ func Trailers(session string, steering []string) string {
 	return t
 }
 
+// maxLinkDepth bounds a chain of steering symlinks; a longer chain (or a loop) is refused.
+const maxLinkDepth = 16
+
 // steeringTargets finds the symlinks in the worktree (tracked or not, ignored or not) whose own
-// path is steering, and returns where they point, relative to the worktree. A target outside the
-// worktree is not listed here (Commit refuses those).
+// path is steering, follows each chain to its end, and returns every place it passes, relative to
+// the RESOLVED worktree (on a Mac /var is a link to /private/var, and an absolute link inside the
+// worktree would otherwise look like it leaves it). Edits under any of them are steering. A
+// target outside the worktree is not listed here (Commit refuses those).
 func (r *Runner) steeringTargets() ([]string, error) {
 	out, err := r.Run("ls-files", "-z", "--cached", "--others")
+	if err != nil {
+		return nil, err
+	}
+	root, err := filepath.EvalSymlinks(r.Worktree)
 	if err != nil {
 		return nil, err
 	}
@@ -121,22 +130,33 @@ func (r *Runner) steeringTargets() ([]string, error) {
 		if !IsSteering(p) {
 			continue
 		}
-		abs := filepath.Join(r.Worktree, p)
-		if st, err := os.Lstat(abs); err != nil || st.Mode()&fs.ModeSymlink == 0 {
-			continue
+		cur := filepath.Join(root, p)
+		for depth := 0; ; depth++ {
+			if st, err := os.Lstat(cur); err != nil || st.Mode()&fs.ModeSymlink == 0 {
+				break
+			}
+			if depth >= maxLinkDepth {
+				return nil, fmt.Errorf("%w: symlink chain at %q is longer than %d", ErrRefused, p, maxLinkDepth)
+			}
+			l, err := os.Readlink(cur)
+			if err != nil {
+				break
+			}
+			if !filepath.IsAbs(l) {
+				l = filepath.Join(filepath.Dir(cur), l)
+			}
+			// resolve the parent directories (they may be links too), keep the last element
+			l = filepath.Clean(l)
+			if d, err := filepath.EvalSymlinks(filepath.Dir(l)); err == nil {
+				l = filepath.Join(d, filepath.Base(l))
+			}
+			rel, err := filepath.Rel(root, l)
+			if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
+				break
+			}
+			targets = append(targets, filepath.ToSlash(rel))
+			cur = l
 		}
-		l, err := os.Readlink(abs)
-		if err != nil {
-			continue
-		}
-		if !filepath.IsAbs(l) {
-			l = filepath.Join(filepath.Dir(abs), l)
-		}
-		rel, err := filepath.Rel(r.Worktree, filepath.Clean(l))
-		if err != nil || rel == ".." || strings.HasPrefix(rel, "../") {
-			continue
-		}
-		targets = append(targets, filepath.ToSlash(rel))
 	}
 	return targets, nil
 }

@@ -51,7 +51,7 @@ func TestArgsAllowlistBlock(t *testing.T) {
 func TestArgsAllowlistAllow(t *testing.T) {
 	r, gd, wt := repo(t)
 	write(t, wt, "second.txt", "2\n")
-	if _, err := r.Commit("s", "second"); err != nil {
+	if _, err := r.Commit("s", "second", quiet); err != nil {
 		t.Fatal(err)
 	}
 	write(t, wt, "n.txt", "n\n")
@@ -75,13 +75,13 @@ func TestArgsAllowlistAllow(t *testing.T) {
 func TestRenameDoesNotHideSteeringFile(t *testing.T) {
 	r, _, wt := repo(t)
 	write(t, wt, ".claude/settings.json", "{\"a\":1,\"b\":2,\"c\":3,\"d\":4}\n")
-	if _, err := r.Commit("s", "add settings"); err != nil {
+	if _, err := r.Commit("s", "add settings", quiet); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.Rename(filepath.Join(wt, ".claude/settings.json"), filepath.Join(wt, "notes.json")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := r.Commit("s", "innocent rename"); err != nil {
+	if _, err := r.Commit("s", "innocent rename", quiet); err != nil {
 		t.Fatal(err)
 	}
 	msg, _ := r.Run("log", "-1", "--format=%B")
@@ -153,7 +153,7 @@ func TestSymlinksInWorktreeDoNotLeakHostFiles(t *testing.T) {
 		}
 	}
 	// a commit refuses links that leave the worktree (and leaves nothing staged) ...
-	if _, err := r.Commit("s", "links"); err == nil {
+	if _, err := r.Commit("s", "links", quiet); err == nil {
 		t.Fatal("a commit with symlinks to host files was made")
 	}
 	if out, _ := r.Run("diff", "--cached", "--name-only"); strings.TrimSpace(out) != "" {
@@ -164,7 +164,7 @@ func TestSymlinksInWorktreeDoNotLeakHostFiles(t *testing.T) {
 	os.Remove(filepath.Join(wt, "leakdir"))
 	os.Remove(filepath.Join(wt, "nulllink"))
 	os.Symlink("README.md", filepath.Join(wt, "innerlink"))
-	if _, err := r.Commit("s", "links"); err != nil {
+	if _, err := r.Commit("s", "links", quiet); err != nil {
 		t.Fatal(err)
 	}
 	if out, _ := r.Run("show", "--format=%B", "-p", "HEAD"); strings.Contains(out, "TOP SECRET") {
@@ -182,7 +182,7 @@ func TestSHA256Repo(t *testing.T) {
 	r := &Runner{GitDir: gd, Worktree: wt}
 	write(t, wt, "a.txt", "a\n")
 	write(t, wt, ".gitattributes", "* filter=evil\n")
-	if _, err := r.Commit("s", "sha256"); err != nil {
+	if _, err := r.Commit("s", "sha256", quiet); err != nil {
 		t.Fatalf("host git failed on a SHA-256 repo: %v", err)
 	}
 	if out, err := r.Run("log", "--oneline"); err != nil || !strings.Contains(out, "sha256") {

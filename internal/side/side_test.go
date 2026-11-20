@@ -16,10 +16,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
@@ -550,5 +553,99 @@ func TestTheForwarderRefusesAProtocolUpgrade(t *testing.T) {
 	case q := <-r.seen:
 		t.Fatalf("the door saw %s %s", q.Method, q.URL.Path)
 	default:
+	}
+}
+
+// lockedJournal is a journal that the test can read while the server writes to it.
+type lockedJournal struct {
+	mu  sync.Mutex
+	evs []journal.Event
+}
+
+func (l *lockedJournal) Append(e journal.Event) (journal.Record, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.evs = append(l.evs, e)
+	return journal.Record{}, nil
+}
+
+func (l *lockedJournal) of(typ string) []journal.Event {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var o []journal.Event
+	for _, e := range l.evs {
+		if e.Type == typ {
+			o = append(o, e)
+		}
+	}
+	return o
+}
+
+// context "the cockpit computes hear and idle from journal facts": the forwarder's load and its end are
+// journalled with the sidecar's identity, and the load carries a hash of the generation key, never the
+// token or the key.
+func TestForwarderLifecycleIsJournalled(t *testing.T) {
+	j := &lockedJournal{}
+	r := newRig(t, func(c *Config) { c.Journal, c.Sid, c.Gen = j, "sSIDE1", 1 })
+	tok, in := r.secrets(1500 * time.Millisecond)
+	if err := Load(r.ctl, in); err != nil {
+		t.Fatal(err)
+	}
+	if got := j.of("fwd.loaded"); len(got) != 1 || got[0].Sid != "sSIDE1" || got[0].Gen != 1 ||
+		strings.Contains(string(got[0].Data), tok) || strings.Contains(string(got[0].Data), token.CnfOf(r.gk.Public)) ||
+		!strings.Contains(string(got[0].Data), `"exp":`) || !strings.Contains(string(got[0].Data), `"cnf":"`) {
+		t.Fatalf("fwd.loaded: %+v", got)
+	}
+	select {
+	case <-r.done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("still serving after the token expired")
+	}
+	if len(j.of("fwd.expired")) != 1 {
+		t.Fatalf("fwd.expired: %+v", j.evs)
+	}
+}
+
+// context "a fence hammering the forwarder with refused requests": the journal gets cumulative counts by a
+// fixed reason, never a header, path or body, and no more than MaxFwdLogs summaries however long it goes.
+func TestDeniedSummariesAreBoundedAndCarryNoRequestData(t *testing.T) {
+	j := &lockedJournal{}
+	r := newRig(t, func(c *Config) {
+		c.Journal, c.Sid, c.Gen = j, "sSIDE1", 1
+		c.MaxFwdLogs, c.DenySummaryEvery = 3, 10*time.Millisecond
+	})
+	_, in := r.secrets(time.Hour)
+	if err := Load(r.ctl, in); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 20; i++ { // fixed flood, spaced so several summary ticks see a change
+		resp, err := http.Get("http://" + r.port + "/PATH-SECRET-" + strconv.Itoa(i) + "/x")
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		time.Sleep(15 * time.Millisecond)
+	}
+	r.cancel()
+	<-r.done
+	got := j.of("fwd.denied")
+	if len(got) != 3 {
+		t.Fatalf("%d fwd.denied summaries, want exactly the bound of 3", len(got))
+	}
+	for _, e := range got {
+		if strings.Contains(string(e.Data), "SECRET") || !strings.Contains(string(e.Data), `"not a door route"`) {
+			t.Errorf("summary %s", e.Data)
+		}
+	}
+	if last := got[len(got)-1]; !strings.Contains(string(last.Data), `"total":20`) {
+		t.Errorf("the final summary (reserved slot) should hold the full count: %s", last.Data)
+	}
+}
+
+// context "a journal needs an identity": records without sid and gen would be unattributable.
+func TestJournalNeedsAnIdentity(t *testing.T) {
+	u, _ := url.Parse("http://127.0.0.1:1")
+	if _, err := New(Config{Listen: "127.0.0.1:8080", Control: "/run/side/ctl.sock", Doors: map[string]*url.URL{"m": u}, Journal: &lockedJournal{}}); err == nil {
+		t.Fatal("a journal without sid and gen was accepted")
 	}
 }

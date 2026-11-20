@@ -415,3 +415,17 @@ func TestDiffDriverLayers(t *testing.T) {
 	}
 	t.Error("GIT_EXTERNAL_DIFF is not pinned")
 }
+
+// T:git-steering-flag — block: a global option as the first argument (`-c`, `--exec-path`,
+// `--git-dir`, `-C`) is not a verb, so the fence cannot use it to change how git runs.
+func TestGlobalOptionsAreNotVerbs(t *testing.T) {
+	r, _, _ := repo(t)
+	for _, args := range [][]string{
+		{"-c", "core.hooksPath=/x", "status"}, {"--exec-path=/x", "status"}, {"--git-dir=/x", "status"},
+		{"-C", "/", "status"}, {"--work-tree=/", "status"}, {"--config-env=a=B", "status"},
+	} {
+		if _, err := r.Run(args...); err == nil || !strings.Contains(err.Error(), "refused") {
+			t.Errorf("git %v was not refused: %v", args, err)
+		}
+	}
+}

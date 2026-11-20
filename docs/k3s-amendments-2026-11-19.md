@@ -228,7 +228,7 @@ dropped, given A1 (no door or hostd is left in `cc-sandbox` for the launcher to 
 | 6 | no PVC, ephemeral, CSI, hostPath, configMap or downwardAPI volumes; **only `emptyDir`** | `!has(object.spec.volumes) \|\| object.spec.volumes.all(v, has(v.emptyDir))` | the agent gets no data it wasn't handed by the sidecar; closes the PVC hole |
 | 7 | every `emptyDir` has a `sizeLimit` | `…all(v, has(v.emptyDir.sizeLimit))` | K9 enforced, not just documented |
 | 8 | containers: exactly one, named `fence`; initContainers: at most one, named `side`, `restartPolicy: Always` (a native sidecar); no ephemeralContainers | `object.spec.containers.size() == 1 && object.spec.containers[0].name == 'fence' && (!has(object.spec.initContainers) \|\| (object.spec.initContainers.size() <= 1 && object.spec.initContainers.all(c, c.name == 'side' && has(c.restartPolicy) && c.restartPolicy == 'Always'))) && !has(object.spec.ephemeralContainers)` | doc 5 F2 shape; nothing else rides in a session pod |
-| 9 | `shareProcessNamespace` absent or false; `hostUsers` absent or true (PSA covers host*) | `!has(object.spec.shareProcessNamespace) \|\| object.spec.shareProcessNamespace == false` | the fence can't see or ptrace the sidecar's token |
+| 9 | `shareProcessNamespace` absent or false; `hostUsers` absent or true (**relaxed by k3s `39cf29b`: `hostUsers: false` is now allowed**; PSA covers host*) | `!has(object.spec.shareProcessNamespace) \|\| object.spec.shareProcessNamespace == false` | the fence can't see or ptrace the sidecar's token |
 | 10 | `dnsPolicy: None`, and `dnsConfig` with no nameservers or only `127.0.0.1` | `has(object.spec.dnsPolicy) && object.spec.dnsPolicy == 'None' && (!has(object.spec.dnsConfig) \|\| !has(object.spec.dnsConfig.nameservers) \|\| object.spec.dnsConfig.nameservers.all(n, n == '127.0.0.1'))` | defence in depth on top of the no-DNS NetPol |
 | 11 | images in digest form from our two repos: `^ghcr\.io/<owner>/(ccsbx-fence\|ccsbx)@sha256:[0-9a-f]{64}$`, for containers and initContainers (**applies to every pod in `cc-sandbox`**, launcher or not); and no pod in `cc-sandbox` carries `role` `door` or `hostd` | `object.spec.containers.all(c, c.image.matches('^ghcr\\.io/<owner>/(ccsbx-fence\|ccsbx)@sha256:[0-9a-f]{64}$'))` + the same for initContainers | no tag-only or foreign image; the watchdog pod is the one exception (it keeps its own image rule) |
 | 12 | `pods/exec` and `pods/attach` by the launcher only into pods named `ccsbx-s-*` (CONNECT) | `request.name.startsWith('ccsbx-s-')` on resource `pods`, subresources `exec`, `attach`, operation `CONNECT` | the launcher never execs into a non-session pod (the watchdog, a test pod) |
@@ -250,8 +250,9 @@ dropped, given A1 (no door or hostd is left in `cc-sandbox` for the launcher to 
 Also, `kubectl exec` into the watchdog pod is refused. The F2 reference pod is admitted.
 
 **LIVE: k3s `1e76dc1` (devops:#5dxt, merged; PriorityClass `ccsbx-session` and the scoped quotas
-exist; k3s's check 139/0).** A tightening of the rules above for launcher-created pods. Only the
-last row (`hostUsers`) is still **COMING**:
+exist; k3s's check 139/0).** A tightening of the rules above for launcher-created pods. The last row
+(`hostUsers`) is **LIVE since k3s `39cf29b`** (Tomas approved it 2026-11-20; rule 9 now refuses only
+`shareProcessNamespace`):
 
 | Change | Rule | Why |
 |---|---|---|
@@ -259,7 +260,7 @@ last row (`hostUsers`) is still **COMING**:
 | no `runtimeClassName`, no finalizers | new | no `runtimeClassName`: a session can't pick a runtime with weaker isolation than the default. No finalizers: a session pod can't block its own deletion (cleanup and quota stay in the launcher's hands) |
 | `terminationGracePeriodSeconds` at most 60 (unset = 30 is fine) | new | a stopping session can't hold the node's resources for long |
 | ephemeral containers (`kubectl debug`) refused in **both namespaces, for everyone** | widens rule 8 | `kubectl debug` would inject a container that bypasses the pod spec's fences (and could reach the sidecar's token); attach is exec only |
-| **COMING:** `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | with `hostUsers: false` a session's uid 0 maps to an unprivileged host uid, so a container escape on future-two's shared kernel lands as nobody, not as host root. Required only after a test pod proves it on future-two (k3s version, idmapped mount of the session volume); requiring it is Tomas's call |
+| **LIVE (k3s `39cf29b`):** `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | with `hostUsers: false` a session's uid 0 maps to an unprivileged host uid, so a container escape on future-two's shared kernel lands as nobody, not as host root. Required only after a test pod proves it on future-two (k3s version, idmapped mount of the session volume); requiring it is Tomas's call |
 
 ---
 

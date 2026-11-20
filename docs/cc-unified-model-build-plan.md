@@ -436,8 +436,9 @@ the PriorityClass `ccsbx-session` and the scoped quotas exist. F2 must build to 
 - `terminationGracePeriodSeconds` at most 60 (unset means 30, which is fine);
 - ephemeral containers (`kubectl debug`) are refused in both namespaces, for everyone. F5 attach
   and any debugging use `exec`;
-- **COMING (not live yet; the k3s side has not shipped it):** `hostUsers: false` is allowed. It
-  becomes **required** once a test pod proves it on future-two; Tomas decides when.
+- **LIVE since k3s `39cf29b` (Tomas approved it 2026-11-20; VAP rule 9 now refuses only
+  `shareProcessNamespace`):** `hostUsers: false` is allowed for launcher pods. It becomes **required**
+  once a test pod proves it on future-two; Tomas decides when.
 
 The launcher kubeconfig (K8) is ready, and k3s encrypts it as soon as R10b's age public key
 arrives. **Second batch:** Tomas confirmed it to the k3s side on 2026-11-19. The exact spec is in

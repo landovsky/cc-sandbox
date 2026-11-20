@@ -15,5 +15,8 @@ FROM scratch
 ARG TARGETARCH
 COPY --chmod=0555 bin/ccsbx-linux-${TARGETARCH} /usr/local/bin/ccsbx
 ENV PATH=/usr/local/bin
+# where the pod mounts the side-state volume (internal/side.ControlPath); `serve` makes ctl/ there, 0700. The default lives
+# on the volume, so a read-only root is enough; an image whose control path is on its own root fs cannot start (side-runs).
+ENV CCSBX_SIDE_CONTROL=/run/ccsbx/side/ctl/ctl.sock
 USER 10002:10002
 ENTRYPOINT ["/usr/local/bin/ccsbx", "side"]

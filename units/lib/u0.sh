@@ -31,6 +31,7 @@ term_user = "ccsbx-term"
 signer_user = "ccsbx-keys"
 kubeconfig = "/var/lib/ccsbx-launch/launcher.kubeconfig"
 k8s_machine = "${K8S_MACHINE}"
+k8s_side_image = "${SIDE_IMAGE}"
 hub_url = "http://127.0.0.1:4011"
 hub_secret = "/etc/ccsbx/hub-admin.secret"
 EOT

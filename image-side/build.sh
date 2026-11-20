@@ -9,6 +9,6 @@ here="$(cd "$(dirname "$0")/.." && pwd)"
 GO="${GO:-$HOME/.local/go/bin/go}"; TAG="${TAG:-ccsbx-side:dev}"
 arch="$("$GO" env GOARCH)"
 mkdir -p "$here/image-side/bin"
-(cd "$here" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" "$GO" build -trimpath -ldflags "-s -w -X main.version=side-dev" -o "image-side/bin/ccsbx-linux-$arch" ./cmd/ccsbx)
+(cd "$here" && CGO_ENABLED=0 GOOS=linux GOARCH="$arch" "$GO" build -trimpath -buildvcs=false -ldflags "-s -w -X main.version=side-dev" -o "image-side/bin/ccsbx-linux-$arch" ./cmd/ccsbx)
 docker build --build-arg "TARGETARCH=$arch" -t "$TAG" "$here/image-side"
 echo "built $TAG ($arch); test it: CCSBX_TEST_IMAGE=$TAG tests/side-image-test.sh all"

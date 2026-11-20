@@ -50,7 +50,7 @@ jobs:
           set -eu
           mkdir -p image-side/bin
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags "-s -w -X main.version=${GITHUB_SHA}" \
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -buildvcs=false -ldflags "-s -w -X main.version=${GITHUB_SHA}" \
               -o "image-side/bin/ccsbx-linux-$arch" ./cmd/ccsbx
           done
           file image-side/bin/* || true
@@ -107,7 +107,7 @@ jobs:
       - name: Tests use the default (docker) builder
         run: docker buildx use default
 
-      - name: "T:side-image (user, no shell, no setuid, runs read-only)"
+      - name: "T:side-image (user, no shell, no setuid, serves on a read-only root)"
         run: |
           set -eu
           export CCSBX_TEST_IMAGE=ccsbx-side:candidate

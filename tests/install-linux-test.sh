@@ -35,7 +35,7 @@ fx() {                                   # fx NAME → a fresh fake root with su
 ins() {                                  # ins FXDIR ARGS… — run the installer inside the fake root, recording commands
   local d="$1"; shift
   CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/rec/cmds" CCSBX_BIN_DIR="$d/dist" CCSBX_P15_FILE="$d/p15.tsv" \
-  CCSBX_HUB_SECRET_FROM="${HUBSRC-$d/hubsecret}" CCSBX_OWNER=tomas CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" CCSBX_IMAGE="${IMG:-ghcr.io/landovsky/ccsbx-fence@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "$inst" "$@"
+  CCSBX_SIDE_IMAGE="${SIDEIMG-ghcr.io/landovsky/ccsbx@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb}" CCSBX_HUB_SECRET_FROM="${HUBSRC-$d/hubsecret}" CCSBX_OWNER=tomas CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" CCSBX_IMAGE="${IMG:-ghcr.io/landovsky/ccsbx-fence@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}" "$inst" "$@"
 }
 snapshot() { (cd "$1" && find root dist -type f -o -type l | sort | xargs -r sha256sum 2>/dev/null; cat rec/cmds 2>/dev/null); }
 
@@ -496,6 +496,16 @@ d="$(fx r3h)"; ins "$d" install --yes >/dev/null 2>&1
 out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
 t "r3: check looks at ccsbx-launch, ccsbx-term, their uids, the launch dir and the hub secret" bash -c 'for k in "user ccsbx-launch exists" "user ccsbx-term exists" "five different uids\|share uid" "/var/lib/ccsbx-launch is" "hub-admin.secret is"; do grep -q "$k" <<<"$1" || { echo "no check: $k"; exit 1; }; done' _ "$out"
 t "r3: the hub secret is listed as absent in the first backup, so uninstall removes it" grep -qx /etc/ccsbx/hub-admin.secret "$d/root/var/backups/ccsbx-install/original/ABSENT"
+
+echo "# the sidecar image (#3wsr): by digest, from our repo, fail closed"
+d="$(fx side)"; ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "side: the digest is written to ccsbx-root.toml as k8s_side_image" bash -c '[ "$1" -eq 0 ] && grep -qx "k8s_side_image = \"ghcr.io/landovsky/ccsbx@sha256:b\{64\}\"" "$2/root/etc/ccsbx/ccsbx-root.toml"' _ "$rc" "$d"
+for bad in "" "ghcr.io/landovsky/ccsbx:latest" "ghcr.io/landovsky/ccsbx@sha256:abc" "ghcr.io/landovsky/ccsbx-fence@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "ghcr.io/other/ccsbx@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" "ghcr.io/landovsky/ccsbx@sha256:BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB"; do
+  d="$(fx sideb)"; SIDEIMG="$bad" ins "$d" install --yes >/dev/null 2>"$d/err"; rc=$?
+  t "side: --side-image '${bad:-unset}' is refused (exit 3), nothing changed" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/rec/cmds" ] && [ ! -e "$2/root/etc/ccsbx" ]' _ "$rc" "$d"
+done
+d="$(fx sidec)"; ins "$d" install --yes --side-image ghcr.io/landovsky/ccsbx@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc >/dev/null 2>&1
+t "side: the --side-image option overrides the environment" grep -q 'sha256:c\{64\}' "$d/root/etc/ccsbx/ccsbx-root.toml"
 
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"

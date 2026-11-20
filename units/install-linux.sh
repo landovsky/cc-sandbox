@@ -36,6 +36,8 @@
 #   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
 #   --pairs P             what the signer may sign: exact profile:billing|billing,... (CCSBX_PAIRS; default: built from
 #                         <repo>/profiles/*.json that list this machine, e.g. dev-default:api|stub,e2e-default:stub)
+#   --side-image REF      the sidecar image of pod sessions, BY DIGEST: ghcr.io/landovsky/ccsbx@sha256:<64 hex> (CCSBX_SIDE_IMAGE, required;
+#                         written to ccsbx-root.toml as k8s_side_image). A tag is refused. The digest comes from the side-image Actions run (#3wsr)
 #   --hub-secret-from F   the owner's file holding the hub's shared secret (the hub's SB_SECRET), (CCSBX_HUB_SECRET_FROM, default
 #                         ~owner/.config/session-bus/secret). Its FIRST LINE is copied to /etc/ccsbx/hub-admin.secret, root 0600, for
 #                         ccsbx-root's relay mint; never printed. Must be a regular file (no symlink). Verify it at Gate M (night-1-morning.md, 8c)
@@ -60,7 +62,7 @@ case "${1:-}" in
   *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
-MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"
+MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"; SIDE_IMAGE="${CCSBX_SIDE_IMAGE:-}"
 HUB_SECRET_FROM="${CCSBX_HUB_SECRET_FROM:-}"; K8S_MACHINE="${CCSBX_K8S_MACHINE:-future-two}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
@@ -73,6 +75,7 @@ while [ $# -gt 0 ]; do
     --machine) MACHINE="${2:?--machine NAME}"; shift ;;
     --pairs) PAIRS="${2:?--pairs P}"; shift ;;
     --image) IMAGE="${2:?--image REF}"; shift ;;
+    --side-image) SIDE_IMAGE="${2:?--side-image REF}"; shift ;;
     --hub-secret-from) HUB_SECRET_FROM="${2:?--hub-secret-from FILE}"; shift ;;
     --k8s-machine) K8S_MACHINE="${2:?--k8s-machine NAME}"; shift ;;
     --with-deploy) WITH_DEPLOY=1 ;;
@@ -141,11 +144,14 @@ WORKTREE_ROOT="$(IFS=,; echo "${_roots[*]}")"
 if [ -z "$IMAGE" ]; then ROOT_ERRORS+=("no fence image: pass --image ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the CI-built candidate, U1a); a tag is refused")
 elif [[ "$IMAGE" != *@sha256:* ]]; then ROOT_ERRORS+=("image '$IMAGE' is a tag: hostd and ccsbx-root refuse every start of a tag (image_not_pinned); use ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex>")
 elif ! [[ "$IMAGE" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("image '$IMAGE' is not ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the only repo a candidate may come from)"); fi
+# the sidecar image: by digest from our own repo only; ccsbx-root's pod-create refuses a config without it
+if [ -z "$SIDE_IMAGE" ]; then ROOT_ERRORS+=("no sidecar image: pass --side-image ghcr.io/landovsky/ccsbx@sha256:<64 hex> (the digest of the side-image Actions run, #3wsr); a tag is refused")
+elif ! [[ "$SIDE_IMAGE" =~ ^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("sidecar image '$SIDE_IMAGE' is not ghcr.io/landovsky/ccsbx@sha256:<64 hex> (a tag, or another repo, is refused)"); fi
 # the root-owned pins copy: ccsbx-root and hostd read it, never the owner-writable repo (profiles are embedded in the binaries)
 MANAGED_PATHS+=(/etc/ccsbx/pins.toml)
 [ -f "$REPO_DIR/pins.toml" ] || ROOT_ERRORS+=("no $REPO_DIR/pins.toml to install as /etc/ccsbx/pins.toml")
 RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
-export OWNER MACHINE PAIRS IMAGE WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+export OWNER MACHINE PAIRS IMAGE SIDE_IMAGE WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()

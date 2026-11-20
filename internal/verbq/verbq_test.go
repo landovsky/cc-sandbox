@@ -7,6 +7,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -250,5 +253,56 @@ func TestReingestedRequestIsNotQueuedTwice(t *testing.T) {
 	}
 	if st, _ := r.q.Status("production"); st.Pending != 1 {
 		t.Fatalf("%d pending", st.Pending)
+	}
+}
+
+// ---- review of PR #4: replay must never cut away verbs, and a withdrawn verb stays withdrawn ----
+
+// context: --max-bytes was raised and one verb's line is bigger than a bufio.Scanner's 1 MiB: the old
+// replay stopped there and truncated every verb queued after it at the next start.
+func TestVerbsAfterAVeryLongLineSurviveARestart(t *testing.T) {
+	r := newRig(t)
+	big := json.RawMessage(`{"x":"` + strings.Repeat("a", 1500<<10) + `"}`)
+	for i, body := range []json.RawMessage{json.RawMessage(`{}`), big, json.RawMessage(`{}`)} {
+		if _, err := r.q.Enqueue("production", Item{ID: fmt.Sprintf("01ARZ3NDEKTSV4RRFFQ69G5FA%d", i), Sid: "s1", Gen: 1, Rid: fmt.Sprintf("r%d", i), Type: "ccf.mark", Body: body}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q2 := r.reopen()
+	got, _ := q2.Pending("production", "", "")
+	if len(got) != 3 {
+		t.Fatalf("%d of 3 verbs after a restart", len(got))
+	}
+}
+
+// context: a complete line that does not parse (or an enq without an item) is corruption. It used to
+// panic the daemon (crash loop) or truncate the queue; now the open is refused and nothing is cut.
+func TestCorruptCompleteLineRefusesToOpenAndCutsNothing(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "production.jsonl")
+	good := `{"op":"enq","item":{"id":"01ARZ3NDEKTSV4RRFFQ69G5FAA","sid":"s1","gen":1,"rid":"r","type":"ccf.mark","seq":1}}` + "\n"
+	os.WriteFile(p, []byte(good+`{"op":"enq"}`+"\n"+good), 0o600)
+	if q, err := Open(dir); err == nil {
+		defer q.Close()
+		if _, err := q.Pending("production", "", ""); err == nil {
+			t.Fatal("a corrupt queue was opened")
+		}
+	}
+	st, _ := os.Stat(p)
+	if st.Size() != int64(len(good)*2+len(`{"op":"enq"}`)+1) {
+		t.Fatalf("the queue file was cut: %d bytes", st.Size())
+	}
+}
+
+// context: the journal append failed after the verb was queued, so the session was told io_error and
+// will retry under a new rid. The withdrawn verb must not come back after a restart.
+func TestWithdrawnVerbStaysWithdrawnAfterARestart(t *testing.T) {
+	r := newRig(t)
+	it, _ := r.q.Enqueue("production", Item{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAA", Sid: "s1", Gen: 1, Rid: "r", Type: "ccf.mark", Body: json.RawMessage(`{}`)})
+	if err := r.q.Withdraw("production", it.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := r.reopen().Pending("production", "", ""); len(got) != 0 {
+		t.Fatalf("%d verbs back after restart", len(got))
 	}
 }

@@ -83,7 +83,15 @@ func verbHandler(q *verbq.Queue, d *start.Daemon, j appender, rt *msg.Router) ho
 			data = env.Data
 		}
 		if j != nil {
+			if it.Seq == 0 {
+				// Already applied and answered (a re-ingest after an epoch reset): don't journal
+				// it again, and don't turn its final answer back into "queued".
+				return hostd.Reply{Status: "queued", Result: map[string]any{"seq": 0}}
+			}
 			if _, err := j.Append(journal.Event{ID: r.ID, Sid: r.Sid, Gen: r.Gen, Node: r.Label, Realm: realm, Src: "fence", Type: r.Type, Data: data}); err != nil {
+				// The session is told io_error and will retry under a new rid: the verb must not
+				// stay queued too, or the cockpit applies it twice.
+				_ = q.Withdraw(realm, it.ID)
 				return hostd.Reply{Status: "error", Result: map[string]string{"code": "io_error"}}
 			}
 		}

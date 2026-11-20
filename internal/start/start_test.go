@@ -1,6 +1,7 @@
 package start
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -448,5 +449,19 @@ func TestNoSessionsDirIsAnEmptyListNotAnError(t *testing.T) {
 	recs, err := d.Records()
 	if err != nil || len(recs) != 0 {
 		t.Fatalf("%v %v", recs, err)
+	}
+}
+
+// context: a spec without a realm (an older cc-tree, a stub) used to journal session.* events under
+// "" and ccf.* under "production", so a cockpit reading one realm missed half of a session. The
+// realm is normalised once, at parse time; one the verb queue would refuse is refused at start.
+func TestParseSpecNormalisesTheRealm(t *testing.T) {
+	base := `{"v":1,"request_id":"r","owner":"tomas","machine":"m","label":"l","harness":"claude","profile":"p"%s}`
+	s, err := ParseSpec([]byte(fmt.Sprintf(base, "")))
+	if err != nil || s.Realm != "production" {
+		t.Fatalf("%v %+v", err, s)
+	}
+	if _, err := ParseSpec([]byte(fmt.Sprintf(base, `,"realm":"Prod"`))); err == nil {
+		t.Fatal("a realm the queue would refuse was accepted")
 	}
 }

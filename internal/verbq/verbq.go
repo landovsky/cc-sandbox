@@ -159,15 +159,22 @@ func (q *Queue) realm(name string) (*realmQ, error) {
 	r := &realmQ{pending: map[string]*Item{}, keys: map[string]string{}}
 	p := filepath.Join(q.Dir, name+".jsonl")
 	if f, err := os.Open(p); err == nil {
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 1<<20), 1<<20)
+		// No line-length limit (a large --max-bytes makes a long enq line), and only a torn LAST
+		// line (no newline: a crash mid-write) is ever cut off. A complete line that does not
+		// parse is corruption: refuse to open rather than truncate away every verb after it.
+		br := bufio.NewReaderSize(f, 1<<16)
 		var good int64
-		for sc.Scan() {
-			var rc rec
-			if json.Unmarshal(sc.Bytes(), &rc) != nil {
+		for {
+			line, rerr := br.ReadBytes('\n')
+			if rerr != nil { // EOF: whatever is left has no newline, a torn write
 				break
 			}
-			good += int64(len(sc.Bytes())) + 1
+			var rc rec
+			if json.Unmarshal(line, &rc) != nil || (rc.Op == "enq" && rc.Item == nil) {
+				f.Close()
+				return nil, fmt.Errorf("verb queue %s is corrupt at byte %d: refusing to open (nothing was cut)", p, good)
+			}
+			good += int64(len(line))
 			switch rc.Op {
 			case "enq":
 				it := *rc.Item
@@ -202,12 +209,47 @@ func (q *Queue) realm(name string) (*realmQ, error) {
 	return r, nil
 }
 
+// write appends one record and fsyncs it. A failed write or fsync is cut back, so no half line
+// stays for the next record to run on from (which a restart would answer by truncating away every
+// verb after it).
 func (r *realmQ) write(rc rec) error {
 	b, _ := json.Marshal(rc)
-	if _, err := r.f.Write(append(b, '\n')); err != nil {
+	st, err := r.f.Stat()
+	if err != nil {
 		return err
 	}
-	return r.f.Sync()
+	_, err = r.f.Write(append(b, '\n'))
+	if err == nil {
+		err = r.f.Sync()
+	}
+	if err != nil {
+		if terr := r.f.Truncate(st.Size()); terr != nil {
+			return fmt.Errorf("%w (and the cut-back failed: %v)", err, terr)
+		}
+		return err
+	}
+	return nil
+}
+
+// Withdraw takes a just-enqueued verb back out: the caller could not complete the step that
+// had to go with it (journaling it), told the session it failed, and the session will retry
+// under a new rid, so the cockpit must not apply it as well. No reply is written.
+func (q *Queue) Withdraw(realm, id string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	r, err := q.realm(realm)
+	if err != nil {
+		return err
+	}
+	if r.pending[id] == nil {
+		return ErrNoSuchItem
+	}
+	res := Result{Status: "error", Code: "withdrawn"}
+	if err := r.write(rec{Op: "res", ID: id, Res: &res, TS: q.now().UTC()}); err != nil {
+		return err
+	}
+	delete(r.pending, id)
+	return nil
 }
 
 // Enqueue stores a verb and returns it with its seq. A repeat of the same (sid, gen, rid)

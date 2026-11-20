@@ -105,7 +105,7 @@
   install: it always restores from the FIRST backup (`/var/backups/ccsbx-install/original/`).
   **It undoes:** the units (hostd, signer, signer socket), the sudoers rules `90-ccsbx-root` and
   `91-ccsbx-deploy`, `ccsbx-root`, `ccsbx-deploy`, `ccsbx`, `/etc/ccsbx/ccsbx-root.toml`; every
-  `sudoers.d` file as it was (then `visudo -c`); sops's owner and mode; the firewall rule for 7480;
+  `sudoers.d` file as it was (then `visudo -c`); sops's owner and mode;
   the owner's `ccsbx-clients` membership. The backup is then renamed `original.undone-<time>`.
   **It does NOT undo:** docker/lxd group membership (re-add with `gpasswd -a tomas docker` to
   waive invariant 14 again), the lxd snap, the users `ccsbx` and `ccsbx-keys`, the group

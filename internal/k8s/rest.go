@@ -174,8 +174,12 @@ func (r *REST) ListPods(ctx context.Context, ns, sel string) ([]Pod, error) {
 	return out.Items, nil
 }
 
-func (r *REST) DeletePod(ctx context.Context, ns, name string, grace int) error {
-	err := r.do(ctx, "DELETE", podsPath(ns)+"/"+url.PathEscape(name)+"?gracePeriodSeconds="+strconv.Itoa(grace), nil, nil)
+func (r *REST) DeletePod(ctx context.Context, ns, name, uid string, grace int) error {
+	if uid == "" {
+		return errors.New("delete needs the pod's UID as a precondition")
+	}
+	opts := map[string]any{"apiVersion": "v1", "kind": "DeleteOptions", "gracePeriodSeconds": grace, "preconditions": map[string]string{"uid": uid}}
+	err := r.do(ctx, "DELETE", podsPath(ns)+"/"+url.PathEscape(name)+"?gracePeriodSeconds="+strconv.Itoa(grace), opts, nil)
 	if errors.Is(err, ErrNotFound) {
 		return nil
 	}

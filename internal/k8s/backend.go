@@ -146,8 +146,8 @@ func (b *Backend) Get(ctx context.Context, sid string, gen int) (*Status, error)
 	return &st, nil
 }
 
-// Delete removes the pod by exact name with a grace period of at most 60 s; an absent pod is fine.
-func (b *Backend) Delete(ctx context.Context, sid string, gen int) error {
+// Delete removes the pod by exact name, only if its UID is uid (the one recorded from Create), with a grace period of at most 60 s; an absent pod is fine.
+func (b *Backend) Delete(ctx context.Context, sid string, gen int, uid string) error {
 	ref, err := b.ref(sid, gen)
 	if err != nil {
 		return err
@@ -156,7 +156,14 @@ func (b *Backend) Delete(ctx context.Context, sid string, gen int) error {
 	if g < 0 || g > maxGrace {
 		g = maxGrace
 	}
-	return b.C.DeletePod(ctx, ref.Namespace, ref.Name, int(g))
+	// The UID is a server-side precondition: a pod that has since been replaced under the same name
+	// (not ours) is not deleted by us, and the owner is told which pod it is.
+	err = b.C.DeletePod(ctx, ref.Namespace, ref.Name, uid, int(g))
+	var ae *APIError
+	if errors.As(err, &ae) && ae.Status == 409 {
+		return &ConflictError{Namespace: ref.Namespace, Pod: ref.Name, Why: "has another UID than the one recorded, so it was not deleted"}
+	}
+	return err
 }
 
 // List returns the session pods of the namespace (role=session).

@@ -28,7 +28,9 @@
 #   --yes                 really do it (install and uninstall)
 #   --bin-dir DIR         built binaries + SHA256SUMS            (CCSBX_BIN_DIR, default <repo>/dist)
 #   --owner USER          the human who keeps access            (CCSBX_OWNER, default the invoking user)
-#   --allowed-roots A,B   ccsbx-root's workdir roots            (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt)
+#   --allowed-roots A,B   ccsbx-root's workdir roots AND hostd's --worktree-root: one source, the same comma list written to both
+#                                                              (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt, the owner from SUDO_USER via getent)
+#   --image REF           the fence image hostd passes to panes   (CCSBX_IMAGE, default ccsbx-fence:dev until a pin exists)
 #   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
 #   --pairs P             what the signer may sign: exact profile:billing|billing,... (CCSBX_PAIRS; default: built from
 #                         <repo>/profiles/*.json that list this machine, e.g. dev-default:api|stub,e2e-default:stub)
@@ -52,7 +54,7 @@ case "${1:-}" in
   *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
-MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"
+MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-ccsbx-fence:dev}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -63,6 +65,7 @@ while [ $# -gt 0 ]; do
     --allowed-roots) ALLOWED_ROOTS="${2:?--allowed-roots A,B}"; shift ;;
     --machine) MACHINE="${2:?--machine NAME}"; shift ;;
     --pairs) PAIRS="${2:?--pairs P}"; shift ;;
+    --image) IMAGE="${2:?--image REF}"; shift ;;
     --with-deploy) WITH_DEPLOY=1 ;;
     --backup) RESTORE_OVERRIDE="${2:?--backup DIR}"; shift ;;
     --purge-keys) PURGE_KEYS=1 ;;
@@ -81,8 +84,9 @@ OWNER="$(real_user)"; OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"; OWNE
 [ -n "$MACHINE" ] || MACHINE="$(hostname -s 2>/dev/null)"
 # the pairs come from the profiles themselves: each profile that lists this machine, with ITS billings (a flat
 # profiles x billings product would let a profile be signed with a billing it does not allow)
-if [ -z "$PAIRS" ] && compgen -G "$REPO_DIR/profiles/*.json" >/dev/null; then
-  PAIRS="$(python3 -I - "$MACHINE" "$REPO_DIR"/profiles/*.json <<'PY' 2>/dev/null
+pairs_from() {   # pairs_from DIR — name:billing|billing,... of every profile in DIR that lists this machine
+  compgen -G "$1/*.json" >/dev/null || return 0
+  python3 -I - "$MACHINE" "$1"/*.json <<'PY' 2>/dev/null
 import json, sys
 machine, out = sys.argv[1], []
 for f in sys.argv[2:]:
@@ -91,7 +95,13 @@ for f in sys.argv[2:]:
         out.append(p["name"] + ":" + "|".join(p["billing"]))
 print(",".join(out))
 PY
-)"
+}
+# the root-owned copy is the source once it exists (the repo is owner-writable); the first install reads the repo,
+# and u0b_keys recomputes from the copy the same run has just written
+PAIRS_DEFAULTED=0
+if [ -z "$PAIRS" ]; then
+  PAIRS_DEFAULTED=1
+  if compgen -G "$(pth /etc/ccsbx/profiles)/*.json" >/dev/null; then PAIRS="$(pairs_from "$(pth /etc/ccsbx/profiles)")"; else PAIRS="$(pairs_from "$REPO_DIR/profiles")"; fi
 fi
 SCOPE_ERRORS=()
 [[ "$MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || SCOPE_ERRORS+=("machine name '$MACHINE' is not a plain host name (--machine)")
@@ -101,14 +111,23 @@ _b='(api|subscription|stub)'
 ROOT_ERRORS=(); ALLOWED_ROOTS_TOML=""
 IFS=, read -r -a _roots <<<"$ALLOWED_ROOTS"
 for _r in "${_roots[@]}"; do
-  if [[ "$_r" =~ ^/[A-Za-z0-9._@+/-]+$ ]] && [ "$_r" != / ] && [[ "$_r" != *..* ]]; then
+  if [[ "$_r" =~ ^/[A-Za-z0-9._@+/-]+$ ]] && [ "$_r" != / ] && [[ "$_r" != *..* ]] && [[ "$_r" != */ ]] && [[ "$_r" != *//* ]]; then
     [ -n "$PREFIX" ] || [ -d "$_r" ] || ROOT_ERRORS+=("allowed root $_r does not exist")
     ALLOWED_ROOTS_TOML+="\"$_r\", "
   else ROOT_ERRORS+=("allowed root '$_r' is not a plain absolute path (no /, .., quotes, globs or spaces)"); fi
 done
 ALLOWED_ROOTS_TOML="${ALLOWED_ROOTS_TOML%, }"
+# hostd --worktree-root takes the same comma list as allowed_roots (no spaces, no empty entry, no trailing slash, no ~)
+[[ "$ALLOWED_ROOTS" =~ (^,|,,|,$) ]] && ROOT_ERRORS+=("allowed roots '$ALLOWED_ROOTS' has an empty entry")
+WORKTREE_ROOT="$(IFS=,; echo "${_roots[*]}")"
+[[ "$IMAGE" =~ ^[A-Za-z0-9._/:@-]+$ ]] || ROOT_ERRORS+=("image '$IMAGE' is not a plain image reference (--image)")
+# the root-owned copies hostd, the signer scope and later readers use, never the owner-writable repo
+PROFILES_ETC=/etc/ccsbx/profiles
+for _p in "$REPO_DIR"/profiles/*.json; do [ -e "$_p" ] && MANAGED_PATHS+=("$PROFILES_ETC/$(basename "$_p")"); done
+MANAGED_PATHS+=(/etc/ccsbx/pins.toml)
+[ -f "$REPO_DIR/pins.toml" ] || ROOT_ERRORS+=("no $REPO_DIR/pins.toml to install as /etc/ccsbx/pins.toml")
 RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
-export OWNER MACHINE PAIRS BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+export OWNER MACHINE PAIRS IMAGE WORKTREE_ROOT PROFILES_ETC BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()

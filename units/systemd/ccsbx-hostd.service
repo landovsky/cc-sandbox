@@ -5,6 +5,9 @@
 # --ccmsg-bin is deliberately UNSET: hostd as uid ccsbx cannot use the owner's bus sockets, so messages to an
 # unfenced manager wait for the hub spoke (B10/B11/M2b). Every flag also reads CCSBX_<FLAG>; unknown flags are fatal.
 # The command line is `ccsbx-hostd run ...` with exactly the flags the U3a/G builder adds on n1-g (review R1):
+# Helper mode (PR #12): --run-dir reads outboxes/CLOSED under ccsbx-root's run dir through group ccsbx (hostd must not need
+# wt/, gd/, quarantine/ or home/); --pins/--profiles are the ROOT-OWNED copies under /etc/ccsbx written by the installer;
+# @WORKTREE_ROOT@ is the SAME comma list as ccsbx-root.toml's allowed_roots and @IMAGE@ the fence image: both are filled in at install.
 # --local-socket, --socket-group, --signer, --listen (loopback only), --listen-token-file. An unknown flag is
 # fatal in hostd, so confirm them with `ccsbx-hostd run --help` before the gate. The token file (0600, ccsbx) is made by the installer. hostd sends messages with `send-keys` into the
 # tmux server it owns on --tmux-socket (an absolute path, `tmux -S`, in /run/ccsbx, 0700 ccsbx: reached by `sudo ccsbx-root attach`, never directly).
@@ -27,7 +30,7 @@ Type=simple
 User=ccsbx
 Group=ccsbx
 SupplementaryGroups=ccsbx-clients
-ExecStart=/usr/local/libexec/ccsbx/ccsbx-hostd run --state /var/lib/ccsbx --local-socket /run/ccsbx-api/hostd.sock --socket-group ccsbx-clients --signer /run/ccsbx-signer/sign.sock --listen 127.0.0.1:7480 --listen-token-file /var/lib/ccsbx/listen.token --tmux-socket /run/ccsbx/tmux.sock
+ExecStart=/usr/local/libexec/ccsbx/ccsbx-hostd run --state /var/lib/ccsbx --local-socket /run/ccsbx-api/hostd.sock --socket-group ccsbx-clients --signer /run/ccsbx-signer/sign.sock --listen 127.0.0.1:7480 --listen-token-file /var/lib/ccsbx/listen.token --tmux-socket /run/ccsbx/tmux.sock --run-dir /var/lib/ccsbx-run --pins /etc/ccsbx/pins.toml --profiles /etc/ccsbx/profiles --worktree-root @WORKTREE_ROOT@ --image @IMAGE@
 StateDirectory=ccsbx
 StateDirectoryMode=0750
 RuntimeDirectory=ccsbx-api
@@ -49,7 +52,7 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
 LockPersonality=yes
-ReadWritePaths=/var/lib/ccsbx /run/ccsbx /run/ccsbx-api
+ReadWritePaths=/var/lib/ccsbx /run/ccsbx /run/ccsbx-api /var/lib/ccsbx-run
 
 [Install]
 WantedBy=multi-user.target

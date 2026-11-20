@@ -26,7 +26,12 @@ func TestKubectlExecArgvEnvAndExitCode(t *testing.T) {
 	t.Setenv("KUBECONFIG", "/home/tomas/.kube/config")
 	t.Setenv("HTTPS_PROXY", "http://evil")
 	var out bytes.Buffer
-	x := Kubectl{Bin: bin, Kubeconfig: "/var/lib/ccsbx-keys/launcher.kubeconfig"}
+	kc := filepath.Join(t.TempDir(), "launcher.kubeconfig")
+	os.WriteFile(kc, []byte("apiVersion: v1\n"), 0o600)
+	x, err := NewKubectl(bin, kc)
+	if err != nil {
+		t.Fatal(err)
+	}
 	code, err := x.Exec(context.Background(), "cc-sandbox", "ccsbx-s-s0abcdefgh-g1", "side", []string{"sh", "-c", "cat >/run/x"},
 		IO{Stdin: strings.NewReader("TOKEN\n"), Stdout: &out})
 	if err != nil || code != 7 || out.String() != "TOKEN\n" {
@@ -34,7 +39,7 @@ func TestKubectlExecArgvEnvAndExitCode(t *testing.T) {
 	}
 	b, _ := os.ReadFile(log)
 	first := strings.SplitN(string(b), "\n", 2)[0]
-	if first != "--kubeconfig /var/lib/ccsbx-keys/launcher.kubeconfig -n cc-sandbox exec -i -c side ccsbx-s-s0abcdefgh-g1 -- sh -c cat >/run/x" {
+	if first != "--kubeconfig "+kc+" -n cc-sandbox exec -i -c side ccsbx-s-s0abcdefgh-g1 -- sh -c cat >/run/x" {
 		t.Errorf("kubectl was called as %q", first)
 	}
 	for _, leaked := range []string{"KUBECONFIG=", "HTTPS_PROXY", "evil", "HOME=/home"} {
@@ -95,14 +100,81 @@ func TestBackendExecChecksBeforeRunning(t *testing.T) {
 	}
 }
 
-// F5: the attach command is kubectl exec -it into the fence's tmux by exact pod name.
+// M2: with no usable kubeconfig kubectl falls back to plain HTTP on localhost:8080, where any local
+// process may listen, and the secrets that travel on stdin would go to it. Nothing is run, and stdin
+// is not read, unless both paths are absolute and the kubeconfig is a regular file.
+func TestKubectlRefusesUnusablePathsBeforeRunningAnything(t *testing.T) {
+	bin, log := stubKubectl(t, `cat`)
+	kc := filepath.Join(t.TempDir(), "kc")
+	os.WriteFile(kc, []byte("x"), 0o600)
+	dir := t.TempDir()
+	for name, k := range map[string]Kubectl{
+		"an empty kubeconfig":        {Bin: bin},
+		"a relative kubeconfig":      {Bin: bin, Kubeconfig: "kubeconfig"},
+		"a missing kubeconfig":       {Bin: bin, Kubeconfig: filepath.Join(dir, "nope")},
+		"a kubeconfig that is a dir": {Bin: bin, Kubeconfig: dir},
+		"a relative binary":          {Bin: "kubectl", Kubeconfig: kc},
+		"an empty binary":            {Kubeconfig: kc},
+		"an unclean binary path":     {Bin: filepath.Dir(bin) + "/../" + filepath.Base(filepath.Dir(bin)) + "/kubectl", Kubeconfig: kc},
+	} {
+		in := &readCounter{r: strings.NewReader("TOKEN")}
+		code, err := k.Exec(context.Background(), "cc-sandbox", "ccsbx-s-s0abcdefgh-g1", "side", []string{"cat"}, IO{Stdin: in})
+		if err == nil || code != -1 || in.n != 0 {
+			t.Errorf("%s: %d %v (stdin read %d bytes)", name, code, err, in.n)
+		}
+		if _, err := NewKubectl(k.Bin, k.Kubeconfig); err == nil {
+			t.Errorf("%s: NewKubectl accepted it", name)
+		}
+	}
+	// a relative kubeconfig that happens to exist in the working directory is still refused
+	wd := t.TempDir()
+	os.WriteFile(filepath.Join(wd, "kubeconfig"), []byte("x"), 0o600)
+	old, _ := os.Getwd()
+	os.Chdir(wd)
+	defer os.Chdir(old)
+	if _, err := NewKubectl(bin, "kubeconfig"); err == nil || !strings.Contains(err.Error(), "absolute") {
+		t.Errorf("a relative kubeconfig that exists was accepted: %v", err)
+	}
+	if _, err := os.Stat(log); err == nil {
+		t.Error("kubectl was run for a refused configuration")
+	}
+}
+
+type readCounter struct {
+	r *strings.Reader
+	n int
+}
+
+func (c *readCounter) Read(p []byte) (int, error) { n, err := c.r.Read(p); c.n += n; return n, err }
+
+// F5 / S1: the attach command is derived from the sid and generation, never from a caller's pod
+// name, and is refused while kubectl or the kubeconfig is not an absolute path.
 func TestAttachArgv(t *testing.T) {
 	b := NewBackend(nil, nil, DefaultConfig())
 	b.Kubectl, b.Kubeconfig = "/usr/local/bin/kubectl", "/var/lib/ccsbx-keys/launcher.kubeconfig"
-	ref := Ref{Namespace: "cc-sandbox", Name: PodName("s0abcdefgh", 3), Sid: "s0abcdefgh", Gen: 3}
-	got := strings.Join(b.AttachArgv(ref, "s0abcdefgh"), " ")
+	got, err := b.AttachArgv("s0abcdefgh", 3)
 	want := "/usr/local/bin/kubectl --kubeconfig /var/lib/ccsbx-keys/launcher.kubeconfig -n cc-sandbox exec -it -c fence ccsbx-s-s0abcdefgh-g3 -- tmux attach-session -t =s0abcdefgh:"
-	if got != want {
-		t.Errorf("%s", got)
+	if err != nil || strings.Join(got, " ") != want {
+		t.Errorf("%v %v", got, err)
+	}
+	for _, c := range []struct {
+		sid string
+		gen int
+	}{{"-n", 1}, {"../x", 1}, {"S0ABCDEFGH", 1}, {"s0abcdefgh", 0}, {"s0abcdefgh", 10000}, {"", 1}} {
+		if a, err := b.AttachArgv(c.sid, c.gen); err == nil {
+			t.Errorf("(%q, %d) gave %v", c.sid, c.gen, a)
+		}
+	}
+	for name, mod := range map[string]func(*Backend){
+		"no kubectl":         func(b *Backend) { b.Kubectl = "" },
+		"a relative kubectl": func(b *Backend) { b.Kubectl = "kubectl" },
+		"no kubeconfig":      func(b *Backend) { b.Kubeconfig = "" },
+		"a relative one":     func(b *Backend) { b.Kubeconfig = "kc" },
+	} {
+		b2 := *b
+		mod(&b2)
+		if a, err := b2.AttachArgv("s0abcdefgh", 1); err == nil {
+			t.Errorf("%s gave %v", name, a)
+		}
 	}
 }

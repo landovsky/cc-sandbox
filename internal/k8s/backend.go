@@ -9,6 +9,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -35,9 +37,12 @@ type Status struct {
 }
 
 func statusOf(p *Pod) Status {
-	st := Status{Phase: p.Status.Phase, Reason: p.Status.Reason}
-	st.Ref = Ref{Namespace: p.Metadata.Namespace, Name: p.Metadata.Name, Sid: p.Metadata.Labels["ccsbx.sid"]}
-	fmt.Sscanf(p.Metadata.Labels["ccsbx.gen"], "%d", &st.Ref.Gen)
+	st := Status{Ref: Ref{Namespace: p.Metadata.Namespace, Name: p.Metadata.Name, Sid: p.Metadata.Labels["ccsbx.sid"]}}
+	st.Ref.Gen = atoiOr(p.Metadata.Labels["ccsbx.gen"])
+	if p.Status == nil {
+		return st
+	}
+	st.Phase, st.Reason = p.Status.Phase, p.Status.Reason
 	for _, cs := range p.Status.ContainerStatuses {
 		if cs.Name == "fence" {
 			st.FenceReady = cs.Ready
@@ -48,6 +53,11 @@ func statusOf(p *Pod) Status {
 		}
 	}
 	return st
+}
+
+// roundTrips: the pod the server returned is the one asked for, with labels that name it.
+func roundTrips(p *Pod, sid string, gen int) bool {
+	return p.Metadata.Labels["ccsbx.sid"] == sid && p.Metadata.Labels["ccsbx.gen"] == strconv.Itoa(gen) && p.Metadata.Name == PodName(sid, gen)
 }
 
 func (b *Backend) ref(sid string, gen int) (Ref, error) {
@@ -68,12 +78,24 @@ func (b *Backend) Create(ctx context.Context, s Spec) (*Ref, error) {
 	_, err = b.C.CreatePod(ctx, b.Cfg.Namespace, pod)
 	var ae *APIError
 	if errors.As(err, &ae) && ae.Status == 409 {
+		// A pod of this name is already there. It is "ours" only if it is THIS pod: built from the
+		// same spec (the hash annotation), still passing the contract, and not on its way out. The
+		// labels alone prove nothing: a pod from an older attempt (another image, other limits) or
+		// one someone else made under the name would otherwise be handed the token.
 		got, gerr := b.C.GetPod(ctx, b.Cfg.Namespace, pod.Metadata.Name)
 		if gerr != nil {
 			return nil, gerr
 		}
-		if got.Metadata.Labels["ccsbx.sid"] != s.Sid || got.Metadata.Labels["ccsbx.gen"] != fmt.Sprint(s.Gen) {
+		switch {
+		case !roundTrips(got, s.Sid, s.Gen):
 			return nil, fmt.Errorf("pod %s exists but is not this generation's", pod.Metadata.Name)
+		case got.Metadata.DeletionTimestamp != nil:
+			return nil, fmt.Errorf("pod %s exists but is being deleted: wait for it to go, then create again", pod.Metadata.Name)
+		case got.Metadata.Annotations[HashAnnotation] != pod.Metadata.Annotations[HashAnnotation]:
+			return nil, fmt.Errorf("pod %s exists but was built from another spec", pod.Metadata.Name)
+		}
+		if err := b.Cfg.CheckFetched(got); err != nil {
+			return nil, fmt.Errorf("pod %s exists but breaks the contract: %v", pod.Metadata.Name, err)
 		}
 		return &ref, nil
 	}
@@ -92,6 +114,9 @@ func (b *Backend) Get(ctx context.Context, sid string, gen int) (*Status, error)
 	p, err := b.C.GetPod(ctx, ref.Namespace, ref.Name)
 	if err != nil {
 		return nil, err
+	}
+	if !roundTrips(p, sid, gen) {
+		return nil, fmt.Errorf("the API returned a pod that is not %s", ref.Name)
 	}
 	st := statusOf(p)
 	return &st, nil
@@ -118,7 +143,9 @@ func (b *Backend) List(ctx context.Context) ([]Status, error) {
 	}
 	var out []Status
 	for i := range ps {
-		if ps[i].Metadata.Labels[RoleLabel] == "session" { // the server's selector is not taken on trust
+		// the server's selector is not taken on trust: only a pod that round-trips is ours
+		sid, gen := ps[i].Metadata.Labels["ccsbx.sid"], atoiOr(ps[i].Metadata.Labels["ccsbx.gen"])
+		if ps[i].Metadata.Labels[RoleLabel] == "session" && sidRe.MatchString(sid) && roundTrips(&ps[i], sid, gen) {
 			out = append(out, statusOf(&ps[i]))
 		}
 	}
@@ -149,9 +176,20 @@ func (b *Backend) Exec(ctx context.Context, ref Ref, container string, cmd []str
 }
 
 // AttachArgv is the command line that attaches a terminal to the fence's tmux (F5): kubectl exec -it
-// into the fence container, by exact pod name, with the kubeconfig under ccsbx-keys. The caller
-// execs it as the user that holds the kubeconfig; nothing here runs it.
-func (b *Backend) AttachArgv(ref Ref, sid string) []string {
+// into the fence container, by exact pod name derived here from the sid and generation (a caller
+// names the session, never the pod), with the kubeconfig under ccsbx-keys. The caller execs it as the
+// user that holds the kubeconfig; nothing here runs it. It refuses while kubectl or the kubeconfig is
+// not an absolute path, because kubectl without a kubeconfig talks to localhost.
+func (b *Backend) AttachArgv(sid string, gen int) ([]string, error) {
+	ref, err := b.ref(sid, gen)
+	if err != nil {
+		return nil, err
+	}
+	for name, p := range map[string]string{"kubectl": b.Kubectl, "kubeconfig": b.Kubeconfig} {
+		if !filepath.IsAbs(p) || filepath.Clean(p) != p {
+			return nil, fmt.Errorf("%s %q must be a clean absolute path", name, p)
+		}
+	}
 	return []string{b.Kubectl, "--kubeconfig", b.Kubeconfig, "-n", ref.Namespace, "exec", "-it", "-c", "fence", ref.Name, "--",
-		"tmux", "attach-session", "-t", "=" + sid + ":"}
+		"tmux", "attach-session", "-t", "=" + sid + ":"}, nil
 }

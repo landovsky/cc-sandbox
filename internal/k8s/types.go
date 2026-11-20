@@ -9,14 +9,18 @@ type Pod struct {
 	Kind       string     `json:"kind"`
 	Metadata   ObjectMeta `json:"metadata"`
 	Spec       PodSpec    `json:"spec"`
-	Status     PodStatus  `json:"status,omitempty"`
+	Status     *PodStatus `json:"status,omitempty"`
 }
 
 type ObjectMeta struct {
-	Name       string            `json:"name"`
-	Namespace  string            `json:"namespace,omitempty"`
-	Labels     map[string]string `json:"labels,omitempty"`
-	Finalizers []string          `json:"finalizers,omitempty"`
+	Name        string            `json:"name"`
+	Namespace   string            `json:"namespace,omitempty"`
+	Labels      map[string]string `json:"labels,omitempty"`
+	Finalizers  []string          `json:"finalizers,omitempty"`
+	Annotations map[string]string `json:"annotations,omitempty"`
+	// DeletionTimestamp is set by the server on a pod being deleted; it is only read.
+	DeletionTimestamp *string `json:"deletionTimestamp,omitempty"`
+	UID               string  `json:"uid,omitempty"`
 }
 
 type PodSpec struct {

@@ -17,7 +17,8 @@
 //	func (b *Backend) Delete(ctx, sid string, gen int) error    // by exact name, grace <= 60 s; absent = ok
 //	func (b *Backend) List(ctx) ([]Status, error)               // role=session pods of this namespace
 //	func (b *Backend) Exec(ctx, ref Ref, container string, cmd []string, io IO) (exit int, err error)
-//	func (b *Backend) AttachArgv(ref Ref, sid string) []string  // kubectl exec -it -c fence ... tmux attach
+//	func (b *Backend) AttachArgv(sid string, gen int) ([]string, error) // kubectl exec -it -c fence ... tmux attach; derives the pod, refuses non-absolute kubectl/kubeconfig
+//	func NewKubectl(bin, kubeconfig string) (Kubectl, error)    // the production Execer; absolute paths, kubeconfig must exist
 //	func PodFor(Spec) (*Pod, error)                             // pure; the contract is checked here
 //
 // The Client and Execer are interfaces too, so a fake API server and a fake kubectl stand in.
@@ -45,7 +46,9 @@ type IO struct {
 }
 
 // Execer runs a command in a container of a pod (kubectl exec, with the kubeconfig under
-// ccsbx-keys). Exit is the command's exit code; err is a failure to run it at all.
+// ccsbx-keys). Exit is the command's exit code; err is a failure to run it at all. Note kubectl's
+// own failures (Forbidden, NotFound, connection refused) also exit 1: a caller that delivers
+// secrets must treat any non-zero exit as "not delivered", never as the remote command's answer.
 type Execer interface {
 	Exec(ctx context.Context, ns, pod, container string, cmd []string, io IO) (exit int, err error)
 }

@@ -7,11 +7,14 @@ package k8s
 import (
 	"context"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +22,7 @@ import (
 
 type fakeAPI struct {
 	mu       sync.Mutex
-	pods     map[string]Pod
+	pods     map[string]map[string]any // stored as the server saw them: decoded raw, not through our types
 	log      []string
 	auth     []string
 	failNext int // answer this status once
@@ -27,7 +30,7 @@ type fakeAPI struct {
 
 func newAPI(t *testing.T) (*fakeAPI, *REST) {
 	t.Helper()
-	f := &fakeAPI{pods: map[string]Pod{}}
+	f := &fakeAPI{pods: map[string]map[string]any{}}
 	srv := httptest.NewServer(f)
 	t.Cleanup(srv.Close)
 	tok := filepath.Join(t.TempDir(), "token")
@@ -55,26 +58,33 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(strings.TrimPrefix(r.URL.Path, base), "/")
 	switch {
 	case r.Method == "POST" && name == "":
-		var p Pod
+		var p map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&p); err != nil {
 			reply(400, map[string]string{"message": err.Error()})
 			return
 		}
-		if why := admit(&p); why != "" {
+		if why := admit(p); why != "" {
 			reply(422, map[string]string{"reason": "Invalid", "message": why})
 			return
 		}
-		if _, ok := f.pods[p.Metadata.Name]; ok {
+		n := str(dig(p, "metadata", "name"))
+		if _, ok := f.pods[n]; ok {
 			reply(409, map[string]string{"reason": "AlreadyExists", "message": "exists"})
 			return
 		}
-		p.Status.Phase = "Pending"
-		f.pods[p.Metadata.Name] = p
+		p["status"] = map[string]any{"phase": "Pending"}
+		// what the server's own admission adds: its default tolerations
+		spec := p["spec"].(map[string]any)
+		spec["tolerations"] = append(spec["tolerations"].([]any),
+			map[string]any{"key": "node.kubernetes.io/not-ready", "operator": "Exists", "effect": "NoExecute"},
+			map[string]any{"key": "node.kubernetes.io/unreachable", "operator": "Exists", "effect": "NoExecute"})
+		f.pods[n] = p
 		reply(201, p)
 	case r.Method == "GET" && name == "":
-		var items []Pod
+		var items []any
 		for _, p := range f.pods {
-			if sel := r.URL.Query().Get("labelSelector"); sel == "" || p.Metadata.Labels[strings.SplitN(sel, "=", 2)[0]] == strings.SplitN(sel, "=", 2)[1] {
+			sel := r.URL.Query().Get("labelSelector")
+			if sel == "" || str(dig(p, "metadata", "labels", strings.SplitN(sel, "=", 2)[0])) == strings.SplitN(sel, "=", 2)[1] {
 				items = append(items, p)
 			}
 		}
@@ -97,38 +107,119 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// admit is the cluster's policy, as the k3s side listed it: a rule per line.
-func admit(p *Pod) string {
-	s := p.Spec
+// dig walks a raw decoded JSON document; str turns what it finds into a string ("" if absent).
+func dig(m any, path ...string) any {
+	for _, k := range path {
+		mm, ok := m.(map[string]any)
+		if !ok {
+			return nil
+		}
+		m = mm[k]
+	}
+	return m
+}
+func str(v any) string  { s, _ := v.(string); return s }
+func list(v any) []any  { l, _ := v.([]any); return l }
+func isTrue(v any) bool { b, _ := v.(bool); return b }
+
+// size reads a quantity the way the cluster does, in MiB; ok is false for anything else.
+func size(v any) (mi int64, ok bool) {
+	q := str(v)
+	var n int64
 	switch {
-	case !strings.HasPrefix(p.Metadata.Name, "ccsbx-s-"):
-		return "name must start with ccsbx-s-"
-	case p.Metadata.Labels["cc-sandbox/role"] != "session":
-		return "role must be session"
-	case s.PriorityClassName != "ccsbx-session":
-		return "priorityClassName must be ccsbx-session"
-	case s.RuntimeClassName != nil || len(p.Metadata.Finalizers) > 0:
-		return "no runtimeClassName or finalizers"
-	case s.ShareProcessNamespace != nil && *s.ShareProcessNamespace:
-		return "no shareProcessNamespace"
-	case s.TerminationGracePeriodSeconds != nil && *s.TerminationGracePeriodSeconds > 60:
-		return "grace over 60"
-	case len(s.Containers) != 1 || s.Containers[0].Name != "fence" || len(s.InitContainers) > 1:
-		return "one container named fence and at most one init container"
-	case s.AutomountServiceAccountToken == nil || *s.AutomountServiceAccountToken:
-		return "no service account token"
+	case strings.HasSuffix(q, "Gi"):
+		_, err := fmt.Sscanf(strings.TrimSuffix(q, "Gi"), "%d", &n)
+		return n * 1024, err == nil
+	case strings.HasSuffix(q, "Mi"):
+		_, err := fmt.Sscanf(strings.TrimSuffix(q, "Mi"), "%d", &n)
+		return n, err == nil
 	}
-	for _, c := range append(append([]Container{}, s.InitContainers...), s.Containers...) {
-		if !strings.HasPrefix(c.Image, "ghcr.io/landovsky/ccsbx-fence@sha256:") && !strings.HasPrefix(c.Image, "ghcr.io/landovsky/ccsbx@sha256:") {
-			return "image " + c.Image
-		}
-		if c.SecurityContext == nil || c.SecurityContext.Capabilities == nil || c.SecurityContext.Capabilities.Drop[0] != "ALL" {
-			return "PSS restricted: drop ALL"
+	return 0, false
+}
+
+// admit is the cluster's policy, written here from the k3s side's list and reading the RAW pod JSON,
+// not our types: rules 1-8, the launcher VAP, PSS restricted. It never panics on a short list.
+func admit(p map[string]any) string {
+	name, labels, spec := str(dig(p, "metadata", "name")), dig(p, "metadata", "labels"), dig(p, "spec")
+	if !strings.HasPrefix(name, "ccsbx-s-") || len(name) > 63 {
+		return "the name must start with ccsbx-s- (1)"
+	}
+	if ns := str(dig(p, "metadata", "namespace")); ns != "" && ns != "cc-sandbox" {
+		return "the namespace of the URL (1)"
+	}
+	if str(dig(labels, "cc-sandbox/role")) != "session" {
+		return "label cc-sandbox/role=session (2)"
+	}
+	if len(list(dig(p, "metadata", "finalizers"))) > 0 || dig(spec, "runtimeClassName") != nil {
+		return "no finalizers or runtimeClassName (3)"
+	}
+	if isTrue(dig(spec, "shareProcessNamespace")) || isTrue(dig(spec, "hostNetwork")) || isTrue(dig(spec, "hostPID")) || isTrue(dig(spec, "hostIPC")) {
+		return "no shared or host namespaces (3)"
+	}
+	if g, ok := dig(spec, "terminationGracePeriodSeconds").(float64); ok && (g > 60 || g < 0) {
+		return "grace 0..60 (3)"
+	}
+	if str(dig(spec, "priorityClassName")) != "ccsbx-session" {
+		return "priorityClassName must be ccsbx-session (4)"
+	}
+	if str(dig(spec, "nodeSelector", "kubernetes.io/hostname")) != "future-two" {
+		return "nodeSelector kubernetes.io/hostname=future-two (5)"
+	}
+	tol := false
+	for _, t := range list(dig(spec, "tolerations")) {
+		if str(dig(t, "key")) == "pool" && str(dig(t, "value")) == "shared" && str(dig(t, "effect")) == "NoSchedule" && str(dig(t, "operator")) == "Equal" {
+			tol = true
 		}
 	}
-	for _, v := range s.Volumes {
-		if v.EmptyDir == nil {
-			return "only emptyDir volumes"
+	if !tol {
+		return "toleration pool=shared:NoSchedule (5)"
+	}
+	if v, set := dig(spec, "automountServiceAccountToken").(bool); !set || v {
+		return "automountServiceAccountToken false (6)"
+	}
+	for _, v := range list(dig(spec, "volumes")) {
+		if dig(v, "emptyDir") == nil {
+			return "only emptyDir volumes: no Secret, projected, hostPath (6)"
+		}
+		if mi, ok := size(dig(v, "emptyDir", "sizeLimit")); !ok || mi <= 0 || mi > 40*1024 {
+			return "every emptyDir needs a sizeLimit of at most 40Gi (6)"
+		}
+	}
+	cs, inits := list(dig(spec, "containers")), list(dig(spec, "initContainers"))
+	if len(cs) != 1 || str(dig(cs[0], "name")) != "fence" || len(inits) > 1 || (len(inits) == 1 && str(dig(inits[0], "name")) != "side") {
+		return "one container named fence and at most one init container named side (7)"
+	}
+	for _, c := range append(append([]any{}, inits...), cs...) {
+		img := str(dig(c, "image"))
+		if !strings.HasPrefix(img, "ghcr.io/landovsky/ccsbx-fence@sha256:") && !strings.HasPrefix(img, "ghcr.io/landovsky/ccsbx@sha256:") {
+			return "image from our ghcr repos by digest (7)"
+		}
+		if h := img[strings.Index(img, "sha256:")+7:]; len(h) != 64 {
+			return "a full sha256 digest (7)"
+		}
+		for key, max := range map[string]int64{"memory": 4 * 1024, "ephemeral-storage": 40 * 1024} {
+			if mi, ok := size(dig(c, "resources", "limits", key)); !ok || mi <= 0 || mi > max {
+				return "limits: at most 4Gi memory, 40Gi ephemeral (8)"
+			}
+		}
+		if cpu := str(dig(c, "resources", "limits", "cpu")); cpu == "" || cpu == "0" {
+			return "a cpu limit (8)"
+		} else if n, err := strconv.Atoi(cpu); err != nil && !strings.HasSuffix(cpu, "m") || err == nil && n > 4 {
+			return "at most 4 CPU (8)"
+		}
+		// PSS restricted
+		sc := dig(c, "securityContext")
+		if isTrue(dig(sc, "allowPrivilegeEscalation")) || dig(sc, "allowPrivilegeEscalation") == nil || isTrue(dig(sc, "privileged")) {
+			return "PSS restricted: no privilege escalation, not privileged (8)"
+		}
+		if d := list(dig(sc, "capabilities", "drop")); len(d) == 0 || str(d[0]) != "ALL" || len(list(dig(sc, "capabilities", "add"))) > 0 {
+			return "PSS restricted: drop ALL, add none (8)"
+		}
+		if !isTrue(dig(sc, "runAsNonRoot")) && !isTrue(dig(spec, "securityContext", "runAsNonRoot")) {
+			return "PSS restricted: runAsNonRoot (8)"
+		}
+		if str(dig(spec, "securityContext", "seccompProfile", "type")) != "RuntimeDefault" && str(dig(sc, "seccompProfile", "type")) != "RuntimeDefault" {
+			return "PSS restricted: seccomp RuntimeDefault (8)"
 		}
 	}
 	return ""
@@ -232,10 +323,17 @@ func TestBackendRefusesBadNamesAndForeignPods(t *testing.T) {
 	if len(f.log) != 0 {
 		t.Errorf("requests were made: %v", f.log)
 	}
-	f.pods["ccsbx-s-door"] = Pod{Metadata: ObjectMeta{Name: "ccsbx-s-door", Labels: map[string]string{"cc-sandbox/role": "door"}}}
+	f.pods["ccsbx-s-door"] = rawPod(Pod{Metadata: ObjectMeta{Name: "ccsbx-s-door", Labels: map[string]string{"cc-sandbox/role": "door"}}})
 	if l, _ := b.List(ctx); len(l) != 0 {
 		t.Errorf("a door pod was listed as a session: %v", l)
 	}
+}
+
+func rawPod(p Pod) map[string]any {
+	b, _ := json.Marshal(p)
+	var m map[string]any
+	json.Unmarshal(b, &m)
+	return m
 }
 
 func TestAPIErrorsAreReportedWithTheirStatus(t *testing.T) {
@@ -246,13 +344,92 @@ func TestAPIErrorsAreReportedWithTheirStatus(t *testing.T) {
 	if !errors.As(err, &ae) || ae.Status != 403 || ae.Msg != "boom" {
 		t.Errorf("%v", err)
 	}
-	// a pod that exists but belongs to another generation is not returned as ours
-	p, _ := PodFor(goodSpec())
-	p.Metadata.Labels["ccsbx.gen"] = "9"
-	f.pods[p.Metadata.Name] = *p
-	if _, err := b.Create(context.Background(), goodSpec()); err == nil || !strings.Contains(err.Error(), "not this generation") {
-		t.Errorf("%v", err)
+}
+
+// S2: a pod already there under the name is "ours" only if it is THIS pod: the same spec hash, still
+// within the contract, and not being deleted. The server's own default tolerations do not matter.
+func TestCreateOnAConflictAcceptsOnlyTheSamePod(t *testing.T) {
+	ctx := context.Background()
+	b, f := newBackend(t)
+	if _, err := b.Create(ctx, goodSpec()); err != nil {
+		t.Fatal(err)
 	}
+	name := PodName("s0abcdefgh", 2)
+	if _, err := b.Create(ctx, goodSpec()); err != nil {
+		t.Errorf("the same pod again (with the server's default tolerations): %v", err)
+	}
+	cases := map[string]func(m map[string]any){
+		"another generation's labels": func(m map[string]any) { dig(m, "metadata", "labels").(map[string]any)["ccsbx.gen"] = "9" },
+		"a pod being deleted": func(m map[string]any) {
+			dig(m, "metadata").(map[string]any)["deletionTimestamp"] = "2026-11-20T10:00:00Z"
+		},
+		"a pod from another spec (another hash)": func(m map[string]any) {
+			dig(m, "metadata", "annotations").(map[string]any)[HashAnnotation] = strings.Repeat("0", 64)
+		},
+		"a pod with no hash": func(m map[string]any) { delete(dig(m, "metadata").(map[string]any), "annotations") },
+		"a pod that has since broken the contract": func(m map[string]any) {
+			list(dig(m, "spec", "containers"))[0].(map[string]any)["securityContext"].(map[string]any)["privileged"] = true
+		},
+	}
+	for why, mod := range cases {
+		orig := f.pods[name]
+		b2, _ := json.Marshal(orig)
+		var cp map[string]any
+		json.Unmarshal(b2, &cp)
+		mod(cp)
+		f.pods[name] = cp
+		if _, err := b.Create(ctx, goodSpec()); err == nil {
+			t.Errorf("%s was accepted as ours", why)
+		}
+		f.pods[name] = orig
+	}
+}
+
+// S6: every violation of the contract, sent RAW to the fake cluster (past PodFor and
+// CheckContract), is refused by the cluster's own rules too, for each rule the k3s side lists.
+func TestTheFakeClusterRefusesWhatTheContractRefuses(t *testing.T) {
+	covered := 0
+	for _, tc := range contractCases() {
+		_, r := newAPI(t) // a fresh cluster per case: an admitted pod would make the next one a conflict
+		p := goodPod(t)
+		tc.mod(p)
+		_, err := r.CreatePod(context.Background(), "cc-sandbox", p)
+		var ae *APIError
+		clusterRefuses := errors.As(err, &ae) && ae.Status == 422
+		if clusterRefuses {
+			covered++
+		}
+		// rules that are ours alone (the design: uids, volume ownership, per-container repos, ports,
+		// credentials in env, names derived from labels) are not the cluster's to enforce
+		if !clusterRefuses && !oursAlone(tc.name) {
+			t.Errorf("%s: the cluster's admission let it through (%v)", tc.name, err)
+		}
+	}
+	if covered < 40 {
+		t.Errorf("only %d violations were refused by the cluster's rules", covered)
+	}
+	// the good pod is admitted
+	_, r := newAPI(t)
+	if _, err := r.CreatePod(context.Background(), "cc-sandbox", goodPod(t)); err != nil {
+		t.Errorf("the cluster refused the good pod: %v", err)
+	}
+	// and an empty capability list, a short list and a bare object do not panic it
+	for _, raw := range []string{`{}`, `{"metadata":{"name":"ccsbx-s-x","labels":{"cc-sandbox/role":"session"}},"spec":{"containers":[{"name":"fence","securityContext":{"capabilities":{"drop":[]}}}]}}`} {
+		resp, err := http.Post(r.Base+"/api/v1/namespaces/cc-sandbox/pods", "application/json", strings.NewReader(raw))
+		if err != nil || resp.StatusCode != 422 {
+			t.Errorf("%s: %v %v", raw, resp, err)
+		}
+	}
+}
+
+// oursAlone names the contract cases the cluster's list does not cover: they are this design's.
+func oursAlone(name string) bool {
+	for _, w := range []string{"uid", "root", "group", "sidecar", "fence", "mount", "write", "port", "credential", "key in", "environment", "derived", "ends in a dash", "state", "relay", "volume that is not an emptyDir", "no worktree", "init container", "unset", "pod not", "extra node selector", "toleration of everything", "hostUsers", "DNS", "nameserver", "dropped with another", "requests below"} {
+		if strings.Contains(name, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // The token is read on every request: a renewal needs no restart, and a missing token is an error
@@ -275,10 +452,16 @@ func TestConnConfig(t *testing.T) {
 		os.WriteFile(p, []byte(body), 0o600)
 		return p
 	}
-	if _, err := LoadConnConfig(w(`{"server":"https://10.0.0.1:6443","token_file":"/t"}`)); err != nil {
+	if _, err := LoadConnConfig(w(`{"server":"https://10.0.0.1:6443","token_file":"/t","ca_file":"/ca"}`)); err != nil {
 		t.Error(err)
 	}
-	for _, bad := range []string{`{"server":"http://x","token_file":"/t"}`, `{"server":"https://x"}`, `{"server":"https://x","token_file":"/t","extra":1}`, `not json`, `{"server":"","token_file":"/t"}`} {
+	for _, bad := range []string{
+		`{"server":"http://x","token_file":"/t","ca_file":"/ca"}`, `{"server":"https://x","ca_file":"/ca"}`,
+		`{"server":"https://x","token_file":"/t","ca_file":"/ca","extra":1}`, `not json`, `{"server":"","token_file":"/t","ca_file":"/ca"}`,
+		`{"server":"https://x","token_file":"/t"}`, // S3: no CA, no system roots
+		`{"server":"https://x/api","token_file":"/t","ca_file":"/ca"}`, `{"server":"https://u:p@x","token_file":"/t","ca_file":"/ca"}`,
+		`{"server":"https://x?a=b","token_file":"/t","ca_file":"/ca"}`,
+	} {
 		if _, err := LoadConnConfig(w(bad)); err == nil {
 			t.Errorf("accepted %s", bad)
 		}
@@ -286,11 +469,93 @@ func TestConnConfig(t *testing.T) {
 	if _, err := NewREST(&ConnConfig{Server: "https://x", TokenFile: "/t", CAFile: w("no pem")}); err == nil {
 		t.Error("a CA file with no certificate was accepted")
 	}
+	if _, err := NewREST(&ConnConfig{Server: "https://x", TokenFile: "/t"}); err == nil || !strings.Contains(err.Error(), "ca_file is required") {
+		t.Errorf("a client with no CA was built (it would trust every public CA): %v", err)
+	}
+}
+
+// S4: a redirect is never followed (it would replay the body and keep the token); it is an error.
+func TestRedirectsAreNotFollowed(t *testing.T) {
+	var hit bool
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { hit = true }))
+	defer target.Close()
+	redir := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+r.URL.Path, http.StatusTemporaryRedirect)
+	}))
+	defer redir.Close()
+	_, r := newAPI(t)
+	c, err := NewREST(&ConnConfig{Server: "https://x", TokenFile: r.TokenFile, CAFile: writeTestCA(t)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Base = redir.URL // plain http for the test; only the redirect policy is under test
+	c.HTTP.Transport = nil
+	_, err = c.CreatePod(context.Background(), "cc-sandbox", goodPod(t))
+	var ae *APIError
+	if !errors.As(err, &ae) || ae.Status != 307 || hit {
+		t.Errorf("err=%v, the redirect target was hit: %v", err, hit)
+	}
+}
+
+func writeTestCA(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewTLSServer(http.NotFoundHandler())
+	defer srv.Close()
+	p := filepath.Join(t.TempDir(), "ca.pem")
+	pem := string(pemOf(srv))
+	os.WriteFile(p, []byte(pem), 0o600)
+	return p
+}
+
+// N2/N3: the server's words are clipped and cleaned, an empty token is refused, an oversized answer
+// is reported as such.
+func TestServerTextAndEmptyTokenAndBigAnswers(t *testing.T) {
+	f, r := newAPI(t)
+	_ = f
+	evil := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		switch req.URL.Query().Get("labelSelector") {
+		case "big":
+			w.Write(append([]byte(`{"items":[],"pad":"`), make([]byte, 9<<20)...))
+		default:
+			w.WriteHeader(422)
+			json.NewEncoder(w).Encode(map[string]string{"reason": "Invalid\x1b]52;c;Zm9v\x07", "message": "bad\x1b[2J" + strings.Repeat("x", 5000)})
+		}
+	}))
+	defer evil.Close()
+	r.Base = evil.URL
+	_, err := r.GetPod(context.Background(), "cc-sandbox", "x")
+	var ae *APIError
+	if !errors.As(err, &ae) || strings.ContainsAny(ae.Msg+ae.Reason, "\x1b\x07") || len(ae.Msg) > 1100 {
+		t.Errorf("the server's text was not cleaned: %q", err)
+	}
+	if _, err := r.ListPods(context.Background(), "cc-sandbox", "big"); err == nil || !strings.Contains(err.Error(), "larger than") {
+		t.Errorf("an oversized answer: %v", err)
+	}
+	os.WriteFile(r.TokenFile, []byte(" \n"), 0o600)
+	if _, err := r.ListPods(context.Background(), "cc-sandbox", "x"); err == nil || !strings.Contains(err.Error(), "empty") {
+		t.Errorf("an empty token was sent: %v", err)
+	}
+}
+
+// N4: a server that returns another pod, or a list item that does not round-trip, is not believed.
+func TestGetAndListDoNotTrustTheServersLabels(t *testing.T) {
+	b, f := newBackend(t)
+	ctx := context.Background()
+	b.Create(ctx, goodSpec())
+	name := PodName("s0abcdefgh", 2)
+	m := f.pods[name]
+	dig(m, "metadata", "labels").(map[string]any)["ccsbx.gen"] = "2x"
+	if _, err := b.Get(ctx, "s0abcdefgh", 2); err == nil {
+		t.Error("a pod whose generation label is '2x' was returned for generation 2")
+	}
+	if l, _ := b.List(ctx); len(l) != 0 {
+		t.Errorf("a pod that does not round-trip was listed: %v", l)
+	}
 }
 
 func TestStatusReadsTheFenceContainer(t *testing.T) {
 	p, _ := PodFor(goodSpec())
-	p.Status.Phase = "Failed"
+	p.Status = &PodStatus{Phase: "Failed"}
 	cs := ContainerStatus{Name: "fence"}
 	cs.State.Terminated = &struct {
 		ExitCode int    `json:"exitCode"`
@@ -301,4 +566,9 @@ func TestStatusReadsTheFenceContainer(t *testing.T) {
 	if st.Phase != "Failed" || st.FenceExit == nil || *st.FenceExit != 137 || st.Ref.Gen != 2 {
 		t.Errorf("%+v", st)
 	}
+}
+
+// pemOf is the certificate a TLS test server presents, as PEM.
+func pemOf(srv *httptest.Server) []byte {
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw})
 }

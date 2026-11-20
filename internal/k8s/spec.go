@@ -6,7 +6,11 @@
 package k8s
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"net"
 	"regexp"
 	"strconv"
 	"strings"
@@ -44,7 +48,13 @@ func DefaultConfig() Config {
 	}
 }
 
-// Spec is one generation.
+// HashAnnotation records the sha256 of the pod as built, so a pod that is already there under the
+// same name is accepted only if it is this very one.
+const HashAnnotation = "ccsbx.landovsky/spec-hash"
+
+// Spec is one generation. Label and OwnerUID are the caller's own bookkeeping and are NOT written
+// to the pod (the cluster has no business knowing them). FenceCmd and SideCmd must carry no
+// credential: tokens and keys reach the sidecar by exec stdin, never in the spec.
 type Spec struct {
 	Sid, Label     string
 	Gen            int
@@ -70,7 +80,35 @@ var (
 // generation of at most 4 digits the name is at most 31 characters, well inside a DNS label.
 func PodName(sid string, gen int) string { return fmt.Sprintf("ccsbx-s-%s-g%d", sid, gen) }
 
-var podNameRe = regexp.MustCompile(`^ccsbx-s-[a-z0-9][a-z0-9-]*$`)
+var (
+	podNameRe = regexp.MustCompile(`^ccsbx-s-[a-z0-9]([a-z0-9]|-[a-z0-9])*$`)
+	dnsLabel  = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+)
+
+func atoiOr(s string) int {
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+// validate checks the values the cluster owns before they go into a pod or a kubectl argv.
+func (c Config) validate() error {
+	if !dnsLabel.MatchString(c.Namespace) || len(c.Namespace) > maxName {
+		return fmt.Errorf("namespace %q is not a DNS label", c.Namespace)
+	}
+	if net.ParseIP(c.DNS) == nil {
+		return fmt.Errorf("dns %q is not an IP address", c.DNS)
+	}
+	if c.GraceSeconds < 0 || c.GraceSeconds > maxGrace {
+		return fmt.Errorf("grace %d outside 0..%d", c.GraceSeconds, maxGrace)
+	}
+	if len(c.AllowedRepos) == 0 {
+		return fmt.Errorf("no allowed image repositories")
+	}
+	return nil
+}
 
 // PodFor builds the pod with the default config.
 func PodFor(s Spec) (*Pod, error) { return DefaultConfig().PodFor(s) }
@@ -136,7 +174,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 					{Name: "worktree", MountPath: "/work"}, {Name: "out", MountPath: "/run/ccsbx/out", ReadOnly: true},
 					{Name: "in", MountPath: "/run/ccsbx/in"}, {Name: "managed", MountPath: "/etc/claude-code"},
 					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "relay-cred", MountPath: "/run/ccsbx/relay"},
-					{Name: "tmp", MountPath: "/tmp"},
+					{Name: "side-tmp", MountPath: "/tmp"},
 				},
 			}},
 			Containers: []Container{{
@@ -151,7 +189,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			}},
 			Volumes: []Volume{
 				vol("worktree", s.WorktreeMB, false), vol("out", 64, false), vol("in", 16, false), vol("managed", 8, false),
-				vol("home", 512, false), vol("tmp", 512, true), vol("side-state", 8, true), vol("relay-cred", 1, true),
+				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("relay-cred", 1, true),
 			},
 		},
 	}
@@ -161,7 +199,38 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 	if err := c.CheckContract(p); err != nil {
 		return nil, err
 	}
+	h, err := specHash(p)
+	if err != nil {
+		return nil, err
+	}
+	p.Metadata.Annotations = map[string]string{HashAnnotation: h}
 	return p, nil
+}
+
+// specHash is the sha256 of the pod's canonical JSON without its annotations.
+func specHash(p *Pod) (string, error) {
+	q := *p
+	q.Metadata.Annotations = nil
+	b, err := json.Marshal(&q)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// CheckFetched is CheckContract for a pod the server returned: the server adds its default
+// NoExecute tolerations (not-ready, unreachable), which are not ours to refuse, and nothing else.
+func (c Config) CheckFetched(p *Pod) error {
+	q := *p
+	q.Spec.Tolerations = nil
+	for _, t := range p.Spec.Tolerations {
+		if t.Effect == "NoExecute" && strings.HasPrefix(t.Key, "node.kubernetes.io/") {
+			continue
+		}
+		q.Spec.Tolerations = append(q.Spec.Tolerations, t)
+	}
+	return c.CheckContract(&q)
 }
 
 // quantity values in the units we write and the cluster limits in.
@@ -199,13 +268,23 @@ func toMilli(v string) (int64, bool) {
 }
 
 const (
-	maxMemMi  = 4 * 1024
-	maxCPUm   = 4000
-	maxEphMi  = 40 * 1024
-	maxGrace  = 60
-	sideOnlyA = "side-state"
-	sideOnlyB = "relay-cred"
+	maxMemMi = 4 * 1024
+	maxCPUm  = 4000
+	maxEphMi = 40 * 1024
+	maxGrace = 60
+	maxName  = 63
 )
+
+// volumeOwner is the allow-list of who may mount what. Volumes both containers may mount are the
+// few that carry the worktree and the two directions of the outbox; everything the sidecar keeps
+// secrets or scratch in is the sidecar's alone, and the fence's scratch and home are the fence's. In
+// particular the two never share a /tmp: a world-writable directory the agent can write is not a
+// place for the process that holds the token.
+var volumeOwner = map[string]string{
+	"worktree": "both", "out": "both", "in": "both", "managed": "both",
+	"side-state": "side", "relay-cred": "side", "side-tmp": "side",
+	"home": "fence", "tmp": "fence",
+}
 
 // CheckContract refuses a pod the cluster's admission policy would refuse, and one that departs from
 // the fence's own design (uids, volume access, ports). It reads the pod, not the Spec, so it holds
@@ -214,8 +293,14 @@ func (c Config) CheckContract(p *Pod) error {
 	var errs []string
 	bad := func(f string, a ...any) { errs = append(errs, fmt.Sprintf(f, a...)) }
 	m, s := p.Metadata, p.Spec
-	if !podNameRe.MatchString(m.Name) || len(m.Name) > 63 {
+	if !podNameRe.MatchString(m.Name) || len(m.Name) > maxName {
 		bad("name %q must match ccsbx-s-<...> and fit 63 characters", m.Name)
+	}
+	if want := PodName(m.Labels["ccsbx.sid"], atoiOr(m.Labels["ccsbx.gen"])); m.Name != want {
+		bad("name %q is not the one derived from its sid and generation labels (%q)", m.Name, want)
+	}
+	if err := c.validate(); err != nil {
+		bad("config: %v", err)
 	}
 	if m.Namespace != c.Namespace {
 		bad("namespace %q, want %q", m.Namespace, c.Namespace)
@@ -293,8 +378,8 @@ func (c Config) CheckContract(p *Pod) error {
 		if ct.Name == "side" {
 			uid = SideUID
 		}
-		if !digestRe.MatchString(ct.Image) || !c.repoAllowed(digestRe.FindStringSubmatch(ct.Image)[1]) {
-			bad("%s: image %q must be an allowed repository by sha256 digest", ct.Name, ct.Image)
+		if mm := digestRe.FindStringSubmatch(ct.Image); mm == nil || !c.repoAllowed(mm[1]) || mm[1] != c.repoFor(ct.Name) {
+			bad("%s: image %q must be %s by sha256 digest", ct.Name, ct.Image, c.repoFor(ct.Name))
 		}
 		sc := ct.SecurityContext
 		switch {
@@ -339,8 +424,11 @@ func (c Config) CheckContract(p *Pod) error {
 			if _, ok := vols[mnt.Name]; !ok {
 				bad("%s mounts %s, which is not a volume", ct.Name, mnt.Name)
 			}
-			if ct.Name == "fence" && (mnt.Name == sideOnlyA || mnt.Name == sideOnlyB) {
-				bad("fence mounts %s, which is the sidecar's alone", mnt.Name)
+			switch who := volumeOwner[mnt.Name]; {
+			case who == "":
+				bad("%s mounts %s, which is not a volume of this design", ct.Name, mnt.Name)
+			case who != "both" && who != ct.Name:
+				bad("%s mounts %s, which is %s's alone", ct.Name, mnt.Name, who)
 			}
 		}
 		for _, e := range ct.Env {
@@ -368,6 +456,18 @@ func (c Config) CheckContract(p *Pod) error {
 		return fmt.Errorf("pod %s breaks the contract: %s", m.Name, strings.Join(errs, "; "))
 	}
 	return nil
+}
+
+// repoFor is the repository each container runs from: the fence from the fence image, the sidecar
+// from the ccsbx binary image (the first and second of AllowedRepos).
+func (c Config) repoFor(container string) string {
+	if container == "side" && len(c.AllowedRepos) > 1 {
+		return c.AllowedRepos[1]
+	}
+	if len(c.AllowedRepos) > 0 {
+		return c.AllowedRepos[0]
+	}
+	return ""
 }
 
 func (c Config) repoAllowed(repo string) bool {

@@ -21,6 +21,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ErrNotFound: the API answered 404.
@@ -60,8 +61,14 @@ func LoadConnConfig(path string) (*ConnConfig, error) {
 	if err != nil || u.Scheme != "https" || u.Host == "" {
 		return nil, fmt.Errorf("%s: server %q must be an https URL", path, c.Server)
 	}
+	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.User != nil || u.Fragment != "" {
+		return nil, fmt.Errorf("%s: server %q must be scheme://host[:port] only", path, c.Server)
+	}
 	if c.TokenFile == "" {
 		return nil, fmt.Errorf("%s: token_file is required", path)
+	}
+	if c.CAFile == "" {
+		return nil, fmt.Errorf("%s: ca_file is required (the cluster CA is the only root trusted; no system roots)", path)
 	}
 	return &c, nil
 }
@@ -75,19 +82,24 @@ type REST struct {
 
 // NewREST builds a client; with CAFile set the cluster CA is the only root trusted.
 func NewREST(c *ConnConfig) (*REST, error) {
-	tr := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}
-	if c.CAFile != "" {
-		pem, err := os.ReadFile(c.CAFile)
-		if err != nil {
-			return nil, err
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(pem) {
-			return nil, fmt.Errorf("%s: no certificate in it", c.CAFile)
-		}
-		tr.TLSClientConfig.RootCAs = pool
+	if c.CAFile == "" {
+		return nil, errors.New("ca_file is required: with none, the whole public PKI would be trusted with the launcher token")
 	}
-	return &REST{Base: strings.TrimRight(c.Server, "/"), TokenFile: c.TokenFile, HTTP: &http.Client{Transport: tr, Timeout: 30 * time.Second}}, nil
+	pem, err := os.ReadFile(c.CAFile)
+	if err != nil {
+		return nil, err
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pem) {
+		return nil, fmt.Errorf("%s: no certificate in it", c.CAFile)
+	}
+	tr := &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: pool}}
+	return &REST{Base: strings.TrimRight(c.Server, "/"), TokenFile: c.TokenFile, HTTP: &http.Client{
+		Transport: tr, Timeout: 30 * time.Second,
+		// the API server does not redirect these verbs; a redirect (a proxy, an LB) would replay the
+		// body and keep the token on the new request
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+	}}, nil
 }
 
 func (r *REST) do(ctx context.Context, method, path string, body any, out any) error {
@@ -104,6 +116,9 @@ func (r *REST) do(ctx context.Context, method, path string, body any, out any) e
 	if err != nil {
 		return fmt.Errorf("launcher token: %w", err)
 	}
+	if strings.TrimSpace(string(tok)) == "" {
+		return errors.New("launcher token file is empty")
+	}
 	req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(string(tok)))
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -114,14 +129,18 @@ func (r *REST) do(ctx context.Context, method, path string, body any, out any) e
 		return err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	const maxBody = 8 << 20
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxBody+1))
+	if len(b) > maxBody {
+		return fmt.Errorf("kubernetes API answer is larger than %d bytes", maxBody)
+	}
 	if resp.StatusCode == http.StatusNotFound {
 		return ErrNotFound
 	}
 	if resp.StatusCode/100 != 2 {
 		var st struct{ Reason, Message string }
 		json.Unmarshal(b, &st)
-		return &APIError{Status: resp.StatusCode, Reason: st.Reason, Msg: st.Message}
+		return &APIError{Status: resp.StatusCode, Reason: clip(st.Reason), Msg: clip(st.Message)}
 	}
 	if out != nil {
 		return json.Unmarshal(b, out)
@@ -161,4 +180,19 @@ func (r *REST) DeletePod(ctx context.Context, ns, name string, grace int) error 
 		return nil
 	}
 	return err
+}
+
+// clip shortens a server-supplied text and drops non-printable characters (a log line or a terminal
+// must not be steered by it).
+func clip(s string) string {
+	var out []rune
+	for _, r := range s {
+		if len(out) >= 1024 {
+			break
+		}
+		if unicode.IsPrint(r) {
+			out = append(out, r)
+		}
+	}
+	return string(out)
 }

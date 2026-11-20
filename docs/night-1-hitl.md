@@ -87,7 +87,7 @@ could start a fence yet: the client that calls `ccsbx-root` (U1c) isn't built, a
 first would also cut every hp worker off from docker. A builds U1c by 11-21; D fixes two steps
 in the Gate M list (go under sudo; the seccomp step moves into the table as 8b, so §3 above
 becomes part of the gate). Merged and ready: the signer, `ccsbx-root`, the fence image.
-Steps with commands: `docs/night-1-morning.md` (§ "Gate M, step by step").
+Steps with commands: `docs/night-1-morning.md` (§ "Gate M, step by step"). The title of #4x65 says "ACL paste": that is step 11b there, a placeholder until the k3s PR number is known (`paste k3s PR <TBD>: steps follow`).
 
 ## 5 · Arm!
 

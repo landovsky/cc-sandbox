@@ -61,7 +61,7 @@ Item: 1 fence, 2 launch, 3 events. "Main" says what the code shows, not what the
 | B5 | fenced presence on the hub | `n1-c` | B6c | hub deploy is live-tool: after | done | (G) |
 | B1 | hostd as hub client | `n1-g-b1` (not merged) | B11 | yes | merge | G |
 | M2b | cross-machine msgs via hub | hub half in `n1-c`; daemon half absent | B1-B3, B5, B10, U3b | yes (local hub) | S | G |
-| B7 | ACL tag:ccsbx to hub 4011 | requirements only | k3s K5, R4 | no (ACL paste) | XS | k3s |
+| B7 | ACL tag:ccsbx to hub 4011, tag:ccsbx-hostd to peer 7480 | requirements only | k3s K5, R4 | no (ACL paste) | XS | k3s |
 | install-mac | `units/install-mac.sh`, `_ccsbx`, LaunchDaemon signer | **absent**; signer has no Mac unit | U0b | write yes; run needs Mac root | M | D |
 | C19-C20 | e2e per hook point, cockpit kill | e2e/00-07 exist against the stub only; 02-events needs C4a deployed | C4a, C18 | stub yes | S | F |
 

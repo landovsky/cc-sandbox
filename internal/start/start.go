@@ -77,6 +77,19 @@ func (d *Daemon) now() time.Time {
 	return time.Now()
 }
 
+// AbsRoots makes every entry of a comma-separated worktree-root list absolute (a relative entry is
+// taken from the current directory, as a single --worktree-root always was). Entries are not
+// otherwise touched: CheckWorkdir validates them exactly as ccsbx-root validates allowed_roots.
+func AbsRoots(list string) string {
+	parts := strings.Split(list, ",")
+	for i, p := range parts {
+		if a, err := filepath.Abs(p); err == nil && p != "" {
+			parts[i] = a
+		}
+	}
+	return strings.Join(parts, ",")
+}
+
 func (d *Daemon) runRoot() string {
 	if d.RunDir != "" {
 		return d.RunDir

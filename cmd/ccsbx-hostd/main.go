@@ -64,7 +64,7 @@ func app() *cli.App {
 				f.Int("max-total", 20000, "requests per generation in its lifetime; beyond that they are shed")
 				f.String("run-dir", "", "where generations' outboxes are read: <run-dir>/s/<sid>/g<n>/{out,in,CLOSED} (default: the state dir). Helper mode: ccsbx-root's run dir, /var/lib/ccsbx-run, where out/ is 10001:ccsbx 2770 and hostd reads it through the group; every openat2/fstat check (owner uid = --fence-uid) still applies")
 				f.String("pins", "pins.toml", "production pins file for session starts (digests that may run under any profile)")
-				f.String("worktree-root", home, "session starts: every worktree must be strictly inside this directory (symlinks resolved)")
+				f.String("worktree-root", home, "session starts: comma-separated absolute directories (the syntax and meaning of ccsbx-root.toml allowed_roots, e.g. /home/u/git,/home/u/wt): a workdir must be strictly inside one of them after symlinks are resolved; a bad entry stops every start; hidden dirs of the home are refused when a root is the home")
 				f.String("cc-version", "", "Claude Code version recorded in a started session's pin")
 				f.Int("max-live", 8, "session starts: machine_full above this many live sessions")
 				f.Int("max-per-hour", 20, "session starts: rate_capped above this many starts per caller per hour")
@@ -191,7 +191,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		}
 		d := *sd // a copy per call: Uid differs, everything else is hostd's configuration
 		d.Uid, d.RunDir = uid, runDir
-		d.ProfilesDir, d.PinsFile, d.WorktreeRoot = abs(get("profiles")), abs(get("pins")), abs(get("worktree-root"))
+		d.ProfilesDir, d.PinsFile, d.WorktreeRoot = abs(get("profiles")), abs(get("pins")), start.AbsRoots(get("worktree-root"))
 		d.Image, d.CCVersion, d.Socket = get("image"), get("cc-version"), get("tmux-socket")
 		d.MaxLive, d.MaxPerHour = num("max-live"), num("max-per-hour")
 		return d.Start(spec)

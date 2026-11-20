@@ -56,10 +56,11 @@ func adminPost(t *testing.T, url, admin, path string, body any) map[string]any {
 
 func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s msg.Session) *realMachine {
 	t.Helper()
-	tok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "spoke", "machine": name, "trees": []string{"cc-sandbox"}})["token"].(string)
+	tok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "spoke", "machine": name, "name": "ccsbx", "trees": []string{"cc-sandbox"}})["token"].(string)
 	out, j := &xOut{}, &xJ{}
 	rt := &msg.Router{Dir: &xDir{[]msg.Session{s}}, Out: out, Idle: xIdle{}, StateDir: t.TempDir()}
 	client := &hubc.Client{URL: url, Token: func() (string, error) { return tok, nil }}
+	// (hostd's own principal: spoke:<machine>/ccsbx, fenced entries and its own downlink only)
 	// the stand-in for `ccsbx-root relay-mint`: the hub's admin API, which hostd itself never holds
 	mint := func(_ context.Context, sid string, gen int, pub string, _ bool) (string, error) {
 		// may_reach is the session's MANAGER only, as root derives it (Tomas's open question #3cy2: peers stay
@@ -320,6 +321,18 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	refused("an unsigned claim of the fenced worker's id", "claims-fenced", mac, map[string]string{"id": workerID, "machine": "mac3"})
 	// 5. a bound sender outside the worker's scope (uother is not its manager)
 	refused("a bound sender outside the scope", "out-of-scope", mac, map[string]string{"id": uotherID, "machine": "mac3"})
+
+	// 5b. the two principals of a machine (hub-enforced): the owner's cannot read hostd's downlink, nor track a
+	// fenced entry; hostd's cannot track an unfenced one. (Why: a process of the owner's uid holds the owner's token.)
+	if _, _, err := mac.Poll(ctx, "spoke:mac3/ccsbx", 0, time.Second); !hubc.IsForbidden(err) {
+		t.Errorf("the owner's spoke polling hostd's downlink: want 403, got %v", err)
+	}
+	if _, err := mac.Track(ctx, []map[string]any{{"key": "ccsbx:forged", "label": "forged", "machine": "mac3", "fenced": true, "uid": "eeeeeeee-0000-4000-8000-0000000000a9", "downlink": "spoke:mac3/ccsbx"}}, 120); !hubc.IsForbidden(err) {
+		t.Errorf("the owner's spoke tracking a fenced entry: want 403, got %v", err)
+	}
+	if _, err := (&hubc.Client{URL: url, Token: func() (string, error) { return hp.tok, nil }}).Track(ctx, []map[string]any{{"key": "hp2/%1", "label": "unf", "machine": "hp2", "pane": "%1"}}, 120); !hubc.IsForbidden(err) {
+		t.Errorf("hostd's principal tracking an unfenced entry: want 403, got %v", err)
+	}
 
 	// 6. the fenced worker reaches the unfenced manager (its node is in the relay's may_reach: the manager
 	// only), typed there with the fenced stamp; the test plays the manager's spoke by polling its downlink.

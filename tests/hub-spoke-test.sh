@@ -1,7 +1,7 @@
 #!/bin/bash
 # tests/hub-spoke-test.sh: B1 against the REAL session-bus hub (dotfiles branch n1-c, which has B10/B11:
 # the live hub on :4011 does not, until Tomas merges it). It starts a throwaway hub on a spare loopback
-# port from the dotfiles library (never the live hub), mints a spoke principal, and runs
+# port from the dotfiles library (never the live hub), mints hostd's spoke principal (spoke:m1/ccsbx), and runs
 # internal/hubspoke's real-hub test: hostd's spoke registers a fenced session and receives a test
 # frame whose ack reaches the waiting /deliver. Direct mode: results are NOT EVIDENCE.
 #
@@ -26,7 +26,7 @@ NAME="sbccsbx-hub-$$"
 sb_hub_start "$NAME" SB_SECRET="$ADMIN"
 sb_hub_wait 60 || { echo "FAIL: the test hub did not come up"; sb_hub_log "$NAME" | tail -5; exit 1; }
 TOK=$(curl -s -X POST -H 'content-type: application/json' -H "authorization: Bearer $ADMIN" \
-  -d '{"role":"spoke","machine":"m1"}' "http://127.0.0.1:$SB_TEST_PORT/v1/principals" | jq -r .token)
+  -d '{"role":"spoke","machine":"m1","name":"ccsbx"}' "http://127.0.0.1:$SB_TEST_PORT/v1/principals" | jq -r .token)
 [[ "$TOK" == sbp1.* ]] || { echo "FAIL: could not mint a spoke principal"; exit 1; }
 cd "$HERE" || exit 1
 export PATH="$PATH:$HOME/.local/go/bin"

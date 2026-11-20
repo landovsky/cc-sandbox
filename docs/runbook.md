@@ -431,6 +431,13 @@ THIS machine, minted once by the hub's admin; hostd never holds the admin secret
 owner's bus sockets). It tracks its fenced sessions there (with their tree `node`, taken from the session
 record, never from the fence) and polls `spoke:<machine>/ccsbx`.
 
+**Two principals per machine, enforced by the hub.** `spoke:<machine>/ccsbx` is hostd's: it may track FENCED
+entries only, join/poll only `spoke:<machine>/ccsbx`, and may not deliver; its token lives only in the
+root:ccsbx 0640 file. `spoke:<machine>` is the owner's sessions' (ccmsg, the spoke service, hooks): UNFENCED
+entries only (any fenced flag, attach claim or routing into the ccsbx downlink is refused, 403) and it may
+not join or poll the ccsbx downlink. So an owner-uid process holding the owner's token can never act with
+hostd's rights (tracking a fenced identity, reading hostd's frames), and the reverse.
+
 - **Receiving.** A delivery that claims `fenced` is verified by hostd itself: the Ed25519 stamp (domain
   `ccsbx-stamp-v1`, 120 s skew, 10-minute nonce cache), the `to` it names must be THIS target, the sender's
   node comes from the hub's presence entry for its sid, and scope is re-checked against the target's own
@@ -452,10 +459,12 @@ record, never from the fence) and polls `spoke:<machine>/ccsbx`.
   by more than one live entry (which of them is the manager is not for it to guess): `msg.dropped`.
 - **A spoke principal's deliver** may reach its own machine's sessions and any FENCED session (the receiving
   hostd verifies and scopes it); focus, rename, drop and read stay on its own machine.
-- **Minting the machine's spoke credential** (once, as the hub admin, on the hub host; the file is root-owned,
-  0640, group ccsbx): `curl -X POST -H "authorization: Bearer $ADMIN" -d '{"role":"spoke","machine":"<machine>","trees":["cc-sandbox"]}' http://127.0.0.1:4011/v1/principals`.
-  Without `trees` the hub drops every node and nothing can be scoped or addressed; hostd logs a warning
-  when its own entries come back without one. Re-minting a machine's spoke replaces the old token.
+- **Minting hostd's credential** (once, as the hub admin, on the hub host; the file is root-owned, 0640, group
+  ccsbx): `curl -X POST -H "authorization: Bearer $ADMIN" -d '{"role":"spoke","machine":"<machine>","name":"ccsbx","trees":["cc-sandbox"]}' http://127.0.0.1:4011/v1/principals`
+  (`name` is only ever `ccsbx`; the id is `spoke:<machine>/ccsbx`). The same call without `name` mints the
+  owner's `spoke:<machine>`. Without `trees` the hub drops every node and nothing can be scoped or addressed;
+  hostd logs a warning when its own entries come back without one. Re-minting a principal replaces ITS old
+  token only; the other principal of the machine is untouched.
 
 ### Moving a machine's owner sessions onto its spoke principal (deploy gate ❓ 2xq4: NOT deployed)
 What changes: today every spoke and every reader (ccmsg, ccq, cc-pick, cc-tree, sb-hook) on a machine uses the
@@ -474,16 +483,22 @@ the default until a machine opts in.
   the spoke service's `SB_SECRET` to the token and restart it: on hp `systemctl --user edit` the spoke unit's
   Environment, then `systemctl --user restart`; on the Mac edit the LaunchAgent plist's `SB_SECRET` and
   `launchctl kickstart -k`; (5) `ccq` shows the machine's sessions again under the new principal within one
-  lease; (6) hostd uses the SAME machine token (a spoke principal is one per machine: minting a second token for the
-  machine replaces the first for everyone), in its own file (`--hub-token-file`, root:ccsbx 0640): whenever the
-  machine's token is re-minted, update every file that holds it (the owner's `spoke-token`, the spoke
-  service's `SB_SECRET`, hostd's token file) and restart those that cache it.
+  lease; (6) hostd gets its OWN principal, `spoke:<machine>/ccsbx` (minted with `"name":"ccsbx"`, above), in its own
+  file (`--hub-token-file`, root:ccsbx 0640, the ONLY place that token lives: never in the owner's
+  `spoke-token`, the spoke service's `SB_SECRET` or any owner-readable file; the hub refuses the owner's token
+  on the ccsbx downlink and on fenced entries, and hostd's on everything else). Re-minting one principal
+  replaces only its own token: update the files that hold THAT one (the owner's `spoke-token` and the spoke
+  service's `SB_SECRET` for `spoke:<machine>`; hostd's token file for the ccsbx one) and restart those that
+  cache it. Order matters only for hostd: until it has its own token, run it with `--hub-token-file` unset
+  (no hub traffic) rather than with the owner's token, which the hub now refuses for it.
 - **What keeps working**: nodes still resolve in `ccmsg` and cc-tree deliver (an entry from a spoke principal keeps
   its node when the tree is in its `trees`; a tree not listed is dropped, so mint with every tree you use).
   Standalone (no cc-sandbox) works either way: the flag is a file in the owner's config dir.
 - **Rollback**: delete `~/.config/session-bus/spoke-token`, put the shared secret back in the spoke service's
-  `SB_SECRET`, restart it; the readers go back to the shared secret at once. The principal can be revoked
-  (`DELETE /v1/principals/spoke:<machine>`) or simply left to expire (its default lifetime).
+  `SB_SECRET`, restart it; the readers go back to the shared secret at once. The principals can be revoked
+  (`DELETE /v1/principals/spoke:<machine>`, `.../spoke:<machine>/ccsbx`) or simply left to expire (their default
+  lifetime). Rolling back the owner side never touches hostd's: it keeps its own token and file; to switch hostd's hub
+  traffic off, unset `--hub-token-file` and restart it.
 - **Node bound.** The hub keeps a fenced entry's `node` only for the trees the machine's spoke principal was
   minted for (`trees`), so a fence cannot publish an owner's unrelated tree node.
 - **Known limit: the public key is supplied by the hub.** hostd verifies the stamp against the `pub` the hub

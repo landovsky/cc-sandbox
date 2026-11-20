@@ -306,3 +306,19 @@ func TestWithdrawnVerbStaysWithdrawnAfterARestart(t *testing.T) {
 		t.Fatalf("%d verbs back after restart", len(got))
 	}
 }
+
+// context: a verb could not be withdrawn (the disk is full): it stays queued although its session
+// was told it failed. The queue can't be trusted, so it refuses everything until a restart.
+func TestQueueThatCannotWithdrawIsBroken(t *testing.T) {
+	r := newRig(t)
+	it, _ := r.q.Enqueue("production", Item{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAA", Sid: "s1", Gen: 1, Rid: "r", Type: "ccf.mark", Body: json.RawMessage(`{}`)})
+	r.q.mu.Lock()
+	r.q.realms["production"].f.Close() // the file is gone: neither the write nor the cut-back can work
+	r.q.mu.Unlock()
+	if err := r.q.Withdraw("production", it.ID); err == nil || !errors.Is(err, ErrBroken) {
+		t.Fatalf("%v", err)
+	}
+	if _, err := r.q.Enqueue("production", Item{ID: "01ARZ3NDEKTSV4RRFFQ69G5FAB", Sid: "s1", Gen: 1, Rid: "r2", Type: "ccf.mark", Body: json.RawMessage(`{}`)}); !errors.Is(err, ErrBroken) {
+		t.Fatalf("a broken queue accepted a verb: %v", err)
+	}
+}

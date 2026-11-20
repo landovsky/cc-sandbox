@@ -349,7 +349,11 @@ func (s *Store) Append(e Event) (Record, error) {
 		}
 	}
 	if werr != nil {
-		if terr := s.cur.Truncate(good); terr != nil {
+		terr := s.cur.Truncate(good)
+		if terr == nil {
+			terr = s.cur.Sync() // the cut-back itself must be durable, or a crash brings the half line back
+		}
+		if terr != nil {
 			s.broken = fmt.Errorf("%w: write failed (%v) and could not be rolled back (%v)", ErrBroken, werr, terr)
 			return rec, s.broken
 		}

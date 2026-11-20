@@ -103,7 +103,12 @@ type rec struct {
 	NB   time.Time `json:"nb,omitempty"`
 }
 
+// ErrBroken: the realm's queue file is in a state we can't vouch for; every write is refused until
+// the daemon restarts and replays it.
+var ErrBroken = errors.New("queue_broken")
+
 type realmQ struct {
+	broken  error
 	f       *os.File
 	seq     int64
 	pending map[string]*Item  // by id
@@ -213,6 +218,9 @@ func (q *Queue) realm(name string) (*realmQ, error) {
 // stays for the next record to run on from (which a restart would answer by truncating away every
 // verb after it).
 func (r *realmQ) write(rc rec) error {
+	if r.broken != nil {
+		return r.broken
+	}
 	b, _ := json.Marshal(rc)
 	st, err := r.f.Stat()
 	if err != nil {
@@ -223,8 +231,14 @@ func (r *realmQ) write(rc rec) error {
 		err = r.f.Sync()
 	}
 	if err != nil {
-		if terr := r.f.Truncate(st.Size()); terr != nil {
-			return fmt.Errorf("%w (and the cut-back failed: %v)", err, terr)
+		terr := r.f.Truncate(st.Size())
+		if terr == nil {
+			terr = r.f.Sync() // the cut-back must be durable too
+		}
+		if terr != nil {
+			// We no longer know what is in the file: refuse every further write for this realm.
+			r.broken = fmt.Errorf("%w: write failed (%v) and the cut-back failed (%v)", ErrBroken, err, terr)
+			return r.broken
 		}
 		return err
 	}
@@ -246,7 +260,11 @@ func (q *Queue) Withdraw(realm, id string) error {
 	}
 	res := Result{Status: "error", Code: "withdrawn"}
 	if err := r.write(rec{Op: "res", ID: id, Res: &res, TS: q.now().UTC()}); err != nil {
-		return err
+		// The verb stays queued although its session was told it failed: the cockpit would apply
+		// it and the retry again. A queue that can't even record a withdrawal (a full disk) is
+		// not trustworthy: mark it broken so nothing more is accepted into it.
+		r.broken = fmt.Errorf("%w: a verb could not be withdrawn (%v)", ErrBroken, err)
+		return r.broken
 	}
 	delete(r.pending, id)
 	return nil

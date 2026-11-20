@@ -637,3 +637,32 @@ func TestRelayedMessageInScopeAllow(t *testing.T) {
 		t.Fatalf("%+v %v", res, w.out.lines)
 	}
 }
+
+// context: replace takes seconds (stop, wait, launch). The router's lock must not be held for it,
+// or every other session's messages stall behind one replace; and a replace that fails leaves the
+// pane as idle as it was.
+func TestWithIdleDoesNotHoldTheRouterLockWhileItActs(t *testing.T) {
+	w := newWorld(t, sess("sM", "cc-sandbox:mgr", true, ""), sess("sN", "cc-sandbox:n", true, ""))
+	w.stop("sM")
+	w.now = w.now.Add(time.Second)
+	done := make(chan struct{})
+	go func() {
+		w.r.WithIdle("sM", 1, func() error { w.r.IdleNow("sN", 1); return nil }) // takes the lock: deadlocks if held
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the router lock was held during act")
+	}
+}
+
+func TestWithIdleFailureLeavesThePaneIdle(t *testing.T) {
+	w := newWorld(t, sess("sM", "cc-sandbox:mgr", true, ""))
+	w.stop("sM")
+	w.now = w.now.Add(time.Second)
+	w.r.WithIdle("sM", 1, func() error { return os.ErrPermission })
+	if !w.r.IdleNow("sM", 1) {
+		t.Fatal("a failed replace left the pane marked busy")
+	}
+}

@@ -133,3 +133,13 @@ func TestUnknownSocketGroupFailsClosed(t *testing.T) {
 		t.Fatal("the daemon started")
 	}
 }
+
+// context: the fence-event budget is a tunable, so it is a flag with an env var.
+func TestEventBudgetHasFlags(t *testing.T) {
+	_, h := runHostd("run", "--help")
+	for _, w := range []string{"-event-rate", "-event-burst", "CCSBX_EVENT_RATE", "CCSBX_EVENT_BURST"} {
+		if !strings.Contains(h, w) {
+			t.Errorf("--help does not list %s", w)
+		}
+	}
+}

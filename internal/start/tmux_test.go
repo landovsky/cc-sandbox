@@ -5,6 +5,9 @@
 package start
 
 import (
+	"time"
+
+	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -34,10 +37,11 @@ func TestTmuxHardeningIsInTheSameInvocation(t *testing.T) {
 	}
 }
 
-// context: hostd runs as a service uid and the owner attaches from another uid through a shared
-// socket path (--tmux-socket /run/ccsbx/tmux.sock). tmux creates its socket 0600, so the launcher
-// must make it 0660 itself, and the server must be addressed with -S, not -L.
-func TestAbsoluteTmuxSocketIsUsedWithSAndMadeGroupReachable(t *testing.T) {
+// context: hostd runs as a service uid and its tmux server lives on a shared socket PATH
+// (--tmux-socket /run/ccsbx/tmux.sock). The server must be addressed with -S, and the socket must
+// stay 0600: a group-writable tmux socket would let any process of a group member type into fenced
+// panes and run commands as the service uid. The owner gets in through `ccsbx-root attach`.
+func TestAbsoluteTmuxSocketIsUsedWithSAndStaysPrivate(t *testing.T) {
 	if _, err := exec.LookPath("tmux"); err != nil {
 		t.Skip("no tmux")
 	}
@@ -54,21 +58,22 @@ func TestAbsoluteTmuxSocketIsUsedWithSAndMadeGroupReachable(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, err := os.Stat(sock)
-	if err != nil || st.Mode().Perm() != 0o660 {
-		t.Fatalf("socket %v err %v", st, err)
+	if err != nil || st.Mode().Perm()&0o077 != 0 {
+		t.Fatalf("socket %v err %v: must not be open to group or others", st, err)
 	}
 	if !tl.Alive("sabc123") {
 		t.Fatal("the session is not on the -S server")
 	}
 }
 
-// context: if the socket can't be made 0660 (it is not where it should be), the session must not be
-// left running on a socket with the wrong mode: Launch fails.
-func TestLaunchFailsClosedWhenTheSharedSocketCannotBeChmodded(t *testing.T) {
-	tl := &TmuxLauncher{Exe: "/bin/ccsbx", Socket: "/nonexistent-dir/t.sock", Command: func(string, ...string) *exec.Cmd { return exec.Command("true") }}
-	rec := &Record{Sid: "sabc123", Gen: 1}
-	rec.Spec.Workdir.Path = "/var/tmp"
-	if err := tl.Launch(rec); err == nil || !strings.Contains(err.Error(), "0660") {
-		t.Fatalf("%v", err)
+// context: a wedged tmux server must not stall the daemon: the launcher's calls are bounded too.
+func TestLauncherTmuxCallsTimeOut(t *testing.T) {
+	old := tmuxsock.Timeout
+	tmuxsock.Timeout = 200 * time.Millisecond
+	defer func() { tmuxsock.Timeout = old }()
+	tl := &TmuxLauncher{Exe: "x", Socket: "x", Command: func(string, ...string) *exec.Cmd { return exec.Command("sleep", "30") }}
+	t0 := time.Now()
+	if tl.Alive("s1") || time.Since(t0) > 3*time.Second {
+		t.Fatalf("alive or slow: %s", time.Since(t0))
 	}
 }

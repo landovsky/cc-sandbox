@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -91,7 +92,9 @@ func verbHandler(q *verbq.Queue, d *start.Daemon, j appender, rt *msg.Router) ho
 			if _, err := j.Append(journal.Event{ID: r.ID, Sid: r.Sid, Gen: r.Gen, Node: r.Label, Realm: realm, Src: "fence", Type: r.Type, Data: data}); err != nil {
 				// The session is told io_error and will retry under a new rid: the verb must not
 				// stay queued too, or the cockpit applies it twice.
-				_ = q.Withdraw(realm, it.ID)
+				if werr := q.Withdraw(realm, it.ID); werr != nil {
+					log.Printf("ccsbx-hostd: verb %s could not be withdrawn after a journal failure (%v); the queue for realm %s is now refused until restart", it.ID, werr, realm)
+				}
 				return hostd.Reply{Status: "error", Result: map[string]string{"code": "io_error"}}
 			}
 		}

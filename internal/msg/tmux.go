@@ -5,7 +5,6 @@
 package msg
 
 import (
-	"bytes"
 	"fmt"
 	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
 	"os/exec"
@@ -18,23 +17,7 @@ import (
 var ExecTimeout = 5 * time.Second
 
 // runCmd runs c, killing it after ExecTimeout, and returns its combined output.
-func runCmd(c *exec.Cmd) ([]byte, error) {
-	var buf bytes.Buffer
-	c.Stdout, c.Stderr = &buf, &buf
-	if err := c.Start(); err != nil {
-		return nil, err
-	}
-	done := make(chan error, 1)
-	go func() { done <- c.Wait() }()
-	select {
-	case err := <-done:
-		return buf.Bytes(), err
-	case <-time.After(ExecTimeout):
-		_ = c.Process.Kill()
-		<-done
-		return buf.Bytes(), fmt.Errorf("timed out after %s", ExecTimeout)
-	}
-}
+func runCmd(c *exec.Cmd) ([]byte, error) { return tmuxsock.RunFor(c, ExecTimeout) }
 
 // Tmux delivers into the pane of session `sid` on `tmux -L Socket`. It is the only delivery on
 // the Mac and the fallback on Linux until the native inbox (C0b, needs root). The router calls

@@ -32,17 +32,17 @@ func (t *TmuxLauncher) Launch(r *Record) error {
 	args := []string{"new-session", "-d", "-s", r.Sid, "-c", r.Spec.Workdir.Path, t.Exe, "run", "--sid", r.Sid, "--gen", strconv.Itoa(r.Gen)}
 	args = append(args, t.Env...)
 	args = append(args, ";", "set-option", "-g", "set-clipboard", "off", ";", "set-option", "-g", "allow-passthrough", "off")
-	if out, err := t.cmd(args...).CombinedOutput(); err != nil {
+	if out, err := tmuxsock.Run(t.cmd(args...)); err != nil {
 		return fmt.Errorf("tmux new-session: %v: %s", err, out)
 	}
-	// A shared socket path (the service uid's tmux, reached by the owner's uid through a group):
-	// tmux creates it 0600, so make it 0660 ourselves. Fail closed: if that can't be done the
-	// session is ended again rather than left on a socket nobody in the group can reach, or one
-	// with the wrong mode.
+	// The socket stays as tmux made it: 0600, owned by this uid. It is NOT opened to a group: a
+	// group-writable tmux socket would let any process of a group member type into fenced panes
+	// and run commands as this uid, undoing the privilege split. The owner reaches a pane
+	// through `ccsbx-root attach <sid>` instead.
 	if tmuxsock.IsPath(t.Socket) {
-		if err := os.Chmod(t.Socket, 0o660); err != nil {
+		if st, err := os.Stat(t.Socket); err != nil || st.Mode().Perm()&0o077 != 0 {
 			_ = t.Stop(r.Sid)
-			return fmt.Errorf("tmux socket %s: cannot set mode 0660 (session ended): %v", t.Socket, err)
+			return fmt.Errorf("tmux socket %s is missing or readable by others (session ended): %v", t.Socket, err)
 		}
 	}
 	return nil
@@ -50,10 +50,12 @@ func (t *TmuxLauncher) Launch(r *Record) error {
 
 // Stop ends the session's pane (and so its fence run: `ccsbx run` cleans its container up).
 func (t *TmuxLauncher) Stop(sid string) error {
-	return t.cmd("kill-session", "-t", "="+sid).Run()
+	_, err := tmuxsock.Run(t.cmd("kill-session", "-t", "="+sid))
+	return err
 }
 
 // Alive reports whether the session's tmux session exists.
 func (t *TmuxLauncher) Alive(sid string) bool {
-	return t.cmd("has-session", "-t", "="+sid).Run() == nil
+	_, err := tmuxsock.Run(t.cmd("has-session", "-t", "="+sid))
+	return err == nil
 }

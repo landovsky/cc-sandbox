@@ -59,6 +59,8 @@ func app() *cli.App {
 				f.Int("max-bytes", 64<<10, "largest request file; bigger (even sparse) is refused unread")
 				f.Int("rate", 10, "requests per second per outbox")
 				f.Int("burst", 20, "token bucket size per outbox")
+				f.Int("event-rate", 50, "fence hook events journaled per second per outbox; beyond the burst they are dropped and counted (events_shed)")
+				f.Int("event-burst", 500, "event bucket size per outbox")
 				f.Int("max-total", 20000, "requests per generation in its lifetime; beyond that they are shed")
 				f.String("tmux-socket", "ccsbx", "tmux server the session panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (a socket shared between uids; hostd makes it 0660)")
 				f.String("machine", hostname(), "this machine's name, stamped on journal records")
@@ -138,7 +140,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	} // a message is typed only into a pane whose last hook event is Stop
 	h := hostd.New(hostd.Config{Journal: j, OnEvent: onEvent, OnTick: func() { rt.Pump(pumpReply(get("state"))) },
 		StateDir: get("state"), FenceUID: num("fence-uid"), MaxBytes: int64(num("max-bytes")),
-		Handler: m.handle, Rate: float64(num("rate")), Burst: num("burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
+		Handler: m.handle, Rate: float64(num("rate")), Burst: num("burst"), EventRate: float64(num("event-rate")), EventBurst: num("event-burst"), MaxTotal: num("max-total"), Logf: lg.Printf,
 	})
 	if get("once") == "true" {
 		st := h.Scan()

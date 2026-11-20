@@ -336,19 +336,34 @@ func (r *Router) deliverOwner(who string, target Session, text string) Result {
 }
 
 // WithIdle runs act only if the session is at its prompt, and marks the pane busy first, under
-// the router's lock: the idle check and the action are one step, so a queued message can't be
-// pumped into the pane between them (C9b's replace would kill a turn that message started).
+// the router's lock; the action itself runs outside it. The idle check and the busy mark are one
+// step, so a queued message can't be pumped into the pane between them (C9b's replace would kill a
+// turn that message started), and other sessions' messages are not held up while it runs.
 // It reports whether act ran.
 func (r *Router) WithIdle(sid string, gen int, act func() error) (bool, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.cfg()
 	r.load()
 	if !r.ready(sid, gen) {
+		r.mu.Unlock()
 		return false, nil
 	}
-	r.delivered[sid] = r.now()
-	return true, act()
+	prev, had := r.delivered[sid]
+	r.delivered[sid] = r.now() // busy: Pump and senders see this pane as not at its prompt
+	r.mu.Unlock()
+	// act (a stop and a launch: seconds) runs WITHOUT the router's lock, so every other
+	// session's messages keep flowing; this pane stays busy until its next Stop.
+	err := act()
+	if err != nil { // nothing changed: the pane is as idle as it was
+		r.mu.Lock()
+		if had {
+			r.delivered[sid] = prev
+		} else {
+			delete(r.delivered, sid)
+		}
+		r.mu.Unlock()
+	}
+	return true, err
 }
 
 // IdleNow reports whether the session is at its input prompt right now.

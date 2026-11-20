@@ -219,20 +219,33 @@ print(urllib.request.urlopen(r,timeout=5).read().decode())"
     tok=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["token"])' "$STATE/secrets.json")
     key=$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["key"])' "$STATE/secrets.json")
     # Everything the fence can read: every process's environ and cmdline, its env, and every
-    # readable file outside /proc,/sys,/dev; plus how docker describes the container.
-    dump=$( { docker exec "ccsbx-$sid-g1" sh -c 'cat /proc/[0-9]*/environ /proc/[0-9]*/cmdline 2>/dev/null; env; find / -xdev \( -path /proc -o -path /sys -o -path /dev \) -prune -o -type f -readable -size -2M -exec cat {} + 2>/dev/null'; docker inspect "ccsbx-$sid-g1"; } | tr '\0' '\n')
+    # readable regular file on EVERY mount the fence has (read from /proc/mounts: /tmp, the home,
+    # /run/ccsbx/*, the workdir are separate mounts that `find / -xdev` would skip); plus how docker
+    # describes the container.
+    scan='cat /proc/[0-9]*/environ /proc/[0-9]*/cmdline 2>/dev/null; env
+      while read -r _ mp fst _; do
+        case "$fst" in proc|sysfs|devpts|devtmpfs|cgroup|cgroup2|mqueue|securityfs|debugfs|tracefs|bpf|pstore) continue;; esac
+        find "$mp" -xdev -type f -readable -size -2M -exec cat {} + 2>/dev/null
+      done < /proc/mounts'
+    dump_now() { { docker exec "ccsbx-$sid-g1" sh -c "$scan"; docker inspect "ccsbx-$sid-g1"; } | tr '\0' '\n'; }
+    dump=$(dump_now)
     [ -n "$dump" ] || fail "scan produced nothing"
     echo "$dump" | grep -qF "$sid" || fail "scan control failed: the fence's own sid is not in the dump, so the scan sees too little"
-    for needle in "${tok##*.}" "$(echo "$tok" | cut -d. -f2)" "$key" "Bearer ey"; do
+    sig=${tok##*.}; pay=$(echo "$tok" | cut -d. -f2)
+    for needle in "$sig" "$pay" "$key" "Bearer ey"; do
       echo "$dump" | grep -qF -- "$needle" && fail "secret material visible in the fence (needle ${needle:0:12}…)"
     done
-    # Positive control (the scan must be able to fail): plant the token in the fence's /tmp and the
-    # same scan has to find it. The container is thrown away at the end of the test.
-    docker exec "ccsbx-$sid-g1" sh -c "echo ${tok##*.} > /tmp/planted"
-    docker exec "ccsbx-$sid-g1" sh -c 'cat /tmp/planted' | grep -qF "${tok##*.}" || fail "positive control: the planted token was not found by the scan method"
-    docker exec "ccsbx-$sid-g1" rm -f /tmp/planted
+    # Positive controls (the scan must be able to fail): plant one piece of the token ONLY on each
+    # separate mount the agent writes to, re-run the same scan, and require every piece to show up.
+    # A scan that skips a mount goes red here.
+    docker exec "ccsbx-$sid-g1" sh -c "echo $sig > /tmp/planted" || fail "control: cannot write /tmp in the fence"
+    docker exec "ccsbx-$sid-g1" sh -c "echo $pay > \"\$HOME/planted\"" || fail "control: cannot write the fence's home"
+    d2=$(dump_now)
+    echo "$d2" | grep -qF "$sig" || fail "control: the token planted in /tmp was not found, the scan misses that mount"
+    echo "$d2" | grep -qF "$pay" || fail "control: the token planted in the home was not found, the scan misses that mount"
+    docker exec "ccsbx-$sid-g1" sh -c 'rm -f /tmp/planted "$HOME/planted"'
     # fwd's own process is not in the fence's pid namespace.
-    docker exec "ccsbx-$sid-g1" sh -c 'grep -l '[-][-]door' /proc/[0-9]*/cmdline 2>/dev/null' | grep -q . && fail "the forwarder process is visible from the fence"
+    docker exec "ccsbx-$sid-g1" sh -c "grep -l '[-][-]door' /proc/[0-9]*/cmdline 2>/dev/null" | grep -q . && fail "the forwarder process is visible from the fence"
     ok "after a successful model call, no token, key or Bearer header anywhere the fence can read ($(echo "$dump" | wc -l) lines scanned, control found)"
   fi;;
 

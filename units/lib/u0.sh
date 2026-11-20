@@ -34,14 +34,10 @@ k8s_machine = "${K8S_MACHINE}"
 hub_url = "http://127.0.0.1:4011"
 hub_secret = "/etc/ccsbx/hub-admin.secret"
 EOT
-  note "the hub's admin secret, for ccsbx-root's relay mint: copied from $HUB_SECRET_FROM, root 0600, never printed, never leaves hp"
+  note "the hub's admin secret (the shared SB_SECRET), for ccsbx-root's relay mint: the first line of $HUB_SECRET_FROM, root 0600, never printed, never leaves hp"
   # plan never reads the file (and `plan -v` must not print it): the placeholder stands in for it
-  if [ "$MODE" = install ]; then put /etc/ccsbx/hub-admin.secret 0600 root:root < <(tr -d '\r\n' < "$HUB_SECRET_FROM")
+  if [ "$MODE" = install ]; then put /etc/ccsbx/hub-admin.secret 0600 root:root < <(head -n1 "$HUB_SECRET_FROM" | tr -d '\r')
   else put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"(the secret, read from the --hub-secret-from file at install)"; fi
-  if [ -n "$HUB_CLAIMS_DIR" ]; then
-    note "the hub's node claims: its own 0700 directory, owned by the hub's user ($OWNER); set SB_NODE_CLAIMS_FILE=$HUB_CLAIMS_DIR/claims.json in the hub's unit (dotfiles; not edited here)"
-    cmd install -d -o "$OWNER" -g "$OWNER" -m 0700 "$HUB_CLAIMS_DIR"
-  else note "no --hub-claims-dir: SB_NODE_CLAIMS_FILE is not set up (node claims are lost at a hub restart; set it in the hub's unit)"; fi
   note "a root-owned copy of the pins: ccsbx-root and hostd read THIS, never the owner-writable repo"
   put /etc/ccsbx/pins.toml 0644 root:root < "$REPO_DIR/pins.toml"
   note "pins.toml is empty today: only e2e candidate images run, as expected, until U1a is pinned"
@@ -262,7 +258,7 @@ u0_uninstall() {
   try gpasswd -d "$(real_user)" ccsbx-clients
   try systemctl daemon-reload
   note "NOT undone, on purpose: docker/lxd membership and the lxd snap (re-add with gpasswd -a $(real_user) docker if you want invariant 14 waived again);"
-  note "  users ccsbx, ccsbx-keys, ccsbx-launch, ccsbx-term (and /var/lib/ccsbx-launch with its kubeconfig) and group ccsbx-clients; the hub claims directory; /var/lib/ccsbx; /etc/ccsbx and $LIBEXEC (now empty)"
+  note "  users ccsbx, ccsbx-keys, ccsbx-launch, ccsbx-term (and /var/lib/ccsbx-launch with its kubeconfig) and group ccsbx-clients; /var/lib/ccsbx; /etc/ccsbx and $LIBEXEC (now empty)"
   step "U0 undo: retire the backup so a later install starts from a fresh first backup"
   cmd mv "$RESTORE_DIR" "$RESTORE_DIR.undone-$(date +%Y%m%d-%H%M%S)"
 }

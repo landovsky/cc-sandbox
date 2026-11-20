@@ -474,11 +474,15 @@ t "r3: the signer's scope allows future-two as well (else the launcher's token i
 t "r3: ccsbx-root.toml names launch_user, term_user, signer_user, the kubeconfig under ccsbx-launch, k8s_machine, the hub" bash -c 'for k in "launch_user = \"ccsbx-launch\"" "term_user = \"ccsbx-term\"" "signer_user = \"ccsbx-keys\"" "kubeconfig = \"/var/lib/ccsbx-launch/launcher.kubeconfig\"" "k8s_machine = \"future-two\"" "hub_url = \"http://127.0.0.1:4011\"" "hub_secret = \"/etc/ccsbx/hub-admin.secret\""; do grep -qF "$k" "$1" || { echo "missing $k"; exit 1; }; done' _ "$toml"
 t "r3: the pod and relay verbs are on" bash -c 'grep "^verbs" "$1" | grep -q "pod-create.*pod-load.*pod-stop.*pod-status.*relay-mint"' _ "$toml"
 t "r3: hub-admin.secret is root:root 0600 and holds the secret without a newline's worth of extras" bash -c 'grep -q "^chown root:root /etc/ccsbx/hub-admin.secret" "$1/rec/cmds" && [ "$(stat -c %a "$1/root/etc/ccsbx/hub-admin.secret")" = 600 ] && [ "$(cat "$1/root/etc/ccsbx/hub-admin.secret")" = hub-secret-value-not-printed ]' _ "$d"
+printf 'first-line-secret\nsecond line must not be copied\n' > "$d/hubsecret2"; d2="$(fx r3two)"; HUBSRC="$d/hubsecret2" ins "$d2" install --yes >/dev/null 2>&1
+t "r3: only the FIRST LINE of the owner's secret file is copied" bash -c '[ "$(cat "$1/root/etc/ccsbx/hub-admin.secret")" = first-line-secret ]' _ "$d2"
+out="$(CCSBX_OWNER=tomas "$inst" plan 2>&1)"
+t "r3: with no option the source is ~owner/.config/session-bus/secret" bash -c 'grep -q "/.config/session-bus/secret" <<<"$1"' _ "$out"
 t "r3: the secret is never printed by the install" bash -c '! grep -q hub-secret-value-not-printed "$1" "$2"' _ "$d/out" "$d/err"
 t "r3: the sudoers rule is unchanged: one rule for ccsbx-root covers the pod verbs for the owner and hostd" bash -c 'f="$1/root/etc/sudoers.d/.90-ccsbx-root.new"; [ "$(grep -c "^[a-z][a-z0-9_-]* ALL=(root) NOPASSWD: /usr/local/sbin/ccsbx-root\$" "$f")" = 2 ] && ! grep -q ccsbx-launch "$f"' _ "$d"
 plan="$(ins "$d" plan -v 2>&1)"
 t "r3: plan -v does not print the secret either" bash -c '! grep -q hub-secret-value-not-printed <<<"$1"' _ "$plan"
-for bad in "" "/nonexistent-hub-secret"; do
+for bad in "/nonexistent-hub-secret"; do
   d="$(fx r3b)"; HUBSRC="$bad" ins "$d" install --yes >/dev/null 2>"$d/err"; rc=$?
   t "r3: hub secret source '${bad:-unset}' is refused (exit 3), nothing changed" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/rec/cmds" ] && [ ! -e "$2/root/etc/ccsbx" ]' _ "$rc" "$d"
 done
@@ -488,10 +492,6 @@ d="$(fx r3d)"; ln -s "$d/hubsecret" "$d/hublink"; HUBSRC="$d/hublink" ins "$d" i
 t "r3: a symlink as the secret source is refused (exit 3)" test "$rc" -eq 3
 d="$(fx r3e)"; ins "$d" install --yes --k8s-machine "$(hostname -s | tr A-Z a-z)" >/dev/null 2>&1; rc=$?
 t "r3: a k8s machine equal to this machine is refused (exit 3)" test "$rc" -eq 3
-d="$(fx r3f)"; mkdir -p "$d/hubs"; ins "$d" install --yes --hub-claims-dir /var/lib/ccsbx-hub-claims >/dev/null 2>&1; rc=$?
-t "r3: --hub-claims-dir makes a 0700 directory owned by the owner" bash -c '[ "$1" -eq 0 ] && grep -q "^install -d -o tomas -g tomas -m 0700 /var/lib/ccsbx-hub-claims" "$2/rec/cmds"' _ "$rc" "$d"
-d="$(fx r3g)"; ins "$d" install --yes --hub-claims-dir '/var/lib/x/../y' >/dev/null 2>&1; rc=$?
-t "r3: a claims dir with .. is refused (exit 3)" test "$rc" -eq 3
 d="$(fx r3h)"; ins "$d" install --yes >/dev/null 2>&1
 out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
 t "r3: check looks at ccsbx-launch, ccsbx-term, their uids, the launch dir and the hub secret" bash -c 'for k in "user ccsbx-launch exists" "user ccsbx-term exists" "five different uids\|share uid" "/var/lib/ccsbx-launch is" "hub-admin.secret is"; do grep -q "$k" <<<"$1" || { echo "no check: $k"; exit 1; }; done' _ "$out"

@@ -91,6 +91,9 @@
      does the steps in the order `plan` printed. Steps that can fail on this machine come before the
      sudoers change, and the whole sudoers config is re-checked after it. It stops at the first
      failed step, says which, and says `PARTIAL INSTALL` with the undo command.
+     It prints `DONE` only after hostd and the signer are up. hostd listens on loopback only
+     (`127.0.0.1:7480`, with a token file), so the firewall question (S11) does not arise.
+     Before step 2 do the manual checks listed in `docs/night-1-morning.md` (S5, S9, S14, S15).
   3. `sudo reboot` (group changes apply to new login sessions only).
   4. `units/install-linux.sh check`.
 - **Check:** `check` exits 0 after the reboot and prints one `ok`/`FAIL` line per step. Before the

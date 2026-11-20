@@ -400,6 +400,14 @@ if unshare -Urm true 2>/dev/null; then
   kill "$upid" 2>/dev/null; wait "$upid" 2>/dev/null
 else echo "ok   - (skipped: unprivileged user namespaces are not available here)"; fi
 
+echo "# Gate M review: the post-install check asks the signer to sign; check verifies the seccomp profile; tmux comment"
+d="$(fx g)"; CCSBX_TEST_SIGN_RC=1 ins "$d" install --yes >"$d/out" 2>"$d/err"; rc=$?
+t "G: a signer that does not sign the test claim (bad scope) means NOT DONE, even though its socket exists" bash -c '[ '"$rc"' -eq 1 ] && grep -q "did not sign" "$1" && ! grep -q "^DONE" "$2"' _ "$d/err" "$d/out"
+d="$(fx gok)"; ins "$d" install --yes >"$d/out" 2>&1; t "G: …and DONE when it signs" bash -c 'grep -q "^DONE" "$1" && grep -qx sign-probe "$2"' _ "$d/out" "$d/rec/cmds"
+out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
+t "G: check has a seccomp profile line (a FAIL here, nothing installed in the fake root)" grep -q 'seccomp profile verifies' <<<"$out"
+t "G: the tmux unit comment no longer claims -f /dev/null gives no prefix or status line, and names the new-window cost" bash -c '! grep -q "no config file, no status line, no prefix" "$1" && grep -q "built-in defaults" "$1" && grep -q "new-window" "$1"' _ "$tmx"
+
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"
 

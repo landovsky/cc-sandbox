@@ -33,6 +33,8 @@ StateDirectoryMode=0750
 RuntimeDirectory=ccsbx-api
 RuntimeDirectoryMode=0700
 # /run/ccsbx (the tmux socket, 0600) belongs to ccsbx-tmux.service; hostd only connects to it and never starts the server.
+# NOTE: uid ccsbx can open a tmux window on that socket, outside this sandbox, so the sandbox does not contain a compromised
+# hostd (a known cost, see ccsbx-tmux.service); what it limits is accidents and the rest of the system's files.
 # The API socket needs a directory the owner can traverse, so it lives in /run/ccsbx-api (made 0755 below); the
 # socket itself is ccsbx:ccsbx-clients 0660 (--socket-group), so the directory mode grants nothing by itself.
 ExecStartPre=+/usr/bin/chmod 0755 /run/ccsbx-api

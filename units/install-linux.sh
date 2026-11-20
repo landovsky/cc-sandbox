@@ -207,7 +207,13 @@ post_install_check() {
     done
   fi
   [ "$ready" = 0 ] || die "ccsbx-hostd or the signer is not up (a crash loop?): see 'journalctl -u ccsbx-hostd -u ccsbx-signer'. NOT DONE"
-  note "up"
+  # the signer is socket-activated: the socket file exists even if the service exits 2 on a bad scope, so ask it to sign
+  if [ "${EXEC%%:*}" = record ]; then rec sign-probe; [ "${CCSBX_TEST_SIGN_RC:-0}" = 0 ] || die "the signer did not sign the in-scope test claim (bad scope or key?): see 'journalctl -u ccsbx-signer'. NOT DONE"
+  else
+    CHECK_FAIL=0; sign_check
+    [ "$CHECK_FAIL" -eq 0 ] || die "the signer did not sign the in-scope test claim (see above; 'journalctl -u ccsbx-signer'). NOT DONE"
+  fi
+  note "up, and the signer signs"
 }
 steps_install() {
   if [ "$MODE" = install ]; then step "back up every file the install replaces (once; never overwritten)"; backup_originals; fi

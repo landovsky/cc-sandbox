@@ -169,6 +169,7 @@ u0_check() {
   if systemctl is-enabled lxd-installer.socket >/dev/null 2>&1; then bad "lxd-installer.socket is still enabled"; else ok "lxd-installer.socket not enabled"; fi
   expect "ccsbx-hostd is active" systemctl is-active --quiet ccsbx-hostd.service
   tmux_check
+  expect "the seccomp profile verifies (ccsbx seccomp-profile --verify)" "$(pth /usr/local/bin/ccsbx)" seccomp-profile --verify "$(pth /etc/ccsbx/seccomp.json)"
   # sudo -n -l lists NOPASSWD only for ccsbx-root (and ccsbx-deploy if Q12 = yes)
   local out extra
   if out="$(sudo -n -l 2>/dev/null)"; then

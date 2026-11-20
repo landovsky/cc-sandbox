@@ -1540,3 +1540,13 @@ block = "tests/twin-go.sh ./internal/gitroute TestChangesUnderHooksPathAreSteeri
 invariants = [24, 25]
 backends = ["unit"]
 where = "hp"
+
+[[rule]]
+id = "h1-stopped-proof-and-fence-reads"
+title = "Commit's stopped proof asks the runtime (docker by exact name, or ccsbx-root status) as well as the pane, holds the session lock until the commit is done, and RunForFence verifies every positional as a revision"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/start TestStoppedProof && tests/twin-go.sh ./internal/gitroute TestCommitNeedsAStoppedFence"
+block = "tests/twin-go.sh ./internal/start TestStoppedProofAsksTheRuntime && tests/twin-go.sh ./internal/start TestStoppedProofHoldsTheSessionLockUntilReleased && tests/twin-go.sh ./internal/start TestDockerRuntimeAsksByTheExactName && tests/twin-go.sh ./internal/start TestHelperRuntimeAsksRootsStatusVerb && tests/twin-go.sh ./internal/backend TestRunningAsksByTheExactNameAndFailsClosed && tests/twin-go.sh ./internal/rootcmd TestStatusSaysRunningOrStopped && tests/twin-go.sh ./internal/rootcmd TestStatusIsRefusedLikeTheOtherVerbs && tests/twin-go.sh ./internal/gitroute TestCommitHoldsTheProofUntilTheCommitIsMade && tests/twin-go.sh ./internal/gitroute TestRunForFenceVerifiesEveryPositionalAsARevision"
+invariants = [11, 24]
+backends = ["unit"]
+where = "hp"

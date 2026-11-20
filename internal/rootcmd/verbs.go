@@ -283,6 +283,51 @@ func (e *env) stopCmd() *cli.Command {
 	}
 }
 
+func (e *env) statusCmd() *cli.Command {
+	return &cli.Command{
+		Name:    "status",
+		Summary: "print running or stopped for one session's current and previous generation (read-only)",
+		Recipes: `  sudo -n /usr/local/sbin/ccsbx-root status -- s0k1dry66qg
+  Takes only the sid. Prints "running" if the container of the record's generation, or of the one
+  before it, is running, else "stopped"; exit 1 (and no answer) if docker cannot be asked. It changes
+  nothing: the daemon uses it before it lets the host read a worktree (the stopped proof).`,
+		Run: func(_ *cli.Flags, args []string, stdout, stderr io.Writer) int {
+			sid, ok := oneSid("status", args, stderr)
+			if !ok {
+				return cli.ExitUsage
+			}
+			w, err := e.prelude("status")
+			if err == nil {
+				err = e.hostNS()
+			}
+			if err != nil {
+				return fail(stderr, "status", err)
+			}
+			rec, err := e.session(w, sid)
+			if err != nil {
+				return fail(stderr, "status", err)
+			}
+			docker, err := e.cfg.binary(e.cfg.Docker)
+			if err != nil {
+				return fail(stderr, "status", err)
+			}
+			b := e.d.NewBackend(docker, e.d.Mounter)
+			for g := rec.Gen; g >= 1 && g >= rec.Gen-1; g-- {
+				running, err := b.Running(backend.Spec{Sid: rec.Sid, Gen: g})
+				if err != nil {
+					return fail(stderr, "status", err)
+				}
+				if running {
+					fmt.Fprintln(stdout, "running")
+					return cli.ExitOK
+				}
+			}
+			fmt.Fprintln(stdout, "stopped")
+			return cli.ExitOK
+		},
+	}
+}
+
 func (e *env) gcCmd() *cli.Command {
 	return &cli.Command{
 		Name:    "gc",
@@ -399,6 +444,9 @@ func (d *dockerBackend) Run(s backend.Spec, files map[string][]byte, stage Stage
 	return r.Run(s)
 }
 func (d *dockerBackend) Stop(s backend.Spec) error { return d.runner("").Stop(s) }
+func (d *dockerBackend) Running(s backend.Spec) (bool, error) {
+	return d.runner("").Running(s)
+}
 func (d *dockerBackend) Orphans(runDir, sessions string) ([]backend.Orphan, error) {
 	return d.runner(sessions).Orphans(runDir)
 }

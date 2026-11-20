@@ -528,17 +528,43 @@ func (r *Runner) RunForFence(args ...string) (string, error) {
 	switch args[0] {
 	case "status", "ls-files":
 		return "", fmt.Errorf("%w: git %s reads the worktree; not for the fence", ErrRefused, args[0])
-	case "diff":
-		revs := 0
+	}
+	// Positionals before "--" must be revisions that exist, each one checked by git itself
+	// (rev-parse --verify --end-of-options <x>^{object}): a name that is not one (a file in the
+	// worktree, "README.md", "a") would be read by `git diff` as a PATH and diffed against the
+	// worktree. `a..b` and `a...b` are checked on each side.
+	revs := 0
+	switch args[0] {
+	case "diff", "show", "log", "rev-list", "merge-base":
 		for _, a := range args[1:] {
 			if a == "--" {
 				break
 			}
+			if strings.HasPrefix(a, "-") {
+				continue // a flag, already allowlisted (and a format value has no revision in it)
+			}
+			sides := []string{a}
+			if strings.Contains(a, "..") {
+				sides = strings.FieldsFunc(a, func(r rune) bool { return r == '.' })
+				if len(sides) == 0 {
+					return "", fmt.Errorf("%w: %q names no revision", ErrRefused, a)
+				}
+				revs += 2
+			} else {
+				revs++
+			}
+			for _, x := range sides {
+				if err := r.verifyRev(x); err != nil {
+					return "", err
+				}
+			}
+		}
+	}
+	switch args[0] {
+	case "diff":
+		for _, a := range args[1:] {
 			if a == "--cached" || a == "--staged" {
 				return "", fmt.Errorf("%w: git diff --cached reads the index; not for the fence", ErrRefused)
-			}
-			if !strings.HasPrefix(a, "-") {
-				revs += 1 + strings.Count(a, "..")
 			}
 		}
 		if revs < 2 {
@@ -546,6 +572,19 @@ func (r *Runner) RunForFence(args ...string) (string, error) {
 		}
 	}
 	return r.exec(args...)
+}
+
+// verifyRev asks git (bounded, with the hardened environment) whether x names an object. A
+// `<rev>:<path>` is checked as written; anything else as `<x>^{object}`.
+func (r *Runner) verifyRev(x string) error {
+	spec := x + "^{object}"
+	if strings.Contains(x, ":") {
+		spec = x
+	}
+	if _, err := r.exec("rev-parse", "--verify", "--end-of-options", spec); err != nil {
+		return fmt.Errorf("%w: %q is not a revision (a path would be read from the worktree)", ErrRefused, x)
+	}
+	return nil
 }
 
 // exec runs without the allowlist: for the fixed argument lists of this package only.

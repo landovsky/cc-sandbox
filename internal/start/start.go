@@ -70,9 +70,11 @@ type Daemon struct {
 	// HelperProven: the helper has actually run on this machine and the docker group is gone. Only
 	// then does a reply claim evidence; the mere presence of ccsbx-root proves nothing (invariants 12, 14).
 	HelperProven bool
-	Launcher     Launcher
-	ReplaceWait  time.Duration // how long Replace waits for the old fence to shut down (default 15s)
-	Now          func() time.Time
+	// Runtime says whether a generation's container is running (the stopped proof asks it).
+	Runtime     Runtime
+	Launcher    Launcher
+	ReplaceWait time.Duration // how long Replace waits for the old fence to shut down (default 15s)
+	Now         func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
 	Exe string
 }

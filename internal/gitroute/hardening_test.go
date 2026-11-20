@@ -545,3 +545,69 @@ func TestSteeringSymlinkChains(t *testing.T) {
 		t.Error("a symlink loop was not refused")
 	}
 }
+
+// R7: a positional that is not a revision is read by `git diff` as a PATH, and diffed against the
+// worktree. Every positional before "--" must verify as a revision, so none of these forms gets
+// worktree bytes to the fence, whatever the names.
+func TestRunForFenceVerifiesEveryPositionalAsARevision(t *testing.T) {
+	r, _, wt := repo(t)
+	write(t, wt, "a", "TOP SECRET from a\n")
+	write(t, wt, "b", "TOP SECRET from b\n")
+	write(t, wt, "README.md", "TOP SECRET changed\n")
+	for _, args := range [][]string{
+		{"diff", "HEAD", "README.md"}, {"diff", "README.md", "HEAD"}, {"diff", "a", "b"}, {"diff", "a", "HEAD"},
+		{"diff", "HEAD", "b"}, {"diff", "HEAD...b"}, {"diff", "a..HEAD"}, {"diff", "HEAD", "nonexistent"},
+		{"log", "-p", "a"}, {"show", "b"}, {"rev-list", "a"}, {"diff", "..", "HEAD"},
+	} {
+		out, err := r.RunForFence(args...)
+		if err == nil || strings.Contains(out, "SECRET") {
+			t.Errorf("git %v was answered for the fence: %q %v", args, out, err)
+		}
+	}
+	// real revisions, in every spelling, still work
+	for _, args := range [][]string{
+		{"diff", "HEAD", "HEAD"}, {"diff", "HEAD~0", "HEAD"}, {"diff", "HEAD...HEAD"}, {"diff", "HEAD..HEAD"},
+		{"diff", "HEAD", "HEAD", "--", "README.md"}, {"show", "HEAD:README.md"}, {"log", "-1", "HEAD"}, {"rev-list", "--count", "HEAD"},
+	} {
+		if _, err := r.RunForFence(args...); err != nil {
+			t.Errorf("git %v was refused: %v", args, err)
+		}
+	}
+}
+
+// R6: the proof is HELD until the commit is over: a git process of the commit runs while the
+// proof's hold is in force, and the release comes after it.
+type heldProof struct {
+	flag string
+	log  *[]string
+}
+
+func (h heldProof) Hold() (func(), error) {
+	os.WriteFile(h.flag, []byte("held"), 0o644)
+	*h.log = append(*h.log, "hold")
+	return func() { os.Remove(h.flag); *h.log = append(*h.log, "release") }, nil
+}
+
+func TestCommitHoldsTheProofUntilTheCommitIsMade(t *testing.T) {
+	r, gd, wt := repo(t)
+	dir := t.TempDir()
+	flag, seen := filepath.Join(dir, "held"), filepath.Join(dir, "seen-held-at-commit")
+	// a git wrapper that notes whether the hold was in force when the commit command runs
+	r2 := &Runner{GitDir: gd, Worktree: wt, Git: fakeGit(t, `for a; do [ "$a" = commit ] && [ -e `+flag+` ] && echo yes >> `+seen+`; done`)}
+	_ = r
+	write(t, wt, "n.txt", "n\n")
+	var log []string
+	if _, err := r2.Commit("s", "held", heldProof{flag, &log}); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(seen); !strings.Contains(string(b), "yes") {
+		t.Error("the commit ran when the hold was not in force")
+	}
+	if strings.Join(log, ",") != "hold,release" {
+		t.Errorf("order %v", log)
+	}
+	// a refused hold stops before anything is staged
+	if _, err := r2.Commit("s", "x", StoppedFunc(func() error { return os.ErrExist })); err == nil {
+		t.Error("a refused hold did not stop the commit")
+	}
+}

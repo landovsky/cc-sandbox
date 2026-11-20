@@ -40,6 +40,8 @@ type fakeBackend struct {
 	docker  string
 	// beforeStage runs after the checks and before the staging: the moment the owner could swap a path.
 	beforeStage func()
+	running     map[int]bool // generation -> container running
+	runErr      error
 	staged      bool
 }
 
@@ -100,6 +102,12 @@ func (f *fakeBackend) Run(s backend.Spec, files map[string][]byte, stage Stager,
 	return f.code, nil
 }
 func (f *fakeBackend) Stop(s backend.Spec) error { f.stopped = append(f.stopped, s); return nil }
+func (f *fakeBackend) Running(s backend.Spec) (bool, error) {
+	if f.runErr != nil {
+		return false, f.runErr
+	}
+	return f.running[s.Gen], nil
+}
 func (f *fakeBackend) Orphans(string, string) ([]backend.Orphan, error) {
 	return f.orphans, nil
 }
@@ -1214,5 +1222,52 @@ func TestGitdirInAHiddenHomeDirectoryIsRefused(t *testing.T) {
 	mk(t, ok, 0o755)
 	if _, err := f.cfg.gitdir(ok, os.Getuid(), home); err != nil {
 		t.Errorf("an ordinary gitdir was refused: %v", err)
+	}
+}
+
+// ---- status: read-only, for the daemon's stopped proof ----
+
+func TestStatusSaysRunningOrStopped(t *testing.T) {
+	f := newFx(t)
+	if c, out := f.call("status", "--", sid); c != 0 || strings.TrimSpace(out) != "stopped" {
+		t.Errorf("%d %q", c, out)
+	}
+	f.fb.running = map[int]bool{2: true}
+	if c, out := f.call("status", "--", sid); c != 0 || strings.TrimSpace(out) != "running" {
+		t.Errorf("the current generation: %d %q", c, out)
+	}
+	f.fb.running = map[int]bool{1: true} // the record is at gen 2: the previous one counts
+	if c, out := f.call("status", "--", sid); c != 0 || strings.TrimSpace(out) != "running" {
+		t.Errorf("the previous generation: %d %q", c, out)
+	}
+	f.fb.running = map[int]bool{}
+	f.fb.runErr = fmt.Errorf("docker is down")
+	if c, out := f.call("status", "--", sid); c != 1 || strings.Contains(out, "stopped") {
+		t.Errorf("a failure to ask was answered: %d %q", c, out)
+	}
+	if f.acted() {
+		t.Error("status changed something")
+	}
+}
+
+func TestStatusIsRefusedLikeTheOtherVerbs(t *testing.T) {
+	f := newFx(t)
+	f.env["SUDO_UID"] = fmt.Sprint(os.Getuid() + 7)
+	f.wantRefusedMsg("another user's session", "may not act", "status", "--", sid)
+	f = newFx(t)
+	f.sameNS = false
+	f.wantRefusedMsg("another mount namespace", "mount namespace", "status", "--", sid)
+	f = newFx(t)
+	f.writeConfig("verbs = [\"run\"]\n")
+	f.wantRefusedMsg("neither status nor stop enabled", "not enabled", "status", "--", sid)
+	f = newFx(t)
+	f.writeConfig("verbs = [\"stop\"]\n") // a config written before status existed: stop implies the read-only status
+	if c, out := f.call("status", "--", sid); c != 0 {
+		t.Errorf("status was refused where stop is enabled: %d %s", c, out)
+	}
+	for _, a := range [][]string{{"status"}, {"status", sid, "x"}, {"status", "--json", sid}, {"status", "--", "../x"}} {
+		if c, _ := newFx(t).call(a...); c != 64 {
+			t.Errorf("%v: exit %d, want 64", a, c)
+		}
 	}
 }

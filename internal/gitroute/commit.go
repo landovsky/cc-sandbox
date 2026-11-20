@@ -190,12 +190,19 @@ func (r *Runner) indexGitlinks() (map[string]string, error) {
 // Stopped is proof, from whoever owns the session record, that no fence generation is running
 // against this worktree. Commit refuses without it, so F3/C22 cannot call Commit on a live fence
 // by accident. It is a seam, not a lock: the owner must not hand out a proof it has not checked.
-type Stopped interface{ FenceStopped() error }
+//
+// Hold is called once, before anything is staged: it returns only if no generation is running, and
+// the owner KEEPS the answer true until release is called, which Commit does when it is finished
+// (the daemon holds its session lock for that long, so a resume cannot start a fence in between).
+type Stopped interface {
+	Hold() (release func(), err error)
+}
 
-// StoppedFunc adapts a function to Stopped.
+// StoppedFunc adapts a function that only checks (and holds nothing) to Stopped. Tests use it;
+// the daemon's proof (start.StoppedProof) holds its lock.
 type StoppedFunc func() error
 
-func (f StoppedFunc) FenceStopped() error { return f() }
+func (f StoppedFunc) Hold() (func(), error) { return func() {}, f() }
 
 // Commit stages everything and commits with the Fenced-Session and Steering-Files trailers. The
 // trailers come from the host's view of the staged change, never from the agent's message.
@@ -205,9 +212,11 @@ func (r *Runner) Commit(session, message string, proof Stopped) (string, error) 
 	if proof == nil {
 		return "", fmt.Errorf("%w: commit needs proof that the fence is stopped (the worktree is still writable by the agent)", ErrRefused)
 	}
-	if err := proof.FenceStopped(); err != nil {
+	release, err := proof.Hold()
+	if err != nil {
 		return "", fmt.Errorf("%w: the fence is not stopped: %v", ErrRefused, err)
 	}
+	defer release() // held until the commit is made (or refused)
 	if !sessionRe.MatchString(session) {
 		return "", fmt.Errorf("%w: session id %q", ErrRefused, session)
 	}

@@ -1278,3 +1278,32 @@ func TestEveryGitFileReadSiteIsBounded(t *testing.T) {
 		}
 	}
 }
+
+// Running asks docker for the exact container name and never turns a failure to ask into
+// "not running".
+func TestRunningAsksByTheExactNameAndFailsClosed(t *testing.T) {
+	d := vt(t)
+	log := filepath.Join(d, "log")
+	fake := func(body string) *Runner {
+		p := filepath.Join(d, "docker")
+		os.WriteFile(p, []byte("#!/bin/sh\nprintf '%s\\n' \"$*\" >> "+log+"\n"+body+"\n"), 0o755)
+		return &Runner{Docker: p}
+	}
+	if ok, err := fake("echo true").Running(Spec{Sid: "s0abcdefgh", Gen: 4}); err != nil || !ok {
+		t.Fatalf("%v %v", ok, err)
+	}
+	if b, _ := os.ReadFile(log); string(b) != "inspect --format {{.State.Running}} ccsbx-s0abcdefgh-g4\n" {
+		t.Errorf("%q", b)
+	}
+	if ok, err := fake("echo false").Running(Spec{Sid: "s0abcdefgh", Gen: 4}); err != nil || ok {
+		t.Errorf("%v %v", ok, err)
+	}
+	if ok, err := fake(`echo "Error: No such object: x"; exit 1`).Running(Spec{Sid: "s0abcdefgh", Gen: 4}); err != nil || ok {
+		t.Errorf("%v %v", ok, err)
+	}
+	for _, bad := range []string{`echo "daemon not running"; exit 1`, `echo what`, `exit 9`} {
+		if ok, err := fake(bad).Running(Spec{Sid: "s0abcdefgh", Gen: 4}); err == nil || ok {
+			t.Errorf("%q: %v %v", bad, ok, err)
+		}
+	}
+}

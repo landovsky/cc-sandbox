@@ -121,3 +121,24 @@ func (r *Runner) Stop(s Spec) error {
 	}
 	return nil
 }
+
+// Running asks docker whether this generation's container (the exact name derived from sid and
+// gen) is running. A container that does not exist is not running; any other failure is an error,
+// never "not running".
+func (r *Runner) Running(s Spec) (bool, error) {
+	out, err := exec.Command(r.docker(), "inspect", "--format", "{{.State.Running}}", s.Container()).CombinedOutput()
+	o := strings.TrimSpace(string(out))
+	if err != nil {
+		if strings.Contains(o, "No such object") || strings.Contains(o, "No such container") {
+			return false, nil
+		}
+		return false, fmt.Errorf("docker inspect %s: %v: %s", s.Container(), err, o)
+	}
+	switch o {
+	case "true":
+		return true, nil
+	case "false":
+		return false, nil
+	}
+	return false, fmt.Errorf("docker inspect %s: unexpected answer %q", s.Container(), o)
+}

@@ -60,7 +60,7 @@ func daemonFrom(f *cli.Flags) (*start.Daemon, error) {
 	d := &start.Daemon{
 		ProfileLoader: loader,
 		StateDir:      abs(get("state")), ProfilesDir: profilesDir, Machine: get("machine"), Uid: os.Getuid(),
-		Backend: "docker", Root: mode, Exe: exe, PinsFile: abs(get("pins")), WorktreeRoot: start.AbsRoots(get("worktree-root")),
+		Backend: "docker", Root: mode, Runtime: runtimeFor(mode), Exe: exe, PinsFile: abs(get("pins")), WorktreeRoot: start.AbsRoots(get("worktree-root")),
 	}
 	return d, nil
 }
@@ -166,4 +166,13 @@ func runStart(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "started %s (%s) attach: %v\n", rep.Sid, rep.ID, rep.Attach.Local)
 	}
 	return cli.ExitOK
+}
+
+// runtimeFor is how the stopped proof asks whether a container runs: docker in direct mode, the
+// read-only `ccsbx-root status` in helper mode (the caller has no docker there).
+func runtimeFor(mode string) start.Runtime {
+	if mode == "helper" {
+		return start.HelperRuntime{}
+	}
+	return start.DockerRuntime{Docker: "docker"}
 }

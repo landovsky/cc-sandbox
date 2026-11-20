@@ -17,7 +17,7 @@ import (
 )
 
 // Verbs is every verb there is. The config's `verbs` can only switch some of them off.
-var Verbs = []string{"run", "stop", "renew", "gc", "attach", "exec-token"}
+var Verbs = []string{"run", "stop", "renew", "gc", "attach", "exec-token", "status"}
 
 // Config is the policy. TrustedUID is who must own the files root believes; it is 0 in production
 // and is never read from the file.
@@ -199,6 +199,13 @@ func (c *Config) validate(roots []string) error {
 
 // Enabled reports whether a verb is switched on.
 func (c *Config) Enabled(v string) bool {
+	if v == "status" { // read-only: allowed wherever stop is, so a config written before it existed still works
+		return c.enabled("status") || c.enabled("stop")
+	}
+	return c.enabled(v)
+}
+
+func (c *Config) enabled(v string) bool {
 	for _, x := range c.Verbs {
 		if x == v {
 			return true

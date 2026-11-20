@@ -31,6 +31,8 @@ type Backend interface {
 	// directories exist and before docker is asked for anything.
 	Run(s backend.Spec, files map[string][]byte, stage Stager, stdin io.Reader, stdout, stderr io.Writer) (int, error)
 	Stop(s backend.Spec) error
+	// Running says whether the generation's container (exact name) is running; read-only.
+	Running(s backend.Spec) (bool, error)
 	Orphans(runDir, sessionsDir string) ([]backend.Orphan, error)
 	Reap(runDir string, o []backend.Orphan) error
 }
@@ -78,7 +80,7 @@ func App(cfg *Config, d *Deps, getenv func(string) string) *cli.App {
 		Name: "ccsbx-root", Summary: "the fixed-verb root door for the fence (U0): run stop renew gc attach exec-token",
 		Version: "dev", Getenv: getenv, EnvPrefix: "CCSBX_ROOT_",
 		Cmds: []*cli.Command{
-			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(),
+			e.runCmd(), e.stopCmd(), e.gcCmd(), e.attachCmd(), e.statusCmd(),
 			e.notWired("renew", "renew the machine's credentials (needs the signer, U0b)"),
 			e.notWired("exec-token", "mint an exec token for one session (needs the signer, U0b)"),
 		},

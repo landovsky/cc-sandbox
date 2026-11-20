@@ -38,12 +38,15 @@ type Record struct {
 	RequestID string `json:"request_id"`
 	// RequestIDs is every request that produced a generation of this session, so a retry of
 	// the gen-1 start after a resume can't start a second session.
-	RequestIDs []string   `json:"request_ids,omitempty"`
-	Uid        int        `json:"uid"` // the caller, from the OS
-	Started    time.Time  `json:"started"`
-	Ended      *time.Time `json:"ended,omitempty"`
-	Spec       LaunchSpec `json:"spec"`
-	Reply      StartReply `json:"reply"`
+	RequestIDs []string `json:"request_ids,omitempty"`
+	Uid        int      `json:"uid"` // the caller, from the OS
+	// StartedBy is who asked, when it was not a process on this machine: "owner:<login>@<device>", stamped by
+	// the daemon from the tailnet's word about the caller (M2c), never from the request.
+	StartedBy string     `json:"started_by,omitempty"`
+	Started   time.Time  `json:"started"`
+	Ended     *time.Time `json:"ended,omitempty"`
+	Spec      LaunchSpec `json:"spec"`
+	Reply     StartReply `json:"reply"`
 	// GitDir is the gitdir the fence may see read-only, decided once at the session's first
 	// start. Later generations reuse it: the worktree's .git file is agent-written and is never
 	// read again.
@@ -71,15 +74,21 @@ type Daemon struct {
 	ProfileLoader func(name string) (*profile.Profile, error)
 	Machine       string // this machine's name; a spec for another machine is refused
 	Uid           int    // the caller's uid (from the OS, never from the spec)
+	// WorktreeCheck asks root whether a path is a git worktree root under allowed_roots (helper mode, remote starts only):
+	// it returns the resolved path, or an error for ANY doubt. nil: remote starts are refused in helper mode.
+	WorktreeCheck func(path string) (resolved, gitdir string, err error)
+	StartedBy     string // a remote caller's stamped identity, recorded with the session (M2c); "" for a local start
 	Image         string // fence image reference recorded in the pin
 	PinsFile      string // pins.toml; missing means no production pins
 	WorktreeRoot  string // every worktree must be inside this directory (CCSBX_WORKTREE_ROOT)
 	CCVersion     string
 	MaxLive       int // machine_full above this many live sessions
 	MaxPerHour    int // rate_capped above this many starts by one caller in an hour
-	Backend       string
-	Socket        string // tmux -L name for the attach command; default ccsbx
-	Root          string // "direct" or "helper"
+	// RemoteMaxPerHour is the same cap for starts asked for over the tailnet (StartedBy != ""), counted apart.
+	RemoteMaxPerHour int
+	Backend          string
+	Socket           string // tmux -L name for the attach command; default ccsbx
+	Root             string // "direct" or "helper"
 	// HelperProven: the helper has actually run on this machine and the docker group is gone. Only
 	// then does a reply claim evidence; the mere presence of ccsbx-root proves nothing (invariants 12, 14).
 	HelperProven bool
@@ -193,12 +202,16 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		return nil, err
 	}
 
-	// Idempotent per (caller, request_id): a retry gets the same reply and starts nothing.
+	// Idempotent per (uid, caller identity, request_id): a retry gets the same reply and starts nothing. A request_id
+	// another caller used is not this one's; the same caller reusing it for ANOTHER label is request_id_reused.
 	for _, r := range recs {
-		if r.Uid == d.Uid && (r.RequestID == s.RequestID || contains(r.RequestIDs, s.RequestID)) {
+		if r.Uid == d.Uid && r.StartedBy == d.StartedBy && (r.RequestID == s.RequestID || contains(r.RequestIDs, s.RequestID)) {
 			rep := r.Reply
 			if r.RequestID != s.RequestID { // an older generation's request: its own reply is not kept
 				return nil, refuse(BadSpec, "request_id %s was already used for an earlier generation of %s", s.RequestID, r.Sid)
+			}
+			if r.Label != s.Label {
+				return nil, refuse(RequestIDReused, "request_id was already used for another session")
 			}
 			return &rep, nil
 		}
@@ -214,6 +227,40 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		return nil, refuse(NotBuilt, "only workdir.path is supported (repo/base/branch needs the git route, H1)")
 	}
 	var rw string
+	remote := d.StartedBy != ""
+	// A REMOTE caller's refusal text is fixed: an OS error would carry paths and let the caller probe what exists.
+	wdErr := func(what string, err error) *Refusal {
+		if remote {
+			return refuse(BadSpec, "%s is not acceptable", what)
+		}
+		return refuse(BadSpec, "%s: %v", what, err)
+	}
+	if remote && d.Root == "helper" {
+		// The owner's home is unreadable to hostd here, so "is this directory a git worktree root" is asked of root
+		// (`ccsbx-root worktree-check`, docs/m2c-remote-start.md §4b) BEFORE anything is written. Without a checker
+		// the remote start is refused: any directory under the worktree root would otherwise mount read-write.
+		if d.WorktreeCheck == nil {
+			return nil, refuse(NotBuilt, "a remote start needs the worktree check that helper mode cannot make here")
+		}
+		// a record whose pane died but is not marked ended would count as a live session on this very workdir
+		// (root counts Ended == nil): end the dead ones first, under the lock this Start already holds
+		for _, r := range recs {
+			if r.Backend != "k8s" && r.Ended == nil && !d.Launcher.Alive(r.Sid) {
+				d.markEnded(r)
+			}
+		}
+		got, gitdir, err := d.WorktreeCheck(s.Workdir.Path)
+		if errors.Is(err, ErrNoHelper) {
+			return nil, refuse(NotBuilt, "a remote start needs ccsbx-root, which is not installed here")
+		}
+		if errors.Is(err, ErrCannotTell) { // root could not tell (exit 3): our side's trouble, not the caller's spec
+			return nil, refuse(Internal, "the worktree check could not be made on this machine (see the daemon's log)")
+		}
+		if err != nil || got != filepath.Clean(s.Workdir.Path) {
+			return nil, refuse(BadSpec, "workdir is not a git worktree root")
+		}
+		s.GitDir = gitdir // derived by root, never from the caller: `ccsbx-root run` compares it with its own derivation
+	}
 	if d.Root == "helper" {
 		// hostd runs as the service uid and cannot enter the owner's home (0750): it never touches the
 		// filesystem here. The CLIENT resolved the workdir and the gitdir as the owner (ResolveClientPaths);
@@ -221,10 +268,10 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		var err error
 		rw, err = backend.CheckWorkdirLexical(s.Workdir.Path, d.WorktreeRoot, d.StateDir, d.RunDir)
 		if err != nil {
-			return nil, refuse(BadSpec, "workdir: %v", err)
+			return nil, wdErr("workdir", err)
 		}
 		if err := backend.CheckGitDirLexical(s.GitDir, rw, d.WorktreeRoot); err != nil {
-			return nil, refuse(BadSpec, "gitdir: %v", err)
+			return nil, wdErr("gitdir", err)
 		}
 	} else {
 		if s.GitDir != "" {
@@ -233,10 +280,17 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		var err error
 		rw, err = backend.CheckWorkdir(s.Workdir.Path, d.WorktreeRoot, d.StateDir)
 		if err != nil {
-			return nil, refuse(BadSpec, "workdir: %v", err)
+			return nil, wdErr("workdir", err)
 		}
 		if st, err := os.Stat(rw); err != nil || !st.IsDir() {
-			return nil, refuse(BadSpec, "workdir.path %s is not a directory", s.Workdir.Path)
+			return nil, wdErr("workdir", err)
+		}
+		if remote {
+			// a remote start must name a git WORKTREE ROOT (its own .git at exactly this path): not a parent of
+			// repos, not a subdirectory of one, not a plain directory under the root
+			if gd, err := backend.ResolveGitDir(rw, d.Uid); err != nil || gd == "" {
+				return nil, refuse(BadSpec, "workdir is not a git worktree root")
+			}
 		}
 	}
 	s.Workdir.Path = rw // the resolved path is what gets mounted and recorded
@@ -277,17 +331,30 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		if r.Ended == nil && d.Launcher.Alive(r.Sid) {
 			live++
 			if r.Spec.Label == s.Label {
-				return nil, refuse(AlreadyRunning, "%s already_running on %s (sid %s)", s.Label, d.Machine, r.Sid)
+				ref := refuse(AlreadyRunning, "%s already_running on %s (sid %s)", s.Label, d.Machine, r.Sid)
+				ref.Machine, ref.Sid, ref.State = d.Machine, r.Sid, "running"
+				return nil, ref
+			}
+			// one workdir, one live session: a workdir equal to, containing or inside another live session's is
+			// refused (the agent that owns the outer tree could swap the inner directory for a link between the
+			// check and the mount). A resume of that very session is exempt.
+			if (s.Resume == nil || s.Resume.Sid != r.Sid) && overlaps(r.Spec.Workdir.Path, rw) {
+				return nil, refuse(BadSpec, "the workdir overlaps another live session's")
 			}
 		} else if r.Ended == nil {
 			d.markEnded(r) // the pane is gone: a stale record must not block the label
 		}
-		if r.Uid == d.Uid && d.now().Sub(r.Started) < time.Hour {
+		// remote starts have their own hourly budget (M2c): they cannot use up the owner's local starts
+		if r.Uid == d.Uid && d.now().Sub(r.Started) < time.Hour && (r.StartedBy != "") == (d.StartedBy != "") {
 			started++
 		}
 	}
-	if d.MaxPerHour > 0 && started >= d.MaxPerHour {
-		return nil, refuse(RateCapped, "%d starts in the last hour (cap %d)", started, d.MaxPerHour)
+	hourCap := d.MaxPerHour
+	if d.StartedBy != "" {
+		hourCap = d.RemoteMaxPerHour
+	}
+	if hourCap > 0 && started >= hourCap {
+		return nil, refuse(RateCapped, "%d starts in the last hour (cap %d)", started, hourCap)
 	}
 	if d.MaxLive > 0 && live >= d.MaxLive {
 		return nil, refuse(MachineFull, "%d live sessions (cap %d)", live, d.MaxLive)
@@ -301,6 +368,8 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 			return nil, refuse(BadSpec, "resume: no session %q", s.Resume.Sid)
 		}
 		switch {
+		case d.StartedBy != "" && old.StartedBy != d.StartedBy:
+			return nil, refuse(ResumeNotYours, "resume: session %s was not started by this caller", old.Sid)
 		case old.Uid != d.Uid:
 			return nil, refuse(BadSpec, "resume: session %s belongs to another caller", old.Sid)
 		case old.Label != s.Label:
@@ -338,7 +407,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 				return nil, refuse(BadSpec, "workdir git metadata: %v", err)
 			}
 		}
-		rec = &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s, GitDir: gd}
+		rec = &Record{Sid: sid, Gen: 1, Label: s.Label, RequestID: s.RequestID, Uid: d.Uid, Started: d.now().UTC(), Spec: *s, GitDir: gd, StartedBy: d.StartedBy}
 	}
 	sid := rec.Sid
 	rec.Reply = StartReply{
@@ -366,6 +435,52 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	return &rep, nil
 }
 
+// LiveByLabel are this machine's live sessions of a label (a record not ended whose pane is alive), read-only.
+func (d *Daemon) LiveByLabel(label string) ([]*Record, error) {
+	recs, err := d.records()
+	if err != nil {
+		return nil, err
+	}
+	var out []*Record
+	for _, r := range recs {
+		if r.Ended == nil && r.Spec.Label == label && d.Launcher.Alive(r.Sid) {
+			out = append(out, r)
+		}
+	}
+	return out, nil
+}
+
+// Recorded is the reply of the start this caller already made with this request_id, or nil: read-only, so a caller can
+// answer a retry from the record without launching anything.
+func (d *Daemon) Recorded(uid int, startedBy, requestID, label string) (*StartReply, bool) {
+	recs, err := d.records()
+	if err != nil {
+		return nil, false
+	}
+	for _, r := range recs {
+		if r.Uid == uid && r.StartedBy == startedBy && r.RequestID == requestID {
+			rep := r.Reply
+			return &rep, r.Label == label
+		}
+	}
+	return nil, false
+}
+
+// Seen reports whether this caller already started a session with this request_id (so a retry is answered by
+// Start's own idempotency, not refused because the label it started is now live).
+func (d *Daemon) Seen(requestID string) bool {
+	recs, err := d.records()
+	if err != nil {
+		return false
+	}
+	for _, r := range recs {
+		if r.Uid == d.Uid && (r.RequestID == requestID || contains(r.RequestIDs, requestID)) {
+			return true
+		}
+	}
+	return false
+}
+
 // Load reads one record, for `ccsbx run --sid`.
 func (d *Daemon) Load(sid string) (*Record, error) {
 	if !sidRe.MatchString(sid) {
@@ -377,6 +492,21 @@ func (d *Daemon) Load(sid string) (*Record, error) {
 	}
 	var r Record
 	return &r, json.Unmarshal(b, &r)
+}
+
+// ErrNoHelper: ccsbx-root is not installed, so no worktree check can be made (the start is not_built, not bad_spec).
+var ErrNoHelper = errors.New("ccsbx-root is not installed")
+
+// ErrCannotTell: ccsbx-root worktree-check exited 3 (an unreadable config or record, a read error): no verdict, and not the caller's fault.
+var ErrCannotTell = errors.New("the worktree check could not tell")
+
+// overlaps: a and b are the same directory, or one is inside the other.
+func overlaps(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if a == "." || b == "." || a == "" || b == "" {
+		return false
+	}
+	return a == b || strings.HasPrefix(a, b+string(filepath.Separator)) || strings.HasPrefix(b, a+string(filepath.Separator))
 }
 
 func contains(l []string, s string) bool {
@@ -421,8 +551,11 @@ func (d *Daemon) records() ([]*Record, error) {
 			continue
 		}
 		r, err := d.Load(strings.TrimSuffix(e.Name(), ".json"))
+		if errors.Is(err, os.ErrNotExist) {
+			continue // removed since the listing (a failed launch rolls its record back): not a read failure
+		}
 		if err != nil {
-			return nil, err
+			return nil, err // any other doubt is an error, never "no such session": callers refuse on it
 		}
 		out = append(out, r)
 	}

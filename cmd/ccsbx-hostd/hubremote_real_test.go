@@ -92,13 +92,20 @@ func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s 
 	// (hostd's own principal: spoke:<machine>/ccsbx, fenced entries and its own downlink only)
 	// the stand-in for `ccsbx-root relay-mint`: the hub's admin API, which hostd itself never holds
 	mint := func(_ context.Context, sid string, gen int, pub string, _ bool) (string, error) {
-		// may_reach is the session's MANAGER only, as root derives it (Tomas's open question #3cy2: peers stay
-		// reachable only when they are fenced, over the signed path)
+		// as root derives it from the record: `manager` is the ONE unfenced target, `may_reach` the manager and every
+		// placed peer (the hub reaches a fenced target only if it is listed, an unfenced one only if it is the manager)
 		var reach []string
+		manager := ""
 		if s.Scope.Manager.Node != "" && s.Scope.Manager.Machine != "" {
-			reach = append(reach, s.Scope.Manager.Machine+"/"+s.Scope.Manager.Node)
+			manager = s.Scope.Manager.Machine + "/" + s.Scope.Manager.Node
+			reach = append(reach, manager)
 		}
-		m := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": sid, "gen": fmt.Sprint(gen), "pub": pub, "may_reach": reach})
+		for _, p := range s.Scope.Peers {
+			if m := s.Scope.PeerMachines[p]; m != "" {
+				reach = append(reach, m+"/"+p)
+			}
+		}
+		m := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": sid, "gen": fmt.Sprint(gen), "pub": pub, "may_reach": reach, "manager": manager})
 		return m["token"].(string), nil
 	}
 	hr := newHubRemote(client, url, name, rt, j, t.Logf, mint, t.TempDir())
@@ -187,7 +194,7 @@ func TestRealHubTwoMachinesExchangeSignedMessagesAndRefuseForgeries(t *testing.T
 	// 3. T:xmachine-forged-from, at the hub: a relay that signs for one sid but sends as another, or tampers
 	// with the body, is refused by the hub (403) and nothing is typed.
 	pub, priv, _ := stamp.NewKey()
-	rtok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": "s0forger01", "gen": "1", "pub": pub})["token"].(string)
+	rtok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": "s0forger01", "gen": "1", "pub": pub, "may_reach": []string{"mac/cc-sandbox:mgr"}})["token"].(string)
 	es, _ := hp.hr.hub.Sessions(ctx)
 	mid := hubc.FindNode(es, "cc-sandbox:mgr")["id"].(string)
 	c := &hubc.Client{URL: url, Token: func() (string, error) { return rtok, nil }}
@@ -436,11 +443,25 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 		t.Fatalf("a relay reached an unfenced node outside its may_reach: %v", err)
 	}
 
-	// 7. the shared secret (every owner session on every machine holds it) is conflict-checked too: it cannot
-	// re-track the manager's node elsewhere to make it ambiguous and cut the worker's channel (the hub refuses,
-	// 409; hostd's own handling of a node held twice is covered by the unit tests).
-	if _, err := owner.Track(ctx, []map[string]any{{"key": "ws/evil", "label": "evil", "node": "cc-sandbox:umgr", "uid": "eeeeeeee-0000-4000-8000-0000000000a4", "machine": "mac9", "pane": "%1", "state": "waiting"}}, 120); !hubc.IsConflict(err) {
-		t.Fatalf("the shared secret re-tracking a held node: want 409, got %v", err)
+	// 7. the shared secret behaves as it always did (the hub neither claims nor refuses for it): a legacy entry may copy the
+	// manager's node on another machine. That is safe because hostd binds the node to the record's machine: the worker's next
+	// report still reaches the real manager (mac3), and the copy on mac9 is neither sent to nor heard.
+	if _, err := owner.Track(ctx, []map[string]any{{"key": "ws/evil", "label": "evil", "node": "cc-sandbox:umgr", "uid": "eeeeeeee-0000-4000-8000-0000000000a4", "machine": "mac9", "pane": "%1", "state": "waiting"}}, 120); err != nil {
+		t.Fatalf("the shared secret was refused: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if ok, err := sendVia(hp, worker, "cc-sandbox:umgr", "report", "after the copy"); !ok || err != nil {
+		t.Fatalf("a legacy copy of the manager's node on another machine cut the worker's channel: %v %v", ok, err)
+	}
+	select {
+	case f := <-got:
+		var d hubc.Deliver
+		json.Unmarshal(f.Payload, &d)
+		if !strings.Contains(d.Text, "after the copy") {
+			t.Fatalf("what mac3 got: %+v", d)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the real manager got nothing")
 	}
 
 	// 9. (rounds 5 and 6) squatting an ABSENT manager's node. The worker's manager umgr5 is an unfenced session
@@ -624,8 +645,11 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	if n != 2 {
 		t.Fatalf("the setup: %d entries share the short id %s, want 2", n, shortID)
 	}
-	if ok, _ := sendVia(hp13, w13, "cc-sandbox:umgr13", "report", "to the manager, not to its twin"); ok {
-		t.Fatal("a message was sent to an address another entry shares")
+	// the sender addresses the full uid, so a ground SHORT id blocks nothing: the real manager gets it, the twin does not
+	if ok, err := sendVia(hp13, w13, "cc-sandbox:umgr13", "report", "to the manager, not to its twin"); err != nil {
+		t.Logf("send: %v (the manager's pane is not being polled here: the hub may report it undelivered)", err)
+	} else {
+		_ = ok
 	}
 	if fs, _, err := x4Client.Poll(ctx, "spoke:x4", 0, time.Second); err == nil && len(fs) != 0 {
 		t.Fatalf("the decoy's downlink got the message: %d frames", len(fs))

@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -34,6 +35,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
 
@@ -75,6 +77,42 @@ func rootMinter() minter {
 		}
 		return r.Token, nil
 	}
+}
+
+// rootWorktreeCheck is the helper-mode remote start's worktree check (docs/m2c-remote-start.md §4b):
+// `sudo -n ccsbx-root worktree-check -- <path>`: exit 0 and stdout `<path>\n<gitdir>\n` (the resolved path, then the gitdir root
+// derived: both required), or anything else (2 refused, 3 could not tell, a timeout, a stalled helper) which is a refusal. Bounded
+// like SudoPodRoot.run: SIGTERM on the deadline (sudo relays it; SIGKILL to sudo would orphan the verb and leave it holding the pipe
+// while hostd holds the daemon lock), a 1 s WaitDelay, a fixed environment.
+func rootWorktreeCheck(path string) (string, string, error) {
+	if !start.HelperInstalled() {
+		return "", "", start.ErrNoHelper
+	}
+	out, err := runBounded(5*time.Second, start.SudoBin, "-n", start.RootBin, "worktree-check", "--", path)
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && ee.ExitCode() == 3 {
+			return "", "", start.ErrCannotTell
+		}
+		return "", "", fmt.Errorf("worktree-check refused")
+	}
+	return parseWorktreeAnswer(out)
+}
+
+// parseWorktreeAnswer takes the verb's stdout. EXACTLY two non-empty, clean, absolute lines: the path, then its derived
+// gitdir. A one-line answer or an empty second line (an older ccsbx-root) would record the start with no gitdir and
+// `ccsbx-root run` would refuse it later: refuse now. Start checks the first line is the asked path and the gitdir lies in a root.
+func parseWorktreeAnswer(out []byte) (string, string, error) {
+	lines := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+	if len(out) > 8192 || len(lines) != 2 {
+		return "", "", fmt.Errorf("worktree-check did not answer <path>\\n<gitdir>")
+	}
+	for _, l := range lines {
+		if l == "" || !filepath.IsAbs(l) || filepath.Clean(l) != l {
+			return "", "", fmt.Errorf("worktree-check answered a line that is not a clean absolute path")
+		}
+	}
+	return lines[0], lines[1], nil
 }
 
 type relayKey struct {
@@ -528,3 +566,21 @@ func (h *hubRemote) pruneKeys() {
 }
 
 var _ = errors.New
+
+// runBounded runs a command with a fixed environment and returns its stdout, bounded by d: SIGTERM at the deadline (sudo
+// relays it to the verb), then a 1 s WaitDelay that closes the pipes even if something still holds them, so a stalled
+// or signal-ignoring child cannot keep the caller (which holds the daemon lock) waiting.
+func runBounded(d time.Duration, bin string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	defer cancel()
+	c := exec.CommandContext(ctx, bin, args...)
+	c.WaitDelay = time.Second
+	c.Cancel = func() error { return c.Process.Signal(syscall.SIGTERM) }
+	c.Env = []string{"PATH=/usr/bin:/bin", "LANG=C.UTF-8"}
+	var out, errb bytes.Buffer
+	c.Stdout, c.Stderr = &out, &errb
+	if err := c.Run(); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}

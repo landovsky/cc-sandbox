@@ -139,14 +139,18 @@ func TestTheHubsStatusReachesTheCallerAsItWas(t *testing.T) {
 func TestAnEntryThatSharesTheChosenOnesAddressIsNeverSentToBlock(t *testing.T) {
 	mgr := map[string]any{"id": "a1b2c3", "uid": "u-real", "key": "ccsbx:s0real", "node": "cc-sandbox:mgr", "machine": "mac", "fenced": true}
 	for name, other := range map[string]map[string]any{
-		"a colliding short id":          {"id": "a1b2c3", "uid": "u-ground", "key": "x4/%1", "node": "cc-sandbox:other", "machine": "x4"},
 		"the same uid":                  {"id": "ffffff", "uid": "u-real", "key": "x4/%2", "machine": "x4"},
-		"the same key":                  {"id": "eeeeee", "uid": "u-else", "key": "ccsbx:s0real", "machine": "x4"},
+		"a key equal to the chosen uid": {"id": "eeeeee", "uid": "u-else", "key": "u-real", "machine": "x4"},
 		"an id equal to the chosen uid": {"id": "u-real", "uid": "u-x", "key": "x4/%3", "machine": "x4"},
 	} {
 		if _, err := Resolve([]map[string]any{mgr, other}, "cc-sandbox:mgr", "mac", "hp"); !errors.Is(err, msg.ErrAmbiguousNode) {
 			t.Errorf("%s: %v", name, err)
 		}
+	}
+	// a ground SHORT id alone blocks nothing: the address is the full uid and the hub never fans a uid out
+	twin := map[string]any{"id": "a1b2c3", "uid": "u-ground", "key": "x4/%1", "node": "cc-sandbox:other", "machine": "x4"}
+	if got, err := Resolve([]map[string]any{mgr, twin}, "cc-sandbox:mgr", "mac", "hp"); err != nil || got.ID != "u-real" {
+		t.Errorf("a shared short id blocked the send: %v %v", got, err)
 	}
 	unrelated := map[string]any{"id": "123456", "uid": "u-other", "key": "x4/%9", "node": "cc-sandbox:other", "machine": "x4"}
 	got, err := Resolve([]map[string]any{mgr, unrelated}, "cc-sandbox:mgr", "mac", "hp")

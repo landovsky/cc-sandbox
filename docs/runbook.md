@@ -723,6 +723,28 @@ them has a group-writable umask (the sidecar's checkout must use 002). A sidecar
 as large as the worktree) is mounted at `/run/ccsbx/side/snapshot`, nested in the side-state volume's path. Whether the
 cluster's admission accepts `fsGroup` and the nested mount is a Gate M question.
 
+## Remote start and the one-live-generation rule (M2c)
+
+Off unless `--owner-user <account>` (the local account sessions run as) is given with the tailnet listener. The owner's other
+machine calls `POST /v1/sessions` (contract: docs/m2c-remote-start.md): OWNER class only (a peer, another login or an unlisted device is
+403), `Content-Type: application/json`, a LaunchSpec whose `owner` equals `--owner-user` and whose `machine` is this one. A remote start
+goes through the SAME start as a local one (profile approved for this machine, the worktree-root check on `workdir.path`, pins, caps) and is
+recorded with who asked (`started_by`, `owner:<login>@<device>`, from the tailnet's word; it is also in `session.started`). What a remote
+caller may ask for is the PROFILE's to allow (`grants`, `harness_args` in the profile JSON, none by default); `resume` only for a session
+that same caller started. Caps: 3 a minute per caller, 10 a minute per calling device, `--remote-max-per-hour` (10, counted apart from the
+local `--max-per-hour`); a retry with the same `request_id` after a lost answer gets the first reply (keyed per caller, brief excluded, kept
+24 h); one still launching answers `409 start_in_progress` + `Retry-After`.
+**One live generation per label across machines.** `--peers hp-ubuntu=http://...:7480,...` lists the OTHER machines (same list, same names as the
+hub's machine ids, on every machine; each daemon compares the hash of its list with its peers' and refuses with `peer_set_mismatch` if they
+differ). Every start, remote or local, reserves the label here (on disk, renewed until the launch is over), asks every peer in parallel under
+`--peer-ask-timeout` (3 s total) `GET /v1/resolve?v=2&label=`, and refuses if ANY peer has it live (`already_running`, with machine and sid) or
+reserved (`start_in_progress`): no name-order tie-break, so two machines starting one label at once may both refuse and retry (safe) but never both
+launch. **One peer being down refuses every start on every machine** (`peer_unreachable`): accepted, there is no force. To run a single machine
+without the check, leave `--peers` empty. Reservations and in-flight markers older than their time are dropped at daemon start. Until H1's worktree
+builder exists (R-WT) the `repo/base/branch` form is validated but refused `not_built`: only `workdir.path` inside `--worktree-root` starts.
+
+**M2c review round (what changed).** The label check FAILS CLOSED: any trouble reading this machine's session records answers a peer with an error (`peer_unreachable` on its side) and refuses a local start; it never reads as "free". A direct-mode `ccsbx start` asks the peers too: hostd publishes `<state>/remote/peers.json` and the CLI reserves in the same directory and asks the same peers (an unreadable file refuses). A remote start needs a git worktree root (see the contract §4), is refused in helper mode until ccsbx-root can check it, and in direct mode needs `--remote-start-direct` with `--owner-user` = the user hostd runs as (helper mode: someone else): wrong combinations are usage errors at startup. In-flight starts are tracked in memory (a late renewal, a sleeping laptop or a clock step cannot end a reservation), idempotency is keyed per caller and checked against the label, and a lost reply is recovered from the session record. Two live sessions never share or nest workdirs. Residual (direct mode): between the workdir check and `docker run` the daemon does not hold the directory by file descriptor, so a session that owns an enclosing tree could swap a nested directory for a link; the overlap refusal removes the nested-session case, not the general race. Not built: the resolve-v2 per-source rate limit (a peer can make it read the records), the doors' second grants check, reconciling a launch in flight from its record (expiry is safe: Live covers a launched pane).
+
 **The hub's address (D's review).** The hub on hp listens on hp's tailnet address, not on loopback, so `hub_url` is
 `http://A.B.C.D:PORT` (an IPv4 literal in canonical form, with a port; names, IPv6, short and leading-zero forms are refused) and, when the secret is about to be sent, A.B.C.D must be one of THIS host's interface addresses. Before the admin secret is
 sent, every LISTEN socket on the port must be `hub_user`'s AND the url's own address must be one the hub listens on

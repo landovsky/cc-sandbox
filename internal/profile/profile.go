@@ -24,6 +24,35 @@ type Profile struct {
 	Deny     []string `json:"deny"`      // extra Claude Code permission rules to deny
 	Mode     string   `json:"mode"`      // Claude Code default mode inside the fence
 	E2E      bool     `json:"e2e"`       // an e2e-* profile: may use the stub's local mode (C18)
+	// Grants are the grant names a REMOTE start may ask for with this profile on this machine (M2c): the
+	// request names grants, the profile decides which are possible. None listed = a remote start asks for none.
+	Grants []string `json:"grants,omitempty"`
+	// HarnessArgs are the flags a remote start may pass the harness (e.g. "--model"); a flag not listed, or a
+	// bare word that is not the value of one, is refused. None listed = no harness_args from a remote caller.
+	HarnessArgs []string `json:"harness_args,omitempty"`
+}
+
+var grantRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,63}$`)
+var flagRe = regexp.MustCompile(`^--[a-z][a-z0-9-]{0,40}$`)
+
+// GrantAllowed reports whether a remote start may request this grant name with this profile.
+func (p *Profile) GrantAllowed(g string) bool {
+	for _, x := range p.Grants {
+		if x == g {
+			return true
+		}
+	}
+	return false
+}
+
+// HarnessArgAllowed reports whether a remote start may pass this flag to the harness.
+func (p *Profile) HarnessArgAllowed(f string) bool {
+	for _, x := range p.HarnessArgs {
+		if x == f {
+			return true
+		}
+	}
+	return false
 }
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
@@ -57,6 +86,16 @@ func (p *Profile) Validate() error {
 	case "bypassPermissions", "acceptEdits", "default", "plan":
 	default:
 		return fmt.Errorf("profile %s: unknown mode %q", p.Name, p.Mode)
+	}
+	for _, g := range p.Grants {
+		if !grantRe.MatchString(g) {
+			return fmt.Errorf("profile %s: grant name %q is not valid", p.Name, g)
+		}
+	}
+	for _, f := range p.HarnessArgs {
+		if !flagRe.MatchString(f) {
+			return fmt.Errorf("profile %s: harness_args entry %q is not a --flag", p.Name, f)
+		}
 	}
 	if p.E2E != (len(p.Name) >= 4 && p.Name[:4] == "e2e-") {
 		return fmt.Errorf("profile %s: e2e=%v must match the e2e- name prefix", p.Name, p.E2E)

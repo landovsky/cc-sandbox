@@ -9,22 +9,28 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/hubc"
 	"github.com/landovsky/cc-sandbox/internal/hubspoke"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
+	"github.com/landovsky/cc-sandbox/internal/remotestart"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
+	"github.com/landovsky/cc-sandbox/profiles"
 )
 
 // mux sends each request type to its piece. A type nobody has built yet is answered
@@ -212,6 +218,8 @@ type startPolicy struct {
 	// or a peer on any other is refused at start, before anything is published (a typo, or a spec trying to
 	// bind someone's node to a machine that is not one of ours). Empty = only the shape is checked.
 	KnownMachines []string
+	// RemoteMaxPerHour is the hourly cap on starts asked for over the tailnet, counted apart from the local ones.
+	RemoteMaxPerHour int
 }
 
 var machineIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
@@ -282,8 +290,20 @@ func warnOnce(logf func(string, ...any)) func(string) {
 // not the caller's own name (the owner is part of the session's id, the journal and token identity),
 // and a worktree-root list ccsbx-root would not accept. Then Daemon.Start with a per-call copy of sd.
 func startHandler(sd *start.Daemon, p startPolicy) func(uid int, spec []byte) (*start.StartReply, error) {
-	return func(uid int, specJSON []byte) (*start.StartReply, error) {
-		if uid == 0 || uid == os.Getuid() || uid < p.MinUID {
+	by := startHandlerBy(sd, p, nil)
+	return func(uid int, spec []byte) (*start.StartReply, error) { return by(uid, spec, "") }
+}
+
+// startHandlerBy is startHandler with the stamped identity of a REMOTE caller ("" for a local one, whose uid is
+// the socket peer's). The label check across machines (guard) runs for EVERY start that is not itself the remote
+// path (which runs it already): a local `ccsbx start` and a remote start of one label must not both launch.
+func startHandlerBy(sd *start.Daemon, p startPolicy, guard *remotestart.Service) func(uid int, spec []byte, startedBy string) (*start.StartReply, error) {
+	return func(uid int, specJSON []byte, startedBy string) (*start.StartReply, error) {
+		// A REMOTE start (startedBy != "") runs as the operator-configured --owner-user, not as a socket peer: in
+		// direct mode that is the user hostd itself runs as (nothing to protect: the panes are that user's too); in
+		// helper mode hostd's uid is the service user and the owner must be someone else.
+		serviceUser := uid == os.Getuid() && (startedBy == "" || sd.Root == "helper")
+		if uid == 0 || serviceUser || uid < p.MinUID {
 			return nil, &start.Refusal{Code: start.BadSpec, Msg: fmt.Sprintf("uid %d may not start sessions (root, the service user, or below the minimum uid %d)", uid, p.MinUID)}
 		}
 		spec, err := start.ParseSpec(specJSON)
@@ -298,11 +318,29 @@ func startHandler(sd *start.Daemon, p startPolicy) func(uid int, spec []byte) (*
 		}
 		d := *sd // a copy per call: Uid differs, everything else is hostd's configuration
 		d.Uid, d.RunDir = uid, p.RunDir
+		if d.Root == "helper" && d.WorktreeCheck == nil {
+			d.WorktreeCheck = rootWorktreeCheck
+		}
 		// The roots are passed through unchanged: hostd is a service, a relative entry means nothing to
 		// it, and CheckWorkdir refuses exactly what ccsbx-root's allowed_roots refuses.
 		d.PinsFile, d.WorktreeRoot = p.Pins, p.WorktreeRoots
 		d.Image, d.CCVersion, d.Socket = p.Image, p.CCVersion, p.TmuxSocket
-		d.MaxLive, d.MaxPerHour = p.MaxLive, p.MaxPerHour
+		d.MaxLive, d.MaxPerHour, d.RemoteMaxPerHour, d.StartedBy = p.MaxLive, p.MaxPerHour, p.RemoteMaxPerHour, startedBy
+		// A retry already recorded is answered from the record, read-only. Anything else goes through the Guard even
+		// if a record vanishes meanwhile (a failed launch rolls its record back): Start's own idempotency is inside it.
+		if guard != nil && startedBy == "" {
+			if rep, same := d.Recorded(uid, "", spec.RequestID, spec.Label); rep != nil {
+				if !same {
+					return nil, &start.Refusal{Code: start.RequestIDReused, Msg: "request_id was already used for another session"}
+				}
+				return rep, nil
+			}
+			rep, ref := guard.Guard(context.Background(), spec.Label, "local:"+strconv.Itoa(uid), func() (*start.StartReply, error) { return d.Start(spec) })
+			if ref != nil {
+				return nil, ref
+			}
+			return rep, nil
+		}
 		return d.Start(spec)
 	}
 }
@@ -384,4 +422,113 @@ func fencedEntries(machine string, all []msg.Session, idleSince func(sid string,
 		out = append(out, e)
 	}
 	return out
+}
+
+// startHandlerBy2 is the LOCAL start with the cross-machine label check in front of it.
+func startHandlerBy2(sd *start.Daemon, p startPolicy, guard *remotestart.Service) func(uid int, spec []byte) (*start.StartReply, error) {
+	by := startHandlerBy(sd, p, guard)
+	return func(uid int, spec []byte) (*start.StartReply, error) { return by(uid, spec, "") }
+}
+
+// remoteService builds the remote start (M2c) from hostd's flags: nil when --owner-user and --peers are both empty.
+// The peer list is validated here (name=url, http or https, no duplicates, never this machine itself), so a typo is
+// a startup error and not a start that refuses forever.
+func remoteService(get func(string) string, num func(string) int, sd *start.Daemon, p startPolicy, stderr io.Writer) (*remotestart.Service, int) {
+	owner, peerList := get("owner-user"), splitList(get("peers"))
+	if owner == "" && len(peerList) == 0 {
+		remotestart.Unpublish(get("state")) // a stale list must not outlive a config that dropped it
+		return nil, 0
+	}
+	machine := get("machine")
+	names := []string{machine}
+	var peers []remotestart.Peer
+	seen := map[string]bool{machine: true}
+	for _, kv := range peerList {
+		name, u, ok := strings.Cut(kv, "=")
+		pu, err := url.Parse(u)
+		if !ok || !machineIDRe.MatchString(name) || seen[name] || err != nil || (pu.Scheme != "http" && pu.Scheme != "https") || pu.Host == "" {
+			fmt.Fprintf(stderr, "ccsbx-hostd: --peers %q: want <machine>=<http(s) url>, one per OTHER machine, no repeats\n", kv)
+			return nil, cli.ExitUsage
+		}
+		seen[name] = true
+		names = append(names, name)
+		peers = append(peers, remotestart.Peer{Name: name, URL: strings.TrimRight(u, "/")})
+	}
+	timeout, err := time.ParseDuration(get("peer-ask-timeout"))
+	if err != nil || timeout <= 0 || timeout > time.Minute {
+		fmt.Fprintf(stderr, "ccsbx-hostd: --peer-ask-timeout %q: want a duration up to 1m\n", get("peer-ask-timeout"))
+		return nil, cli.ExitUsage
+	}
+	remoteOn := false
+	if owner != "" {
+		u, err := user.Lookup(owner)
+		if err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: --owner-user %q: no such user\n", owner)
+			return nil, cli.ExitUsage
+		}
+		ouid, _ := strconv.Atoi(u.Uid)
+		switch {
+		case sd.Root == "helper" && ouid == os.Getuid():
+			fmt.Fprintln(stderr, "ccsbx-hostd: --owner-user is hostd's own user, which in helper mode is the service user: the owner must be someone else")
+			return nil, cli.ExitUsage
+		case sd.Root != "helper" && ouid != os.Getuid():
+			fmt.Fprintln(stderr, "ccsbx-hostd: in direct mode --owner-user must be the user hostd runs as (the panes and docker are that user's)")
+			return nil, cli.ExitUsage
+		case sd.Root != "helper" && get("remote-start-direct") != "true":
+			fmt.Fprintln(stderr, "ccsbx-hostd: --owner-user in direct mode starts non-evidence fences for anyone on a listed owner device: add --remote-start-direct to say you mean it")
+			return nil, cli.ExitUsage
+		}
+		remoteOn = true
+	}
+	remoteStart := p
+	lookupUID := func(n string) (int, error) {
+		u, err := user.Lookup(n)
+		if err != nil {
+			return 0, err
+		}
+		return strconv.Atoi(u.Uid)
+	}
+	svc, err := remotestart.New(remotestart.Config{
+		Machine: machine, OwnerUser: owner, Peers: peers, PeerSet: remotestart.PeerSetHash(names), StateDir: filepath.Join(get("state"), "remote"),
+		Profiles: profiles.Load,
+		LookupUID: func(n string) (int, error) {
+			u, err := user.Lookup(n)
+			if err != nil {
+				return 0, err
+			}
+			return strconv.Atoi(u.Uid)
+		},
+		Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
+			return startHandlerBy(sd, remoteStart, nil)(uid, spec, by)
+		},
+		Live: func(label string) ([]remotestart.View, error) {
+			recs, err := sd.LiveByLabel(label)
+			if err != nil {
+				return nil, err // could not tell: the answer to a peer is an error, never "nothing live"
+			}
+			var out []remotestart.View
+			for _, r := range recs {
+				out = append(out, remotestart.View{Machine: machine, Sid: r.Sid, Gen: r.Gen, State: "running"})
+			}
+			return out, nil
+		},
+		Recorded: func(by, rid, label string) (*start.StartReply, bool) {
+			uid, err := lookupUID(owner)
+			if err != nil {
+				return nil, false
+			}
+			return sd.Recorded(uid, by, rid, label)
+		},
+		RemoteEnabled: remoteOn,
+		Logf:          log.Printf, PerUserMinute: num("remote-per-user-minute"), PerMachineMinute: num("remote-per-machine-minute"), AskTimeout: timeout,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "ccsbx-hostd: remote start: %v\n", err)
+		return nil, cli.ExitFail
+	}
+	if err := svc.Publish(); err != nil { // a direct-mode `ccsbx start` reads this and asks the same peers
+		fmt.Fprintf(stderr, "ccsbx-hostd: cannot publish the peer list for local starts: %v\n", err)
+		return nil, cli.ExitFail
+	}
+	return svc, 0
 }

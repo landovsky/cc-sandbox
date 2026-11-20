@@ -4,18 +4,28 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"net/http/httptest"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/landovsky/cc-sandbox/internal/daemonapi"
 	"github.com/landovsky/cc-sandbox/internal/hostd"
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/msg"
+	"github.com/landovsky/cc-sandbox/internal/profile"
+	"github.com/landovsky/cc-sandbox/internal/remotestart"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
 	"github.com/landovsky/cc-sandbox/profiles"
@@ -220,6 +230,16 @@ func wdir(t *testing.T) string {
 	return d
 }
 
+// gitwdir is wdir plus `git init`: a remote start must name a git worktree root.
+func gitwdir(t *testing.T) string {
+	t.Helper()
+	d := wdir(t)
+	if out, err := exec.Command("git", "init", "-q", d).CombinedOutput(); err != nil {
+		t.Skipf("git init: %v %s", err, out)
+	}
+	return d
+}
+
 func policyFor(t *testing.T, lookup string) (*start.Daemon, startPolicy) {
 	t.Helper()
 	sd := &start.Daemon{StateDir: t.TempDir(), Machine: "hp-ubuntu", Root: "direct", Exe: "ccsbx", Backend: "docker", Launcher: start.NoLauncher{}, ProfileLoader: profiles.Load}
@@ -315,5 +335,388 @@ func TestAHubWarningIsLoggedOncePerMessage(t *testing.T) {
 	w("another")
 	if n != 2 {
 		t.Fatalf("logged %d times, want 2", n)
+	}
+}
+
+// context (R2-C1): the cross-machine label check runs for EVERY start, a local `ccsbx start` on the unix socket
+// included. Otherwise a remote start from the Mac and a local start on hp, one second apart, would both launch the
+// same label, and the reservation protocol would protect nothing.
+func TestALocalStartAsksThePeersToo(t *testing.T) {
+	w := wdir(t)
+	sd, p := policyFor(t, "tomas")
+	var asked []string
+	svc, err := remotestart.New(remotestart.Config{
+		Machine: "hp-ubuntu", OwnerUser: "tomas", PeerSet: "S", StateDir: t.TempDir(),
+		Peers:    []remotestart.Peer{{Name: "mac-tomas", URL: "http://mac"}},
+		Profiles: profiles.Load, LookupUID: func(string) (int, error) { return os.Getuid(), nil },
+		Starter: func(int, []byte, string) (*start.StartReply, error) { return nil, errors.New("unused") },
+		Live:    func(string) ([]remotestart.View, error) { return nil, nil },
+		AskPeer: func(_ context.Context, pe remotestart.Peer, label string) (remotestart.Answer, error) {
+			asked = append(asked, pe.Name+" "+label)
+			return remotestart.Answer{Live: []remotestart.View{{Machine: "mac-tomas", Sid: "s0there", State: "running"}}, PeerSet: "S"}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := startHandlerBy2(sd, p, svc)
+	_, err = h(4000, []byte(fmt.Sprintf(specOf, "tomas", w)))
+	if r, ok := err.(*start.Refusal); !ok || r.Code != start.AlreadyRunning || r.Machine != "mac-tomas" {
+		t.Fatalf("a local start of a label that is live on a peer: %v", err)
+	}
+	if len(asked) != 1 || !strings.Contains(asked[0], "cc-sandbox:x") {
+		t.Fatalf("the peer was not asked: %v", asked)
+	}
+	// nothing was recorded or launched
+	if recs, _ := os.ReadDir(filepath.Join(sd.StateDir, "sessions")); len(recs) != 0 {
+		t.Fatalf("a refused start left %d records", len(recs))
+	}
+}
+
+func remoteRig(t *testing.T) (*start.Daemon, startPolicy, *remotestart.Service) {
+	t.Helper()
+	sd, p := policyFor(t, "tomas")
+	p.RemoteMaxPerHour = 2
+	svc, err := remotestart.New(remotestart.Config{
+		Machine: "hp-ubuntu", OwnerUser: "tomas", PeerSet: "S", StateDir: t.TempDir(),
+		Profiles: profiles.Load, LookupUID: func(string) (int, error) { return os.Getuid(), nil },
+		Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
+			return startHandlerBy(sd, p, nil)(uid, spec, by)
+		},
+		Live: func(label string) ([]remotestart.View, error) {
+			recs, _ := sd.LiveByLabel(label)
+			var out []remotestart.View
+			for _, r := range recs {
+				out = append(out, remotestart.View{Machine: "hp-ubuntu", Sid: r.Sid, Gen: r.Gen, State: "running"})
+			}
+			return out, nil
+		},
+		PerUserMinute: 100, PerMachineMinute: 100,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return sd, p, svc
+}
+
+// context (M2c end to end, path form): the owner's other machine starts a session HERE; it goes through the same
+// start as a local one (profile, worktree root, pins), is recorded with who asked, and a retry after a lost answer
+// is the same session.
+func TestARemoteStartIsRecordedWithWhoAskedAndRetriesAreIdempotent(t *testing.T) {
+	w := gitwdir(t)
+	sd, _, svc := remoteRig(t)
+	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac-tomas.example.ts.net"}
+	body := []byte(fmt.Sprintf(specOf, "tomas", w))
+	rep, ref := svc.Start(context.Background(), me, body)
+	if ref != nil {
+		t.Fatalf("%v", ref)
+	}
+	rec, err := sd.Load(rep.Sid)
+	if err != nil || rec.StartedBy != me.StartedBy {
+		t.Fatalf("the record does not say who asked: %+v %v", rec, err)
+	}
+	again, ref := svc.Start(context.Background(), me, body)
+	if ref != nil || again.Sid != rep.Sid {
+		t.Fatalf("a retry started a second session: %v %v", again, ref)
+	}
+	// a path outside the worktree root is refused exactly as a local start refuses it (nothing remote widens it)
+	out := []byte(fmt.Sprintf(specOf, "tomas", "/etc"))
+	out = []byte(strings.Replace(string(out), `"r1"`, `"r2"`, 1))
+	out = []byte(strings.Replace(string(out), "cc-sandbox:x", "cc-sandbox:y", 1))
+	if _, ref := svc.Start(context.Background(), me, out); ref == nil || ref.Code != start.BadSpec {
+		t.Fatalf("a remote workdir outside the worktree root: %v", ref)
+	}
+}
+
+// context (C2): a remote caller may resume only a session it started; the owner's local sessions, and another
+// device's, are not its to take over.
+func TestARemoteCallerCannotResumeASessionItDidNotStart(t *testing.T) {
+	w := gitwdir(t)
+	sd, _, svc := remoteRig(t)
+	a := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
+	b := remotestart.Caller{StartedBy: "owner:tomas@example.com@old-laptop", Machine: "laptop"}
+	rep, ref := svc.Start(context.Background(), a, []byte(fmt.Sprintf(specOf, "tomas", w)))
+	if ref != nil {
+		t.Fatal(ref)
+	}
+	sd.Launcher = start.NoLauncher{}
+	resume := strings.Replace(fmt.Sprintf(specOf, "tomas", w), `"request_id":"r1"`, `"request_id":"r2","resume":{"sid":"`+rep.Sid+`"}`, 1)
+	if _, ref := svc.Start(context.Background(), b, []byte(resume)); ref == nil || ref.Code != start.ResumeNotYours {
+		t.Fatalf("another device resumed it: %v", ref)
+	}
+}
+
+// context (C8): the remote hourly budget is its own: using it up leaves the owner's local starts alone, and the
+// other way round.
+func TestTheRemoteHourlyBudgetIsSeparateFromTheLocalOne(t *testing.T) {
+	w := gitwdir(t)
+	sd, p, svc := remoteRig(t)
+	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
+	label := func(i int) string {
+		return strings.NewReplacer(`"r1"`, fmt.Sprintf(`"r%d"`, i), "cc-sandbox:x", fmt.Sprintf("cc-sandbox:x%d", i)).Replace(fmt.Sprintf(specOf, "tomas", w))
+	}
+	for i := 1; i <= 2; i++ {
+		if _, ref := svc.Start(context.Background(), me, []byte(label(i))); ref != nil {
+			t.Fatalf("remote start %d: %v", i, ref)
+		}
+	}
+	if _, ref := svc.Start(context.Background(), me, []byte(label(3))); ref == nil || ref.Code != start.RateCapped {
+		t.Fatalf("the 3rd remote start in the hour: %v", ref)
+	}
+	local := strings.Replace(label(4), w, wdir(t), 1) // a local start needs no git worktree: its own plain directory
+	if _, err := startHandler(sd, p)(4000, []byte(local)); err != nil {
+		t.Fatalf("a LOCAL start was refused because remote starts used up the remote budget: %v", err)
+	}
+}
+
+// context (C6, C12 review): a remote workdir.path is checked exactly as a local one: symlinks resolved, strictly
+// inside a configured root, no hidden home directories. Each case is a way a remote caller could point the fence at
+// something that is not a worktree: a symlink out of the root, a sibling that merely starts with the root's name, a
+// dot-directory such as ~/.ssh, the root itself.
+func TestARemoteWorkdirIsHeldToTheWorktreeRootBlock(t *testing.T) {
+	_, _, svc := remoteRig(t)
+	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
+	root := "/var/tmp"
+	inside := gitwdir(t) // a real directory under the root
+	outside, _ := os.MkdirTemp(os.TempDir(), "ccsbx-outside-")
+	t.Cleanup(func() { os.RemoveAll(outside) })
+	link := filepath.Join(inside, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	sibling := root + "2" // /var/tmp2: starts with the root's name, is not inside it
+	os.MkdirAll(sibling, 0o700)
+	t.Cleanup(func() { os.RemoveAll(sibling) })
+	home, _ := os.UserHomeDir()
+	hidden := filepath.Join(home, ".ssh") // outside the root, as a hidden home directory is
+	plain := wdir(t)                      // a real directory under the root that is NOT a git worktree
+	repoSub := filepath.Join(inside, "sub")
+	os.MkdirAll(repoSub, 0o755)
+	n := 0
+	try := func(path string) *start.Refusal {
+		n++
+		body := strings.NewReplacer(`"r1"`, fmt.Sprintf(`"rw%d"`, n), "cc-sandbox:x", fmt.Sprintf("cc-sandbox:w%d", n)).Replace(fmt.Sprintf(specOf, "tomas", path))
+		_, ref := svc.Start(context.Background(), me, []byte(body))
+		return ref
+	}
+	for name, p := range map[string]string{
+		"a symlink out of the root":                                   link,
+		"a sibling that starts with the root":                         sibling,
+		"a hidden directory (~/.ssh-like)":                            hidden,
+		"the root itself":                                             root,
+		"a path with ..":                                              inside + "/../../etc",
+		"a relative path":                                             "tmp/x",
+		"a plain directory (not a worktree)":                          plain,
+		"a subdirectory of a repo":                                    repoSub,
+		"the parent of repos (the root's own child that holds repos)": filepath.Dir(plain),
+	} {
+		if ref := try(p); ref == nil || ref.Code != start.BadSpec {
+			t.Errorf("%s: %v", name, ref)
+		}
+	}
+	if ref := try(inside); ref != nil {
+		t.Fatalf("a directory inside the root was refused: %v", ref)
+	}
+}
+
+// context (M2c, direct mode): in direct mode hostd runs AS the owner, so the owner's own uid is exactly what a remote
+// start must run as; in helper mode hostd's uid is the service user, and an owner-user equal to it is a
+// misconfiguration that must not start sessions.
+func TestARemoteStartMayRunAsHostdsOwnUserOnlyInDirectMode(t *testing.T) {
+	w := wdir(t)
+	for _, c := range []struct {
+		root string
+		ok   bool
+	}{{"direct", true}, {"helper", false}} {
+		sd, p := policyFor(t, "tomas")
+		sd.Root = c.root
+		_, err := startHandlerBy(sd, p, nil)(os.Getuid(), []byte(fmt.Sprintf(specOf, "tomas", w)), "owner:tomas@example.com@mac")
+		refused := err != nil && strings.Contains(err.Error(), "may not start sessions")
+		if refused == c.ok {
+			t.Errorf("%s mode: refused as the service user = %v (%v)", c.root, refused, err)
+		}
+	}
+}
+
+// context (M2c over real HTTP): two daemons that ask each other through GET /v1/resolve?v=2 (the real routes, JSON and
+// all), each with its own state and a launcher that records a live session. One label is live on one machine only,
+// whichever asks first, and a start on the other is refused with where it lives.
+func TestTwoDaemonsAskingEachOtherOverHTTPNeverStartTheSameLabelTwice(t *testing.T) {
+	type machine struct {
+		sd  *start.Daemon
+		svc *remotestart.Service
+		ts  *httptest.Server
+	}
+	names := []string{"hp-ubuntu", "mac-tomas"}
+	set := remotestart.PeerSetHash(names)
+	ms := map[string]*machine{}
+	srvOf := map[string]*daemonapi.Server{}
+	for _, n := range names {
+		sd, p := policyFor(t, "tomas")
+		sd.Machine = n
+		m := &machine{sd: sd}
+		ms[n] = m
+		srv := &daemonapi.Server{}
+		srvOf[n] = srv
+		m.ts = httptest.NewServer(srv.Handler())
+		t.Cleanup(m.ts.Close)
+		_ = p
+	}
+	for _, n := range names {
+		other := names[0]
+		if n == names[0] {
+			other = names[1]
+		}
+		m := ms[n]
+		sd, p := policyFor(t, "tomas")
+		sd.Machine = n
+		sd.Launcher = aliveLauncher{}   // a launched session counts as live
+		sd.ProfileLoader = bothMachines // the profile is approved on both machines of this test
+		m.sd = sd
+		nn := n
+		svc, err := remotestart.New(remotestart.Config{
+			Machine: n, OwnerUser: "tomas", PeerSet: set, StateDir: t.TempDir(),
+			Peers:     []remotestart.Peer{{Name: other, URL: ms[other].ts.URL}},
+			Profiles:  bothMachines,
+			LookupUID: func(string) (int, error) { return os.Getuid(), nil },
+			Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
+				return startHandlerBy(sd, p, nil)(uid, spec, by)
+			},
+			Live: func(label string) ([]remotestart.View, error) {
+				recs, _ := sd.LiveByLabel(label)
+				var out []remotestart.View
+				for _, r := range recs {
+					out = append(out, remotestart.View{Machine: nn, Sid: r.Sid, Gen: r.Gen, State: "running"})
+				}
+				return out, nil
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		m.svc = svc
+		srvOf[n].Remote = svc
+	}
+	w := gitwdir(t)
+	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
+	body := func(machine, rid string) []byte {
+		return []byte(strings.NewReplacer(`"r1"`, `"`+rid+`"`, "hp-ubuntu", machine).Replace(fmt.Sprintf(specOf, "tomas", w)))
+	}
+	// the same label, started on BOTH machines at the same moment
+	var wg sync.WaitGroup
+	results := make([]*start.Refusal, 2)
+	ok := make([]bool, 2)
+	for i, n := range names {
+		wg.Add(1)
+		go func(i int, n string) {
+			defer wg.Done()
+			rep, ref := ms[n].svc.Start(context.Background(), me, body(n, "q"+strconv.Itoa(i)))
+			results[i], ok[i] = ref, rep != nil
+		}(i, n)
+	}
+	wg.Wait()
+	if ok[0] && ok[1] {
+		t.Fatal("the same label was started on both machines")
+	}
+	// afterwards: it lives on exactly one; a start on the other is refused with where
+	var live string
+	for _, n := range names {
+		if recs, _ := ms[n].sd.LiveByLabel("cc-sandbox:x"); len(recs) > 0 {
+			live = n
+		}
+	}
+	if live == "" {
+		for _, r := range results {
+			if r == nil || (r.Code != start.StartInProgress && r.Code != start.AlreadyRunning) {
+				t.Fatalf("neither machine started it, and a refusal is not the safe kind: %v", r)
+			}
+		}
+		return // both refused and would retry: the safe worst case
+	}
+	other := names[0]
+	if live == names[0] {
+		other = names[1]
+	}
+	_, ref := ms[other].svc.Start(context.Background(), me, body(other, "later"))
+	if ref == nil || ref.Code != start.AlreadyRunning || ref.Machine != live {
+		t.Fatalf("a start on %s after it lives on %s: %v", other, live, ref)
+	}
+}
+
+// aliveLauncher launches nothing and reports every session alive (start.NoLauncher reports none, so its records never
+// block a label: right for most tests, wrong for one about a label that IS live).
+type aliveLauncher struct{}
+
+func (aliveLauncher) Launch(*start.Record) error { return nil }
+func (aliveLauncher) Alive(string) bool          { return true }
+
+func bothMachines(name string) (*profile.Profile, error) {
+	p, err := profiles.Load(name)
+	if err == nil {
+		p.Machines = append(p.Machines, "mac-tomas")
+	}
+	return p, err
+}
+
+// context (M2, review): one unreadable file in the session records must make the label check say "cannot tell", not
+// "nothing live"; a record that merely vanished between the listing and the read (a failed launch rolls back) must not.
+func TestAnUnreadableSessionRecordIsAnErrorNotAFreeLabel(t *testing.T) {
+	sd, _ := policyFor(t, "tomas")
+	sd.Launcher = aliveLauncher{}
+	os.MkdirAll(filepath.Join(sd.StateDir, "sessions"), 0o700)
+	if _, err := sd.LiveByLabel("cc-sandbox:x"); err != nil {
+		t.Fatalf("no sessions at all is an empty answer: %v", err)
+	}
+	os.WriteFile(filepath.Join(sd.StateDir, "sessions", "junk.json"), []byte("{not json"), 0o600)
+	if _, err := sd.LiveByLabel("cc-sandbox:x"); err == nil {
+		t.Fatal("a bad record file was read as 'nothing live'")
+	}
+}
+
+// context (S5, review): in direct mode a remote start is an explicit opt-in and its owner is the user hostd runs as;
+// in helper mode it is someone else. A misconfiguration is a usage error at startup, never a surprise at the first start.
+func TestRemoteStartOwnerUserRulesAreCheckedAtStartup(t *testing.T) {
+	me, _ := user.Current()
+	other := "root"
+	if me.Username == "root" {
+		other = "nobody"
+	}
+	for name, c := range map[string]struct {
+		root, owner, direct string
+		ok                  bool
+	}{
+		"direct, the hostd user, opted in":  {"direct", me.Username, "true", true},
+		"direct, the hostd user, no opt-in": {"direct", me.Username, "false", false},
+		"direct, another user":              {"direct", other, "true", false},
+		"helper, the hostd user":            {"helper", me.Username, "false", false},
+	} {
+		sd, p := policyFor(t, "tomas")
+		sd.Root = c.root
+		get := func(k string) string {
+			return map[string]string{"owner-user": c.owner, "peers": "", "machine": "hp-ubuntu", "state": t.TempDir(), "peer-ask-timeout": "3s", "remote-start-direct": c.direct}[k]
+		}
+		_, rc := remoteService(get, func(string) int { return 0 }, sd, p, io.Discard)
+		if (rc == 0) != c.ok {
+			t.Errorf("%s: exit %d, want ok=%v", name, rc, c.ok)
+		}
+	}
+}
+
+// context (R3-S2, review): the same caller reusing a request_id for ANOTHER label must not be handed the first start's reply.
+func TestAReusedRequestIDForAnotherLabelIsRefusedNotReplayed(t *testing.T) {
+	w := wdir(t)
+	sd, p := policyFor(t, "tomas")
+	svc, _ := remotestart.New(remotestart.Config{Machine: "hp-ubuntu", PeerSet: "S", StateDir: t.TempDir(),
+		Live: func(string) ([]remotestart.View, error) { return nil, nil }, Profiles: profiles.Load,
+		Starter: func(uid int, spec []byte, by string) (*start.StartReply, error) {
+			return startHandlerBy(sd, p, nil)(uid, spec, by)
+		}})
+	h := startHandlerBy(sd, p, svc)
+	if _, err := h(4000, []byte(fmt.Sprintf(specOf, "tomas", w)), ""); err != nil {
+		t.Fatal(err)
+	}
+	other := strings.Replace(fmt.Sprintf(specOf, "tomas", w), "cc-sandbox:x", "cc-sandbox:y", 1)
+	if _, err := h(4000, []byte(other), ""); err == nil || !strings.Contains(err.Error(), start.RequestIDReused) {
+		t.Fatalf("the old reply was replayed for another label: %v", err)
 	}
 }

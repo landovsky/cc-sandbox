@@ -351,7 +351,11 @@ func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, s
 				box.overflow = true
 				h.Cfg.Logf("hostd: %s/%s: outbox over its lifetime cap (%d); shedding the rest", sid, gen, h.Cfg.MaxTotal)
 			}
-			box.seen[n] = 0
+			// Remember a shed name only up to a bound: a fence that keeps creating NEW names would otherwise grow this
+			// set without end (memory), and a shed name is cheap to meet again (it is skipped here, unread).
+			if len(box.seen) < 2*h.Cfg.MaxTotal {
+				box.seen[n] = 0
+			}
 			st.Shed++
 			continue
 		}

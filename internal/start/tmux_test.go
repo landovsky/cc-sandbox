@@ -74,8 +74,9 @@ func TestLauncherTmuxCallsTimeOut(t *testing.T) {
 	defer func() { tmuxsock.Timeout = old }()
 	tl := &TmuxLauncher{Exe: "x", Socket: "x", Command: func(string, ...string) *exec.Cmd { return exec.Command("sleep", "30") }}
 	t0 := time.Now()
-	if tl.Alive("s1") || time.Since(t0) > 3*time.Second {
-		t.Fatalf("alive or slow: %s", time.Since(t0))
+	// "cannot tell" (a wedged server) counts as alive: the label check fails closed, and the call is bounded
+	if !tl.Alive("s1") || time.Since(t0) > 3*time.Second {
+		t.Fatalf("not alive on a timeout, or slow: %s", time.Since(t0))
 	}
 }
 

@@ -227,28 +227,39 @@ func (c CLI) SelfIPs(ctx context.Context) ([]netip.Addr, error) {
 }
 
 // CheckBinary refuses a tailscale binary whose path decides who every caller is, when someone else could
-// change it: it must be absolute, a regular file, and neither it nor its directory writable by group or other.
+// change it: it must be absolute, a regular file, owned by root or this user, and neither it nor ANY directory on
+// its real path (symlinks resolved: a link into a writable directory counts) writable by group or other or owned by
+// someone else.
 func CheckBinary(path string) error {
 	if !filepath.IsAbs(path) {
 		return fmt.Errorf("%q is not an absolute path", path)
 	}
-	fi, err := os.Stat(path)
+	real, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		return err
+	}
+	fi, err := os.Stat(real)
 	if err != nil {
 		return err
 	}
 	if !fi.Mode().IsRegular() {
 		return fmt.Errorf("%s is not a regular file", path)
 	}
-	for _, p := range []string{path, filepath.Dir(path)} {
+	for p := real; ; p = filepath.Dir(p) {
 		st, err := os.Stat(p)
 		if err != nil {
 			return err
 		}
-		if st.Mode().Perm()&0o022 != 0 {
+		if st.Mode().Perm()&0o022 != 0 && !(st.IsDir() && st.Mode()&os.ModeSticky != 0 && p != filepath.Dir(real)) {
 			return fmt.Errorf("%s is writable by group or other: whoever can write it decides every caller's identity", p)
 		}
+		if sys, ok := st.Sys().(*syscall.Stat_t); ok && sys.Uid != 0 && int(sys.Uid) != os.Getuid() {
+			return fmt.Errorf("%s is owned by uid %d, not root or this daemon's user", p, sys.Uid)
+		}
+		if p == "/" {
+			return nil
+		}
 	}
-	return nil
 }
 
 // CheckSocket expects tailscaled's LocalAPI socket: a unix socket owned by root or by the daemon's own user.

@@ -4,7 +4,9 @@
 package start
 
 import (
+	"errors"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/profiles"
 	"os"
 	"os/exec"
 	"os/user"
@@ -167,11 +169,19 @@ func TestStart(t *testing.T) {
 		d, _ := newDaemon(t)
 		d.MaxLive = 2
 		for i, l := range []string{"a", "b"} {
-			if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = l; s.RequestID = "r" + string(rune('0'+i)) })); err != nil {
+			if _, err := d.Start(spec(func(s *LaunchSpec) {
+				s.Label = l
+				s.RequestID = "r" + string(rune('0'+i))
+				s.Workdir.Path = sub(t, spec(nil).Workdir.Path, l)
+			})); err != nil {
 				t.Fatal(err)
 			}
 		}
-		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "c"; s.RequestID = "r9" })); code(err) != MachineFull {
+		if _, err := d.Start(spec(func(s *LaunchSpec) {
+			s.Label = "c"
+			s.RequestID = "r9"
+			s.Workdir.Path = sub(t, spec(nil).Workdir.Path, "c")
+		})); code(err) != MachineFull {
 			t.Fatal(err)
 		}
 	})
@@ -182,7 +192,11 @@ func TestStart(t *testing.T) {
 		now := time.Now()
 		d.Now = func() time.Time { return now }
 		for i, l := range []string{"a", "b"} {
-			d.Start(spec(func(s *LaunchSpec) { s.Label = l; s.RequestID = "r" + string(rune('0'+i)) }))
+			d.Start(spec(func(s *LaunchSpec) {
+				s.Label = l
+				s.RequestID = "r" + string(rune('0'+i))
+				s.Workdir.Path = sub(t, spec(nil).Workdir.Path, l)
+			}))
 		}
 		for sid := range fl.alive {
 			fl.alive[sid] = false
@@ -605,6 +619,157 @@ func TestHelperModeRefusesAGitdirOutsideTheWorktreeRoots(t *testing.T) {
 		s.GitDir = "/etc/.git/worktrees/x"
 	})
 	if _, err := d.Start(s); err == nil || !strings.Contains(err.Error(), "not under a worktree root") {
+		t.Fatalf("%v", err)
+	}
+}
+
+// context (docs/m2c-remote-start.md §4): the repo form is refused not_built until the git route exists, but its
+// values are validated NOW, at parse time, so that route can never receive an option, a path or a revision
+// range in place of a name.
+func TestTheRepoFormIsValidatedAtParseTimeBlock(t *testing.T) {
+	spec := func(repo, base, branch string) []byte {
+		return []byte(fmt.Sprintf(`{"v":1,"request_id":"r1","owner":"tomas","machine":"hp-ubuntu","label":"cc-sandbox:x","harness":"claude","profile":"dev-default","billing":"api","workdir":{"repo":%q,"base":%q,"branch":%q}}`, repo, base, branch))
+	}
+	if _, err := ParseSpec(spec("github.com/landovsky/cc-sandbox", "main", "ccsbx/326q")); err != nil {
+		t.Fatalf("a good repo form: %v", err)
+	}
+	for name, c := range map[string][3]string{
+		"a base that is an option":    {"github.com/a/b", "--upload-pack=x", "br"},
+		"a branch that is an option":  {"github.com/a/b", "main", "-b"},
+		"a revision range":            {"github.com/a/b", "a..b", "br"},
+		"a doubled slash":             {"github.com/a/b", "main", "x//y"},
+		"a lock suffix":               {"github.com/a/b", "main", "x.lock"},
+		"a trailing slash":            {"github.com/a/b", "main/", "br"},
+		"an @{ reflog form":           {"github.com/a/b", "main@{1}", "br"},
+		"a repo that is another host": {"gitlab.com/a/b", "main", "br"},
+		"a repo that is a url":        {"https://github.com/a/b", "main", "br"},
+		"a repo with a path escape":   {"github.com/../b", "main", "br"},
+		"an empty base":               {"github.com/a/b", "", "br"},
+	} {
+		if _, err := ParseSpec(spec(c[0], c[1], c[2])); err == nil {
+			t.Errorf("%s was accepted", name)
+		}
+	}
+}
+
+// sub makes (and returns) a sibling workdir under base: sessions that are live at once need workdirs that do not overlap.
+func sub(t *testing.T, base, name string) string {
+	t.Helper()
+	p := filepath.Join(base, name)
+	if err := os.MkdirAll(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// context (one workdir, one live session): an outer tree's agent could swap an inner directory for a link between the
+// check and the mount, so a workdir that equals, contains or sits inside another live session's is refused.
+func TestOverlappingWorkdirsOfLiveSessionsAreRefused(t *testing.T) {
+	d, _ := newDaemon(t)
+	base := spec(nil).Workdir.Path
+	a := sub(t, base, "outer")
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "a"; s.RequestID = "r1"; s.Workdir.Path = a })); err != nil {
+		t.Fatal(err)
+	}
+	for name, p := range map[string]string{"the same directory": a, "inside it": sub(t, a, "inner"), "containing it": base} {
+		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "b"; s.RequestID = "r2" + name; s.Workdir.Path = p })); code(err) != BadSpec {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "c"; s.RequestID = "r3"; s.Workdir.Path = sub(t, base, "sibling") })); err != nil {
+		t.Errorf("a sibling was refused: %v", err)
+	}
+}
+
+// context (R-H, docs/m2c-remote-start.md §4b): in helper mode hostd cannot look inside the owner's home, so a remote
+// start asks root whether the path is a git worktree root. Any doubt is a refusal, and with no checker there is no
+// remote start at all; a local start never asks.
+func TestAHelperModeRemoteStartAsksRootAndRefusesOnAnyDoubt(t *testing.T) {
+	d, _ := newDaemon(t)
+	d.Root, d.StartedBy = "helper", "owner:tomas@example.com@mac"
+	helperImage(d)
+	d.WorktreeRoot = filepath.Dir(spec(nil).Workdir.Path)
+	p := spec(nil).Workdir.Path
+	if _, err := d.Start(spec(nil)); code(err) != NotBuilt {
+		t.Fatalf("no checker: %v", err)
+	}
+	d.WorktreeCheck = func(string) (string, string, error) { return "", "", ErrNoHelper }
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "r-nohelper" })); code(err) != NotBuilt {
+		t.Fatalf("no helper installed must be not_built, not bad_spec: %v", err)
+	}
+	for name, chk := range map[string]func(string) (string, string, error){
+		"root refuses":              func(string) (string, string, error) { return "", "", errors.New("exit 2") },
+		"root cannot tell":          func(string) (string, string, error) { return "", "", errors.New("exit 3") },
+		"root answers another path": func(string) (string, string, error) { return "/etc", "", nil },
+	} {
+		d.WorktreeCheck = chk
+		if _, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "r-" + name })); code(err) != BadSpec {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	asked := ""
+	d.WorktreeCheck = func(q string) (string, string, error) { asked = q; return q, filepath.Join(q, ".git"), nil }
+	rep, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "r-ok"; s.Profile, s.Billing = "e2e-default", "stub" }))
+	if asked != p {
+		t.Fatalf("root was asked about %q, not the spec's path %q (err %v)", asked, p, err)
+	}
+	if err != nil {
+		t.Fatalf("an approved path was refused: %v", err)
+	}
+	// the gitdir root derived is what the record keeps: `ccsbx-root run` compares it with its own derivation
+	if rec, lerr := d.Load(rep.Sid); lerr != nil || rec.GitDir != filepath.Join(p, ".git") {
+		t.Fatalf("the record's gitdir is %q (%v), want the one root derived", rec.GitDir, lerr)
+	}
+}
+
+// context (R-H review S4): a session whose pane died but whose record is not marked ended counts as live to root, so a
+// remote resume or restart on the same workdir would be refused as an overlap. The dead record is ended BEFORE root is asked.
+func TestAStaleLiveRecordIsEndedBeforeRootIsAsked(t *testing.T) {
+	d, fl := newDaemon(t)
+	d.Root, d.StartedBy = "helper", "owner:tomas@example.com@mac"
+	helperImage(d)
+	d.WorktreeRoot = filepath.Dir(spec(nil).Workdir.Path)
+	d.WorktreeCheck = func(q string) (string, string, error) { return q, filepath.Join(q, ".git"), nil }
+	first, err := d.Start(spec(func(s *LaunchSpec) { s.Profile, s.Billing = "e2e-default", "stub" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sid := range fl.alive {
+		fl.alive[sid] = false // the pane died; the record still says live
+	}
+	sawLive := false
+	d.WorktreeCheck = func(q string) (string, string, error) {
+		if r, _ := d.Load(first.Sid); r != nil && r.Ended == nil {
+			sawLive = true
+		}
+		return q, filepath.Join(q, ".git"), nil
+	}
+	if _, err := d.Start(spec(func(s *LaunchSpec) {
+		s.RequestID = "r2"
+		s.Label = "cc-sandbox:again"
+		s.Profile, s.Billing = "e2e-default", "stub"
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if sawLive {
+		t.Fatal("root was asked while the dead session's record still said live")
+	}
+}
+
+// helperImage makes helper mode's start acceptable to the image pin check: an e2e profile may run a candidate digest of our repo.
+func helperImage(d *Daemon) {
+	d.Image = "ghcr.io/landovsky/ccsbx-fence@sha256:" + strings.Repeat("a", 64)
+	d.ProfileLoader = profiles.Load
+}
+
+// context (R-H round 2): root's exit 3 ("could not tell") is this machine's trouble, not a bad spec: internal, not bad_spec.
+func TestACheckThatCouldNotTellIsInternalNotBadSpec(t *testing.T) {
+	d, _ := newDaemon(t)
+	d.Root, d.StartedBy = "helper", "owner:tomas@example.com@mac"
+	helperImage(d)
+	d.WorktreeRoot = filepath.Dir(spec(nil).Workdir.Path)
+	d.WorktreeCheck = func(string) (string, string, error) { return "", "", ErrCannotTell }
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Profile, s.Billing = "e2e-default", "stub" })); code(err) != "internal" {
 		t.Fatalf("%v", err)
 	}
 }

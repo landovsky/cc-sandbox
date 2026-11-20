@@ -29,6 +29,8 @@ verbs = ["run", "stop", "status", "renew", "gc", "attach", "exec-token", "pod-cr
 launch_user = "ccsbx-launch"
 term_user = "ccsbx-term"
 signer_user = "ccsbx-keys"
+signer_socket = "/run/ccsbx-signer/launch.sock"
+hub_user = "${OWNER}"
 kubeconfig = "/var/lib/ccsbx-launch/launcher.kubeconfig"
 k8s_machine = "${K8S_MACHINE}"
 hub_url = "http://127.0.0.1:4011"
@@ -225,6 +227,7 @@ u0_uninstall() {
   note "units are stopped and disabled BEFORE their files are removed (a disable needs the file)"
   try systemctl disable --now ccsbx-hostd.service
   try systemctl disable --now ccsbx-tmux.service
+  try systemctl disable --now ccsbx-signer-launch.socket
   try systemctl disable --now ccsbx-signer.socket
   try systemctl disable --now ccsbx-signer.service
   note "this restores the state before the FIRST install; hand edits to sudoers.d since then are lost"

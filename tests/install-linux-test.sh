@@ -469,7 +469,7 @@ d="$(fx r3)"; ins "$d" install --yes >"$d/out" 2>"$d/err"; rc=$?; c="$d/rec/cmds
 t "r3: the install succeeds" test "$rc" -eq 0
 t "r3: ccsbx-launch is a system user with its own 0700 home, and the signer's user is not it" bash -c 'grep -q "^useradd --system --home-dir /var/lib/ccsbx-launch --create-home --shell /usr/sbin/nologin ccsbx-launch" "$1" && grep -q "^chown ccsbx-launch:ccsbx-launch /var/lib/ccsbx-launch" "$1" && grep -q "^chmod 0700 /var/lib/ccsbx-launch" "$1"' _ "$c"
 t "r3: ccsbx-term has no home (/nonexistent, no create-home) and no shell, and is in no group but its own" bash -c 'l="$(grep "ccsbx-term$" "$1" | grep ^useradd)"; grep -q -- "--no-create-home" <<<"$l" && grep -q -- "--home-dir /nonexistent" <<<"$l" && grep -q -- "--shell /usr/sbin/nologin" <<<"$l" && ! grep -q -- "--groups\|-G " <<<"$l" && ! grep -q "gpasswd -a ccsbx-term\|usermod.*ccsbx-term" "$1"' _ "$c"
-t "r3: the signer's unit names the keys peer ccsbx-launch for future-two only" bash -c 'grep -q -- "--keys-peer-user ccsbx-launch --keys-peer-machines future-two" "$1/root/etc/systemd/system/ccsbx-signer.service"' _ "$d"
+t "r3: the signer's unit names the keys peer ccsbx-launch for future-two only" bash -c 'grep -q -- "--keys-peer-user ccsbx-launch --keys-peer-machines future-two --keys-peer-socket /run/ccsbx-signer/launch.sock" "$1/root/etc/systemd/system/ccsbx-signer.service"' _ "$d"
 t "r3: the signer's scope allows future-two as well (else the launcher's token is out of scope)" bash -c 'grep -- "--write-scope" "$1" | grep -q -- "--machines [a-z0-9.-]*.,future-two"' _ "$c"
 t "r3: ccsbx-root.toml names launch_user, term_user, signer_user, the kubeconfig under ccsbx-launch, k8s_machine, the hub" bash -c 'for k in "launch_user = \"ccsbx-launch\"" "term_user = \"ccsbx-term\"" "signer_user = \"ccsbx-keys\"" "kubeconfig = \"/var/lib/ccsbx-launch/launcher.kubeconfig\"" "k8s_machine = \"future-two\"" "hub_url = \"http://127.0.0.1:4011\"" "hub_secret = \"/etc/ccsbx/hub-admin.secret\""; do grep -qF "$k" "$1" || { echo "missing $k"; exit 1; }; done' _ "$toml"
 t "r3: the pod and relay verbs are on" bash -c 'grep "^verbs" "$1" | grep -q "pod-create.*pod-load.*pod-stop.*pod-status.*relay-mint"' _ "$toml"
@@ -496,6 +496,17 @@ d="$(fx r3h)"; ins "$d" install --yes >/dev/null 2>&1
 out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
 t "r3: check looks at ccsbx-launch, ccsbx-term, their uids, the launch dir and the hub secret" bash -c 'for k in "user ccsbx-launch exists" "user ccsbx-term exists" "five different uids\|share uid" "/var/lib/ccsbx-launch is" "hub-admin.secret is"; do grep -q "$k" <<<"$1" || { echo "no check: $k"; exit 1; }; done' _ "$out"
 t "r3: the hub secret is listed as absent in the first backup, so uninstall removes it" grep -qx /etc/ccsbx/hub-admin.secret "$d/root/var/backups/ccsbx-install/original/ABSENT"
+
+echo "# the signer's second socket and hub_user (A's names, n1-a-relay cffe472)"
+d="$(fx sock)"; ins "$d" install --yes >/dev/null 2>&1; u="$d/root/etc/systemd/system"
+t "sock2: the launch socket is ccsbx-keys:ccsbx-launch 0660 at /run/ccsbx-signer/launch.sock" bash -c 'grep -qx "ListenStream=/run/ccsbx-signer/launch.sock" "$1" && grep -qx "SocketUser=ccsbx-keys" "$1" && grep -qx "SocketGroup=ccsbx-launch" "$1" && grep -qx "SocketMode=0660" "$1"' _ "$u/ccsbx-signer-launch.socket"
+t "sock2: the service Requires both sockets and the main socket stays FIRST (fd 3)" bash -c 'grep -qx "Requires=ccsbx-signer.socket ccsbx-signer-launch.socket" "$1"' _ "$u/ccsbx-signer.service"
+t "sock2: the sockets carry names so the order can be checked (main, launch)" bash -c 'grep -qx "FileDescriptorName=main" "$1" && grep -qx "FileDescriptorName=launch" "$2"' _ "$u/ccsbx-signer.socket" "$u/ccsbx-signer-launch.socket"
+t "sock2: the launch socket is enabled before the main one and is stopped on undo" bash -c 'a="$(grep -n "enable --now ccsbx-signer-launch.socket" "$1" | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-signer.socket" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ -n "$b" ] && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
+t "sock2: ccsbx-root.toml has signer_socket = launch.sock and hub_user = the owner" bash -c 'grep -qx "signer_socket = \"/run/ccsbx-signer/launch.sock\"" "$1" && grep -qx "hub_user = \"tomas\"" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+t "sock2: the launch socket unit is a managed path (backed up as absent, removed by undo)" grep -qx /etc/systemd/system/ccsbx-signer-launch.socket "$d/root/var/backups/ccsbx-install/original/ABSENT"
+d="$(fx sockun)"; ins "$d" install --yes >/dev/null 2>&1; : > "$d/rec/cmds"; ins "$d" uninstall --yes >/dev/null 2>&1
+t "sock2: undo disables the launch socket before any unit file is removed, then removes it" bash -c 'c="$1"; a="$(grep -n "disable --now ccsbx-signer-launch.socket" "$c" | head -1 | cut -d: -f1)"; r="$(grep -n "^rm -f /etc/systemd/system/ccsbx-signer-launch.socket" "$c" | head -1 | cut -d: -f1)"; [ -n "$a" ] && [ -n "$r" ] && [ "$a" -lt "$r" ]' _ "$d/rec/cmds"
 
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"

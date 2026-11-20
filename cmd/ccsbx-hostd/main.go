@@ -26,6 +26,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
+	"github.com/landovsky/cc-sandbox/internal/whois"
 	"github.com/landovsky/cc-sandbox/profiles"
 )
 
@@ -84,6 +85,13 @@ func app() *cli.App {
 				f.String("signer", "", "the signer's unix socket: hostd connects there for every token signing and never reads a key file; checked at start (a missing socket is an error, not a hang)")
 				f.String("listen", "", "also serve the journal/cockpit API on this loopback address, e.g. 127.0.0.1:7481; needs --listen-token-file; no deliver, no steal there")
 				f.String("listen-token-file", "", "file (mode 0600) holding the bearer token the --listen address requires")
+				f.String("tailnet-listen", "", "serve the daemon API to the tailnet on this ONE tailnet address, e.g. 100.x.y.z:7480 (never a wildcard or a LAN address). Callers are classed by Tailscale WhoIs, not by anything they send: owner = --owner-login on a device in --owner-devices; peer = a device in --peer-devices or a node with a tag in --peer-tags; everyone else, and every failed WhoIs, gets 403. Off by default: nothing is reachable from the tailnet until the ACL and this flag exist")
+				f.String("owner-login", "", "the owner's Tailscale login name (e.g. you@example.com) for --tailnet-listen")
+				f.String("owner-devices", "", "comma-separated devices (short or MagicDNS names) the owner's login counts as owner on")
+				f.String("peer-devices", "", "comma-separated devices that count as peer daemons")
+				f.String("peer-tags", "", "comma-separated Tailscale tags (tag:ccsbx) whose nodes count as peer daemons")
+				f.String("whois", "auto", "how WhoIs is asked: auto (tailscaled's socket if it exists, else the tailscale CLI), localapi, or cli")
+				f.String("whois-socket", "/var/run/tailscale/tailscaled.sock", "tailscaled's LocalAPI unix socket (--whois localapi|auto)")
 				f.Int("lease-ttl", 90, "cockpit lease TTL in seconds (one holder per realm)")
 				f.Int("queue-max", 10000, "pending cockpit requests per realm before refused: queue_full")
 				f.String("hub-url", "", "the session-bus hub's HTTP address, e.g. http://127.0.0.1:4011: hostd tracks its fenced sessions there and receives deliveries on spoke:<machine>/ccsbx (B1). Empty: no hub (logged)")
@@ -253,6 +261,27 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 			return cli.ExitFail
 		}
 	}
+	if a := get("tailnet-listen"); a != "" {
+		cc := daemonapi.ClassConfig{OwnerLogin: get("owner-login"), OwnerDevices: splitList(get("owner-devices")), PeerDevices: splitList(get("peer-devices")), PeerTags: splitList(get("peer-tags"))}
+		if cc.OwnerLogin == "" && len(cc.PeerDevices) == 0 && len(cc.PeerTags) == 0 {
+			fmt.Fprintln(stderr, "ccsbx-hostd: --tailnet-listen needs --owner-login (with --owner-devices) and/or --peer-devices/--peer-tags: with none, every caller would be refused")
+			return cli.ExitUsage
+		}
+		var r whois.Resolver
+		switch w := get("whois"); {
+		case w == "localapi" || (w == "auto" && fileExists(get("whois-socket"))):
+			r = whois.LocalAPI{Socket: get("whois-socket")}
+		case w == "cli" || w == "auto":
+			r = whois.CLI{}
+		default:
+			fmt.Fprintf(stderr, "ccsbx-hostd: --whois %q: want auto, localapi or cli\n", w)
+			return cli.ExitUsage
+		}
+		l, err := daemonapi.ListenTailnet(a)
+		if !serve(l, err, "tailnet:"+a, srv.TailnetHandler(&whois.Cache{R: r}, cc)) {
+			return cli.ExitFail
+		}
+	}
 	go func() {
 		for range time.Tick(time.Hour) {
 			if n, err := j.Prune(); err != nil {
@@ -371,6 +400,19 @@ func readToken(path string) (string, error) {
 func paneEnv(state, machine, image, mode string) []string {
 	return []string{"--state", state, "--profiles", "-", "--machine", machine, "--image", image, "--root", mode}
 }
+
+// splitList splits a comma-separated flag into its non-empty, trimmed entries.
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
 // runDirOr is the run dir, or the state dir when none is given.
 func runDirOr(run, state string) string {

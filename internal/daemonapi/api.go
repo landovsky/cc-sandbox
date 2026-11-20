@@ -65,10 +65,15 @@ func (s *Server) Handler() http.Handler { return s.build(true) }
 // deliver and steal are not served there at all (owner-class operations, socket only).
 func (s *Server) TCPHandler() http.Handler { return s.build(false) }
 
-func (s *Server) build(local bool) http.Handler {
+func (s *Server) build(local bool) http.Handler { return s.mkHandler(local, !local) }
+
+// mkHandler: local says whether owner operations are served; tokenGate whether the bearer token is
+// required (the loopback port). The tailnet listener serves owner operations with no token, because
+// its callers are identified by Tailscale (see TailnetHandler), never by what they send.
+func (s *Server) mkHandler(local, tokenGate bool) http.Handler {
 	m := s.mux()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !local {
+		if tokenGate {
 			got := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 			if s.Token == "" || subtle.ConstantTimeCompare([]byte(got), []byte(s.Token)) != 1 {
 				writeJSON(w, 401, map[string]any{"error": "unauthorized"})
@@ -108,6 +113,9 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 
 func (s *Server) info(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"epoch": s.J.Epoch(), "head": s.J.Head(), "oldest": s.J.Oldest()}
+	if c := classOf(r); c != ClassNone {
+		out["caller_class"] = c.String()
+	}
 	for k, v := range s.Info {
 		out[k] = v
 	}

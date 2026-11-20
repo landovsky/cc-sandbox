@@ -534,3 +534,19 @@ the default until a machine opts in.
   reply says `error/dropped` and the journal records `msg.dropped` (reason and node, never the text).
 - **Not wired in the unit until:** the hub has B10/B11 and the downlink payload change (dotfiles `n1-g-hub`, a
   merge that is Tomas's), the spoke credential file exists, and `relay-mint` is installed.
+
+## The daemon on the tailnet (M2a)
+
+`ccsbx-hostd --tailnet-listen <this machine's tailnet ip>:7480 --owner-login <you> --owner-devices <devices>
+[--peer-devices ...] [--peer-tags tag:ccsbx]`. OFF by default, and not turned on in the unit until the tailnet
+ACL (R4) and `ufw allow in on tailscale0 to any port 7480` exist. The address must be a tailnet one
+(100.64.0.0/10 or fd7a:115c:a1e0::/48): a wildcard or a LAN address is refused at start.
+
+Who a caller is comes from Tailscale WhoIs for the connection's own peer address, asked of tailscaled's
+LocalAPI socket (hp) or `tailscale whois --json` (the Mac; `--whois cli|localapi|auto`); nothing the caller
+sends counts (not a header, not a body field, not X-Forwarded-For). **owner** = the owner's login on a node in
+`--owner-devices` (a tagged node is never the owner); **peer** = a node in `--peer-devices` or carrying a tag in
+`--peer-tags`; anything else, and any failed WhoIs, is 403. An owner gets the owner operations the local socket
+serves except session start (that needs the caller's uid: local only until M2c); a peer gets info, resolve and
+the session list (M2c adds start, M2d adds deliver). `/v1/info` shows the caller's class as `caller_class`.
+Answers are cached per peer IP for 30 s; a failure is never cached.

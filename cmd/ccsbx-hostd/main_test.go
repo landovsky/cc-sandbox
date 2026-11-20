@@ -257,3 +257,31 @@ func TestHubTtlIsRangeChecked(t *testing.T) {
 		}
 	}
 }
+
+// context: the tailnet listener is off by default and, when asked for, refuses a wildcard, a LAN address, or a
+// config under which every caller would be refused: "nothing live before the ACL".
+func TestTailnetListenerIsOffByDefaultAndRefusesBadConfig(t *testing.T) {
+	_, h := runHostd("run", "--help")
+	for _, w := range []string{"-tailnet-listen", "-owner-login", "-owner-devices", "-peer-devices", "-peer-tags", "-whois", "CCSBX_TAILNET_LISTEN"} {
+		if !strings.Contains(h, w) {
+			t.Errorf("--help does not list %s", w)
+		}
+	}
+	for _, args := range [][]string{
+		{"--tailnet-listen", "0.0.0.0:7480", "--owner-login", "a@b.c", "--owner-devices", "x"},
+		{"--tailnet-listen", "192.168.1.2:7480", "--owner-login", "a@b.c", "--owner-devices", "x"},
+		{"--tailnet-listen", "100.64.0.1:7480"}, // no one would be allowed
+	} {
+		base := []string{"run", "--state", t.TempDir(), "--local-socket", "-"}
+		done := make(chan int, 1)
+		go func() { c, _ := runHostd(append(base, args...)...); done <- c }()
+		select {
+		case c := <-done:
+			if c == 0 {
+				t.Errorf("%v: started", args)
+			}
+		case <-time.After(3 * time.Second):
+			t.Errorf("%v: the daemon started (it would have run until stopped)", args)
+		}
+	}
+}

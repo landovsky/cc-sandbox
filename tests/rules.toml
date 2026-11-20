@@ -1604,3 +1604,25 @@ block = "tests/twin-go.sh ./internal/msg TestRemoteMessageFromAStrangerIsRefused
 invariants = [13]
 backends = ["unit"]
 where = "hp"
+
+# ---- M2a: hostd on the tailnet (n1-g-m2a). Fake WhoIs; nothing is listening before the ACL. Direct mode: not evidence. ----
+
+[[rule]]
+id = "daemon-authz-tailnet"
+title = "on the tailnet listener a caller's class comes from Tailscale WhoIs only: owner = the owner's login on a listed device, peer = a listed daemon, everyone else and every failed WhoIs gets 403; forged identity headers, a tagged node posing as the owner, an unlisted device and a wildcard listen address are all refused"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/daemonapi TestOwnerAndPeerGetTheirClassAllow"
+block = "tests/twin-go.sh ./internal/daemonapi TestEveryOtherCallerIsRefusedBlock"
+invariants = [5, 13]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "tailnet-peer-is-not-owner"
+title = "a peer daemon on the tailnet cannot deliver, take the cockpit lease, read the journal, prompt or replace; session start is not served on the tailnet even to the owner"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/daemonapi TestStartIsNotServedOnTheTailnetEvenToTheOwner"
+block = "tests/twin-go.sh ./internal/daemonapi TestAPeerCannotDoOwnerThingsBlock"
+invariants = [5]
+backends = ["unit"]
+where = "hp"

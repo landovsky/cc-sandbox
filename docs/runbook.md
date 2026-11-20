@@ -534,3 +534,57 @@ the default until a machine opts in.
   reply says `error/dropped` and the journal records `msg.dropped` (reason and node, never the text).
 - **Not wired in the unit until:** the hub has B10/B11 and the downlink payload change (dotfiles `n1-g-hub`, a
   merge that is Tomas's), the spoke credential file exists, and `relay-mint` is installed.
+
+## The daemon on the tailnet (M2a)
+
+`ccsbx-hostd --tailnet-listen <this machine's tailnet ip>:7480 --tailnet-host <this node's MagicDNS name>
+--owner-login <you> --owner-devices <FQDNs> --peer-devices <the other machines' FQDNs>`. For example on the Mac:
+`--owner-devices mac-tomas.<tailnet>.ts.net --peer-devices hp-ubuntu.<tailnet>.ts.net,future-two.<tailnet>.ts.net`
+(hp, the Mac and future-two are untagged devices of the owner's login; peers are listed DEVICES, not tags, for
+Night 2). `--peer-tags` is empty by default and stays so until F4 (Night 3), when an in-cluster hostd comes
+through a `tag:ccsbx-hostd` egress proxy; until then no cluster source gets :7480 at all. OFF by
+default, and not turned on in the unit until the tailnet ACL (R4) and `ufw allow in on tailscale0 to any port
+7480` exist. At start hostd refuses: an address that is not one of THIS node's own tailnet addresses (asked of
+tailscaled, so another VPN's 100.64/10 address does not pass), a short device name (use `host.<tailnet>.ts.net`),
+`--owner-login` without `--owner-devices` (and the reverse), a `--peer-tags` of `tag:ccsbx`, a `--tailscale-bin`
+that is not absolute or is writable by group/other, a `--whois-socket` that is not a socket of root or the
+daemon's user.
+
+**Never `tag:ccsbx` as a peer tag.** It is the cluster operator proxies' tag, and a fenced pod can reach the
+egress proxy (NetPol is per pod): a peer from `tag:ccsbx` would be a fenced pod (hostd refuses it at start). hp
+and the Mac stay untagged user devices; later (F4) only a `tag:ccsbx-hostd` egress proxy used by the in-cluster
+hostd gets :7480 (the ACL text for that is the k3s/D owners' to change: plan §5.2 grant 3 and k3s-amendments A7
+still say `tag:ccsbx`). An
+in-cluster hostd (F4) behind the operator's ingress would see the proxy pod's address, not the caller's, so
+WhoIs-by-address cannot classify callers there: F4 must not use this listener.
+
+Who a caller is comes from Tailscale WhoIs for the connection's own peer address, asked of tailscaled's
+LocalAPI socket (hp) or `tailscale whois --json` (the Mac; `--whois cli|localapi|auto`, `--tailscale-bin`, an
+absolute path resolved once at start, logged; on the Mac the App Store build's CLI talks to the GUI's LocalAPI:
+check it answers `whois` for the service uid before relying on it); nothing the caller sends counts. Before
+WhoIs is asked, a request must come from a tailnet address that is not one of this machine's own (a local
+process connecting to the machine's tailnet address is the machine itself, never the owner), name this daemon in
+`Host` (the listen address or `--tailnet-host`; DNS rebinding is refused), carry no `Origin` and no cross-site
+`Sec-Fetch-Site` (a web page in the owner's browser), and a POST must be `Content-Type: application/json` (415).
+The answer is believed only if the asked address is one of the node's own, and never for a node that advertises
+subnet routes. **owner** = the owner's login on a node in `--owner-devices` (a tagged node is never the owner);
+**peer** = a node tagged with a `--peer-tags` tag, or a `--peer-devices` node that carries the owner's login;
+anything else, and any failed WhoIs, is 403. What each class may call is an explicit table (route, method) in
+`internal/daemonapi/tailnet.go`; a route added to the API is closed on the tailnet until it is classified (a test
+walks the mux). An owner gets the owner operations the local socket serves except session start (M2c adds the
+remote form); a peer gets info, resolve and the session list. `/v1/info` shows the caller's class as
+`caller_class`.
+
+Answers: no cache for the LocalAPI; 5 s for the CLI, a failure remembered 2 s (still an error), one question per
+peer at a time, at most 8 at once. A stream or long poll on the tailnet ends after 60 s (the client reconnects
+and is classed again), at most 64 connections are open at once (`--tailnet-max-conns`), idle ones close after 2 minutes.
+
+**Owner authority is ambient, so the tailnet gives the owner little** (SEC-20, ❓ cc-sandbox:#2dsc, the manager's
+default until Tomas answers): any process on a LISTED owner device, whichever user runs it, would act as the
+owner there with no secret (the loopback TCP port, by contrast, refuses deliver and steal even with its token).
+So over the tailnet the owner gets only `info`, `resolve`, the session list and (M2c) session start. **deliver,
+prompt, replace, the cockpit lease (steal) and the journal (events, streams, cursors, the cockpit's request queue)
+are local-only**: 403 `forbidden` on the tailnet even to the owner, still served on the unix socket. What that
+means for a cockpit on the OTHER machine: it cannot lease, stream events or type into this machine's panes over
+the tailnet; it runs against its own machine's socket until M2d gives these a per-device secret. (`attach` is
+tmux, not an API route.) hostd also warns at start when `--owner-devices` lists this machine.

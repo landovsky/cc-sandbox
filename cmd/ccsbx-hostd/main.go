@@ -6,15 +6,19 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"os/exec"
 	"os/signal"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
@@ -26,6 +30,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/msg"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
+	"github.com/landovsky/cc-sandbox/internal/whois"
 	"github.com/landovsky/cc-sandbox/profiles"
 )
 
@@ -84,6 +89,16 @@ func app() *cli.App {
 				f.String("signer", "", "the signer's unix socket: hostd connects there for every token signing and never reads a key file; checked at start (a missing socket is an error, not a hang)")
 				f.String("listen", "", "also serve the journal/cockpit API on this loopback address, e.g. 127.0.0.1:7481; needs --listen-token-file; no deliver, no steal there")
 				f.String("listen-token-file", "", "file (mode 0600) holding the bearer token the --listen address requires")
+				f.String("tailnet-listen", "", "serve the daemon API to the tailnet on this ONE tailnet address, e.g. 100.x.y.z:7480 (never a wildcard or a LAN address). Callers are classed by Tailscale WhoIs, not by anything they send: owner = --owner-login on a device in --owner-devices; peer = a device in --peer-devices or a node with a tag in --peer-tags; everyone else, and every failed WhoIs, gets 403. Off by default: nothing is reachable from the tailnet until the ACL and this flag exist")
+				f.String("owner-login", "", "the owner's Tailscale login name (e.g. you@example.com) for --tailnet-listen")
+				f.String("owner-devices", "", "comma-separated FULL MagicDNS names (host.<tailnet>.ts.net; short names are refused) the owner's login counts as owner on. Do not list THIS machine: a process on it is never served as owner over the tailnet")
+				f.String("peer-devices", "", "comma-separated FULL MagicDNS names of devices that count as peer daemons when they carry the owner's login (a name alone proves little; tag them and use --peer-tags instead)")
+				f.String("peer-tags", "", "comma-separated Tailscale tags only hostd's devices carry whose nodes count as peer daemons. Empty by default: peers are listed devices (--peer-devices) until F4, which brings a tag:ccsbx-hostd egress proxy for the in-cluster hostd. tag:ccsbx is refused: it is the cluster operator proxies' tag, which a fenced pod can reach")
+				f.String("whois", "auto", "how WhoIs is asked: auto (tailscaled's socket if it exists, else the tailscale CLI), localapi, or cli")
+				f.String("whois-socket", "/var/run/tailscale/tailscaled.sock", "tailscaled's LocalAPI unix socket (--whois localapi|auto); must be a unix socket owned by root or this daemon's user")
+				f.String("tailscale-bin", "", "ABSOLUTE path of the tailscale CLI used for --whois cli (and for this node's tailnet addresses when there is no LocalAPI socket); default: the macOS app's CLI on darwin, else `tailscale` found on PATH ONCE at startup. Refused when it, or its directory, is writable by group or other: whoever can write it decides every caller's identity")
+				f.String("tailnet-host", "", "comma-separated MagicDNS names of THIS node (host.<tailnet>.ts.net) that requests may carry in Host, besides the --tailnet-listen address itself: any other Host is refused (DNS rebinding)")
+				f.Int("tailnet-max-conns", 64, "most simultaneously open connections on the tailnet listener (idle ones count)")
 				f.Int("lease-ttl", 90, "cockpit lease TTL in seconds (one holder per realm)")
 				f.Int("queue-max", 10000, "pending cockpit requests per realm before refused: queue_full")
 				f.String("hub-url", "", "the session-bus hub's HTTP address, e.g. http://127.0.0.1:4011: hostd tracks its fenced sessions there and receives deliveries on spoke:<machine>/ccsbx (B1). Empty: no hub (logged)")
@@ -229,7 +244,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 			fmt.Fprintf(stderr, "ccsbx-hostd: %s: %v\n", what, err)
 			return false
 		}
-		hs := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, ConnContext: daemonapi.PeerContext}
+		hs := &http.Server{Handler: h, ReadHeaderTimeout: 5 * time.Second, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 32 << 10, ConnContext: daemonapi.PeerContext}
 		servers = append(servers, hs)
 		go hs.Serve(l)
 		lg.Printf("api on %s", what)
@@ -250,6 +265,32 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		srv.Token = tok
 		l, err := daemonapi.ListenLoopback(a)
 		if !serve(l, err, a, srv.TCPHandler()) {
+			return cli.ExitFail
+		}
+	}
+	if a := get("tailnet-listen"); a != "" {
+		cc := daemonapi.ClassConfig{OwnerLogin: get("owner-login"), OwnerDevices: splitList(get("owner-devices")), PeerDevices: splitList(get("peer-devices")), PeerTags: splitList(get("peer-tags"))}
+		if err := cc.Validate(); err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: %v\n", err)
+			return cli.ExitUsage
+		}
+		ap, err := netip.ParseAddrPort(a)
+		if err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: --tailnet-listen %q: want <tailnet ip>:<port>: %v\n", a, err)
+			return cli.ExitUsage
+		}
+		cc.Hosts = append([]string{ap.Addr().String()}, splitList(get("tailnet-host"))...)
+		for _, d := range cc.OwnerDevices {
+			if h, _, _ := strings.Cut(strings.ToLower(hostname()), "."); h != "" && strings.HasPrefix(strings.ToLower(d), h+".") {
+				lg.Printf("WARNING: --owner-devices lists this machine (%s): the owner's own processes here are never served as owner over the tailnet (the kernel makes this node the source), so the entry does nothing; and any process on a LISTED device, whichever user runs it, acts as the owner there (ambient authority, no secret)", d)
+			}
+		}
+		r, self, rc := tailnetWho(get, stderr)
+		if rc != 0 {
+			return rc
+		}
+		l, err := daemonapi.ListenTailnet(a, self, num("tailnet-max-conns"))
+		if !serve(l, err, "tailnet:"+a, srv.TailnetHandler(r, cc)) {
 			return cli.ExitFail
 		}
 	}
@@ -371,6 +412,65 @@ func readToken(path string) (string, error) {
 func paneEnv(state, machine, image, mode string) []string {
 	return []string{"--state", state, "--profiles", "-", "--machine", machine, "--image", image, "--root", mode}
 }
+
+// splitList splits a comma-separated flag into its non-empty, trimmed entries.
+// tailnetWho builds the WhoIs resolver for the tailnet listener and reads this node's own tailnet
+// addresses (the listen address must be one of them). Anything unusable is a startup error, not a
+// listener that refuses everyone later: LocalAPI when its socket exists (a socket owned by root or this
+// user), else the tailscale CLI at an absolute, checked path resolved ONCE here.
+func tailnetWho(get func(string) string, stderr io.Writer) (whois.Resolver, []netip.Addr, int) {
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	w, sock := get("whois"), get("whois-socket")
+	switch {
+	case w == "localapi" || (w == "auto" && fileExists(sock)):
+		if err := whois.CheckSocket(sock); err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: --whois-socket: %v\n", err)
+			return nil, nil, cli.ExitUsage
+		}
+		l := &whois.LocalAPI{Socket: sock}
+		self, err := l.SelfIPs(ctx)
+		if err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: this node's tailnet addresses from tailscaled: %v\n", err)
+			return nil, nil, cli.ExitFail
+		}
+		return l, self, 0 // an in-memory lookup in tailscaled: no cache, so a re-tag is seen at once
+	case w == "cli" || w == "auto":
+		bin := get("tailscale-bin")
+		if bin == "" {
+			if runtime.GOOS == "darwin" {
+				bin = "/Applications/Tailscale.app/Contents/MacOS/Tailscale"
+			} else if p, err := exec.LookPath("tailscale"); err == nil {
+				bin = p
+			}
+		}
+		if err := whois.CheckBinary(bin); err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: --tailscale-bin: %v\n", err)
+			return nil, nil, cli.ExitUsage
+		}
+		c := whois.CLI{Bin: bin}
+		self, err := c.SelfIPs(ctx)
+		if err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: this node's tailnet addresses from %s: %v\n", bin, err)
+			return nil, nil, cli.ExitFail
+		}
+		return &whois.Cache{R: c}, self, 0
+	}
+	fmt.Fprintf(stderr, "ccsbx-hostd: --whois %q: want auto, localapi or cli\n", w)
+	return nil, nil, cli.ExitUsage
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
 // runDirOr is the run dir, or the state dir when none is given.
 func runDirOr(run, state string) string {

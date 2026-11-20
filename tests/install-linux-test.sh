@@ -97,7 +97,7 @@ t "the allowed-roots file lists the owner's git root" grep -q '/git"' "$d/root/e
 t "the keys directory is made 0700 for ccsbx-keys" bash -c 'grep -q "chmod 0700 /var/lib/ccsbx-keys" "$1" && grep -q "chown ccsbx-keys:ccsbx-keys /var/lib/ccsbx-keys" "$1"' _ "$cmds"
 t "the signer unit has no network and no key outside its own user" bash -c 'grep -q "RestrictAddressFamilies=AF_UNIX" "$1/root/etc/systemd/system/ccsbx-signer.service" && grep -q "User=ccsbx-keys" "$1/root/etc/systemd/system/ccsbx-signer.service"' _ "$d"
 t "hostd's unit does not run as the key user" bash -c '! grep -q "ccsbx-keys" <(grep -E "^(User|Group)=" "$1/root/etc/systemd/system/ccsbx-hostd.service")' _ "$d"
-t "the firewall rule is only on the tailnet interface" grep -q 'ufw allow in on tailscale0 to any port 7480' "$cmds"
+t "no firewall rule is added: hostd is loopback-only (least privilege)" bash -c '! grep -q "ufw" "$1"' _ "$cmds"
 t "the real system was not touched: the only stub calls were read-only probes (snap list)" bash -c '! grep -vE "^(snap list lxd|systemctl list-unit-files lxd-installer.socket)$" "$1"' _ "$calls"
 
 echo "# uninstall puts the sudoers file back"
@@ -225,7 +225,7 @@ t "S7: uninstall exits 0 after an install with --with-deploy" test "$rc" -eq 0
 for p in /etc/sudoers.d/91-ccsbx-deploy /usr/local/sbin/ccsbx-deploy /etc/ccsbx/ccsbx-root.toml /etc/sudoers.d/90-ccsbx-root /etc/systemd/system/ccsbx-signer.socket; do
   t "S7: uninstall removes $p" grep -qx "rm -f $p" "$d/rec/cmds"
 done
-t "S7: uninstall removes the firewall rule and the owner's ccsbx-clients membership" bash -c 'grep -q "^ufw delete allow in on tailscale0" "$1" && grep -q "^gpasswd -d tomas ccsbx-clients" "$1"' _ "$d/rec/cmds"
+t "S7: uninstall removes the owner's ccsbx-clients membership, and calls no ufw (none was added)" bash -c 'grep -q "^gpasswd -d tomas ccsbx-clients" "$1" && ! grep -q ufw "$1"' _ "$d/rec/cmds"
 t "S7: a unit that was never written does not stop the undo (the disable is tried, failure ignored)" grep -q 'failure ignored' "$d/uout"
 t "S7: the runbook's list of what uninstall leaves matches the installer's own message" bash -c 'grep -q "NOT undone" "$1"' _ "$d/uout"
 

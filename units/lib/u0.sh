@@ -93,7 +93,7 @@ u0_sops() {
 }
 
 u0_hostd() {
-  step "U0 hostd unit and firewall"
+  step "U0 hostd unit"
   put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-hostd.service"
   note "the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced"
   if [ "$MODE" != install ] || [ ! -e "$(pth /var/lib/ccsbx/listen.token)" ]; then
@@ -101,8 +101,7 @@ u0_hostd() {
   fi
   cmd systemctl daemon-reload
   cmd systemctl enable --now ccsbx-hostd.service
-  note "hostd listens on 127.0.0.1:7480 only (with a token file); the firewall rule below is for the tailnet and is harmless while nothing listens there"
-  cmd ufw allow in on tailscale0 to any port 7480 proto tcp comment "ccsbx hostd"
+  note "hostd listens on 127.0.0.1:7480 only (with a token file): no firewall rule is added (least privilege)"
 }
 
 u0_lxd() {
@@ -208,8 +207,7 @@ u0_uninstall() {
     local meta; meta="$(cat "$real/sops.meta")"
     cmd chown "${meta% *}" /usr/local/bin/sops; cmd chmod "${meta#* }" /usr/local/bin/sops
   else note "no sops.meta: sops was not there, nothing to restore"; fi
-  note "5. the firewall rule and the group ccsbx-clients membership"
-  try ufw delete allow in on tailscale0 to any port 7480 proto tcp
+  note "5. the owner's group ccsbx-clients membership"
   try gpasswd -d "$(real_user)" ccsbx-clients
   try systemctl daemon-reload
   note "NOT undone, on purpose: docker/lxd membership and the lxd snap (re-add with gpasswd -a $(real_user) docker if you want invariant 14 waived again);"

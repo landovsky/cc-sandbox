@@ -10,7 +10,7 @@
 # What it does (the same code prints it in `plan` and runs it in `install`):
 #   U0b  users ccsbx + ccsbx-keys, the 0700 key directory, the machine and age keys, the signer unit
 #   U0   ccsbx-root (fixed verbs) as the only NOPASSWD sudo grant; the NOPASSWD grants for docker, apt-get,
-#        dokku and sops removed; sops root-owned; hostd unit + firewall 7480 on the tailnet interface;
+#        dokku and sops removed; sops root-owned; hostd unit (loopback only, no firewall rule);
 #        the accidental lxd snap and its installer socket removed; the owner out of lxd and, LAST, docker
 #   then: reboot. A fresh tmux has the new groups; the old one keeps docker.
 #
@@ -20,7 +20,7 @@
 #   P15  every row of the P14 inventory is done or dropped (units/p15 check)
 #   bins ccsbx-root, ccsbx-hostd, ccsbx-signer, ccsbx exist in --bin-dir and match its SHA256SUMS
 #   sudoers  every sudoers.d NOPASSWD line parses (units/lib/sudoers_strip.py), so nothing is guessed
-#   tools    visudo, ufw, python3, runuser (and age-keygen when there is no age key yet) are installed
+#   tools    visudo, python3, runuser (and age-keygen when there is no age key yet) are installed
 #   owner    a plain login name with uid >= 1000, not root; --allowed-roots are absolute, existing, not /
 #   probes   sops is not a symlink (chown would hit its target)
 #
@@ -129,7 +129,7 @@ eval_gates() {
       gate "SHA256SUMS does not list:$unlisted (an unlisted file would pass unchecked)"
     elif ! (cd "$BIN_DIR" && sha256sum --quiet -c SHA256SUMS >/dev/null 2>&1); then gate "binaries do not match SHA256SUMS"; fi
   fi
-  local tools="visudo ufw python3 runuser"; [ -e "$(pth /var/lib/ccsbx-keys/age.key)" ] || tools+=" age-keygen"
+  local tools="visudo python3 runuser"; [ -e "$(pth /var/lib/ccsbx-keys/age.key)" ] || tools+=" age-keygen"
   for f in $tools; do command -v "$f" >/dev/null 2>&1 || [ -n "$PREFIX" ] || gate "tool not installed: $f"; done
   if [ -L "$(pth /usr/local/bin/sops)" ]; then gate "/usr/local/bin/sops is a symlink: chown would change its target; replace it with the real file first"; fi
   if [ "$WITH_DEPLOY" = 1 ]; then

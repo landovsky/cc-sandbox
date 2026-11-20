@@ -161,7 +161,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		return a
 	}
 	sd := &start.Daemon{StateDir: abs(get("state")), Machine: get("machine"), Root: "direct", Exe: exe, Backend: "docker",
-		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), Env: []string{"--state", abs(get("state")),
+		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Env: []string{"--state", abs(get("state")),
 			"--profiles", abs(get("profiles")), "--machine", get("machine"), "--image", get("image"), "--root", "direct"}}}
 	var servers []*http.Server
 	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}

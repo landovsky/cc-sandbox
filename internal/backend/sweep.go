@@ -22,14 +22,15 @@ var steeringHome = []string{
 }
 
 // sweepScript moves each steering path out of /h into /q (same relative path) and reports it.
-// Symlinks are moved as links, never followed.
+// Symlinks are moved as links, never followed. DIRECT MODE ONLY: it runs the session image as
+// container root, which is acceptable only where the caller already holds docker. Helper mode
+// (ccsbx-root) sweeps in Go, as root, with no container: see sweepHomeGo.
 const sweepScript = `cd /h || exit 1
 for p in "$@"; do
   if [ -e "$p" ] || [ -L "$p" ]; then
     mkdir -p "/q/$(dirname "$p")" && mv "$p" "/q/$p" && echo "moved $p"
   fi
 done
-chmod -R a+rX /q 2>/dev/null
 exit 0`
 
 // QuarantineDir is where a generation's swept steering files go: host side, never mounted.
@@ -39,6 +40,9 @@ func (s Spec) QuarantineDir() string { return filepath.Join(s.GenDir(), "quarant
 // network and one narrow capability set, so it can move files the fence (uid 10001) wrote into
 // a home the host user cannot edit. It touches only the home and the quarantine mounts.
 func (s Spec) SweepArgs() []string {
+	if !s.NotEvid {
+		panic("backend: SweepArgs is direct-mode only; helper mode sweeps in Go (sweepHomeGo)")
+	}
 	a := []string{"run", "--rm", "--network", "none", "--user", "0:0", "--read-only",
 		"--cap-drop", "ALL", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER", "--cap-add", "CHOWN",
 		"--security-opt", "no-new-privileges",

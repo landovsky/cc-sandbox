@@ -51,7 +51,7 @@ func app() *cli.App {
 				Summary: "mint and verify session tokens, dev key file (U5)",
 				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return token.Main(a, o, e) },
 			},
-			steeringCheckCmd(),
+			steeringCheckCmd(), seccompCmd(),
 		},
 	}
 }

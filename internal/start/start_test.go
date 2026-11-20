@@ -4,6 +4,7 @@
 package start
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -666,5 +667,37 @@ func TestOverlappingWorkdirsOfLiveSessionsAreRefused(t *testing.T) {
 	}
 	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Label = "c"; s.RequestID = "r3"; s.Workdir.Path = sub(t, base, "sibling") })); err != nil {
 		t.Errorf("a sibling was refused: %v", err)
+	}
+}
+
+// context (R-H, docs/m2c-remote-start.md §4b): in helper mode hostd cannot look inside the owner's home, so a remote
+// start asks root whether the path is a git worktree root. Any doubt is a refusal, and with no checker there is no
+// remote start at all; a local start never asks.
+func TestAHelperModeRemoteStartAsksRootAndRefusesOnAnyDoubt(t *testing.T) {
+	d, _ := newDaemon(t)
+	d.Root, d.StartedBy = "helper", "owner:tomas@example.com@mac"
+	d.WorktreeRoot = filepath.Dir(spec(nil).Workdir.Path)
+	p := spec(nil).Workdir.Path
+	if _, err := d.Start(spec(nil)); code(err) != NotBuilt {
+		t.Fatalf("no checker: %v", err)
+	}
+	for name, chk := range map[string]func(string) (string, error){
+		"root refuses":              func(string) (string, error) { return "", errors.New("exit 2") },
+		"root cannot tell":          func(string) (string, error) { return "", errors.New("exit 3") },
+		"root answers another path": func(string) (string, error) { return "/etc", nil },
+	} {
+		d.WorktreeCheck = chk
+		if _, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "r-" + name })); code(err) != BadSpec {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	asked := ""
+	d.WorktreeCheck = func(q string) (string, error) { asked = q; return q, nil }
+	_, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "r-ok" }))
+	if asked != p {
+		t.Fatalf("root was asked about %q, not the spec's path %q (err %v)", asked, p, err)
+	}
+	if err != nil && code(err) == NotBuilt {
+		t.Fatalf("an approved path was still refused as not built: %v", err)
 	}
 }

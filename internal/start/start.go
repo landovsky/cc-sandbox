@@ -68,6 +68,9 @@ type Daemon struct {
 	ProfileLoader func(name string) (*profile.Profile, error)
 	Machine       string // this machine's name; a spec for another machine is refused
 	Uid           int    // the caller's uid (from the OS, never from the spec)
+	// WorktreeCheck asks root whether a path is a git worktree root under allowed_roots (helper mode, remote starts only):
+	// it returns the resolved path, or an error for ANY doubt. nil: remote starts are refused in helper mode.
+	WorktreeCheck func(path string) (string, error)
 	StartedBy     string // a remote caller's stamped identity, recorded with the session (M2c); "" for a local start
 	Image         string // fence image reference recorded in the pin
 	PinsFile      string // pins.toml; missing means no production pins
@@ -218,9 +221,16 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		return refuse(BadSpec, "%s: %v", what, err)
 	}
 	if remote && d.Root == "helper" {
-		// The owner's home is unreadable to hostd here, so "is this directory a git worktree root" cannot be
-		// checked, and without it any directory under the worktree root (all of ~/git) would mount read-write.
-		return nil, refuse(NotBuilt, "a remote start needs the worktree check that helper mode cannot make yet")
+		// The owner's home is unreadable to hostd here, so "is this directory a git worktree root" is asked of root
+		// (`ccsbx-root worktree-check`, docs/m2c-remote-start.md §4b) BEFORE anything is written. Without a checker
+		// the remote start is refused: any directory under the worktree root would otherwise mount read-write.
+		if d.WorktreeCheck == nil {
+			return nil, refuse(NotBuilt, "a remote start needs the worktree check that helper mode cannot make here")
+		}
+		got, err := d.WorktreeCheck(s.Workdir.Path)
+		if err != nil || got != filepath.Clean(s.Workdir.Path) {
+			return nil, refuse(BadSpec, "workdir is not a git worktree root")
+		}
 	}
 	if d.Root == "helper" {
 		// hostd runs as the service uid and cannot enter the owner's home (0750): it never touches the

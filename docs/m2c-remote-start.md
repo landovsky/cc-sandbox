@@ -101,11 +101,11 @@ A remote `workdir.path` is NOT checked by shape only: before any record is writt
 home directories) and be a git WORKTREE ROOT (its own `.git` at exactly that path: not a parent of repos, not a
 subdirectory of one, not a plain directory); else `bad_spec` with a fixed message (no path or OS text). It must not equal,
 contain or sit inside another live session's workdir. In HELPER mode hostd cannot look inside the owner's home, so a remote
-start is refused `not_built` until ccsbx-root can make that check; direct mode needs `--remote-start-direct` and `--owner-user` = the user hostd runs as. Nothing can point the fence at `~/.ssh`,
+start asks root (`ccsbx-root worktree-check`, §4b; built: n1-a-wc) and is refused `not_built` only when no checker is installed; direct mode needs `--remote-start-direct` and `--owner-user` = the user hostd runs as. Nothing can point the fence at `~/.ssh`,
 `~` or another repo. A remote start has no gitdir (git verbs are unavailable to it until H1 resolves one).
 
 ### (4b) The helper-mode worktree check: the call hostd makes (R-H, cc-sandbox:#6w6t; A builds ccsbx-root's side to this)
-Until it exists a remote start in helper mode is refused `not_built`. hostd cannot look inside the owner's home, so it asks root, read-only:
+hostd calls it (wired: `rootWorktreeCheck`); with no helper installed a remote start in helper mode is refused `not_built`. Note: root requires the path to hold NO symlink, so hostd passes the path exactly as the spec carries it and the answer must be that same path. hostd cannot look inside the owner's home, so it asks root, read-only:
 
     sudo -n ccsbx-root worktree-check -- <path>
 

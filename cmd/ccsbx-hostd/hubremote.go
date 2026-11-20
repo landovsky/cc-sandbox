@@ -20,6 +20,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
@@ -75,6 +76,38 @@ func rootMinter() minter {
 		}
 		return r.Token, nil
 	}
+}
+
+// rootWorktreeCheck is the helper-mode remote start's worktree check (docs/m2c-remote-start.md §4b):
+// `sudo -n ccsbx-root worktree-check -- <path>`: exit 0 and exactly one absolute path on stdout, or anything else (2 refused,
+// 3 could not tell, a timeout, a missing helper) which is a refusal. The answer must be the path asked about.
+func rootWorktreeCheck(path string) (string, error) {
+	if !start.HelperInstalled() {
+		return "", fmt.Errorf("ccsbx-root is not installed")
+	}
+	c := exec.Command(start.SudoBin, "-n", start.RootBin, "worktree-check", "--", path)
+	var out, errb bytes.Buffer
+	c.Stdout, c.Stderr = &out, &errb
+	if err := c.Start(); err != nil {
+		return "", err
+	}
+	done := make(chan error, 1)
+	go func() { done <- c.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			return "", fmt.Errorf("worktree-check refused")
+		}
+	case <-time.After(5 * time.Second):
+		c.Process.Kill()
+		<-done
+		return "", fmt.Errorf("worktree-check timed out")
+	}
+	line := strings.TrimSuffix(out.String(), "\n")
+	if line == "" || strings.ContainsAny(line, "\n\r") || !filepath.IsAbs(line) || len(line) > 4096 {
+		return "", fmt.Errorf("worktree-check answered something that is not one path")
+	}
+	return line, nil
 }
 
 type relayKey struct {

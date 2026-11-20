@@ -318,6 +318,9 @@ func startHandlerBy(sd *start.Daemon, p startPolicy, guard *remotestart.Service)
 		}
 		d := *sd // a copy per call: Uid differs, everything else is hostd's configuration
 		d.Uid, d.RunDir = uid, p.RunDir
+		if d.Root == "helper" && d.WorktreeCheck == nil {
+			d.WorktreeCheck = rootWorktreeCheck
+		}
 		// The roots are passed through unchanged: hostd is a service, a relative entry means nothing to
 		// it, and CheckWorkdir refuses exactly what ccsbx-root's allowed_roots refuses.
 		d.PinsFile, d.WorktreeRoot = p.Pins, p.WorktreeRoots

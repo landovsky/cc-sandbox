@@ -50,6 +50,19 @@ Run on hp in `~/git/cc-sandbox` unless a step says otherwise. Order matters: the
 
 If a step fails: runbook §2 (rollback), and `sudo units/install-linux.sh uninstall --yes` undoes steps 8 to 9.
 
+Step 8 in detail (changed after the PR #2 review):
+- the first thing `install` does, once every gate is met, is copy every file it will replace to
+  `/var/backups/ccsbx-install/original/`. That backup is made once and never overwritten, so a second
+  run, or a run after a failure, cannot spoil it. `uninstall` always restores from it;
+- the steps that can fail on this machine (sops, the lxd snap and socket) run BEFORE the sudoers
+  files are changed. After the change the whole sudoers config is checked; if it does not parse, the
+  files are put back and the install stops;
+- if it dies it says `PARTIAL INSTALL` and the undo command. Fix the cause and re-run `install --yes`,
+  or run `uninstall --yes`;
+- the signer's socket is made by systemd (`ccsbx-signer.socket`); `check` after the reboot connects
+  to the signer's and hostd's sockets, so a `FAIL` there is a real finding, not a formality;
+- P15's file is read from the owner's home, not root's (`plan` prints the path).
+
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
 
 ```bash
@@ -111,17 +124,19 @@ After the group change only password sudo can start them (`sudo docker start <na
   The installer parses it as root and refuses if a NOPASSWD line isn't one of docker, apt-get,
   dokku, sops (it won't guess).
 
-## `units/install-linux.sh plan` as of 2026-11-20 00:0x (owner tomas)
+## `units/install-linux.sh plan` as of 2026-11-20 08:0x (owner tomas, after the PR #2 review fixes)
 
 ```
-install-linux plan  (owner=tomas)
+install-linux plan  (owner=tomas, bin-dir=<repo>/dist)
 Nothing below is run by 'plan'. The same steps run under 'install --yes' as root.
 GATES (install refuses while any is unmet)
   UNMET: B9 missing: user unit session-bus-hub.service is not active (the native hub release, stream C)
   UNMET: P15 open: 24 row(s) not done or dropped: A5 B-session-bus B-messaging-hub-db-1 B-redis-5ctq B-redis-4s6w … (run units/p15 status)
-  UNMET: binaries missing in <repo>/dist: ccsbx-root ccsbx-hostd ccsbx-signer ccsbx (make build)
+  UNMET: binaries missing in <repo>/dist: ccsbx-root ccsbx-hostd ccsbx-signer ccsbx (a linux build of each + SHA256SUMS in --bin-dir; see --help)
   note: sudoers.d/90-tomas-nopasswd not readable without root: verified at install
   note: sudoers.d/README not readable without root: verified at install
+  P15 status file: /home/tomas/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv
+  allowed roots:   "/home/tomas/git", "/home/tomas/wt"
 
 [01] U0b users and directories: ccsbx (hostd), ccsbx-keys (keys), group ccsbx-clients
      # ccsbx-keys may already exist (R10b creates it and the age key during the day): reused, never recreated
@@ -134,13 +149,14 @@ GATES (install refuses while any is unmet)
      $ chmod 0700 /var/lib/ccsbx-keys
      $ chown ccsbx:ccsbx /var/lib/ccsbx
      $ chmod 0750 /var/lib/ccsbx
-     # the signer's socket is group ccsbx (hostd's gid), so hostd signs without any key access
+     # the signer's socket is made by systemd (ccsbx-signer.socket): ccsbx-keys:ccsbx 0660 in a 0755 dir,
+     # so hostd (group ccsbx) can connect without any access to the key directory
 
 [02] U0 binaries (root-owned, not writable by tomas)
-     # MISSING <repo>/dist/ccsbx-root: install will refuse until it is built (make build)
-     # MISSING <repo>/dist/ccsbx-hostd: install will refuse until it is built (make build)
-     # MISSING <repo>/dist/ccsbx-signer: install will refuse until it is built (make build)
-     # MISSING <repo>/dist/ccsbx: install will refuse until it is built (make build)
+     # MISSING <repo>/dist/ccsbx-root: install will refuse until it is built (a linux build of each + SHA256SUMS in --bin-dir; see --help)
+     # MISSING <repo>/dist/ccsbx-hostd: install will refuse until it is built (a linux build of each + SHA256SUMS in --bin-dir; see --help)
+     # MISSING <repo>/dist/ccsbx-signer: install will refuse until it is built (a linux build of each + SHA256SUMS in --bin-dir; see --help)
+     # MISSING <repo>/dist/ccsbx: install will refuse until it is built (a linux build of each + SHA256SUMS in --bin-dir; see --help)
      $ install -d -o root -g root -m 0755 /usr/local/libexec/ccsbx /etc/ccsbx
      $ install -o root -g root -m 0755 <repo>/dist/ccsbx-root /usr/local/sbin/ccsbx-root
      $ install -o root -g root -m 0755 <repo>/dist/ccsbx-hostd /usr/local/libexec/ccsbx/ccsbx-hostd
@@ -158,47 +174,48 @@ GATES (install refuses while any is unmet)
      # the printed PUBLIC key goes into config/machines/<machine>.json (M9); nothing secret is printed
      # the K8 kubeconfig arrives SOPS-encrypted to the age key; it is decrypted only by ccsbx-keys
 
-[04] U0b signer service (sign(token_claims) only)
-     write /etc/systemd/system/ccsbx-signer.service  (mode 0644, root:root, 35 lines)
+[04] U0b signer socket + service (sign(token_claims) only; the socket is activated by systemd)
+     write /etc/systemd/system/ccsbx-signer.service  (mode 0644, root:root, 34 lines)
+     write /etc/systemd/system/ccsbx-signer.socket  (mode 0644, root:root, 16 lines)
      $ systemctl daemon-reload
-     $ systemctl enable --now ccsbx-signer.service
+     $ systemctl enable --now ccsbx-signer.socket
 
 [05] U0 hostd unit and firewall
-     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 34 lines)
+     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 44 lines)
      $ systemctl daemon-reload
      $ systemctl enable --now ccsbx-hostd.service
      # 7480 only on the tailnet interface; the Mac and future-two reach hostd there
      $ ufw allow in on tailscale0 to any port 7480 proto tcp comment ccsbx\ hostd
 
-[06] U0 sudoers: ccsbx-root is the only NOPASSWD grant
+[06] U0 sops: a root-owned binary (tomas-writable + sudo-runnable was a root path)
+     $ chown root:root /usr/local/bin/sops
+     $ chmod 0755 /usr/local/bin/sops
+
+[07] U0 lxd: remove the accidental snap and its installer socket
+     # closes the root path of a missing-command handler turning 'lxc' into an install
+     # each is done only if it is there: a missing lxd must not stop the install
+     $ snap remove --purge lxd
+     $ systemctl disable --now lxd-installer.socket
+
+[08] U0 sudoers: ccsbx-root is the only NOPASSWD grant
      # 1. the new rule goes in a dot-named staging file (sudo ignores it), is checked, then renamed
      write /etc/sudoers.d/.90-ccsbx-root.new  (mode 0440, root:root, 3 lines)
      $ visudo -cf /etc/sudoers.d/.90-ccsbx-root.new
      $ mv -f /etc/sudoers.d/.90-ccsbx-root.new /etc/sudoers.d/90-ccsbx-root
-     # 2. remove the NOPASSWD grants for docker, apt-get, dokku, sops from every sudoers.d file
+     # 2. remove the NOPASSWD grants for docker, apt, dpkg, snap, dokku, sops from every sudoers.d file
      #    (units/lib/sudoers_strip.py: refuses lines it can't parse, leaves everything else alone)
+     # 3. the whole config is checked again; if it does not parse, every file changed is put back
      $ for f in /etc/sudoers.d/*: sudoers_strip.py f > f.new; visudo -cf f.new; mv f.new f
+     $ visudo -c   (on failure: restore from the first backup, stop)
 
-[07] U0 sops: a root-owned binary (tomas-writable + sudo-runnable was a root path)
-     $ chown root:root /usr/local/bin/sops
-     $ chmod 0755 /usr/local/bin/sops
-
-[08] U0 lxd: remove the accidental snap and its installer socket
-     # closes the root path of a missing-command handler turning 'lxc' into an install
-     $ snap remove lxd
-     $ systemctl disable --now lxd-installer.socket
-     $ gpasswd -d tomas lxd
-
-[09] U0 docker group (LAST): tomas leaves it; effective for new login sessions
+[09] U0 groups (LAST): tomas leaves lxd, then docker; effective for new login sessions
      # running containers keep running: the daemon owns them (P14 inventory)
      # github-runner@N units keep docker through SupplementaryGroups=docker in their own unit:
      #   that is NOT changed here; it is a P15 decision (units/p15 status)
+     $ gpasswd -d tomas lxd
      $ gpasswd -d tomas docker
      # NOW: sudo reboot  (a fresh tmux server has the new groups; the old one keeps docker)
 
-[10] record the backup for uninstall
-     $ ln -sfn /var/backups/ccsbx-install/20261120-000431 /var/backups/ccsbx-install/latest
-
 AFTER: reboot, then units/install-linux.sh check  and  bin/ccsbx-preflight --morning --post-M1
-UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the newest backup under /var/backups/ccsbx-install)
+UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the first backup, /var/backups/ccsbx-install/original; a failed install is undone the same way)
 ```

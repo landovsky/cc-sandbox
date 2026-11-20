@@ -134,7 +134,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 	}
 	fenceCmd := s.FenceCmd
 	if len(fenceCmd) == 0 {
-		fenceCmd = []string{"tmux", "-f", "/dev/null", "new-session", "-s", s.Sid, "claude"}
+		fenceCmd = FenceEntry(s.Sid)
 	}
 	sec := func(uid int64) *ContainerSec {
 		return &ContainerSec{
@@ -182,7 +182,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 				VolumeMounts: []VolumeMount{
 					{Name: "worktree", MountPath: "/work"}, {Name: "out", MountPath: "/run/ccsbx/out", ReadOnly: true},
 					{Name: "in", MountPath: "/run/ccsbx/in"}, {Name: "managed", MountPath: "/etc/claude-code"},
-					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "snapshot", MountPath: "/run/ccsbx/side/snapshot"},
+					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "snapshot", MountPath: "/run/ccsbx/side/snapshot"}, {Name: "gitdir", MountPath: "/run/ccsbx/side/git"},
 					{Name: "side-tmp", MountPath: "/tmp"}, {Name: "journal", MountPath: "/run/ccsbx/journal"},
 				},
 			}},
@@ -198,7 +198,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			}},
 			Volumes: []Volume{
 				vol("worktree", s.WorktreeMB, false), vol("out", 64, false), vol("in", 16, false), vol("managed", 8, false),
-				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("journal", 16, false), vol("snapshot", s.WorktreeMB, false),
+				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("journal", 16, false), vol("snapshot", s.WorktreeMB, false), vol("gitdir", s.WorktreeMB, false),
 			},
 		},
 	}
@@ -320,7 +320,7 @@ const (
 // place for the process that holds the token.
 var volumeOwner = map[string]string{
 	"worktree": "both", "out": "both", "in": "both", "managed": "both",
-	"side-state": "side", "side-tmp": "side", "journal": "side", "snapshot": "side",
+	"side-state": "side", "side-tmp": "side", "journal": "side", "snapshot": "side", "gitdir": "side",
 	"home": "fence", "tmp": "fence",
 }
 
@@ -491,6 +491,9 @@ func (c Config) CheckContract(p *Pod) error {
 			if len(ct.Command) < 3 || ct.Command[0] != SideBinary || ct.Command[1] != "side" || ct.Command[2] != "serve" || len(ct.Command) > 64 {
 				bad("the sidecar runs %s side serve and nothing else (at most 64 arguments)", SideBinary)
 			}
+			// maxScope bounds the scope as the record holds it; ParseScope's re-encoding escapes <, > and & as
+			// \u003c and the like, so a worst-case scope can come out longer than it went in and cross this per-argument
+			// limit. That fails closed (the pod is refused, nothing runs), which is the right way for it to fail.
 			for _, a := range ct.Command {
 				if len(a) > maxScope+256 || strings.ContainsRune(a, 0) {
 					bad("a sidecar argument is too long or holds a NUL")
@@ -498,7 +501,11 @@ func (c Config) CheckContract(p *Pod) error {
 			}
 		}
 	}
-	// who may write what: the fence cannot write in/ or managed/, the sidecar cannot write out/
+	// who may write what: the fence cannot write in/ or managed/, the sidecar cannot write out/. These are mount
+	// flags, and they are what holds: the pod's fsGroup (WorkGID) makes every volume group-owned by a group both
+	// containers are in, with setgid directories, so a file the sidecar writes under in/ or managed/ could be
+	// group-writable and the fence, being in that group, could write it were the mount not read-only. It is read-only
+	// (checked just below, and again in the live pod), so what the sidecar writes there is the fence's to read only.
 	need := map[string]map[string]bool{"fence": {"in": true, "managed": true}, "side": {"out": true}}
 	for _, ct := range all {
 		for _, mnt := range ct.VolumeMounts {
@@ -532,4 +539,18 @@ func (c Config) repoAllowed(repo string) bool {
 		}
 	}
 	return false
+}
+
+// FenceEntry is the fence's default command: wait for the sidecar to finish cloning into /work (it writes
+// /run/ccsbx/in/worktree-ready, or worktree-failed with a reason) and only then start the session. The clone
+// is refused into a non-empty /work, so nothing may write there first. It gives up after ten minutes, and on
+// failure shows the sidecar's reason and exits.
+func FenceEntry(sid string) []string {
+	const script = `n=0; while [ ! -e /run/ccsbx/in/worktree-ready ]; do
+  if [ -e /run/ccsbx/in/worktree-failed ]; then echo "the worktree could not be made:" >&2; cat /run/ccsbx/in/worktree-failed >&2; exit 1; fi
+  n=$((n+1)); [ "$n" -gt 600 ] && { echo "the worktree was not ready after 10 minutes" >&2; exit 1; }
+  sleep 1
+done
+exec tmux -f /dev/null new-session -s "$1" claude`
+	return []string{"/bin/sh", "-c", script, "ccsbx-fence", sid}
 }

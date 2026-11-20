@@ -5,8 +5,10 @@ package rootcmd
 
 import (
 	"context"
+	"errors"
 
 	"github.com/landovsky/cc-sandbox/internal/k8s"
+	"github.com/landovsky/cc-sandbox/internal/revoke"
 	"github.com/landovsky/cc-sandbox/internal/side"
 	"github.com/landovsky/cc-sandbox/internal/signer"
 	"github.com/landovsky/cc-sandbox/internal/token"
@@ -50,4 +52,15 @@ func (p *podImpl) Load(ctx context.Context, ref k8s.Ref, secrets []byte) error {
 
 func realMint(ctx context.Context, cfg *Config, c token.Claims, register func(pub string) (string, error)) ([]byte, error) {
 	return signer.MintPodSecrets(ctx, signer.Client{Socket: cfg.SignerSocket}.Sign, c, register)
+}
+
+func realRevokeToken(ctx context.Context, cfg *Config, b token.RevokeBody) error {
+	if len(cfg.RevokeDoors) == 0 {
+		return errors.New("no revoke_doors in the root config")
+	}
+	hdr, body, err := signer.Client{Socket: cfg.SignerSocket}.SignRevoke(ctx, b)
+	if err != nil {
+		return err
+	}
+	return revoke.Doors{URLs: cfg.RevokeDoors}.Post(ctx, hdr, body)
 }

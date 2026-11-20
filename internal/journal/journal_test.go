@@ -528,3 +528,20 @@ func TestRestartTakesTheHighestSeqOverAllSegments(t *testing.T) {
 		t.Fatalf("seq %d err %v", r.Seq, err)
 	}
 }
+
+// context: the allow side of a failed write: records that were acknowledged stay, in order and
+// gapless, across a restart, and a write failure that did not happen changes nothing.
+func TestFailedWriteRollbackAllow(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	for i := 0; i < 4; i++ {
+		if _, err := s.Append(ev("a")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s.Close()
+	got, _ := open(t, dir).After(0, "", "", 0)
+	if len(got) != 4 || got[3].Seq != 4 {
+		t.Fatalf("%v", seqs(got))
+	}
+}

@@ -111,7 +111,7 @@ func TestMsgInScopeAllow(t *testing.T) {
 
 // context: a worker may not message a stranger session, or the fence could page any session on
 // the machine; and a refused target must not learn anything (nothing delivered).
-func TestMsgOutOfScopeAllow(t *testing.T) { TestMsgInScopeAllow(t) }
+func TestMsgOutOfScopeAllow(t *testing.T) { TestPeersListedInTheScopeAreReachable(t) }
 
 func TestMsgOutOfScopeBlock(t *testing.T) {
 	w := newWorld(t, sess("sW", "cc-sandbox:w1", true, "cc-sandbox:mgr"), sess("sX", "other:x", true, ""), sess("sM", "cc-sandbox:mgr", true, ""))
@@ -627,5 +627,13 @@ func TestWithIdleActsOnceAndMarksThePaneBusy(t *testing.T) {
 	}
 	if ok, _ := w.r.WithIdle("sM", 1, func() error { ran++; return nil }); ok || ran != 1 {
 		t.Fatal("the pane was not marked busy: a second action (or a pumped message) could follow")
+	}
+}
+
+// context: the allow side of the relayed path: an in-scope relayed message lands, fenced.
+func TestRelayedMessageInScopeAllow(t *testing.T) {
+	w := newWorld(t, sess("sR", "cc-sandbox:relay", true, "cc-sandbox:mgr"), sess("sM", "cc-sandbox:mgr", true, ""))
+	if res := w.r.DeliverRelayed("sR", "cc-sandbox:mgr", "hello", Origin{}); res.Status != "ok" || len(w.out.lines["sM"]) != 1 {
+		t.Fatalf("%+v %v", res, w.out.lines)
 	}
 }

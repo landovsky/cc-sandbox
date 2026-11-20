@@ -158,6 +158,8 @@ invariants = [10]
 backends = ["unit"]
 where = "hp"
 
+# RED in direct mode by design: tomas can write the outbox until the privilege split (gate M).
+# (It is red because the write succeeds, not because Prepare refused the setup.)
 [[rule]]
 id = "outbox-host-write-refused"
 title = "the host user cannot write into an outbox (only the fence uid can; the daemon only reads)"
@@ -168,7 +170,7 @@ invariants = [10, 14]
 backends = ["docker"]
 where = "hp"
 
-# ---- U3b: local message delivery (scope rule, stamp, send-keys). Direct mode: not evidence. ----
+# ---- U3a: flood bound. Direct mode: not evidence. ----
 
 [[rule]]
 id = "outbox-flood"
@@ -180,13 +182,14 @@ invariants = [10]
 backends = ["unit"]
 where = "hp"
 
-# RED in direct mode by design: tomas can write the outbox until the privilege split (gate M).
+# ---- daemon rules (plan §6). Direct mode: not evidence. ----
+
 [[rule]]
 id = "daemon-authz"
 title = "the daemon refuses a caller that is not the owner"
 suite = "outbox"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/daemonapi TestOwnerDeliverToAnIdlePaneLands"
+block = "tests/twin-go.sh ./internal/daemonapi TestTCPListenerNeedsTheTokenAndNeverServesOwnerOperations"
 invariants = [5]
 backends = ["unit"]
 where = "any"
@@ -225,8 +228,8 @@ where = "any"
 id = "one-cockpit-per-realm"
 title = "a second cockpit in one realm is refused"
 suite = "outbox"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/daemonapi TestCockpitLeaseAndQueueOverHTTP"
+block = "tests/twin-go.sh ./internal/verbq TestSecondLeaseInTheSameRealmIsRefused"
 invariants = [11]
 backends = ["unit"]
 where = "any"
@@ -251,7 +254,7 @@ invariants = [28]
 backends = ["unit"]
 where = "hp"
 
-# ---- review fixes for U3b: never type into a pane that is not at its prompt ----
+# ---- keys, git, doors, approvals: other streams ----
 
 [[rule]]
 id = "keys-unreadable"
@@ -629,7 +632,7 @@ title = "a worker's message to its manager lands stamped 'fenced', identity from
 suite = "msg"
 allow = "tests/twin-go.sh ./internal/msg TestMsgInScopeAllow"
 block = "tests/twin-go.sh ./internal/msg TestMsgInScopeBlock"
-invariants = [8]
+invariants = [6, 10, 22]
 backends = ["unit"]
 where = "hp"
 
@@ -639,7 +642,7 @@ title = "a message to a session outside manager/peers/reply-to-sender is refused
 suite = "msg"
 allow = "tests/twin-go.sh ./internal/msg TestMsgOutOfScopeAllow"
 block = "tests/twin-go.sh ./internal/msg TestMsgOutOfScopeBlock"
-invariants = [8]
+invariants = [6, 10, 22]
 backends = ["unit"]
 where = "hp"
 
@@ -649,11 +652,11 @@ title = "with cc-tree and the hub unreachable a same-machine message still lands
 suite = "msg"
 allow = "tests/twin-go.sh ./internal/msg TestMsgNoCockpitAllow"
 block = "tests/twin-go.sh ./internal/msg TestMsgNoCockpitBlock"
-invariants = [8]
+invariants = [6, 10, 22]
 backends = ["unit"]
 where = "hp"
 
-# ---- review fixes (U3a) and M3 (journal). Direct mode: not evidence. ----
+# ---- cross-machine messaging (B-pieces, not built here) ----
 
 [[rule]]
 id = "msg-cross-machine"
@@ -1043,3 +1046,87 @@ block = "tests/twin-go.sh ./internal/journal TestIdleNotificationTypeBlock"
 invariants = [5, 6]
 backends = ["unit"]
 where = "hp"
+
+# ---- review of PR #4 (n1-g): twins for what the independent review found. Direct mode: not evidence. ----
+
+[[rule]]
+id = "journal-write-failure"
+title = "a failed journal write or fsync is cut back (or the journal refuses appends): no half line, no reused seq, acknowledged records survive a restart"
+suite = "verbs"
+allow = "tests/twin-go.sh ./internal/journal TestFailedWriteRollbackAllow"
+block = "tests/twin-go.sh ./internal/journal TestFailedWriteIsRolledBackAndNoSeqIsReusedBlock"
+invariants = [28]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "idle-restart-midnight"
+title = "after a restart across UTC midnight a pane's idle state is today's last hook, not yesterday's (a menu is never taken for idle)"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/journal TestIdleAfterRestartAcrossMidnightAllow"
+block = "tests/twin-go.sh ./internal/journal TestIdleAfterRestartAcrossMidnightUsesTheNewestEventBlock"
+invariants = [6, 10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "fence-event-budget"
+title = "one outbox can journal only a bounded rate of events; the rest is dropped and counted"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestFenceEventsWithinTheBudgetAreAllJournaledAllow"
+block = "tests/twin-go.sh ./internal/hostd TestFenceEventsHaveABudgetBlock"
+invariants = [10]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "ended-generation-last-words"
+title = "an ended generation's final ccf.* requests and hook events are kept; it cannot send messages, push or grant"
+suite = "outbox"
+allow = "tests/twin-go.sh ./internal/hostd TestEndedGenerationsLastWordsAreKeptButItCannotActAllow"
+block = "tests/twin-go.sh ./internal/hostd TestRequestsOfAnEndedSessionAreStale"
+invariants = [28, 11]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "replace-atomic"
+title = "session.replace touches nothing mid-turn, and a failed stop, wait or launch leaves a record that says what is true"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/start TestReplaceStartsTheNextGenerationAfterTheOldOneClosed"
+block = "tests/twin-go.sh ./internal/daemonapi TestReplaceMidTurnIs409AndTouchesNothing"
+invariants = [11]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "hub-fallback-realm"
+title = "the bus fallback never covers a label some ccsbx record holds (another realm, or between generations)"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestHubFallbackReachesAnUnfencedManagerAllow"
+block = "tests/twin-go.sh ./internal/msg TestHubFallbackNeverCoversALabelACcsbxRecordHoldsBlock"
+invariants = [6, 22]
+backends = ["unit"]
+where = "hp"
+
+# The entry point exists and is scoped; the downlink READER (B10/B11/M2b) is not built, so a row
+# for "the reader uses DeliverRelayed, never DeliverOwner" stays pending until it is.
+[[rule]]
+id = "relay-downlink-scope"
+title = "a relayed message goes through the scope rule and is stamped fenced, never 'owner device'"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/msg TestRelayedMessageInScopeAllow"
+block = "tests/twin-go.sh ./internal/msg TestRelayedMessageIsScopedAndNeverStampedOwnerBlock"
+invariants = [6, 13, 22]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "relay-reader-uses-relayed-entry"
+title = "the hub downlink reader delivers only through DeliverRelayed (B10/B11/M2b: not built)"
+suite = "msg"
+allow = "pending"
+block = "pending"
+invariants = [13]
+backends = ["unit"]
+where = "any"

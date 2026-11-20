@@ -148,7 +148,14 @@ const secret = "SECRET-HOST-FILE-CONTENT"
 
 // context: a request file that is a symlink to a host file would make the daemon read (and a
 // reply leak) something the fence can't see. The legitimate regular file must still work.
-func TestOutboxSymlinkAllow(t *testing.T) { TestStampFromOutboxAllow(t) }
+func TestOutboxSymlinkAllow(t *testing.T) {
+	f := newFixture(t, nil)
+	os.Symlink("../inside", filepath.Join(f.g, "out", "requests", "rel.json"))
+	f.req("ok.json", `{"type":"ccf.mark"}`)
+	if st := f.h.Scan(); st.Accepted != 1 || f.code("ok") != "queued:" {
+		t.Fatalf("a regular request next to a symlink was not served: %+v %s", st, f.code("ok"))
+	}
+}
 
 func TestOutboxSymlinkBlock(t *testing.T) {
 	f := newFixture(t, nil)
@@ -167,6 +174,9 @@ func TestOutboxSymlinkBlock(t *testing.T) {
 	if strings.Contains(f.dumpAll(), secret) {
 		t.Fatal("host file content reached the daemon's output")
 	}
+	// An absolute link out is stopped by RESOLVE_BENEATH alone; the relative link that stays inside
+	// the outbox is the one only NO_SYMLINKS stops, so this twin must cover it too.
+	TestOutboxSymlinkInsideOutboxIsStillRefused(t)
 }
 
 // context: a relative link that stays inside the outbox passes RESOLVE_BENEATH; only
@@ -196,7 +206,14 @@ func TestOutboxSymlinkedRequestsDirIsNotFollowed(t *testing.T) {
 
 // ---- T:outbox-fifo -------------------------------------------------------------------------
 
-func TestOutboxFifoAllow(t *testing.T) { TestStampFromOutboxAllow(t) }
+func TestOutboxFifoAllow(t *testing.T) {
+	f := newFixture(t, nil)
+	f.req("ok.json", `{"type":"ccf.mark"}`)
+	f.req("pipe.tmp", `not a request`) // a non-request name is ignored, not refused
+	if st := f.h.Scan(); st.Accepted != 1 || st.Refused != 0 {
+		t.Fatalf("%+v", st)
+	}
+}
 
 // context: opening a FIFO for reading blocks until a writer shows up, so a fence that drops a
 // FIFO named x.json could freeze the daemon for every session.
@@ -223,7 +240,14 @@ func TestOutboxFifoBlock(t *testing.T) {
 
 // ---- T:outbox-hardlink ---------------------------------------------------------------------
 
-func TestOutboxHardlinkAllow(t *testing.T) { TestStampFromOutboxAllow(t) }
+func TestOutboxHardlinkAllow(t *testing.T) {
+	f := newFixture(t, nil)
+	f.req("one.json", `{"type":"ccf.mark"}`)
+	f.req("two.json", `{"type":"ccf.mark"}`) // each with its own inode: nlink 1
+	if st := f.h.Scan(); st.Accepted != 2 {
+		t.Fatalf("%+v", st)
+	}
+}
 
 // context: a hard link to a file the fence uid owns elsewhere (another session's outbox) would
 // pass an owner check; nlink == 1 is what proves the file is only this outbox's.
@@ -391,14 +415,24 @@ func TestClosedGenerationIsDrainedOnce(t *testing.T) {
 // The twin needs a real privilege split: out/ owned by the fence uid and closed to everyone else.
 // In direct mode every writer is tomas, so the block twin is RED by design until gate M.
 // It only runs as a twin (CCSBX_TWIN set), so `make test` stays green.
-func TestOutboxHostWriteRefusedAllow(t *testing.T) { TestStampFromOutboxAllow(t) }
+func TestOutboxHostWriteRefusedAllow(t *testing.T) {
+	root, wt := directModeWorktree(t)
+	s := backend.Spec{Sid: sid, Gen: 1, Label: "x", StateDir: t.TempDir(), Workdir: wt, WorktreeRoot: root, MemoryMB: 4096, Pids: 512, NotEvid: true}
+	if err := s.Prepare(); err != nil {
+		t.Fatalf("Prepare in direct mode: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(s.GenDir(), "out")); err != nil {
+		t.Fatalf("the outbox the fence writes to was not made: %v", err)
+	}
+}
 
 func TestOutboxHostWriteRefusedBlock(t *testing.T) {
 	if os.Getenv("CCSBX_TWIN") == "" {
 		t.Skip("twin only: red in direct mode until gate M")
 	}
 	state := t.TempDir()
-	s := backend.Spec{Sid: sid, Gen: 1, Label: "x", StateDir: state, Workdir: "/srv/ccsbx-test-work", NotEvid: true}
+	root, wt := directModeWorktree(t)
+	s := backend.Spec{Sid: sid, Gen: 1, Label: "x", StateDir: state, Workdir: wt, WorktreeRoot: root, MemoryMB: 4096, Pids: 512, NotEvid: true}
 	if err := s.Prepare(); err != nil {
 		t.Fatal(err)
 	}
@@ -471,7 +505,15 @@ func TestRequestsOfAnEndedSessionAreStale(t *testing.T) {
 // context: the ledger is what stops a restart from running a request twice under a new ULID.
 // While it can't be written, the handler must not run; when the disk is back, the request is
 // handled exactly once.
-func TestLedgerFailClosedAllow(t *testing.T) { TestStampFromOutboxAllow(t) }
+func TestLedgerFailClosedAllow(t *testing.T) {
+	f := newFixture(t, nil)
+	f.req("r.json", `{"type":"ccf.mark"}`)
+	f.h.Scan()
+	f.h.Scan() // a second pass, as after a restart: still exactly once
+	if len(f.got) != 1 {
+		t.Fatalf("handled %d times", len(f.got))
+	}
+}
 
 func TestLedgerFailClosedBlock(t *testing.T) {
 	f := newFixture(t, nil)
@@ -525,4 +567,19 @@ func TestRequestsAreHandledInNameOrder(t *testing.T) {
 	if strings.Join(got, ",") != "0001,0002,0003,0004,0005" {
 		t.Fatalf("%v", got)
 	}
+}
+
+// directModeWorktree makes a worktree root outside /tmp (a fixed mount point of the fence, so a
+// workdir there is refused) with a workdir inside it, so Prepare gets as far as the outbox.
+func directModeWorktree(t *testing.T) (root, wt string) {
+	t.Helper()
+	root, err := os.MkdirTemp("/var/tmp", "ccsbx-hostd-test-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(root) })
+	root, _ = filepath.EvalSymlinks(root)
+	wt = filepath.Join(root, "wt")
+	os.Mkdir(wt, 0o755)
+	return root, wt
 }

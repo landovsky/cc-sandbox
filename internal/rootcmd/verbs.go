@@ -102,10 +102,8 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 	// The staging mounts and docker's view of them agree only in the host's mount namespace. Inside
 	// a sandboxed unit (a private /home, say) the workdir would be missing or empty, and the fence
 	// would silently start on nothing: refuse instead.
-	if same, err := e.d.SameMountNS(); err != nil {
-		return 0, refuse("cannot compare mount namespaces: %v", err)
-	} else if !same {
-		return 0, refuse("this process is not in the host's mount namespace (a sandboxed unit?): the fence would get a different view of the workdir. Run ccsbx-root from the host's namespace")
+	if err := e.hostNS(); err != nil {
+		return 0, err
 	}
 	rec, err := e.session(w, sid)
 	if err != nil {
@@ -267,6 +265,9 @@ func (e *env) stopCmd() *cli.Command {
 			if err != nil {
 				return fail(stderr, "stop", err)
 			}
+			if err := e.hostNS(); err != nil {
+				return fail(stderr, "stop", err)
+			}
 			rec, err := e.session(w, sid)
 			if err != nil {
 				return fail(stderr, "stop", err)
@@ -303,6 +304,9 @@ func (e *env) gcCmd() *cli.Command {
 				return cli.ExitUsage
 			}
 			if _, err := e.prelude("gc"); err != nil {
+				return fail(stderr, "gc", err)
+			}
+			if err := e.hostNS(); err != nil {
 				return fail(stderr, "gc", err)
 			}
 			docker, err := e.cfg.binary(e.cfg.Docker)
@@ -448,4 +452,15 @@ func (e *env) stripSession(rec *start.Record) error {
 	defer pw.close()
 	_, err = e.d.Strip(pw.f, rec.Uid, e.logf)
 	return err
+}
+
+// hostNS refuses unless this process is in the host's mount namespace: the staging mounts, the
+// unmounts of them and the walk of the workdir all assume the host's view of the filesystem.
+func (e *env) hostNS() error {
+	if same, err := e.d.SameMountNS(); err != nil {
+		return refuse("cannot compare mount namespaces: %v", err)
+	} else if !same {
+		return refuse("this process is not in the host's mount namespace (a sandboxed unit?): mounts and the workdir would not be the host's. Run ccsbx-root from the host's namespace")
+	}
+	return nil
 }

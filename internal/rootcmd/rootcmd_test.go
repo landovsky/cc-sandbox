@@ -1029,3 +1029,19 @@ func TestSameNS(t *testing.T) {
 		t.Error("an unreadable namespace was accepted")
 	}
 }
+
+// The same refusal for stop and gc: unmounting the staging and cleaning the workdir assume the
+// host's view, and nothing may act on a different one.
+func TestStopAndGcRefuseOutsideTheHostMountNamespace(t *testing.T) {
+	f := newFx(t)
+	f.sameNS = false
+	f.wantRefusedMsg("stop in another mount namespace", "mount namespace", "stop", sid)
+	f.wantRefusedMsg("gc in another mount namespace", "mount namespace", "gc")
+	if len(f.strips) != 0 {
+		t.Error("a workdir was walked from another mount namespace")
+	}
+	g := newFx(t)
+	g.nsErr = fmt.Errorf("permission denied")
+	g.wantRefusedMsg("stop with an unreadable namespace", "cannot compare", "stop", sid)
+	g.wantRefusedMsg("gc with an unreadable namespace", "cannot compare", "gc", "--dry-run")
+}

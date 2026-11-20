@@ -317,7 +317,7 @@ t "R1: every flag in hostd's ExecStart is a flag 'ccsbx-hostd run' has ($src)${b
 t "R1: the unit sets the tmux socket to an absolute path in /run/ccsbx and leaves --ccmsg-bin unset" bash -c 'grep -q -- "--tmux-socket /run/ccsbx/tmux.sock" "$1" && ! grep "^ExecStart=" "$1" | grep -q -- "--ccmsg-bin"' _ "$hd"
 t "R1: /run/ccsbx is 0750 and its group becomes ccsbx-clients, so the owner's attach reaches the sockets" bash -c 'grep -q "^RuntimeDirectoryMode=0750" "$1" && grep -q "^ExecStartPre=+/usr/bin/chgrp ccsbx-clients /run/ccsbx" "$1"' _ "$hd"
 d="$(fx tok)"; ins "$d" install --yes >/dev/null 2>&1
-t "R1: the installer makes hostd's token file (0600, as ccsbx) before it starts hostd" bash -c 'a="$(grep -n "listen.token" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-hostd" "$1" | cut -d: -f1)"; grep -q "umask.077" "$1" && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
+t "R1: the installer makes hostd's token file (0600, as ccsbx) before it starts hostd" bash -c 'a="$(grep -n "listen.token" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-hostd" "$1" | cut -d: -f1)"; grep -q "umask..077" "$1" && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
 
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"

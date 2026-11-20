@@ -31,7 +31,7 @@ func (f *fakeX) Exec(_ context.Context, _ k8s.Ref, c string, cmd []string, io_ k
 func TestLoadIntoSendsSecretsOnStdinOnly(t *testing.T) {
 	f := &fakeX{}
 	sec := []byte(`{"token":"TOKEN-VALUE","key":"KEY-VALUE"}`)
-	if err := LoadInto(context.Background(), f, k8s.Ref{}, sec); err != nil {
+	if err := LoadInto(context.Background(), f, k8s.Ref{UID: "uid-1"}, sec); err != nil {
 		t.Fatal(err)
 	}
 	if f.cont != "side" || f.stdin != string(sec) {
@@ -49,11 +49,20 @@ func TestLoadIntoSendsSecretsOnStdinOnly(t *testing.T) {
 // error, with the reason, and the reason must not carry the secrets.
 func TestLoadIntoReportsARefusal(t *testing.T) {
 	f := &fakeX{code: 1, msg: "side load: already loaded"}
-	err := LoadInto(context.Background(), f, k8s.Ref{}, []byte(`{"token":"T","key":"K"}`))
+	err := LoadInto(context.Background(), f, k8s.Ref{UID: "uid-1"}, []byte(`{"token":"T","key":"K"}`))
 	if err == nil || !strings.Contains(err.Error(), "already loaded") {
 		t.Fatalf("got %v", err)
 	}
-	if LoadInto(context.Background(), f, k8s.Ref{}, nil) == nil {
+	if LoadInto(context.Background(), f, k8s.Ref{UID: "uid-1"}, nil) == nil {
 		t.Fatal("empty secrets accepted")
+	}
+}
+
+// context "Exec checks the live pod UID against the recorded one": a ref with no UID would skip that
+// protection, so LoadInto refuses it before anything is sent.
+func TestLoadIntoNeedsThePodUID(t *testing.T) {
+	f := &fakeX{}
+	if err := LoadInto(context.Background(), f, k8s.Ref{}, []byte(`{"token":"T","key":"K"}`)); err == nil || f.stdin != "" {
+		t.Fatalf("sent without a UID: %v", err)
 	}
 }

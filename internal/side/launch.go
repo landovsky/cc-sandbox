@@ -22,9 +22,12 @@ type Execer interface {
 }
 
 // LoadInto sends secrets (the JSON `ccsbx token mint --fwd-secrets` prints) to the side container of ref.
-// The command line carries no secret. A non-zero exit is an error: the sidecar's refusal text (stderr)
+// ref must carry the UID recorded at Create. The command line carries no secret. A non-zero exit is an error: the sidecar's refusal text (stderr)
 // is returned, never the secrets.
 func LoadInto(ctx context.Context, x Execer, ref k8s.Ref, secrets []byte) error {
+	if ref.UID == "" { // Exec re-checks the live pod UID; a ref without the recorded one must not reach a pod
+		return errors.New("side: ref has no pod UID (use the one recorded at Create)")
+	}
 	if len(secrets) == 0 || len(secrets) > MaxSecrets {
 		return fmt.Errorf("side: secrets must be 1..%d bytes", MaxSecrets)
 	}

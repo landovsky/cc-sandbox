@@ -36,7 +36,7 @@ func attachCmd() *cli.Command {
 		Name:    "attach",
 		Summary: "attach this terminal to a session's pane (tmux -L ccsbx), in place",
 		Recipes: `  ccsbx attach s0k1dry66qg            what 'ssh -t <machine> ccsbx attach <sid>' runs for a remote attach
-  ccsbx attach s0k1dry66qg --read-only    watch without typing
+  ccsbx attach --read-only s0k1dry66qg    watch without typing (flags come before the sid)
   It execs tmux, so it behaves like the attach window cc-tree opens: detach with the outer
   tmux's own controls, close the window to let go; the session keeps running.`,
 		Setup: func(f *cli.Flags) {

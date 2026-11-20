@@ -58,3 +58,19 @@ func TestAttachReportsSudoRefusalsAndDoesNotFallBack(t *testing.T) {
 		t.Errorf("%d %s called=%v", code, out, called)
 	}
 }
+
+// the recipe in `attach --help` is what people copy: flags go before the sid (a flag after it is exit 64)
+func TestTheAttachRecipesParse(t *testing.T) {
+	newStubs(t)
+	old := attachExec
+	defer func() { attachExec = old }()
+	attachExec = func(string, []string, []string) error { return nil }
+	_, help := run("attach", "--help")
+	if strings.Contains(help, "s0k1dry66qg --read-only") {
+		t.Errorf("the recipe puts the flag after the sid:\n%s", help)
+	}
+	// helper mode refuses --read-only, but only after the parser accepted the flag before the sid
+	if _, out := run("attach", "--root", "helper", "--read-only", "s0abcd1"); !strings.Contains(out, "not available through ccsbx-root") {
+		t.Errorf("flags before the sid do not parse: %s", out)
+	}
+}

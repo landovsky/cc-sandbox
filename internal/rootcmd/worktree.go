@@ -47,8 +47,9 @@ var (
 )
 
 const wcHelp = `  sudo -n /usr/local/sbin/ccsbx-root worktree-check -- /home/tomas/git/project
-  Exactly one argument, after --; no option, no environment, no stdin. Prints the resolved absolute path and
-  exits 0 when it is a git worktree root inside an allowed root that overlaps no live session's workdir.
+  Exactly two arguments: the -- and then one path; no option, no environment, no stdin. Prints the resolved
+  absolute path, then its derived gitdir, and exits 0 when it is a git worktree root inside an allowed root that
+  overlaps no live session's workdir.
   Exit 2: refused (one fixed line on stderr, never the path). Exit 3: could not tell (a read error).
   For the service user (hostd) and root only; it changes nothing and takes no lock.`
 

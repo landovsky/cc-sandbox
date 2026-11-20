@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
@@ -78,6 +79,13 @@ func (e *env) gitdirOf(uid int, wd string, wpin *pinned, home string) (string, *
 	derived, err := e.cfg.gitdir(filepath.Clean(target), uid, home)
 	if err != nil {
 		return "", nil, err
+	}
+	// The shape hostd accepts, and nothing wider: <repo>/.git/worktrees/<name> under an allowed root. A linked
+	// worktree of a bare repository (<bare>/worktrees/<name>) was accepted here and refused by hostd's
+	// backend.CheckGitDirLexical, so a start hostd would not send could still be run by hand; both sides now use the
+	// one check, and refusing the bare layout is the choice.
+	if err := backend.CheckGitDirLexical(derived, wd, strings.Join(e.cfg.AllowedRoots, ",")); err != nil {
+		return "", nil, refuse("%v", err)
 	}
 	gp, err := pin(e.d.OpenDir, derived, uid)
 	if err != nil {

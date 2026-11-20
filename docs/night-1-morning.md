@@ -92,6 +92,12 @@ Step 8 in detail (changed after the PR #2 review):
 - `ccsbx-root` runs with a clean environment: the sudoers file has `Defaults!/usr/local/sbin/ccsbx-root env_reset,!setenv`, so `sudo -E` and `VAR=x` do not reach it;
 - the ccsbx tmux server is its own unit, `ccsbx-tmux.service` (uid `ccsbx`, no sandbox, host mount namespace), started before hostd; hostd only connects to `/run/ccsbx/tmux.sock`. `check` (as root) confirms the namespace and that the socket is `ccsbx:600`;
 - `install` prints DONE only after the signer has signed a test claim, not only after its socket exists;
+- helper mode: the install copies `profiles/*.json` to `/etc/ccsbx/profiles/` and `pins.toml` to `/etc/ccsbx/pins.toml`
+  (root:root 0644, dir 0755). hostd (`--profiles`, `--pins`) and the signer's scope use THESE copies, never the
+  owner-writable repo; `pins.toml` is empty today, so only e2e candidate images run. hostd also gets `--run-dir
+  /var/lib/ccsbx-run` (made here, root 0755), `--worktree-root` and `--image ccsbx-fence:dev`. **The default
+  allowed root is now `~/git` only** (it was `~/git,~/wt`): `ccsbx-root.toml`'s `allowed_roots` and hostd's
+  `--worktree-root` (its first entry) are one value; pass `--allowed-roots ~/git,~/wt` to keep `~/wt`;
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
@@ -155,7 +161,7 @@ After the group change only password sudo can start them (`sudo docker start <na
   The installer parses it as root and refuses if a NOPASSWD line isn't one of docker, apt-get,
   dokku, sops (it won't guess).
 
-## `units/install-linux.sh plan` as of 2026-11-20 (owner tomas, after the signer alignment)
+## `units/install-linux.sh plan` as of 2026-11-20 (owner tomas, after the helper-mode flags)
 
 ```
 install-linux plan  (owner=tomas, bin-dir=<repo>/dist)
@@ -167,7 +173,7 @@ GATES (install refuses while any is unmet)
   note: sudoers.d/90-tomas-nopasswd not readable without root: verified at install
   note: sudoers.d/README not readable without root: verified at install
   P15 status file: /home/tomas/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv
-  allowed roots:   "/home/tomas/git", "/home/tomas/wt"
+  allowed roots:   "/home/tomas/git"
   signer scope:    owners=tomas machines=hp-ubuntu pairs=dev-default:api|stub,e2e-default:stub
 
 [01] U0b users and directories: ccsbx (hostd), ccsbx-keys (keys), group ccsbx-clients
@@ -197,6 +203,12 @@ GATES (install refuses while any is unmet)
      $ install -o root -g root -m 0755 <repo>/dist/ccsbx /usr/local/bin/ccsbx
      # ccsbx-root reads its allowed workdir roots from /etc/ccsbx/ccsbx-root.toml (root-owned)
      write /etc/ccsbx/ccsbx-root.toml  (mode 0644, root:root, 3 lines)
+     # root-owned copies of the profiles and the pins: hostd, the signer scope and later readers use THESE, never the owner-writable repo
+     $ install -d -o root -g root -m 0755 /etc/ccsbx/profiles
+     write /etc/ccsbx/profiles/dev-default.json  (mode 0644, root:root, 10 lines)
+     write /etc/ccsbx/profiles/e2e-default.json  (mode 0644, root:root, 10 lines)
+     write /etc/ccsbx/pins.toml  (mode 0644, root:root, 8 lines)
+     # pins.toml is empty today: only e2e candidate images run, as expected, until U1a is pinned
 
 [03] U0b machine key and age key (read only by ccsbx-keys; never by tomas or hostd)
      # age key: created here only if R10b didn't (skipped when /var/lib/ccsbx-keys/age.key exists)
@@ -219,7 +231,10 @@ GATES (install refuses while any is unmet)
 [05] U0 hostd unit
      # the tmux server is its own unit (no sandbox: its panes run sudo ccsbx-root and need the host mount namespace); hostd only connects
      write /etc/systemd/system/ccsbx-tmux.service  (mode 0644, root:root, 35 lines)
-     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 55 lines)
+     # ccsbx-root's run directory (it makes it itself, root-owned 0755; made here so hostd's unit can bind it read-write)
+     $ install -d -o root -g root -m 0755 /var/lib/ccsbx-run
+     # hostd's unit gets the owner's worktree root (/home/tomas/git, the first allowed root) and the fence image (ccsbx-fence:dev)
+     write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 58 lines)
      # the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced
      $ runuser -u ccsbx -- sh -c umask\ 077\;\ head\ -c\ 32\ /dev/urandom\ \|\ base64\ \>\ /var/lib/ccsbx/listen.token
      $ systemctl daemon-reload

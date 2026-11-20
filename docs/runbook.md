@@ -94,6 +94,11 @@
      It prints `DONE` only after hostd and the signer are up. hostd listens on loopback only
      (`127.0.0.1:7480`, with a token file), so the firewall question (S11) does not arise.
      Before step 2 do the manual checks listed in `docs/night-1-morning.md` (S5, S9, S14, S15).
+     **Profiles, pins, worktree root:** the install copies `profiles/*.json` and `pins.toml` to `/etc/ccsbx/`
+     (root-owned); hostd's `--profiles`/`--pins` and the signer's pairs read those copies, not the repo, so an
+     agent that can write the repo cannot change what a profile may bill. Change a profile: edit the repo, merge,
+     rerun `install --yes`. hostd's `--worktree-root` is the first `--allowed-roots` entry (default `~/git`), the
+     same value `ccsbx-root.toml` gets; its `--run-dir` is `/var/lib/ccsbx-run`.
      **Signer scope:** before it enables the signer socket the install has `ccsbx-signer --write-scope` write
      `/var/lib/ccsbx-keys/signer.scope` (0600, `ccsbx-keys`); without it the signer exits 2. The scope lists the
      owner, the machine name and the exact profile:billing pairs from `profiles/*.json` (a profile is signed

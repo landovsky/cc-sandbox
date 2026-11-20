@@ -91,3 +91,41 @@ func TestOurOwnKeyRoundTrips(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// context: the hub keeps a frame until the daemon polls. After an hour of hostd downtime a genuine stamp
+// is an hour old by the daemon's clock; judged at the time the HUB received it, it is fine, and the
+// nonce cache still ages by the daemon's own clock.
+func TestSkewIsJudgedAtTheHubsReceiveTimeButTheCacheAgesByOurClock(t *testing.T) {
+	recv := at(1700000000)
+	later := recv.Add(time.Hour)
+	if _, err := Verify(vecPub, vecSig, vecCtx, later, NewCache()); err != ErrSkew {
+		t.Fatalf("by the daemon's clock it is an hour old: %v", err)
+	}
+	c := NewCache()
+	if _, err := VerifyAt(vecPub, vecSig, vecCtx, recv, later, c); err != nil {
+		t.Fatalf("judged at the hub's receive time it is good: %v", err)
+	}
+	if _, err := VerifyAt(vecPub, vecSig, vecCtx, recv, later.Add(time.Minute), c); err != ErrReplay {
+		t.Fatalf("replay: %v", err)
+	}
+}
+
+// context: the skew boundary at the receiver: just inside is good, just outside is refused.
+func TestSkewBoundary(t *testing.T) {
+	ts := at(1700000000)
+	if _, err := Verify(vecPub, vecSig, vecCtx, ts.Add(Skew), NewCache()); err != nil {
+		t.Errorf("exactly 120 s: %v", err)
+	}
+	if _, err := Verify(vecPub, vecSig, vecCtx, ts.Add(Skew+time.Second), NewCache()); err != ErrSkew {
+		t.Errorf("121 s: %v", err)
+	}
+}
+
+// context: the hub's decoder is strict; Go's default one skips line breaks and trailing bits, so a
+// signature with a CR/LF inside would verify here and be refused there.
+func TestAStampWithLineBreaksInItIsMalformed(t *testing.T) {
+	bad := vecSig[:20] + "\n" + vecSig[20:]
+	if _, err := Verify(vecPub, bad, vecCtx, at(1700000000), NewCache()); err != ErrFormat {
+		t.Fatalf("%v", err)
+	}
+}

@@ -32,6 +32,10 @@ const (
 	NonceTTL = 10 * time.Minute
 )
 
+// b64 is url-safe base64 without padding, STRICT: Go's decoder otherwise skips \r and \n and ignores
+// non-zero trailing bits, which the hub's does not.
+var b64 = base64.RawURLEncoding.Strict()
+
 var idRe = regexp.MustCompile(`^[A-Za-z0-9_-]{8,64}$`)
 
 // Fields are what a stamp binds. From is the sender's sid, To the address as sent, Kind "" if none.
@@ -91,21 +95,27 @@ var (
 
 // Cache remembers {from, nonce} pairs for NonceTTL.
 type Cache struct {
-	mu   sync.Mutex
-	seen map[string]time.Time
+	mu    sync.Mutex
+	seen  map[string]time.Time
+	swept time.Time
 }
 
 // NewCache makes an empty cache.
 func NewCache() *Cache { return &Cache{seen: map[string]time.Time{}} }
 
-// claim is true the first time key is seen.
+// claim is true the first time key is seen. Old entries are swept at most once a minute.
 func (c *Cache) claim(key string, now time.Time) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for k, t := range c.seen {
-		if now.Sub(t) > NonceTTL {
-			delete(c.seen, k)
+	if now.Sub(c.swept) > time.Minute {
+		c.swept = now
+		for k, t := range c.seen {
+			if now.Sub(t) > NonceTTL {
+				delete(c.seen, k)
+			}
 		}
+	} else if t, ok := c.seen[key]; ok && now.Sub(t) > NonceTTL {
+		delete(c.seen, key)
 	}
 	if _, ok := c.seen[key]; ok {
 		return false
@@ -117,7 +127,16 @@ func (c *Cache) claim(key string, now time.Time) bool {
 // Verify checks sig against the sender's public key (url-safe base64, 32 raw bytes) for a message
 // whose stamped fields are ctx (From, To, Kind, Body). It returns the msg_id on success.
 func Verify(pubB64, sig string, ctx Fields, now time.Time, cache *Cache) (string, error) {
-	pub, err := base64.RawURLEncoding.DecodeString(pubB64)
+	return VerifyAt(pubB64, sig, ctx, now, now, cache)
+}
+
+// VerifyAt is Verify with the skew judged at skewAt and the nonce cache kept by cacheNow. A receiver that
+// reads queued downlinks (the hub holds a frame until the daemon polls) judges the stamp at the time the
+// HUB received it, not at the time the daemon got round to it, or an hour of downtime would refuse every
+// genuine stamp; the cache still ages by the receiver's own clock.
+func VerifyAt(pubB64, sig string, ctx Fields, skewAt, cacheNow time.Time, cache *Cache) (string, error) {
+	now := skewAt
+	pub, err := b64.DecodeString(pubB64)
 	if err != nil || len(pub) != ed25519.PublicKeySize {
 		return "", ErrNoKey
 	}
@@ -133,7 +152,7 @@ func Verify(pubB64, sig string, ctx Fields, now time.Time, cache *Cache) (string
 	if err != nil {
 		return "", ErrFormat
 	}
-	raw, err := base64.RawURLEncoding.DecodeString(p[3])
+	raw, err := b64.DecodeString(p[3])
 	if err != nil || len(raw) != ed25519.SignatureSize {
 		return "", ErrFormat
 	}
@@ -144,7 +163,7 @@ func Verify(pubB64, sig string, ctx Fields, now time.Time, cache *Cache) (string
 	if !ed25519.Verify(ed25519.PublicKey(pub), Input(ctx), raw) {
 		return "", ErrSignature
 	}
-	if cache != nil && !cache.claim(ctx.From+"\x00"+ctx.Nonce, now) {
+	if cache != nil && !cache.claim(ctx.From+"\x00"+ctx.Nonce, cacheNow) {
 		return "", ErrReplay
 	}
 	return p[0], nil

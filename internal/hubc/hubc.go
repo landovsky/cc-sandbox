@@ -63,6 +63,8 @@ type Deliver struct {
 	Trust string            `json:"trust,omitempty"`
 	Pub   string            `json:"pub,omitempty"`
 	Body  string            `json:"body,omitempty"`
+	// RecvTS is when the HUB received the message (unix seconds): a stamp's skew is judged at that time.
+	RecvTS int64 `json:"recv_ts,omitempty"`
 }
 
 // Error is a non-2xx answer from the hub.
@@ -93,6 +95,19 @@ var sharedTransport = &http.Transport{
 }
 
 var sharedHTTP = &http.Client{Transport: sharedTransport}
+
+// IsUnauthorized reports a 401 only: the credential itself is not (or no longer) accepted. A 403 is a
+// refusal of THIS request (scope, a stamp, a sender mismatch) and a fresh credential would not change it.
+func IsUnauthorized(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Status == 401
+}
+
+// IsForbidden reports a 403.
+func IsForbidden(err error) bool {
+	var e *Error
+	return errors.As(err, &e) && e.Status == 403
+}
 
 func (c *Client) http() *http.Client {
 	if c.HTTP != nil {

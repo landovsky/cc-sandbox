@@ -9,6 +9,21 @@ A fenced sender is trusted on the hub only as a `relay` principal minted for ONE
 public half of that generation's Ed25519 key (B6c, B3). Minting needs the hub's admin secret. hostd (uid
 ccsbx) generates the keypair in memory and keeps the private half; root registers the public half.
 
+## Scope: hp only, for now
+`relay-mint` mints on the machine that RUNS THE HUB (hp). The hub's admin secret never leaves hp: it is not
+copied to the Mac, to future-two or to any other machine, and `hub_url` must be loopback (below). So today
+only hp's hostd can send a signed message; a fenced manager on the Mac cannot reply through the hub until
+one of these exists:
+- **A per-machine minter principal** (proposal): the hub learns a third role, `minter`, bound to one machine
+  and able to do exactly one thing, `POST /v1/principals {"role":"relay",...}` for a `sid` that THAT machine's
+  own spoke has tracked as fenced with `machine == the minter's machine`. Each machine's root holds only its
+  own minter credential (a different secret per machine, revocable one at a time), never the admin secret.
+  The relay it mints is bound to the sid and to that machine by the hub, so the Mac cannot mint a relay for
+  an hp session. The hub change (a role and its scope rule) goes through the dev manager like every hub change.
+- **Or U5/M9**: the hp-signed session token carries the generation's public key and replaces the relay
+  principal altogether (the receiver verifies the chain instead of the hub vouching for a key).
+Until then the Mac side of T:xmachine-msg waits (`tests/xmachine-mac-test.sh` skips).
+
 ## The verb
 ```
 sudo -n /usr/local/sbin/ccsbx-root relay-mint -- <sid> <gen> <pub>
@@ -27,7 +42,10 @@ sudo -n /usr/local/sbin/ccsbx-root relay-mint -- <sid> <gen> <pub>
    never started, or already closed, has no business sending.)
 4. The record's machine is this machine.
 5. Rate: at most one mint per (sid, gen) per 10 s (a file under the run dir): a loop in hostd must not hammer
-   the hub. A repeat after that re-mints (the hub replaces the earlier token for the same sid and gen).
+   the hub. A repeat after that re-mints (the hub replaces the earlier token for the same sid and gen). The
+   limit and hostd's retry agree: hostd mints again only after a 401 on its relay token, and then asks with
+   `--after-401` so root allows ONE mint inside the 10 s window when the previous token was refused; a
+   plain repeat inside the window is refused (exit 2, `rate`), and hostd backs off instead of retrying.
 
 ## The secret and the hub
 - Admin secret: `/etc/ccsbx/hub-admin.secret`, root:root, mode 0600, read with the same trusted-file check as
@@ -62,6 +80,6 @@ arguments; a symlinked or group-readable secret is refused; a fake hub that answ
 the revoke runs in `run`'s cleanup and in `gc` (a stub hub records the DELETE).
 
 ## What hostd does with it
-`cmd/ccsbx-hostd/hubremote.go`: `rootMinter()` runs exactly the line above through `start.SudoBin`/`start.RootBin`
+`cmd/ccsbx-hostd/hubremote.go`: `rootMinter()` runs exactly the line above (plus `--after-401` before `--` on the one retry) through `start.SudoBin`/`start.RootBin`
 (only if the helper is installed and trusted), reads the token from stdout, and keeps the key and token in
 memory per (sid, gen). On a 401/403 from the hub it mints again once.

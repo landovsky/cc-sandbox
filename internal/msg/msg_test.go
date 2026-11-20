@@ -690,12 +690,13 @@ func TestDeliverWithNoTmuxServerSaysWhichUnitToStart(t *testing.T) {
 type fakeUplink struct {
 	sent      []string
 	delivered bool
+	toSid     string // the session the hub resolved the node to
 	err       error
 }
 
-func (u *fakeUplink) SendRemote(s Session, node, kind, text string) (bool, error) {
+func (u *fakeUplink) SendRemote(s Session, node, kind, text string) (bool, string, error) {
 	u.sent = append(u.sent, s.Sid+">"+node+":"+kind+":"+text)
-	return u.delivered, u.err
+	return u.delivered, u.toSid, u.err
 }
 
 // context: a fenced worker on this machine writes to its manager, who lives on the Mac. Not a session
@@ -771,7 +772,7 @@ func TestRemoteMessageFromAStrangerIsRefusedBlock(t *testing.T) {
 // the node may answer even though it is not in the target's scope.
 func TestRemoteReplyToSenderWithinTheWindow(t *testing.T) {
 	w := newWorld(t, sess("sT", "cc-sandbox:worker", true, "cc-sandbox:mgr"))
-	up := &fakeUplink{delivered: true}
+	up := &fakeUplink{delivered: true, toSid: "s0a"}
 	w.r.Uplink = up
 	w.dir.s[0].Scope.Peers = []string{"other:asked"}
 	if res := w.r.Send(w.dir.s[0], body("other:asked", "question")); res.Status != "ok" {
@@ -785,6 +786,11 @@ func TestRemoteReplyToSenderWithinTheWindow(t *testing.T) {
 	}
 	if res := w.r.DeliverRemote(RemoteSender{Node: "other:never-asked", Sid: "s0b", Machine: "mac"}, "sT", "x"); res.Code != "scope" {
 		t.Fatalf("%+v", res)
+	}
+	// the window is bound to the SESSION the hub resolved the address to, not to the node name: another
+	// session (or a later generation) that publishes the same node does not inherit it
+	if res := w.r.DeliverRemote(RemoteSender{Node: "other:asked", Sid: "s0imposter", Machine: "evil", Fenced: true}, "sT", "x"); res.Code != "scope" {
+		t.Fatalf("a different session with the same node was heard: %+v", res)
 	}
 }
 

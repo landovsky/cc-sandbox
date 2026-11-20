@@ -34,6 +34,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -88,10 +89,13 @@ type Origin struct {
 
 // Router applies the scope rule and delivers.
 type Router struct {
-	Dir      Directory
-	Out      Deliverer
-	Hub      Hub    // optional: for an in-scope node that has no live ccsbx session (an unfenced manager)
-	Uplink   Uplink // optional: a node of ANOTHER machine, through the session bus hub (M2b)
+	Dir    Directory
+	Out    Deliverer
+	Hub    Hub    // optional: for an in-scope node that has no live ccsbx session (an unfenced manager)
+	Uplink Uplink // optional: a node of ANOTHER machine, through the session bus hub (M2b)
+	// Dropped, when set, is called (with the router's lock held: it must not block) for every message that
+	// ended as `dropped`, so the daemon can journal it (reason and node, never the text).
+	Dropped  func(sender Session, node, why string)
 	Idle     Idler
 	StateDir string
 	Now      func() time.Time
@@ -197,29 +201,48 @@ func (r *Router) SendWith(from Session, body []byte, o Origin) Result {
 		// Only when NO ccsbx record anywhere (any realm, live or between generations) holds
 		// that label: otherwise the label is a fenced node that is briefly not live (a replace)
 		// or lives in another realm, and the bus must not become a way around the realm rule.
-		if r.Hub != nil && b.To.Node != "" && !labelKnown(all, b.To.Node) {
-			if !r.pairOK(sender.Sid, "hub:"+b.To.Node) {
-				return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "refused", Code: "rate_capped"})
+		sender := *sender
+		if b.To.Node != "" && !labelKnown(all, b.To.Node) {
+			// Another machine first, through the hub, SIGNED (M2b): a node that is on another machine must
+			// take the signed path even when ccmsg is configured (decision (1): hostd does not use the
+			// owner's bus). Only a node the hub says is on THIS machine (ErrLocalNode), or that the hub does
+			// not hold at all while ccmsg is there (ErrUnknownNode), falls through to ccmsg.
+			if r.Uplink != nil {
+				if !r.pairOK(sender.Sid, "hub:"+b.To.Node) {
+					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "refused", Code: "rate_capped"})
+				}
+				// No lock across the network: a hub round trip (and a root mint) takes seconds, and a send
+				// from each of two machines would otherwise wait for an ack the other's poll handler can't give.
+				r.mu.Unlock()
+				delivered, toSid, err := r.Uplink.SendRemote(sender, b.To.Node, b.Kind, b.Text)
+				r.mu.Lock()
+				switch {
+				case err == nil && delivered:
+					return r.receipt(sender.Sid, sender.Gen, "hub:"+toSid, Result{Status: "ok", To: "hub:" + b.To.Node})
+				case err == nil:
+					r.dropped(sender, b.To.Node, "the hub delivered it to nobody")
+					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "dropped"})
+				case errors.Is(err, ErrUnknownNode) && r.Hub == nil:
+					r.dropped(sender, b.To.Node, "no session on the hub holds that node")
+					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "dropped"})
+				case errors.Is(err, ErrUnknownNode), errors.Is(err, ErrLocalNode):
+					// fall through to ccmsg below
+				default:
+					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "undeliverable"})
+				}
 			}
-			if err := r.Hub.Send(b.To.Node, stampFenced(*sender, b.Text)); err != nil {
-				return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "undeliverable"})
+			if r.Hub != nil {
+				if !r.pairOK(sender.Sid, "hub:"+b.To.Node) {
+					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "refused", Code: "rate_capped"})
+				}
+				r.mu.Unlock()
+				err := r.Hub.Send(b.To.Node, stampFenced(sender, b.Text))
+				r.mu.Lock()
+				if err != nil {
+					return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "undeliverable"})
+				}
+				return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "ok", To: "hub:" + b.To.Node})
 			}
-			return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "ok", To: "hub:" + b.To.Node})
-		}
-		// Not a session of this machine at all: across machines, through the hub (M2b). The sender is
-		// signed for there, and an unreachable target is `dropped`, never a silent success.
-		if r.Uplink != nil && b.To.Node != "" && !labelKnown(all, b.To.Node) {
-			if !r.pairOK(sender.Sid, "hub:"+b.To.Node) {
-				return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "refused", Code: "rate_capped"})
-			}
-			delivered, err := r.Uplink.SendRemote(*sender, b.To.Node, b.Kind, b.Text)
-			switch {
-			case err != nil:
-				return r.receipt(sender.Sid, sender.Gen, "hub:"+b.To.Node, Result{Status: "error", Code: "undeliverable"})
-			case !delivered:
-				return r.receipt(sender.Sid, sender.Gen, "hub:"+b.To.Node, Result{Status: "error", Code: "dropped"})
-			}
-			return r.receipt(sender.Sid, sender.Gen, "hub:"+b.To.Node, Result{Status: "ok", To: "hub:" + b.To.Node})
 		}
 		return r.receipt(sender.Sid, sender.Gen, "", Result{Status: "error", Code: "no_live_session"})
 	}
@@ -255,7 +278,22 @@ func (r *Router) deliverFenced(sender, target Session, text string) Result {
 // the session bus hub: the daemon signs it as the sender (B3) and the hub routes it by tree address.
 // delivered is false when the hub found no live target or the target did not take it.
 type Uplink interface {
-	SendRemote(sender Session, node, kind, text string) (delivered bool, err error)
+	// SendRemote returns whether the hub delivered it and the SESSION ID of the target it resolved (so
+	// the reply window is bound to that session, not to the address as typed). ErrLocalNode: the hub
+	// says that node is on THIS machine. ErrUnknownNode: the hub holds no session for it.
+	SendRemote(sender Session, node, kind, text string) (delivered bool, toSid string, err error)
+}
+
+var (
+	ErrLocalNode   = errors.New("the node is on this machine")
+	ErrUnknownNode = errors.New("the hub holds no session for that node")
+)
+
+// dropped tells whoever journals (Dropped hook) that a message ended as dropped.
+func (r *Router) dropped(sender Session, node, why string) {
+	if r.Dropped != nil {
+		r.Dropped(sender, node, why)
+	}
 }
 
 // RemoteSender is a sender on another machine as the RECEIVING daemon learned it: Node is the
@@ -322,7 +360,7 @@ func (r *Router) remoteInScope(rs RemoteSender, target Session) bool {
 		win = r.MaxReplyWindow
 	}
 	for _, rc := range r.rcpts {
-		if rc.Status == "ok" && rc.From == target.Sid && rc.FromGen == target.Gen && rc.To == "hub:"+rs.Node &&
+		if rc.Status == "ok" && rc.From == target.Sid && rc.FromGen == target.Gen && rs.Sid != "" && rc.To == "hub:"+rs.Sid &&
 			r.now().Sub(rc.TS) <= win && !rc.TS.Before(target.Started) {
 			return true
 		}

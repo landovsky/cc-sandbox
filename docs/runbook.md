@@ -435,7 +435,15 @@ record, never from the fence) and polls `spoke:<machine>/ccsbx`.
   `ccsbx-stamp-v1`, 120 s skew, 10-minute nonce cache), the `to` it names must be THIS target, the sender's
   node comes from the hub's presence entry for its sid, and scope is re-checked against the target's own
   record (manager, peers, reply-to-sender). An unfenced sender is delivered as `unfenced (hub)` under the same
-  scope. The typed text is the verified body, never the hub's rebuilt line.
+  scope. The typed text is rendered by hostd from the verified body, and the hub's own line must carry the
+  same flattened body or the message is refused.
+- **Unfenced senders are not heard.** An unfenced sender's `from.id` is a claim nobody authenticates (every
+  owner Claude session holds the hub secret and can write any id), so a message from one is refused by the
+  receiving hostd instead of passing the scope check as "the manager". A fenced sender, or the owner's own
+  socket (`ccsbx deliver`), reaches a fenced pane. (Decision for later: let a target's record name an
+  unfenced manager explicitly.)
+- **Node bound.** The hub keeps a fenced entry's `node` only for the trees the machine's spoke principal was
+  minted for (`trees`), so a fence cannot publish an owner's unrelated tree node.
 - **Known limit: the public key is supplied by the hub.** hostd verifies the stamp against the `pub` the hub
   sends with the message, so it trusts the hub's routing and its key bookkeeping (a compromised hub could
   substitute a key and forge a stamp for any sender whose node the hub can also fake). Scope still bounds the

@@ -250,7 +250,7 @@ func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router
 	}
 	machine := get("machine")
 	client := &hubc.Client{URL: url, Token: token}
-	hr := newHubRemote(client, url, machine, rt, j, lg.Printf, rootMinter())
+	hr := newHubRemote(client, url, machine, rt, j, lg.Printf, rootMinter(), get("state"))
 	rt.Uplink = hr // a message to a node of another machine goes through the hub, signed
 	sp := hubspoke.New(hubspoke.Config{
 		Client:  client,
@@ -261,20 +261,8 @@ func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router
 			if err != nil {
 				return nil
 			}
-			var out []map[string]any
-			for _, s := range all {
-				if !s.Live {
-					continue
-				}
-				state := "working"
-				if _, idle := rt.Idle.IdleSince(s.Sid, s.Gen); idle {
-					state = "waiting"
-				}
-				// facts the daemon knows; never the session's last output line (B5)
-				out = append(out, map[string]any{"key": "ccsbx:" + s.Sid, "uid": s.Sid, "label": s.Label, "machine": machine,
-					"fenced": true, "downlink": "spoke:" + machine + "/ccsbx", "attach": "ccsbx:" + s.Sid, "state": state})
-			}
-			return out
+			hr.pruneKeys()
+			return fencedEntries(machine, all, rt.Idle.IdleSince)
 		},
 		OnDeliver: func(ctx context.Context, f hubc.Frame, d hubc.Deliver) hubspoke.Result {
 			return hr.onDeliver(ctx, f, d)
@@ -285,4 +273,25 @@ func startHubSpoke(get func(string) string, num func(string) int, rt *msg.Router
 	go func() { sp.Run(ctx); close(done) }()
 	lg.Printf("hub: tracking fenced sessions on %s as spoke:%s/ccsbx", url, machine)
 	return func() { cancel(); <-done }
+}
+
+// fencedEntries is what hostd publishes on the hub for its live fenced sessions: facts the daemon knows,
+// never the session's last output line (B5). `node` is the session's tree node from hostd's OWN record
+// (the daemon's, never the fence's): without it no fenced sender could be scoped by a receiver and no
+// fenced target could be addressed by tree address with the cockpit down (M2b). The hub keeps it only
+// for a fenced entry from this machine's own spoke principal.
+func fencedEntries(machine string, all []msg.Session, idleSince func(sid string, gen int) (time.Time, bool)) []map[string]any {
+	var out []map[string]any
+	for _, s := range all {
+		if !s.Live {
+			continue
+		}
+		state := "working"
+		if _, idle := idleSince(s.Sid, s.Gen); idle {
+			state = "waiting"
+		}
+		out = append(out, map[string]any{"key": "ccsbx:" + s.Sid, "uid": s.Sid, "label": s.Label, "node": s.Label, "machine": machine,
+			"fenced": true, "downlink": "spoke:" + machine + "/ccsbx", "attach": "ccsbx:" + s.Sid, "state": state})
+	}
+	return out
 }

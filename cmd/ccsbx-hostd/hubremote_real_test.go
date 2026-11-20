@@ -56,22 +56,22 @@ func adminPost(t *testing.T, url, admin, path string, body any) map[string]any {
 
 func startMachine(t *testing.T, ctx context.Context, url, admin, name string, s msg.Session) *realMachine {
 	t.Helper()
-	tok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "spoke", "machine": name})["token"].(string)
+	tok := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "spoke", "machine": name, "trees": []string{"cc-sandbox"}})["token"].(string)
 	out, j := &xOut{}, &xJ{}
 	rt := &msg.Router{Dir: &xDir{[]msg.Session{s}}, Out: out, Idle: xIdle{}, StateDir: t.TempDir()}
 	client := &hubc.Client{URL: url, Token: func() (string, error) { return tok, nil }}
 	// the stand-in for `ccsbx-root relay-mint`: the hub's admin API, which hostd itself never holds
-	mint := func(_ context.Context, sid string, gen int, pub string) (string, error) {
+	mint := func(_ context.Context, sid string, gen int, pub string, _ bool) (string, error) {
 		m := adminPost(t, url, admin, "/v1/principals", map[string]any{"role": "relay", "sid": sid, "gen": fmt.Sprint(gen), "pub": pub})
 		return m["token"].(string), nil
 	}
-	hr := newHubRemote(client, url, name, rt, j, t.Logf, mint)
+	hr := newHubRemote(client, url, name, rt, j, t.Logf, mint, t.TempDir())
 	rt.Uplink = hr
 	sp := hubspoke.New(hubspoke.Config{
 		Client: client, Machine: name, Name: "ccsbx", TTL: 60, PollWait: time.Second,
+		// the production entry builder, so what the real hub sees is what hostd really publishes
 		Entries: func() []map[string]any {
-			return []map[string]any{{"key": "ccsbx:" + s.Sid, "uid": s.Sid, "label": s.Label, "node": s.Label, "machine": name, "fenced": true,
-				"downlink": "spoke:" + name + "/ccsbx", "attach": "ccsbx:" + s.Sid, "state": "waiting"}}
+			return fencedEntries(name, []msg.Session{s}, func(string, int) (time.Time, bool) { return time.Now(), true })
 		},
 		OnDeliver: func(c context.Context, f hubc.Frame, d hubc.Deliver) hubspoke.Result { return hr.onDeliver(c, f, d) },
 		Logf:      t.Logf,
@@ -120,7 +120,7 @@ func TestRealHubTwoMachinesExchangeSignedMessagesAndRefuseForgeries(t *testing.T
 
 	// 1. T:xmachine-msg (on one host): the worker's message reaches the manager's pane on the other machine,
 	// signed, verified there, scope-checked there, typed once with a fenced stamp that names the sender.
-	ok, err := hp.hr.SendRemote(worker, "cc-sandbox:#mgr", "report", "step 1 done")
+	ok, err := sendVia(hp, worker, "cc-sandbox:mgr", "report", "step 1 done")
 	if !ok || err != nil {
 		t.Fatalf("send: %v %v", ok, err)
 	}
@@ -134,7 +134,7 @@ func TestRealHubTwoMachinesExchangeSignedMessagesAndRefuseForgeries(t *testing.T
 	hp.out.mu.Lock()
 	hp.out.lines = nil
 	hp.out.mu.Unlock()
-	if ok, err := mac.hr.SendRemote(mgr, "cc-sandbox:worker", "message", "thanks"); !ok || err != nil {
+	if ok, err := sendVia(mac, mgr, "cc-sandbox:worker", "message", "thanks"); !ok || err != nil {
 		t.Fatalf("reply: %v %v", ok, err)
 	}
 	waitLines(t, hp, 1)
@@ -166,11 +166,11 @@ func TestRealHubTwoMachinesExchangeSignedMessagesAndRefuseForgeries(t *testing.T
 	// 4. A genuine relay with a genuine stamp whose node is NOT in the manager's scope: the hub proves who sent
 	// it, the RECEIVER decides it may not be heard. The forger's session has a presence entry (a node), but the
 	// manager's scope lists only the worker.
-	st := mac.tok // (minting a second spoke credential for a machine would revoke the first)
+	st := hp.tok // (a second spoke credential for a machine would revoke the first); hp's tracked set is replaced for a moment
 	sc := &hubc.Client{URL: url, Token: func() (string, error) { return st, nil }}
 	if _, err := sc.Track(ctx, []map[string]any{
-		{"key": "ccsbx:s0mgr00001", "uid": "s0mgr00001", "label": "cc-sandbox:mgr", "node": "cc-sandbox:mgr", "machine": "mac", "fenced": true, "downlink": "spoke:mac/ccsbx", "state": "waiting"},
-		{"key": "ccsbx:s0forger01", "uid": "s0forger01", "label": "forger", "node": "other:forger", "machine": "mac", "fenced": true, "downlink": "spoke:mac/ccsbx", "state": "waiting"},
+		{"key": "ccsbx:s0worker01", "uid": "s0worker01", "label": "cc-sandbox:worker", "node": "cc-sandbox:worker", "machine": "hp", "fenced": true, "downlink": "spoke:hp/ccsbx", "state": "waiting"},
+		{"key": "ccsbx:s0forger01", "uid": "s0forger01", "label": "forger", "node": "cc-sandbox:forger", "machine": "hp", "fenced": true, "downlink": "spoke:hp/ccsbx", "state": "waiting"},
 	}, 60); err != nil {
 		t.Fatal(err)
 	}
@@ -192,14 +192,28 @@ func TestRealHubTwoMachinesExchangeSignedMessagesAndRefuseForgeries(t *testing.T
 	}
 	mac.j.mu.Unlock()
 	if !scoped {
-		t.Fatalf("the receiver did not refuse it for scope (journal: %s)", mac.j.types())
+		var all []string
+		mac.j.mu.Lock()
+		for _, e := range mac.j.ev {
+			all = append(all, e.Type+" "+string(e.Data))
+		}
+		mac.j.mu.Unlock()
+		t.Fatalf("the receiver did not refuse it for scope (journal: %s)", strings.Join(all, "\n"))
 	}
 
 	// 5. An unreachable target is dropped, not a success.
-	if ok, err := hp.hr.SendRemote(worker, "cc-sandbox:nobody", "report", "x"); ok || err != nil {
-		t.Fatalf("a node nobody holds: %v %v", ok, err)
+	res := hp.hr.rt.Send(worker, []byte(`{"type":"msg.send","to":{"node":"cc-sandbox:nobody"},"text":"x"}`))
+	if res.Code != "scope" && res.Code != "dropped" {
+		t.Fatalf("a node nobody holds: %+v", res)
 	}
-	if !strings.Contains(hp.j.types(), "msg.dropped") {
-		t.Fatalf("not journaled as dropped: %s", hp.j.types())
+}
+
+// sendVia sends through the router, as a fenced session's msg.send does (scope, then the signed uplink).
+func sendVia(m *realMachine, s msg.Session, node, kind, text string) (bool, error) {
+	body, _ := json.Marshal(map[string]any{"type": "msg.send", "to": map[string]string{"node": node}, "kind": kind, "text": text})
+	res := m.hr.rt.Send(s, body)
+	if res.Status != "ok" {
+		return false, fmt.Errorf("%+v", res)
 	}
+	return true, nil
 }

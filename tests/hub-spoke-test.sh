@@ -6,13 +6,13 @@
 # frame whose ack reaches the waiting /deliver. Direct mode: results are NOT EVIDENCE.
 #
 #   tests/hub-spoke-test.sh
-#   CCSBX_DOTFILES=<dotfiles checkout with B10/B11> (default ~/.dotfiles/.worktrees/n1-g-hub: B10/B11 plus
+#   CCSBX_DOTFILES=<dotfiles checkout with B10/B11> (default ~/.dotfiles/.worktrees/n1-g-hub2: B10/B11 plus
 #   the M2b downlink payload and node changes; with a hub that has only B10/B11 the M2b test is skipped)
 # Needs docker and the image session-bus:local; skips (exit 0, says so) when either is missing. The
 # hub container is removed by its exact name, by the dotfiles library, and only the one it started.
 set -u
 case "${1:-}" in -h|--help) sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; esac
-D=${CCSBX_DOTFILES:-$HOME/.dotfiles/.worktrees/n1-g-hub}
+D=${CCSBX_DOTFILES:-$HOME/.dotfiles/.worktrees/n1-g-hub2}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 [ -f "$D/tests/lib-sb-hub.sh" ] || { echo "skip: no session-bus test library at $D/tests/lib-sb-hub.sh"; exit 0; }
 [ -f "$D/session-bus/lib/session_bus/http_spoke.ex" ] || { echo "skip: $D has no B11 (http_spoke.ex)"; exit 0; }

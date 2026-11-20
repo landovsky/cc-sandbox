@@ -3,29 +3,39 @@
 // is the one place a message from OUTSIDE this machine meets a fenced pane: every step that decides
 // whether it may is here, in order, and each is tested.
 //
-// Receiving: a fenced sender's stamp (B3) is verified HERE, against the public key the hub supplied
-// (trusting that key is trusting the hub's routing: the end-to-end chain, the hp-signed token that
-// carries the key, comes with U5/M9), the stamp's `to` must name THIS target, the sender's node is
-// taken from the hub's presence entry for its sid (published by that machine's own daemon, never from
-// the message), and scope is re-checked against the target's own record (msg.Router.DeliverRemote).
-// An unfenced sender is delivered as "unfenced (hub)" under the same scope rule.
+// Receiving: only a FENCED sender can be identified, so only a fenced sender is heard. Its stamp (B3) is
+// verified HERE, against the public key the hub supplied (trusting that key is trusting the hub's routing
+// and key bookkeeping: the end-to-end chain, the hp-signed token that carries the key, comes with U5/M9),
+// judged at the time the hub received it; the stamp's `to` must name THIS target; the sender's node comes
+// from the hub's presence entry for its sid, which must be unique, fenced and from the machine it claims;
+// and scope is re-checked against the target's own record (msg.Router.DeliverRemote). The text typed is
+// rendered by hostd from the VERIFIED body, and the hub's own rendering must agree with it. An unfenced
+// sender's `from` is a claim nobody authenticates (any owner process holding the hub secret can write any
+// id), so an unfenced message is refused: it must not pass the scope check on a claimed identity.
 //
 // Sending: a fenced session's message to a node of another machine is signed by hostd with a
 // per-generation key whose public half ccsbx-root registers on the hub as a relay principal
-// (`ccsbx-root relay-mint`; hostd never holds the hub's admin secret). The key lives in memory only.
+// (`ccsbx-root relay-mint`; hostd never holds the hub's admin secret). The key lives in memory only and is
+// wiped when its generation is no longer live.
 package main
 
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/landovsky/cc-sandbox/internal/hubc"
 	"github.com/landovsky/cc-sandbox/internal/hubspoke"
@@ -37,16 +47,21 @@ import (
 )
 
 // minter registers a relay principal for one generation's public key and returns its token.
-type minter func(ctx context.Context, sid string, gen int, pubB64 string) (token string, err error)
+type minter func(ctx context.Context, sid string, gen int, pubB64 string, after401 bool) (token string, err error)
 
 // rootMinter runs `sudo -n ccsbx-root relay-mint -- <sid> <gen> <pub>` (the helper validates the sid and
 // generation against the daemon's record, holds the hub admin secret, and prints {"token": "..."}).
 func rootMinter() minter {
-	return func(ctx context.Context, sid string, gen int, pub string) (string, error) {
+	return func(ctx context.Context, sid string, gen int, pub string, after401 bool) (string, error) {
 		if !start.HelperInstalled() {
 			return "", fmt.Errorf("ccsbx-root is not installed: no relay credential can be minted")
 		}
-		c := exec.CommandContext(ctx, start.SudoBin, "-n", start.RootBin, "relay-mint", "--", sid, strconv.Itoa(gen), pub)
+		args := []string{"-n", start.RootBin, "relay-mint"}
+		if after401 {
+			args = append(args, "--after-401")
+		}
+		args = append(args, "--", sid, strconv.Itoa(gen), pub)
+		c := exec.CommandContext(ctx, start.SudoBin, args...)
 		out, err := tmuxsock.RunFor(c, 15*time.Second)
 		if err != nil {
 			return "", fmt.Errorf("relay-mint: %v", err)
@@ -77,13 +92,42 @@ type hubRemote struct {
 	mint    minter
 	cache   *stamp.Cache
 	now     func() time.Time
+	// handledPath: keys of deliveries already typed or queued, kept on disk for handledTTL, so a restart
+	// between typing and a successful ack does not type the same message again.
+	handledPath string
 
-	mu   sync.Mutex
-	keys map[string]*relayKey // "<sid>/<gen>" -> its key and relay token
+	mu      sync.Mutex
+	keys    map[string]*relayKey // "<sid>/<gen>" -> its key and relay token
+	handled map[string]time.Time
 }
 
-func newHubRemote(c *hubc.Client, url, machine string, rt *msg.Router, j appender, logf func(string, ...any), mint minter) *hubRemote {
-	return &hubRemote{hub: c, url: url, machine: machine, rt: rt, j: j, logf: logf, mint: mint, cache: stamp.NewCache(), now: time.Now, keys: map[string]*relayKey{}}
+const (
+	handledTTL = 20 * time.Minute // the stamp's skew (2 min) plus how long the hub holds an unacked frame
+	// maxQueueAge: a frame older than this at the receiver (by the hub's receive time) is refused even if its
+	// stamp was fine when received: the nonce memory does not outlive it.
+	maxQueueAge = 15 * time.Minute
+)
+
+func newHubRemote(c *hubc.Client, url, machine string, rt *msg.Router, j appender, logf func(string, ...any), mint minter, stateDir string) *hubRemote {
+	h := &hubRemote{hub: c, url: url, machine: machine, rt: rt, j: j, logf: logf, mint: mint, cache: stamp.NewCache(), now: time.Now,
+		keys: map[string]*relayKey{}, handled: map[string]time.Time{}}
+	if stateDir != "" {
+		h.handledPath = filepath.Join(stateDir, "hub", "handled.json")
+		if b, err := os.ReadFile(h.handledPath); err == nil {
+			_ = json.Unmarshal(b, &h.handled)
+		}
+	}
+	rt.Dropped = func(s msg.Session, node, why string) {
+		h.event("msg.dropped", s.Sid, s.Gen, s.Realm, s.Label, map[string]any{"to_node": cap200(node), "reason": cap200(why)})
+	}
+	return h
+}
+
+func cap200(s string) string {
+	if len(s) > 200 {
+		return s[:200] + "…"
+	}
+	return s
 }
 
 func (h *hubRemote) event(typ, sid string, gen int, realm, node string, data map[string]any) {
@@ -100,72 +144,158 @@ func (h *hubRemote) event(typ, sid string, gen int, realm, node string, data map
 
 var kindRe = regexp.MustCompile(`^[a-z0-9_-]{1,32}$`)
 
+func (h *hubRemote) markHandled(key string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	now := h.now()
+	h.handled[key] = now
+	for k, t := range h.handled {
+		if now.Sub(t) > handledTTL {
+			delete(h.handled, k)
+		}
+	}
+	if h.handledPath == "" {
+		return
+	}
+	b, _ := json.Marshal(h.handled)
+	if err := os.MkdirAll(filepath.Dir(h.handledPath), 0o700); err == nil {
+		tmp := h.handledPath + ".tmp"
+		if err = os.WriteFile(tmp, b, 0o600); err == nil {
+			err = os.Rename(tmp, h.handledPath)
+		}
+		if err != nil {
+			h.logf("hub: the handled-messages file could not be written (%v): a restart may type a message again", err)
+		}
+	}
+}
+
+func (h *hubRemote) wasHandled(key string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	t, ok := h.handled[key]
+	return ok && h.now().Sub(t) <= handledTTL
+}
+
 // onDeliver handles one deliver frame from the hub.
 func (h *hubRemote) onDeliver(ctx context.Context, f hubc.Frame, d hubc.Deliver) hubspoke.Result {
+	hk := "m:" + hex.EncodeToString(sumOf(d.Sig+"\x00"+d.UID+"\x00"+d.Body)) // the stamp is unique per message
+	if d.Sig != "" && h.wasHandled(hk) {
+		return hubspoke.Result{OK: true} // already typed or queued before a restart: acknowledge, do not type again
+	}
 	rs, text, verdict := h.vet(ctx, d)
 	if verdict != "" {
-		h.logf("hub: frame %d for %s refused: %s", f.Seq, d.UID, verdict)
-		h.event("msg.refused", d.UID, 0, "", "", map[string]any{"seq": f.Seq, "reason": verdict, "from_sid": d.From["sid"]})
+		h.logf("hub: frame %d for %s refused: %s", f.Seq, cap200(d.UID), cap200(verdict))
+		h.event("msg.refused", cap200(d.UID), 0, "", "", map[string]any{"seq": f.Seq, "reason": cap200(verdict), "from_sid": cap200(d.From["sid"])})
 		return hubspoke.Result{}
 	}
 	res := h.rt.DeliverRemote(rs, d.UID, text)
 	h.event("hub.recv", d.UID, 0, "", "", map[string]any{"seq": f.Seq, "from_sid": rs.Sid, "from_node": rs.Node, "fenced": rs.Fenced, "status": res.Status, "code": res.Code, "bytes": len(text)})
+	if res.Status == "ok" || res.Status == "queued" {
+		h.markHandled(hk)
+	}
 	return hubspoke.Result{OK: res.Status == "ok" || res.Status == "queued", Confirmed: res.Status == "ok"}
 }
+
+func sumOf(s string) []byte { h := sha256.Sum256([]byte(s)); return h[:] }
+
+// hubFlat is the hub's own flattening of a relay's text (SessionBus.HubRouter.relay_line): every run of
+// control, format or whitespace characters becomes one space, the stamp quotes become a middle dot, and
+// the ends are trimmed. The hub's line and ours must agree on it, character for character.
+func hubFlat(s string) string {
+	var sb strings.Builder
+	space := false
+	for _, c := range s {
+		if unicode.Is(unicode.C, c) || unicode.IsSpace(c) {
+			if !space {
+				sb.WriteByte(' ')
+			}
+			space = true
+			continue
+		}
+		space = false
+		if c == '‹' || c == '›' {
+			c = '·'
+		}
+		sb.WriteRune(c)
+	}
+	return strings.TrimSpace(sb.String())
+}
+
+var hubLineRe = regexp.MustCompile(`^\[MSG from [^ ]+ · fenced · #([0-9a-f]{12})\] (.*) ‹end #([0-9a-f]{12})›$`)
 
 // vet decides who the sender really is. verdict "" means: deliver text as rs.
 func (h *hubRemote) vet(ctx context.Context, d hubc.Deliver) (rs msg.RemoteSender, text, verdict string) {
 	if d.UID == "" {
 		return rs, "", "no target"
 	}
+	if d.Trust != "fenced" {
+		// An unfenced sender is whoever wrote `from`: a claim nobody authenticates (every owner CC session
+		// holds the hub secret and can write any id). It must not pass a scope check on that claim.
+		return rs, "", "an unfenced sender cannot be identified, so it is not heard; a fenced sender or the owner's socket can reach this session"
+	}
 	entries, err := h.hub.Sessions(ctx)
 	if err != nil {
 		return rs, "", "the hub's presence list could not be read: " + err.Error()
 	}
 	// The hub must have sent this to a session that really is ours (its entry names the address used).
-	te := hubc.FindSid(entries, d.UID)
+	te := uniqueEntry(entries, d.UID)
 	if te == nil || te["machine"] != h.machine || !addressNames(te, d.To) {
 		return rs, "", "the address in the stamp does not name this target"
 	}
-	body := d.Body
-	if body == "" {
-		body = d.Text
+	sid := d.From["sid"]
+	if d.Sig == "" || d.Pub == "" || sid == "" {
+		return rs, "", "claims fenced without a stamp"
 	}
-	if d.Trust == "fenced" {
-		sid := d.From["sid"]
-		if d.Sig == "" || d.Pub == "" || sid == "" {
-			return rs, "", "claims fenced without a stamp"
-		}
-		if _, err := stamp.Verify(d.Pub, d.Sig, stamp.Fields{From: sid, To: d.To, Kind: d.Kind, Body: d.Body}, h.now(), h.cache); err != nil {
-			return rs, "", "stamp refused: " + err.Error()
-		}
-		se := hubc.FindSid(entries, sid)
-		node, _ := se["node"].(string)
-		if se == nil || node == "" {
-			return rs, "", "the hub has no node for the sender's session"
-		}
-		machine, _ := se["machine"].(string)
-		return msg.RemoteSender{Node: node, Sid: sid, Machine: machine, Fenced: true}, d.Body, ""
-	}
-	// Unfenced: the sender is whoever the hub's presence says holds that bus id; its word about itself
-	// is only a claim, so it is delivered as such ("unfenced (hub)") and held to the same scope rule.
-	id := d.From["id"]
-	var se map[string]any
-	for _, e := range entries {
-		if e["id"] == id && id != "" {
-			se = e
+	// Judged at the time the HUB received it (a frame can wait in the mailbox), bounded by how long we
+	// remember nonces; the cache ages by our own clock.
+	recv := h.now()
+	if d.RecvTS > 0 {
+		recv = time.Unix(d.RecvTS, 0)
+		if h.now().Sub(recv) > maxQueueAge {
+			return rs, "", "the message is older than the receiver remembers nonces for"
 		}
 	}
-	node, _ := se["node"].(string)
-	if se == nil || node == "" {
-		return rs, "", "the sender is not a session with a node on the hub"
+	if _, err := stamp.VerifyAt(d.Pub, d.Sig, stamp.Fields{From: sid, To: d.To, Kind: d.Kind, Body: d.Body}, recv, h.now(), h.cache); err != nil {
+		return rs, "", "stamp refused: " + err.Error()
+	}
+	// What is typed is rendered HERE from the verified body; the hub's own rendering must agree with it, so a
+	// body the hub altered or a text the hub wrote itself is refused, not typed.
+	m := hubLineRe.FindStringSubmatch(d.Text)
+	if m == nil || m[1] != m[3] || m[2] != hubFlat(d.Body) {
+		return rs, "", "the hub's text does not match the verified body"
+	}
+	se := uniqueEntry(entries, sid)
+	if se == nil || se["fenced"] != true {
+		return rs, "", "the sender is not exactly one fenced session on the hub"
 	}
 	machine, _ := se["machine"].(string)
-	sid, _ := se["uid"].(string)
-	return msg.RemoteSender{Node: node, Sid: sid, Machine: machine}, body, ""
+	if machine == h.machine || (d.From["machine"] != "" && d.From["machine"] != machine) {
+		return rs, "", "the sender's hub entry is not from the machine it claims"
+	}
+	node, _ := se["node"].(string)
+	if node == "" {
+		return rs, "", "the hub has no node for the sender's session"
+	}
+	return msg.RemoteSender{Node: node, Sid: sid, Machine: machine, Fenced: true}, d.Body, ""
 }
 
-// addressNames: to is one of the names the hub knows the entry by (its id, key, label or node).
+// uniqueEntry is the hub entry whose uid is sid, only if there is exactly one: two entries for one sid
+// (another machine's spoke publishing it too) leave no way to say which one is the sender.
+func uniqueEntry(entries []map[string]any, sid string) map[string]any {
+	var found map[string]any
+	for _, e := range entries {
+		if u, _ := e["uid"].(string); u == sid {
+			if found != nil {
+				return nil
+			}
+			found = e
+		}
+	}
+	return found
+}
+
+// addressNames: to is one of the names the hub knows the entry by (its id, key, label or node). A label
+// can name several sessions on one machine; a stamp is good once, so the others see it as a replay.
 func addressNames(e map[string]any, to string) bool {
 	if to == "" {
 		return false
@@ -180,50 +310,57 @@ func addressNames(e map[string]any, to string) bool {
 
 // ---- sending ----
 
-// SendRemote implements msg.Uplink.
-func (h *hubRemote) SendRemote(sender msg.Session, node, kind, text string) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+// SendRemote implements msg.Uplink. It takes no lock of the router's: it may take seconds.
+func (h *hubRemote) SendRemote(sender msg.Session, node, kind, text string) (bool, string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
+	h.pruneKeys()
 	entries, err := h.hub.Sessions(ctx)
 	if err != nil {
-		return false, err
+		return false, "", err
 	}
 	e := hubc.FindNode(entries, node)
 	if e == nil {
-		h.dropped(sender, node, "no session on the hub holds that node")
-		return false, nil
+		return false, "", msg.ErrUnknownNode
+	}
+	if m, _ := e["machine"].(string); m == h.machine {
+		return false, "", msg.ErrLocalNode
 	}
 	to, _ := e["id"].(string)
+	toSid, _ := e["uid"].(string)
+	if to == "" || e["fenced"] != true {
+		// The hub lets a relay reach only fenced sessions: do not spend a root mint on a certain 403.
+		return false, "", fmt.Errorf("the node is not a fenced session on the hub: a signed message can reach only fenced sessions")
+	}
 	if !kindRe.MatchString(kind) {
 		kind = "message"
 	}
 	for attempt := 0; attempt < 2; attempt++ {
 		k, err := h.relayFor(ctx, sender, attempt > 0)
 		if err != nil {
-			return false, err
+			return false, toSid, err
 		}
 		sig := stamp.Sign(k.priv, stamp.Fields{From: sender.Sid, To: to, Kind: kind, Body: text}, h.now())
 		c := &hubc.Client{URL: h.url, Token: func() (string, error) { return k.token, nil }}
 		res, err := c.Send(ctx, hubc.SendReq{To: to, Text: text, Kind: kind, Sig: sig,
 			From: map[string]string{"sid": sender.Sid, "fenced": "true", "label": sender.Label, "machine": h.machine, "id": "ccsbx:" + sender.Sid}})
-		if err != nil {
-			if hubc.IsAuth(err) && attempt == 0 {
-				continue // an expired or revoked relay: mint a new one once
+		switch {
+		case err == nil:
+			if res.Delivered < 1 {
+				return false, toSid, nil
 			}
-			return false, err
+			return true, toSid, nil
+		case hubc.IsUnauthorized(err) && attempt == 0:
+			continue // the relay credential expired or was revoked: mint a new one, once
+		case hubc.IsForbidden(err):
+			// a refusal of THIS message (scope, stamp, sender): a new credential would not change it
+			h.logf("hub: message from %s to %s refused by the hub: %v", sender.Sid, node, err)
+			return false, toSid, nil
+		default:
+			return false, toSid, err
 		}
-		if res.Delivered < 1 {
-			h.dropped(sender, node, fmt.Sprintf("the hub delivered to %d of %d matches", res.Delivered, res.Matched))
-			return false, nil
-		}
-		return true, nil
 	}
-	return false, fmt.Errorf("the hub refused the relay credential twice")
-}
-
-func (h *hubRemote) dropped(sender msg.Session, node, why string) {
-	h.logf("hub: message from %s to %s dropped: %s", sender.Sid, node, why)
-	h.event("msg.dropped", sender.Sid, sender.Gen, sender.Realm, sender.Label, map[string]any{"to_node": node, "reason": why})
+	return false, toSid, fmt.Errorf("the hub refused the relay credential twice")
 }
 
 // relayFor returns the generation's key and relay token, minting them once (or again when fresh).
@@ -241,16 +378,45 @@ func (h *hubRemote) relayFor(ctx context.Context, s msg.Session, fresh bool) (*r
 	if err != nil {
 		return nil, err
 	}
-	tok, err := h.mint(ctx, s.Sid, s.Gen, pub)
+	tok, err := h.mint(ctx, s.Sid, s.Gen, pub, fresh)
 	if err != nil {
 		return nil, err
 	}
-	rk := &relayKey{priv: priv, token: tok}
-	for old := range h.keys { // an older generation of this session is over: its key is not kept
-		if strings.HasPrefix(old, s.Sid+"/") && old != k {
-			delete(h.keys, old)
+	if old := h.keys[k]; old != nil {
+		wipe(old)
+	}
+	h.keys[k] = &relayKey{priv: priv, token: tok}
+	return h.keys[k], nil
+}
+
+func wipe(k *relayKey) {
+	for i := range k.priv {
+		k.priv[i] = 0
+	}
+	k.token = ""
+}
+
+// pruneKeys drops (and wipes) the keys of generations that are not live any more: a key is for the life
+// of one generation, not of the daemon.
+func (h *hubRemote) pruneKeys() {
+	all, err := h.rt.Dir.Sessions()
+	if err != nil {
+		return
+	}
+	live := map[string]bool{}
+	for _, s := range all {
+		if s.Live {
+			live[s.Sid+"/"+strconv.Itoa(s.Gen)] = true
 		}
 	}
-	h.keys[k] = rk
-	return rk, nil
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for k, rk := range h.keys {
+		if !live[k] {
+			wipe(rk)
+			delete(h.keys, k)
+		}
+	}
 }
+
+var _ = errors.New

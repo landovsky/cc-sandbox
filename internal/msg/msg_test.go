@@ -666,3 +666,21 @@ func TestWithIdleFailureLeavesThePaneIdle(t *testing.T) {
 		t.Fatal("a failed replace left the pane marked busy")
 	}
 }
+
+// context: delivery into a pane needs the server ccsbx-tmux.service runs; when it is gone the error
+// must say so (and delivery must not start a server).
+func TestDeliverWithNoTmuxServerSaysWhichUnitToStart(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("no tmux")
+	}
+	dir, _ := os.MkdirTemp("/tmp", "nsd")
+	defer os.RemoveAll(dir)
+	sock := dir + "/t.sock"
+	err := (&Tmux{Socket: sock}).Deliver("sabc123", "hello")
+	if err == nil || !strings.Contains(err.Error(), "start ccsbx-tmux.service") {
+		t.Fatalf("%v", err)
+	}
+	if _, e := os.Stat(sock); e == nil {
+		t.Fatal("delivery started a tmux server")
+	}
+}

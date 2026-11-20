@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,27 @@ func Args(sock string) []string {
 		return []string{"-S", sock}
 	}
 	return []string{"-L", sock}
+}
+
+// ErrNoServer is what the daemon says when the tmux server is not there. hostd never starts the
+// server (it lives in ccsbx-tmux.service, in the host mount namespace, so that panes can run
+// ccsbx-root); it only connects to it.
+const ErrNoServer = "tmux server not running: start ccsbx-tmux.service"
+
+// Up reads the result of a `tmux list-sessions`: true if a server answered. A server that is up
+// with no session says "no sessions" (rc 1); no server says "no server running" or "error
+// connecting to <socket>". Anything else is not taken as proof of a server.
+func Up(out []byte, err error) bool {
+	if err == nil {
+		return true
+	}
+	return strings.Contains(string(out), "no sessions")
+}
+
+// NoServer reports whether a failed tmux call failed because there is no server to talk to.
+func NoServer(out []byte) bool {
+	s := string(out)
+	return strings.Contains(s, "no server running") || strings.Contains(s, "error connecting to")
 }
 
 // IsPath reports whether sock is a socket path (shared between uids) rather than a -L name.

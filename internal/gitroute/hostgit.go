@@ -17,6 +17,7 @@ package gitroute
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -25,6 +26,7 @@ import (
 	"regexp"
 	"strings"
 	"syscall"
+	"time"
 )
 
 // The well-known empty trees, per object format.
@@ -40,10 +42,14 @@ type Runner struct {
 	// AllowGitDirInWorktree is for a developer's own repo (steering-check on a normal checkout).
 	// A fenced session's gitdir is never inside its worktree.
 	AllowGitDirInWorktree bool
-	Git                   string // git binary, default /usr/bin/git, else git from PATH
-	Author, Email         string // commit identity; default "ccsbx" / "ccsbx@localhost"
-	Path                  string // PATH for git's own helpers, default /usr/bin:/bin
-	empty                 string // cached empty-tree id for this repo's object format
+	Git                   string        // git binary, default /usr/bin/git, else git from PATH
+	Author, Email         string        // commit identity; default "ccsbx" / "ccsbx@localhost"
+	Path                  string        // PATH for git's own helpers, default /usr/bin:/bin
+	Timeout               time.Duration // per git process; default 60s (a FIFO or a huge file must not hang the host)
+	MaxFiles              int           // Commit refuses a worktree with more entries than this; default 200000
+	MaxFileBytes          int64         // ... or a file larger than this; default 256 MiB
+	empty                 string        // cached empty-tree id for this repo's object format
+	probed                bool          // GIT_ATTR_SOURCE was seen to work with this git binary
 }
 
 // emptyTree is the empty tree of this repository's object format (SHA-1 or SHA-256), asked of git
@@ -84,6 +90,11 @@ var overrides = []string{
 	"protocol.ext.allow=never",
 	"protocol.file.allow=never",
 	"commit.gpgsign=false",
+	// signature verification runs gpg/ssh-keygen/gpgsm over attacker-supplied bytes on the host
+	"gpg.program=/bin/false",
+	"gpg.ssh.program=/bin/false",
+	"gpg.x509.program=/bin/false",
+	"log.showSignature=false",
 	"gc.auto=0",
 	"maintenance.auto=false",
 	"advice.detachedHead=false",
@@ -188,8 +199,8 @@ func checkArgs(args []string) error {
 			if !contains(fs.exact, a) && !matchAny(pats, a) {
 				return fmt.Errorf("%w: flag %s is not allowed for git %s", ErrRefused, a, args[0])
 			}
-			if strings.Contains(a, "%G") {
-				// %G? %GS %GK ... make git run gpg on the host to verify signatures
+			if gpgPlaceholder.MatchString(a) {
+				// %G? %GS %GK ... (also %+G? %-GS and "% G?") make git run gpg on the host
 				return fmt.Errorf("%w: signature placeholders in a format run gpg", ErrRefused)
 			}
 		case strings.HasPrefix(a, ":"):
@@ -243,11 +254,22 @@ func contains(l []string, s string) bool {
 	return false
 }
 
-// minGit is the first git release with GIT_ATTR_SOURCE. Older git ignores it silently, and then a
+// minGit is the first git release with GIT_ATTR_SOURCE (2.41.0; its release notes introduce
+// "git --attr-source=<tree>" and the variable it is equivalent to; 2.40 has neither). Older git ignores it silently, and then a
 // worktree .gitattributes is honoured again, so refuse rather than run unprotected.
-var minGit = [2]int{2, 40}
+var minGit = [2]int{2, 41}
+
+// gpgPlaceholder matches %G and its modified forms (%+G, %-G, "% G"; modifiers may stack).
+var gpgPlaceholder = regexp.MustCompile(`%[-+ ]*G`)
 
 var gitVersionRe = regexp.MustCompile(`git version (\d+)\.(\d+)`)
+
+func (r *Runner) timeout() time.Duration {
+	if r.Timeout > 0 {
+		return r.Timeout
+	}
+	return 60 * time.Second
+}
 
 func (r *Runner) git() string {
 	if r.Git != "" {
@@ -297,6 +319,16 @@ func (r *Runner) checkRepo() error {
 		}
 		gd = c
 	}
+	// include.path / includeIf in a gitdir config pull in a file the agent may control (a relative
+	// include resolves into the worktree in developer-repo mode), which hands it every key the
+	// overrides do not set. No includes, in the gitdir config or the common one.
+	for _, dir := range []string{r.GitDir, gd} {
+		for _, f := range []string{"config", "config.worktree"} {
+			if err := r.noIncludes(filepath.Join(dir, f)); err != nil {
+				return err
+			}
+		}
+	}
 	// $GIT_DIR/info/attributes is read whatever GIT_ATTR_SOURCE says, so it must not exist.
 	for _, a := range []string{filepath.Join(r.GitDir, "info", "attributes"), filepath.Join(gd, "info", "attributes")} {
 		if st, err := os.Stat(a); err == nil && st.Size() > 0 {
@@ -304,6 +336,25 @@ func (r *Runner) checkRepo() error {
 		}
 	}
 	return r.checkGitVersion()
+}
+
+// noIncludes refuses a config file with any include.* or includeIf.* key.
+func (r *Runner) noIncludes(cfg string) error {
+	if _, err := os.Stat(cfg); os.IsNotExist(err) {
+		return nil
+	}
+	c := exec.Command(r.git(), "config", "--file", cfg, "--no-includes", "--name-only", "--get-regexp", `^include`)
+	c.Env = []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME=/nonexistent", "PATH=/usr/bin:/bin"}
+	out, err := c.Output()
+	var ee *exec.ExitError
+	switch {
+	case err == nil:
+		return fmt.Errorf("%w: %s has include settings (%s); includes can pull in a file the agent controls", ErrRefused, cfg, strings.Join(strings.Fields(string(out)), ", "))
+	case errors.As(err, &ee) && ee.ExitCode() == 1:
+		return nil // no match
+	default:
+		return fmt.Errorf("%w: cannot read %s: %v", ErrRefused, cfg, err)
+	}
 }
 
 // hostOwned requires p, if it exists, to be owned by this uid and not group/world writable.
@@ -339,15 +390,60 @@ func (r *Runner) checkGitVersion() error {
 	if err != nil {
 		return err
 	}
-	m := gitVersionRe.FindStringSubmatch(string(out))
+	if err := versionOK(string(out)); err != nil {
+		return err
+	}
+	return r.probeAttrSource()
+}
+
+// versionOK refuses a "git version X.Y..." line older than minGit.
+func versionOK(out string) error {
+	m := gitVersionRe.FindStringSubmatch(out)
 	if m == nil {
 		return fmt.Errorf("%w: cannot read git version from %q", ErrRefused, out)
 	}
 	var maj, min int
 	fmt.Sscanf(m[1]+" "+m[2], "%d %d", &maj, &min)
 	if maj < minGit[0] || (maj == minGit[0] && min < minGit[1]) {
-		return fmt.Errorf("%w: git %d.%d is older than %d.%d, which added GIT_ATTR_SOURCE", ErrRefused, maj, min, minGit[0], minGit[1])
+		return fmt.Errorf("%w: git %d.%d is older than %d.%d (GIT_ATTR_SOURCE, which keeps a worktree .gitattributes from selecting filters, arrived in %d.%d); install a newer git and pass it with --git / CCSBX_GIT", ErrRefused, maj, min, minGit[0], minGit[1], minGit[0], minGit[1])
 	}
+	return nil
+}
+
+// probeAttrSource checks, once per Runner, that this git binary really ignores a worktree
+// .gitattributes when GIT_ATTR_SOURCE is the empty tree. A version string is a claim; this is the
+// behaviour, and a vendor build that lacks the variable fails here instead of failing open.
+func (r *Runner) probeAttrSource() error {
+	if r.probed {
+		return nil
+	}
+	d, err := os.MkdirTemp("", "ccsbx-attr-probe-")
+	if err != nil {
+		return err
+	}
+	defer os.RemoveAll(d)
+	if err := os.WriteFile(filepath.Join(d, ".gitattributes"), []byte("x filter=probe\n"), 0o600); err != nil {
+		return err
+	}
+	env := []string{"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "HOME=/nonexistent", "PATH=/usr/bin:/bin", "GIT_CEILING_DIRECTORIES=" + filepath.Dir(d), "GIT_ATTR_NOSYSTEM=1"}
+	run := func(extra []string, args ...string) (string, error) {
+		c := exec.Command(r.git(), args...)
+		c.Dir, c.Env = d, append(env, extra...)
+		out, err := c.Output()
+		return string(out), err
+	}
+	if _, err := run(nil, "init", "-q"); err != nil {
+		return fmt.Errorf("%w: attribute probe: %v", ErrRefused, err)
+	}
+	empty := emptyTreeSHA1
+	if o, err := run(nil, "rev-parse", "--show-object-format"); err == nil && strings.TrimSpace(o) == "sha256" {
+		empty = emptyTreeSHA256
+	}
+	out, err := run([]string{"GIT_ATTR_SOURCE=" + empty}, "check-attr", "filter", "x")
+	if err != nil || !strings.Contains(out, "unspecified") {
+		return fmt.Errorf("%w: this git does not honour GIT_ATTR_SOURCE (check-attr said %q): a worktree .gitattributes could select filter drivers; use git >= %d.%d (--git / CCSBX_GIT)", ErrRefused, strings.TrimSpace(out), minGit[0], minGit[1])
+	}
+	r.probed = true
 	return nil
 }
 
@@ -361,6 +457,10 @@ func (r *Runner) Cmd(args ...string) (*exec.Cmd, error) {
 
 // cmd builds any verb. Only fixed-argument methods call it for write verbs.
 func (r *Runner) cmd(args ...string) (*exec.Cmd, error) {
+	return r.build(context.Background(), args...)
+}
+
+func (r *Runner) build(ctx context.Context, args ...string) (*exec.Cmd, error) {
 	if err := r.checkRepo(); err != nil {
 		return nil, err
 	}
@@ -372,14 +472,23 @@ func (r *Runner) cmd(args ...string) (*exec.Cmd, error) {
 	// --no-ext-diff keeps diff drivers off even if a config override were missed.
 	switch args[0] {
 	case "diff", "show", "log":
-		argv = append(argv, "--no-ext-diff", "--no-textconv")
+		argv = append(argv, "--no-ext-diff", "--no-textconv", "--ignore-submodules=all")
+	case "status":
+		// diff.ignoreSubmodules is only a default: .gitmodules in the worktree (agent-written) can
+		// say ignore=none and make git run inside an agent-made nested repo. Only the command line
+		// beats it. Callers cannot pass their own (the allowlist has no such flag).
+		argv = append(argv, "--ignore-submodules=all")
 	case "commit":
 		argv = append(argv, "--no-verify", "--no-gpg-sign")
 	}
 	argv = append(argv, args[1:]...)
-	c := exec.Command(r.git(), argv...)
+	c := exec.CommandContext(ctx, r.git(), argv...)
 	c.Dir = r.Worktree
 	c.Env = r.Env()
+	// own process group, so a timeout kills filters and helpers git started, not only git
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	c.WaitDelay = 2 * time.Second
 	return c, nil
 }
 
@@ -394,13 +503,18 @@ func (r *Runner) Run(args ...string) (string, error) {
 
 // exec runs without the allowlist: for the fixed argument lists of this package only.
 func (r *Runner) exec(args ...string) (string, error) {
-	c, err := r.cmd(args...)
+	ctx, cancel := context.WithTimeout(context.Background(), r.timeout())
+	defer cancel()
+	c, err := r.build(ctx, args...)
 	if err != nil {
 		return "", err
 	}
 	var out, errb bytes.Buffer
 	c.Stdout, c.Stderr = &out, &errb
 	if err := c.Run(); err != nil {
+		if ctx.Err() != nil {
+			return out.String(), fmt.Errorf("git %s: timed out after %s", args[0], r.timeout())
+		}
 		return out.String(), fmt.Errorf("git %s: %v: %s", args[0], err, strings.TrimSpace(errb.String()))
 	}
 	return out.String(), nil

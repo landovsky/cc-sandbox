@@ -234,11 +234,12 @@ func TestRefusesAnAddressThatWidensWhatTheFenceSees(t *testing.T) {
 	}
 	dir := t.TempDir()
 	os.Chmod(dir, 0o755)
-	s, _ := New(Config{Listen: "127.0.0.1:8080", Control: filepath.Join(dir, "c.sock"), Doors: doors})
+	s, _ := New(Config{Listen: freeAddr(t), Control: filepath.Join(dir, "c.sock"), Doors: doors})
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second) // a missing guard would serve forever
 	defer cancel()
-	if err := s.Serve(ctx); err == nil {
-		t.Error("a control directory open to others was accepted")
+	// a free port, so the refusal can only come from the directory guard, not from a failed bind
+	if err := s.Serve(ctx); err == nil || !strings.Contains(err.Error(), "must be 0700") {
+		t.Errorf("a control directory open to others: %v, want the 0700 refusal", err)
 	}
 }
 
@@ -298,5 +299,176 @@ func TestControlDirectoryOfAnotherOwnerIsRefused(t *testing.T) {
 	}
 	if err := checkControlDirAs(d, os.Getuid()+1); err == nil || !strings.Contains(err.Error(), "not owned") {
 		t.Fatalf("another uid's directory: %v, want refused", err)
+	}
+}
+
+func freeAddr(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	return l.Addr().String()
+}
+
+// context "kubelet makes an emptyDir root 0777 and root-owned": the socket must sit in a directory the
+// sidecar makes itself (0700), under a parent it does not own and others can write, or the sidecar
+// cannot start in the real pod.
+func TestServeStartsUnderAnOpenVolumeRoot(t *testing.T) {
+	root := t.TempDir()
+	os.Chmod(root, 0o777) // stands in for the kubelet's volume root
+	ctl := filepath.Join(root, "ctl", "ctl.sock")
+	u, _ := url.Parse("http://127.0.0.1:1")
+	s, err := New(Config{Listen: freeAddr(t), Control: ctl, Doors: map[string]*url.URL{"model": u}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() { done <- s.Serve(ctx) }()
+	for i := 0; i < 200; i++ {
+		if c, err := net.Dial("unix", ctl); err == nil {
+			c.Close()
+			break
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("Serve ended: %v", err)
+		default:
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fi, err := os.Stat(filepath.Dir(ctl)); err != nil || fi.Mode().Perm() != 0o700 {
+		t.Fatalf("control dir: %v %v", fi, err)
+	}
+	if fi, err := os.Stat(ctl); err != nil || fi.Mode().Perm() != 0o600 { // S4: the socket's own mode
+		t.Fatalf("control socket mode: %v %v", fi, err)
+	}
+}
+
+// context "the sidecar is a native sidecar, so kubelet restarts it whatever its exit code": the one load
+// has to outlive the process, or a restart (expiry, OOM) would take a second token under the same fence.
+func TestASecondLoadAfterARestartIsRefused(t *testing.T) {
+	r := newRig(t, nil)
+	_, in := r.secrets(time.Hour)
+	if err := Load(r.ctl, in); err != nil {
+		t.Fatal(err)
+	}
+	r.cancel()
+	<-r.done
+	cfg := r.srv.cfg
+	cfg.Listen = freeAddr(t)
+	s2, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go s2.Serve(ctx)
+	for i := 0; i < 200; i++ {
+		if c, err := net.Dial("unix", r.ctl); err == nil {
+			c.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	_, in2 := r.secrets(time.Hour)
+	if err := Load(r.ctl, in2); err == nil || !strings.Contains(err.Error(), "earlier run") {
+		t.Fatalf("load after restart: %v", err)
+	}
+	if s2.Loaded() {
+		t.Fatal("the restarted sidecar took a new token")
+	}
+	b, _ := os.ReadFile(s2.cfg.Marker)
+	if strings.Contains(string(b), "ey") && strings.Count(string(b), ".") > 1 {
+		t.Fatalf("the marker holds a token: %s", b)
+	}
+}
+
+// context "the control socket takes secrets, so its framing is a boundary": a body over the cap, a peer that
+// sends nothing, and more than one JSON value are all refused, on both sides of the socket.
+func TestControlFramingGuards(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.ControlTimeout = 300 * time.Millisecond })
+	// server read cap: a well-formed object that is bigger than MaxSecrets
+	big := `{"token":"` + strings.Repeat("a", MaxSecrets+10) + `","key":"x"}`
+	c, _ := net.Dial("unix", r.ctl)
+	c.Write([]byte(big))
+	c.(*net.UnixConn).CloseWrite()
+	var rep reply
+	json.NewDecoder(c).Decode(&rep)
+	c.Close()
+	if rep.Error != "bad request" {
+		t.Errorf("an object over the cap: %+v, want bad request", rep)
+	}
+	// a second JSON value after the first
+	_, in := r.secrets(time.Hour)
+	c, _ = net.Dial("unix", r.ctl)
+	c.Write(append(in.Bytes(), []byte(`{"x":1}`)...))
+	c.(*net.UnixConn).CloseWrite()
+	rep = reply{}
+	json.NewDecoder(c).Decode(&rep)
+	c.Close()
+	if rep.Error != "bad request" || r.srv.Loaded() {
+		t.Errorf("trailing JSON: %+v loaded=%v", rep, r.srv.Loaded())
+	}
+	// an unknown field
+	c, _ = net.Dial("unix", r.ctl)
+	c.Write([]byte(`{"token":"a","key":"b","extra":1}`))
+	c.(*net.UnixConn).CloseWrite()
+	rep = reply{}
+	json.NewDecoder(c).Decode(&rep)
+	c.Close()
+	if rep.Error != "bad request" {
+		t.Errorf("unknown field: %+v", rep)
+	}
+	// a peer that connects and says nothing is cut off at the deadline
+	c, _ = net.Dial("unix", r.ctl)
+	defer c.Close()
+	start := time.Now()
+	c.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := c.Read(make([]byte, 1)); err == nil || time.Since(start) > 2*time.Second {
+		t.Errorf("a silent peer was not cut off at the deadline (err %v after %v)", err, time.Since(start))
+	}
+	// client cap: refused before anything is dialled (the path does not exist)
+	if err := Load("/nonexistent/ctl.sock", strings.NewReader(big)); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Errorf("client cap: %v", err)
+	}
+}
+
+// context "a door echoes Authorization into an early 103 and into a trailer": ReverseProxy relays both
+// without calling ModifyResponse, so the scrub has to sit at the transport. Read raw, as the fence would.
+func TestTheFenceNeverSeesAnEchoInA1xxOrATrailer(t *testing.T) {
+	r := newRig(t, nil)
+	tok, in := r.secrets(time.Hour)
+	if err := Load(r.ctl, in); err != nil {
+		t.Fatal(err)
+	}
+	r.door.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		auth := q.Header.Get("Authorization")
+		w.Header().Set("X-Early", auth)
+		w.Header().Set("Location", "http://evil.example/")
+		w.WriteHeader(http.StatusEarlyHints)
+		w.Header().Del("X-Early")
+		w.Header().Del("Location")
+		w.Header().Set("Trailer", "X-Tr")
+		w.Write([]byte("body"))
+		w.Header().Set("X-Tr", auth)
+	})
+	c, err := net.Dial("tcp", r.port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	io.WriteString(c, "POST /model/v1/messages HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}")
+	b, _ := io.ReadAll(c)
+	raw := string(b)
+	if !strings.Contains(raw, "body") {
+		t.Fatalf("no response came through:\\n%.300s", raw)
+	}
+	if strings.Contains(raw, tok) || strings.Contains(raw, "evil.example") {
+		t.Fatalf("the fence read a token or a Location in a 1xx or trailer:\\n%.600s", raw)
 	}
 }

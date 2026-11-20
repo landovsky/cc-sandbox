@@ -43,7 +43,7 @@ Flags: (each also CCSBX_SIDE_<NAME>)
   --allow-uid N     the uid that may load secrets (default: our own)
 
 Recipes:
-  from the launcher:  ccsbx token mint … --fwd-secrets | kubectl exec -i -c side POD -- ccsbx side load --control /run/side/ctl.sock
+  from the launcher:  ccsbx token mint … --fwd-secrets | kubectl exec -i -c side POD -- ccsbx side load --control /run/ccsbx/side/ctl/ctl.sock
   what the fence sees: the forwarder port only; try  curl -s localhost:8080/model/health  (503 until loaded)
 Not built yet (F3b/F3c): outbox relay, session journal, bus relay, git commit/push.
 `

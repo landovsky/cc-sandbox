@@ -51,9 +51,14 @@ type Config struct {
 	CAFile   string
 	MaxBody  int64
 	AllowUID int // who may load secrets; default: the sidecar's own uid
-	Logf     func(format string, a ...any)
-	Now      func() time.Time
-	Resolve  func(host string) ([]net.IP, error) // tests
+	// Marker is the no-secret file that records the one load in the side-state volume, which outlives a
+	// container restart (the process does not). Default: <control dir>/loaded.
+	Marker string
+	// ControlTimeout bounds one control connection (default 5s).
+	ControlTimeout time.Duration
+	Logf           func(format string, a ...any)
+	Now            func() time.Time
+	Resolve        func(host string) ([]net.IP, error) // tests
 }
 
 // secrets is what `side load` sends (the same shape `ccsbx fwd` reads on stdin).
@@ -71,10 +76,12 @@ type reply struct {
 type Server struct {
 	cfg     Config
 	loaded  atomic.Bool
+	spent   atomic.Bool // the marker file exists: an earlier process of this container took the load
 	handler atomic.Pointer[http.Handler]
 	expiry  atomic.Int64 // unix seconds; 0 until loaded
 	loadMu  sync.Mutex
 	loadCh  chan struct{} // closed once the secrets are in
+	failed  chan error    // the forwarder died
 }
 
 // New checks the configuration. It refuses a forwarder address that anything but the pod could reach.
@@ -90,6 +97,12 @@ func New(cfg Config) (*Server, error) {
 	if len(cfg.Doors) == 0 {
 		return nil, errors.New("side: at least one --door is required")
 	}
+	if cfg.Marker == "" {
+		cfg.Marker = filepath.Join(filepath.Dir(cfg.Control), "loaded")
+	}
+	if cfg.ControlTimeout == 0 {
+		cfg.ControlTimeout = 5 * time.Second
+	}
 	if cfg.AllowUID == 0 {
 		cfg.AllowUID = os.Getuid()
 	}
@@ -99,7 +112,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	return &Server{cfg: cfg, loadCh: make(chan struct{})}, nil
+	return &Server{cfg: cfg, loadCh: make(chan struct{}), failed: make(chan error, 1)}, nil
 }
 
 // notLoaded answers while there are no secrets. Same body for every path: the fence learns only that
@@ -110,8 +123,22 @@ var notLoaded http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *htt
 
 // Serve opens the control socket and the forwarder port and runs until ctx ends or the token expires.
 func (s *Server) Serve(ctx context.Context) error {
-	if err := checkControlDir(filepath.Dir(s.cfg.Control)); err != nil {
+	// Kubernetes makes an emptyDir root 0777 and root-owned, so the socket sits one level down, in a
+	// directory made here as 0700 (it survives a container restart: EEXIST is fine). The check stays.
+	dir := filepath.Dir(s.cfg.Control)
+	if err := os.Mkdir(dir, 0o700); err == nil {
+		if err := os.Chmod(dir, 0o700); err != nil { // not subject to the umask
+			return err
+		}
+	} else if !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("side: control directory: %w", err)
+	}
+	if err := checkControlDir(dir); err != nil {
 		return err
+	}
+	if _, err := os.Lstat(s.cfg.Marker); err == nil {
+		s.spent.Store(true)
+		s.cfg.Logf("side: a token was loaded by an earlier run of this sidecar; refusing every load (the launcher must replace the pod)")
 	}
 	os.Remove(s.cfg.Control) // a stale socket from a previous run of this container
 	cl, err := net.Listen("unix", s.cfg.Control)
@@ -130,8 +157,13 @@ func (s *Server) Serve(ctx context.Context) error {
 	s.handler.Store(&notLoaded)
 	srv := &http.Server{Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		(*s.handler.Load()).ServeHTTP(w, r)
-	}), ReadHeaderTimeout: 10 * time.Second}
-	go srv.Serve(fl)
+	}), ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute, MaxHeaderBytes: 64 << 10}
+	go func() {
+		if err := srv.Serve(fl); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			s.cfg.Logf("side: forwarder stopped: %v", err)
+			s.fatal(err)
+		}
+	}()
 	go s.control(cl)
 	s.cfg.Logf("side: forwarder on %s, waiting for secrets on %s", s.cfg.Listen, s.cfg.Control)
 
@@ -142,6 +174,8 @@ func (s *Server) Serve(ctx context.Context) error {
 		case <-ctx.Done():
 			srv.Close()
 			return nil
+		case err := <-s.failed:
+			return fmt.Errorf("side: forwarder: %w", err)
 		case <-loadCh:
 			loadCh = nil // a nil channel blocks: this case fires once
 			expired = time.After(time.Until(time.Unix(s.expiry.Load(), 0)))
@@ -150,6 +184,13 @@ func (s *Server) Serve(ctx context.Context) error {
 			srv.Close()
 			return nil
 		}
+	}
+}
+
+func (s *Server) fatal(err error) {
+	select {
+	case s.failed <- err:
+	default:
 	}
 }
 
@@ -190,7 +231,7 @@ func (s *Server) control(l net.Listener) {
 func (s *Server) handle(c net.Conn) {
 	defer c.Close()
 	send := func(r reply) { json.NewEncoder(c).Encode(r) }
-	c.SetDeadline(time.Now().Add(5 * time.Second))
+	c.SetDeadline(time.Now().Add(s.cfg.ControlTimeout))
 	uid, err := peerUID(c)
 	if err != nil || int(uid) != s.cfg.AllowUID {
 		s.cfg.Logf("side: control: refused a peer (uid %d)", uid) // the uid is not a secret
@@ -199,7 +240,8 @@ func (s *Server) handle(c net.Conn) {
 	}
 	var sec secrets
 	dec := json.NewDecoder(io.LimitReader(c, MaxSecrets))
-	if err := dec.Decode(&sec); err != nil {
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&sec); err != nil || dec.More() {
 		send(reply{Error: "bad request"})
 		return
 	}
@@ -217,6 +259,9 @@ func (s *Server) load(sec secrets) error {
 	defer s.loadMu.Unlock()
 	if s.loaded.Load() {
 		return errors.New("already loaded")
+	}
+	if s.spent.Load() {
+		return errors.New("already loaded by an earlier run of this sidecar")
 	}
 	seed, err := base64.StdEncoding.DecodeString(sec.Key)
 	if err != nil || len(seed) != ed25519.SeedSize {
@@ -239,6 +284,14 @@ func (s *Server) load(sec secrets) error {
 	if err != nil {
 		return err
 	}
+	// The marker is created exclusively and holds no secret. It is what makes "one load" last across a
+	// restart of this container (a native sidecar restarts whatever its exit code).
+	mf, err := os.OpenFile(s.cfg.Marker, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return errors.New("already loaded by an earlier run of this sidecar")
+	}
+	fmt.Fprintf(mf, "{\"cnf\":%q,\"exp\":%d}\n", c.Cnf, c.Exp)
+	mf.Close()
 	var h http.Handler = f
 	s.handler.Store(&h)
 	s.expiry.Store(c.Exp)
@@ -264,6 +317,9 @@ func Load(control string, in io.Reader) error {
 	c.SetDeadline(time.Now().Add(10 * time.Second))
 	if _, err := c.Write(b); err != nil {
 		return err
+	}
+	if uc, ok := c.(*net.UnixConn); ok {
+		uc.CloseWrite() // the server reads exactly one JSON object and then wants to see the end
 	}
 	var r reply
 	if err := json.NewDecoder(c).Decode(&r); err != nil {

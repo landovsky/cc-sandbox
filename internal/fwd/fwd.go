@@ -30,7 +30,9 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/http/httputil"
+	"net/textproto"
 	"net/url"
 	"os"
 	"strings"
@@ -151,30 +153,15 @@ func New(cfg Config) (*Forwarder, error) {
 	}
 	f := &Forwarder{cfg: cfg}
 	f.proxy = &httputil.ReverseProxy{
-		Transport:     tr,
+		Transport:     &scrubbingTransport{rt: tr, token: cfg.Token},
 		FlushInterval: -1, // SSE from the model door
 		Rewrite:       f.rewrite,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			cfg.Logf("fwd: upstream error: %s", scrub(err.Error(), cfg.Token))
 			http.Error(w, "bad gateway", http.StatusBadGateway)
 		},
-		// Redirects are responses to the fence; fwd never follows them (a
-		// ReverseProxy doesn't), and Location is dropped below.
-		ModifyResponse: func(resp *http.Response) error {
-			resp.Header.Del("Location")
-			resp.Header.Del("Set-Cookie")
-			// A door that echoes a credential header back must not hand the token to the fence. Bodies are
-			// not scanned (a stream can't be, cheaply); a door that echoes one is a door bug.
-			for k, vs := range resp.Header {
-				for _, v := range vs {
-					if cfg.Token != "" && strings.Contains(v, cfg.Token) {
-						resp.Header.Del(k)
-						break
-					}
-				}
-			}
-			return nil
-		},
+		// Redirects are responses to the fence; fwd never follows them (a ReverseProxy doesn't), and
+		// Location is dropped by scrubbingTransport, together with everything that echoes the token.
 	}
 	return f, nil
 }
@@ -322,4 +309,68 @@ func scrub(s, tok string) string {
 		return s
 	}
 	return strings.ReplaceAll(s, tok, "[token]")
+}
+
+// scrubbingTransport removes from every response the fence will see: Location and Set-Cookie, and any
+// header or trailer value that holds the session token (a door that echoes Authorization back). It sits
+// at the transport, not in ModifyResponse, because ReverseProxy relays 1xx responses (103 Early Hints)
+// and trailers WITHOUT calling ModifyResponse. Bodies are not scanned (a stream can't be, cheaply); a
+// door that echoes the token in a body is a door bug.
+type scrubbingTransport struct {
+	rt    http.RoundTripper
+	token string
+}
+
+func (t *scrubbingTransport) scrub(h map[string][]string) {
+	delete(h, "Location")
+	delete(h, "Set-Cookie")
+	if t.token == "" {
+		return
+	}
+	for k, vs := range h {
+		for _, v := range vs {
+			if strings.Contains(v, t.token) {
+				delete(h, k)
+				break
+			}
+		}
+	}
+}
+
+func (t *scrubbingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// Registered after ReverseProxy's own trace, so this hook runs first and the proxy copies the
+	// already-scrubbed 1xx header to the fence.
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+		Got1xxResponse: func(_ int, h textproto.MIMEHeader) error { t.scrub(h); return nil },
+	}))
+	resp, err := t.rt.RoundTrip(req)
+	if err != nil {
+		return resp, err
+	}
+	t.scrub(resp.Header)
+	if resp.Trailer != nil {
+		resp.Body = &scrubBody{ReadCloser: resp.Body, resp: resp, t: t}
+	}
+	return resp, nil
+}
+
+// scrubBody scrubs the trailers once the body has been read (they are filled in only then).
+type scrubBody struct {
+	io.ReadCloser
+	resp *http.Response
+	t    *scrubbingTransport
+}
+
+func (b *scrubBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err != nil {
+		b.t.scrub(b.resp.Trailer)
+	}
+	return n, err
+}
+
+func (b *scrubBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.t.scrub(b.resp.Trailer)
+	return err
 }

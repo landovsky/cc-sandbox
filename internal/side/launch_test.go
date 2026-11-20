@@ -66,3 +66,12 @@ func TestLoadIntoNeedsThePodUID(t *testing.T) {
 		t.Fatalf("sent without a UID: %v", err)
 	}
 }
+
+// context "a launcher bug feeds the wrong file to the load": LoadInto refuses what could never be a
+// secrets object before it opens an exec stream.
+func TestLoadIntoRefusesOversizedSecrets(t *testing.T) {
+	f := &fakeX{}
+	if err := LoadInto(context.Background(), f, k8s.Ref{UID: "u"}, bytes.Repeat([]byte("a"), MaxSecrets+1)); err == nil || f.stdin != "" || f.cont != "" {
+		t.Fatalf("oversized secrets: %v (exec called: %q)", err, f.cont)
+	}
+}

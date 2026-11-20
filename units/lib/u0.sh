@@ -50,7 +50,11 @@ EOT
     # plan never reads the file (and `plan -v` must not print it): the placeholder stands in for it
     if [ "$MODE" = install ]; then put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"$HUB_SECRET"
     else put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"(the secret, read from the --hub-secret-from file at install)"; fi
-  else note "no --hub-url: no hub secret is read or written"; fi
+  else
+    note "no --hub-url: no hub secret is read or written. A secret left by an EARLIER install with a hub is removed: ccsbx-root refuses relay-mint"
+    note "  because that file is missing (its hub_url default plays no part), so a stale one would keep the relay path half-alive"
+    cmd rm -f /etc/ccsbx/hub-admin.secret
+  fi
   note "a root-owned copy of the pins: ccsbx-root and hostd read THIS, never the owner-writable repo"
   put /etc/ccsbx/pins.toml 0644 root:root < "$REPO_DIR/pins.toml"
   note "pins.toml is empty today: only e2e candidate images run, as expected, until U1a is pinned"

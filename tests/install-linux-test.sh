@@ -648,7 +648,7 @@ t "nohub: without --hub-url the install succeeds with no hub secret at all" bash
 d2="$(fx nh2)"; B9=false HUBURL="" HUBSRC="" ins "$d2" install --yes >/dev/null 2>&1; rc2=$?
 t "nohub: …B9 is skipped: a failing B9 does not stop it (exit 0)" test "$rc2" -eq 0
 t "nohub: hub_url, hub_user and hub_secret are NOT in ccsbx-root.toml, and a comment says why" bash -c '! grep -qE "^(hub_url|hub_user|hub_secret)" "$1" && grep -q "NOT set: this install does not depend on the hub" "$1" && grep -qx "revoke_doors = \[\]" "$1"' _ "$ntoml"
-t "nohub: no hub secret file is written, none is read as the owner, and nothing about the secret is recorded" bash -c '[ ! -e "$1/root/etc/ccsbx/hub-admin.secret" ] && ! grep -q "python3 -I -c" "$1/rec/cmds" && ! grep -q "hub-admin" "$1/rec/cmds"' _ "$d"
+t "nohub: no hub secret file is written, none is read as the owner, and the only command about the secret is removing a stale one" bash -c '[ ! -e "$1/root/etc/ccsbx/hub-admin.secret" ] && ! grep -q "python3 -I -c" "$1/rec/cmds" && ! grep "hub-admin" "$1/rec/cmds" | grep -qv "^rm -f /etc/ccsbx/hub-admin.secret$"' _ "$d"
 t "nohub: the install says so (B9 skipped, no hub dependency)" bash -c 'grep -q "B9 skipped (no --hub-url)" "$1" && grep -q "does not depend on the hub" "$1"' _ "$d/out"
 d="$(fx nh3)"; HUBURL="" HUBSRC="" ins "$d" install --yes --hub-secret-from "$d/hubsecret" >/dev/null 2>&1; rc=$?
 t "nohub: --hub-secret-from without --hub-url is refused (exit 3): it would be silently ignored" test "$rc" -eq 3
@@ -658,6 +658,19 @@ out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$
 t "nohub: check does not fail for a missing hub secret; it notes the install has no hub" bash -c '! grep -q "^FAIL  /etc/ccsbx/hub-admin.secret" <<<"$1" && grep -q "does not depend on the hub" <<<"$1"' _ "$out"
 d="$(fx wh)"; ins "$d" install --yes >/dev/null 2>&1
 t "nohub: WITH --hub-url everything is as before (hub_url, hub_user and hub_secret set, the secret written)" bash -c 'grep -qx "hub_url = \"http://100.64.0.9:4011\"" "$1/root/etc/ccsbx/ccsbx-root.toml" && grep -qx "hub_user = \"tomas\"" "$1/root/etc/ccsbx/ccsbx-root.toml" && [ -e "$1/root/etc/ccsbx/hub-admin.secret" ]' _ "$d"
+
+echo "# no-hub re-run after a with-hub install (manager's SHOULDs on 8a9ad1b)"
+d="$(fx nh5)"; ins "$d" install --yes >/dev/null 2>&1
+t "nohub: the with-hub install wrote the secret" test -e "$d/root/etc/ccsbx/hub-admin.secret"
+out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
+: > "$d/rec/cmds"; HUBURL="" HUBSRC="" ins "$d" install --yes >/dev/null 2>&1; rc=$?
+t "nohub: a no-hub RE-RUN removes the stale /etc/ccsbx/hub-admin.secret (the command is recorded)" bash -c '[ "$1" -eq 0 ] && grep -qx "rm -f /etc/ccsbx/hub-admin.secret" "$2/rec/cmds"' _ "$rc" "$d"
+rm -f "$d/root/etc/ccsbx/hub-admin.secret"; HUBURL="" HUBSRC="" ins "$d" install --yes >/dev/null 2>&1
+out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
+t "nohub: check passes the file test when the secret is absent, and says the refusal relies on it" grep -q "refusal without a hub relies on this file being absent" <<<"$out"
+d="$(fx nh6)"; HUBURL="" HUBSRC="" ins "$d" install --yes >/dev/null 2>&1; : > "$d/root/etc/ccsbx/hub-admin.secret"
+out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check 2>&1)"
+t "nohub: check FAILS when a no-hub config sits next to a hub-admin.secret (a stale secret)" grep -q "^FAIL  /etc/ccsbx/hub-admin.secret exists but ccsbx-root.toml has no hub_url" <<<"$out"
 
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"

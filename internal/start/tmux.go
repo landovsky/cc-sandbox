@@ -36,6 +36,11 @@ func (t *TmuxLauncher) Launch(r *Record) error {
 	return nil
 }
 
+// Stop ends the session's pane (and so its fence run: `ccsbx run` cleans its container up).
+func (t *TmuxLauncher) Stop(sid string) error {
+	return t.cmd("kill-session", "-t", "="+sid).Run()
+}
+
 // Alive reports whether the session's tmux session exists.
 func (t *TmuxLauncher) Alive(sid string) bool {
 	return t.cmd("has-session", "-t", "="+sid).Run() == nil

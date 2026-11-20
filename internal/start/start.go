@@ -336,3 +336,43 @@ func orDefault(s, def string) string {
 
 // Records lists every session record, for the daemon's resolvers (message delivery, journal).
 func (d *Daemon) Records() ([]*Record, error) { return d.records() }
+
+// Stopper is a Launcher that can end a pane (TmuxLauncher).
+type Stopper interface{ Stop(sid string) error }
+
+// Replace is session.replace (C9b): generation+1 of a running session with a new brief. The
+// caller has already checked the turn is over. The old pane is ended, the record gets the next
+// generation (so `ccsbx run --gen` accepts only the new one, and the new generation has its own
+// outbox), and a new pane is launched. Same sid, same label, same workdir and profile.
+func (d *Daemon) Replace(sid, brief string) (*Record, error) {
+	unlock, err := d.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	rec, err := d.Load(sid)
+	if err != nil {
+		return nil, err
+	}
+	if rec.Ended != nil || !d.Launcher.Alive(sid) {
+		return nil, refuse(NotRunning, "%s is not running", sid)
+	}
+	st, ok := d.Launcher.(Stopper)
+	if !ok {
+		return nil, refuse(NotBuilt, "this launcher cannot end a pane")
+	}
+	rec.Gen++
+	rec.Spec.Brief = &Brief{Text: brief}
+	rec.Reply.Gen = rec.Gen
+	rec.Reply.ID = fmt.Sprintf("%s/%s/%s/g%d", rec.Spec.Owner, d.Machine, sid, rec.Gen)
+	if err := d.save(rec); err != nil {
+		return nil, err
+	}
+	if err := st.Stop(sid); err != nil {
+		return nil, fmt.Errorf("end the old pane: %w", err)
+	}
+	if err := d.Launcher.Launch(rec); err != nil {
+		return nil, fmt.Errorf("launch generation %d: %w", rec.Gen, err)
+	}
+	return rec, nil
+}

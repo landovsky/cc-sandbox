@@ -35,10 +35,12 @@ import (
 
 // Server serves one journal.
 type Server struct {
-	J       *journal.Store
-	Q       *verbq.Queue // nil: the cockpit endpoints answer 404
-	Msg     *msg.Router  // nil: the deliver endpoints answer 404
-	Dir     msg.Directory
+	J   *journal.Store
+	Q   *verbq.Queue // nil: the cockpit endpoints answer 404
+	Msg *msg.Router  // nil: the deliver endpoints answer 404
+	Dir msg.Directory
+	// Replace ends a session's pane and starts generation+1 with a brief (C9b); nil: 404.
+	Replace func(sid, brief string) (gen int, err error)
 	Token   string        // bearer token the TCP listener requires (the unix socket needs none: it is 0600)
 	MaxWait time.Duration // longest long-poll
 	Info    map[string]any
@@ -477,7 +479,16 @@ func (s *Server) resolve(w http.ResponseWriter, r *http.Request) {
 // session, 409 target_busy (not at its prompt; the text was NOT typed).
 func (s *Server) deliver(w http.ResponseWriter, r *http.Request) {
 	rest := strings.TrimPrefix(r.URL.Path, "/v1/sessions/")
+	verb := "deliver"
 	sid, ok := strings.CutSuffix(rest, "/deliver")
+	if !ok {
+		verb = "prompt"
+		sid, ok = strings.CutSuffix(rest, "/prompt")
+	}
+	if !ok {
+		verb = "replace"
+		sid, ok = strings.CutSuffix(rest, "/replace")
+	}
 	if !ok || sid == "" || strings.Contains(sid, "/") {
 		writeJSON(w, 404, map[string]any{"error": "not_found"})
 		return
@@ -494,10 +505,19 @@ func (s *Server) deliver(w http.ResponseWriter, r *http.Request) {
 		From  string `json:"from"`
 		Text  string `json:"text"`
 		Queue bool   `json:"queue"`
+		Kind  string `json:"kind"`
+		Brief string `json:"brief"`
 	}
-	body, _ := io.ReadAll(io.LimitReader(r.Body, 64<<10))
+	body, _ := io.ReadAll(io.LimitReader(r.Body, 256<<10))
 	if json.Unmarshal(body, &b) != nil {
 		writeJSON(w, 400, map[string]any{"error": "bad_json"})
+		return
+	}
+	switch verb {
+	case "prompt": // steering text from the owner: typed only at the prompt, never queued
+		b.From, b.Queue = "cc-tree:"+b.Kind, false
+	case "replace":
+		s.replace(w, sid, b.Brief)
 		return
 	}
 	res := s.Msg.DeliverOwner(b.From, sid, b.Text, b.Queue)
@@ -553,4 +573,38 @@ func (s *Server) sessions(w http.ResponseWriter, r *http.Request) {
 		out = append(out, map[string]any{"sid": x.Sid, "label": x.Label, "gen": x.Gen, "realm": x.Realm, "state": "running", "idle": idle})
 	}
 	writeJSON(w, 200, out)
+}
+
+// replace: POST /v1/sessions/<sid>/replace {brief}: session.replace. Only at a turn boundary
+// (the pane is at its prompt): 409 target_busy otherwise, nothing touched. 200 {sid, gen}.
+func (s *Server) replace(w http.ResponseWriter, sid, brief string) {
+	if s.Replace == nil || s.Msg == nil || s.Dir == nil {
+		writeJSON(w, 404, map[string]any{"error": "no_replace"})
+		return
+	}
+	if strings.TrimSpace(brief) == "" {
+		writeJSON(w, 400, map[string]any{"error": "a brief is required"})
+		return
+	}
+	all, _ := s.Dir.Sessions()
+	var cur *msg.Session
+	for i := range all {
+		if all[i].Sid == sid && all[i].Live {
+			cur = &all[i]
+		}
+	}
+	if cur == nil {
+		writeJSON(w, 404, map[string]any{"error": "no_live_session"})
+		return
+	}
+	if !s.Msg.IdleNow(sid, cur.Gen) {
+		writeJSON(w, 409, map[string]any{"error": "target_busy"})
+		return
+	}
+	gen, err := s.Replace(sid, brief)
+	if err != nil {
+		writeJSON(w, 500, map[string]any{"error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"v": 1, "sid": sid, "gen": gen})
 }

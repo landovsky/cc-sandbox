@@ -92,6 +92,7 @@ const (
 	BadSpec            = "bad_spec"
 	WrongMachine       = "wrong_machine"
 	NotBuilt           = "not_built"
+	NotRunning         = "not_running"
 	ImageNotPinned     = "image_not_pinned"
 )
 

@@ -68,6 +68,9 @@ func app() *cli.App {
 				f.Int("queue-max", 10000, "pending cockpit requests per realm before refused: queue_full")
 				f.String("ccmsg-bin", "", "ccmsg (session-bus) to reach an unfenced manager on this machine, e.g. ~/.dotfiles/session-bus/bin/ccmsg; empty: only ccsbx sessions are reachable")
 				f.Bool("hear", false, "C23 hear: tell a worker's manager by message when the worker needs a human decision (permission prompt, question dialog)")
+				f.String("ccsbx-bin", "", "the ccsbx binary a replaced session's pane runs (default: ccsbx next to this binary)")
+				f.String("profiles", "profiles", "directory of <name>.json profiles, passed to the pane of a replaced session")
+				f.String("image", "ccsbx-fence:dev", "fence image, passed to the pane of a replaced session")
 				f.String("interval", "250ms", "time between scans")
 				f.Bool("once", false, "scan once and print the stats as a line, then exit")
 			},
@@ -127,8 +130,31 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "accepted=%d refused=%d shed=%d reasons=%v\n", st.Accepted, st.Refused, st.Shed, st.Reasons)
 		return cli.ExitOK
 	}
+	exe := get("ccsbx-bin")
+	if exe == "" {
+		if self, err := os.Executable(); err == nil {
+			exe = filepath.Join(filepath.Dir(self), "ccsbx")
+		}
+	}
+	abs := func(p string) string {
+		a, err := filepath.Abs(p)
+		if err != nil {
+			return p
+		}
+		return a
+	}
+	sd := &start.Daemon{StateDir: abs(get("state")), Machine: get("machine"), Root: "direct", Exe: exe, Backend: "docker",
+		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), Env: []string{"--state", abs(get("state")),
+			"--profiles", abs(get("profiles")), "--machine", get("machine"), "--image", get("image"), "--root", "direct"}}}
 	var servers []*http.Server
 	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
+	srv.Replace = func(sid, brief string) (int, error) {
+		rec, err := sd.Replace(sid, brief)
+		if err != nil {
+			return 0, err
+		}
+		return rec.Gen, nil
+	}
 	sock := get("socket")
 	if sock == "" {
 		sock = filepath.Join(get("state"), "hostd.sock")

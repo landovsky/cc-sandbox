@@ -41,6 +41,8 @@ func app() *cli.App {
 			pendingCmd(),
 			cockpitCmd(),
 			attachCmd(),
+			promptCmd(),
+			replaceCmd(),
 			selftestCmd(),
 			settingsCmd(),
 			{

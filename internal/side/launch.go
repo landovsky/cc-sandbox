@@ -47,7 +47,13 @@ func LoadInto(ctx context.Context, x Execer, ref k8s.Ref, secrets []byte) error 
 		if len(msg) > 300 {
 			msg = strings.ToValidUTF8(msg[:300], "")
 		}
-		return errors.New("side load refused: " + msg)
+		switch code {
+		case ExitNoSocket:
+			return fmt.Errorf("side load: %s: %w", msg, ErrNoSocket)
+		case ExitAlreadyLoaded:
+			return fmt.Errorf("side load: %s: %w", msg, ErrAlreadyLoaded)
+		}
+		return fmt.Errorf("side load refused: %s: %w", msg, ErrRefused)
 	}
 	return nil
 }

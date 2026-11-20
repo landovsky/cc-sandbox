@@ -27,12 +27,12 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/k8s"
 	"github.com/landovsky/cc-sandbox/internal/pins"
+	"github.com/landovsky/cc-sandbox/internal/side"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/token"
 	"github.com/landovsky/cc-sandbox/profiles"
@@ -302,9 +302,12 @@ func (e *env) waitReady(ctx context.Context, api PodAPI, rec *start.Record) erro
 	}
 }
 
-// loadWithRetry: the sidecar's control socket appears a moment after the container is ready (there is
-// no probe), so a connect failure is retried every 500 ms for 30 s. A refusal by the sidecar is final.
-// "already loaded" after an attempt that was cut off midway means the first one got through.
+// loadWithRetry classifies by what the sidecar's command exited with (side.LoadInto's typed errors),
+// never by words in its stderr. Nothing listening yet (exit 3) is retried every 500 ms for 30 s: the
+// control socket appears a moment after the container is ready and there is no probe. A refusal (exit 1)
+// is final. Anything else (the exec stream cut) may have happened after the sidecar took the load, so it
+// is retried the same way, and then "already loaded" (exit 4) means our own earlier try got through.
+// "Already loaded" with no such earlier try means somebody else loaded it: refused.
 func (e *env) loadWithRetry(ctx context.Context, api PodAPI, ref k8s.Ref, secrets []byte) error {
 	end := e.d.Now().Add(30 * time.Second)
 	maybeLoaded := false
@@ -313,39 +316,28 @@ func (e *env) loadWithRetry(ctx context.Context, api PodAPI, ref k8s.Ref, secret
 		if err == nil {
 			return nil
 		}
-		msg := err.Error()
 		var ce *k8s.ConflictError
 		switch {
-		case errors.As(err, &ce):
+		case errors.As(err, &ce), errors.Is(err, side.ErrRefused):
 			return err
-		case strings.Contains(msg, "already loaded"):
+		case errors.Is(err, side.ErrAlreadyLoaded):
 			if maybeLoaded {
 				return nil
 			}
 			return refuse("the sidecar of %s was already loaded by someone else: delete the pod and start a new generation", ref.Name)
-		case isConnectFailure(msg):
+		case errors.Is(err, side.ErrNoSocket):
 			// nothing reached the sidecar: safe to try again
 		default:
 			maybeLoaded = true // the exec may have been cut after the sidecar took the load
-			if !strings.Contains(msg, "refused") {
-				// a cut transport, not a refusal: retry once to learn whether it loaded
-				if e.d.Now().After(end) {
-					return err
-				}
-				e.d.Sleep(500 * time.Millisecond)
-				continue
+		}
+		if e.d.Now().After(end) {
+			if errors.Is(err, side.ErrNoSocket) {
+				return fmt.Errorf("the sidecar's control socket never came up: %v", err)
 			}
 			return err
 		}
-		if e.d.Now().After(end) {
-			return fmt.Errorf("the sidecar's control socket never came up: %v", err)
-		}
 		e.d.Sleep(500 * time.Millisecond)
 	}
-}
-
-func isConnectFailure(msg string) bool {
-	return strings.Contains(msg, "no such file") || strings.Contains(msg, "connection refused") || strings.Contains(msg, "dial unix")
 }
 
 func (e *env) podStopCmd() *cli.Command {

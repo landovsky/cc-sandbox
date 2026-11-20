@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/k8s"
+	"github.com/landovsky/cc-sandbox/internal/side"
 	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
@@ -348,38 +349,54 @@ func TestPodLoadWhenThePodNeverComesUpMintsNothingAndExits4(t *testing.T) {
 }
 
 func TestPodLoadRetriesAMissingSocketButNotARefusal(t *testing.T) {
-	noSock := errors.New("dial unix /run/ccsbx/side/ctl/ctl.sock: connect: no such file or directory")
+	noSock := fmt.Errorf("side load: dial unix x: %w", side.ErrNoSocket)
 	pf := newPodFx(t)
 	pf.pod.loadErrs = []error{noSock, noSock, nil}
 	if code, out := pf.call("pod-load", sid); code != 0 || len(pf.pod.loads) != 3 {
 		t.Errorf("a socket that comes up late: %d loads=%d %s", code, len(pf.pod.loads), out)
 	}
 	pf = newPodFx(t)
-	pf.pod.loadErrs = []error{noSock}
 	for i := 0; i < 200; i++ {
 		pf.pod.loadErrs = append(pf.pod.loadErrs, noSock)
 	}
 	if code, out := pf.call("pod-load", sid); code != 1 || !strings.Contains(out, "never came up") || len(pf.pod.loads) > 70 {
 		t.Errorf("a socket that never comes up: %d loads=%d %s", code, len(pf.pod.loads), out)
 	}
-	pf = newPodFx(t)
-	pf.pod.loadErrs = []error{errors.New("side load refused: token expired")}
-	if code, out := pf.call("pod-load", sid); code != 1 || len(pf.pod.loads) != 1 || !strings.Contains(out, "token expired") {
-		t.Errorf("a refusal is final: %d loads=%d %s", code, len(pf.pod.loads), out)
+	// a refusal is final, whatever words its text holds
+	for _, msg := range []string{"token expired", "no such file or directory in the payload", "connection refused by the policy"} {
+		pf = newPodFx(t)
+		pf.pod.loadErrs = []error{fmt.Errorf("side load refused: %s: %w", msg, side.ErrRefused)}
+		if code, out := pf.call("pod-load", sid); code != 1 || len(pf.pod.loads) != 1 || !strings.Contains(out, msg) {
+			t.Errorf("%q: %d loads=%d %s", msg, code, len(pf.pod.loads), out)
+		}
 	}
 }
 
-// The exec may be cut after the sidecar took the load: a retry that answers "already loaded" then means
-// ours got through. On the first attempt the same answer means somebody else loaded it.
+// A cut exec stream may have happened after the sidecar took the load: the retry then answers "already
+// loaded" (exit 4), which is our own earlier try. Without such a try the same answer means somebody else
+// loaded it. Both are decided by the typed errors, not by text.
 func TestPodLoadAlreadyLoadedIsOursOnlyAfterACutAttempt(t *testing.T) {
 	pf := newPodFx(t)
-	pf.pod.loadErrs = []error{errors.New("stream closed"), errors.New("side load refused: already loaded")}
-	if code, out := pf.call("pod-load", sid); code != 0 {
+	pf.pod.loadErrs = []error{errors.New("stream closed"), fmt.Errorf("x: %w", side.ErrAlreadyLoaded)}
+	if code, out := pf.call("pod-load", sid); code != 0 || len(pf.pod.loads) != 2 {
 		t.Errorf("after a cut attempt: %d %s", code, out)
 	}
 	pf = newPodFx(t)
-	pf.pod.loadErrs = []error{errors.New("side load refused: already loaded")}
+	pf.pod.loadErrs = []error{fmt.Errorf("x: %w", side.ErrAlreadyLoaded)}
 	pf.refused("already loaded by someone else", "pod-load", "already loaded by someone else")
+	// "not up yet" followed by "already loaded" is NOT ours: nothing of ours ever reached the sidecar
+	pf = newPodFx(t)
+	pf.pod.loadErrs = []error{fmt.Errorf("x: %w", side.ErrNoSocket), fmt.Errorf("x: %w", side.ErrAlreadyLoaded)}
+	pf.refused("a connect failure then already loaded", "pod-load", "already loaded by someone else")
+	// text that merely says it is not a classification
+	pf = newPodFx(t)
+	pf.pod.loadErrs = []error{errors.New("side load: no such file or directory")}
+	if code, _ := pf.call("pod-load", sid); code != 1 && code != 0 {
+		t.Errorf("an unclassified error: %d", code)
+	}
+	if len(pf.pod.loads) < 2 {
+		t.Errorf("an unclassified error (a cut stream) must be retried to learn whether it loaded: %d tries", len(pf.pod.loads))
+	}
 }
 
 func TestPodLoadFailuresNeverPrintTheSecrets(t *testing.T) {
@@ -390,7 +407,7 @@ func TestPodLoadFailuresNeverPrintTheSecrets(t *testing.T) {
 		t.Errorf("mint failure: %d loads=%d %s", code, len(pf.pod.loads), out)
 	}
 	pf = newPodFx(t)
-	pf.pod.loadErrs = []error{errors.New("side load refused: bad key")}
+	pf.pod.loadErrs = []error{fmt.Errorf("side load refused: bad key: %w", side.ErrRefused)}
 	if _, out := pf.call("pod-load", sid); strings.Contains(out, "TOPSECRET") || strings.Contains(out, "SEEDSEED") {
 		t.Errorf("a secret reached the output: %s", out)
 	}
@@ -505,7 +522,7 @@ func TestAHubThatRefusesTheRelayStopsTheLoadAndLeaksNothing(t *testing.T) {
 // A relay that was registered but never delivered must not stay live.
 func TestARelayThatWasNeverDeliveredIsRevoked(t *testing.T) {
 	pf := newPodFx(t)
-	pf.pod.loadErrs = []error{errors.New("side load refused: bad key")}
+	pf.pod.loadErrs = []error{fmt.Errorf("side load refused: bad key: %w", side.ErrRefused)}
 	if code, _ := pf.call("pod-load", sid); code != 1 {
 		t.Fatalf("exit %d", code)
 	}

@@ -12,6 +12,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/cli"
 	"github.com/landovsky/cc-sandbox/internal/profile"
 	"github.com/landovsky/cc-sandbox/internal/settings"
+	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
 func runCmd() *cli.Command {
@@ -41,6 +42,35 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 	if get("sid") == "" {
 		fmt.Fprintln(stderr, "ccsbx run: --sid is required (see ccsbx run --help)")
 		return cli.ExitUsage
+	}
+	if !start.ValidSid(get("sid")) {
+		fmt.Fprintf(stderr, "ccsbx run: --sid %q is not a session id (like s0k1dry66qg)\n", get("sid"))
+		return cli.ExitUsage
+	}
+	mode, err := resolveMode(f)
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx run:", err)
+		return cli.ExitRefused
+	}
+	if mode == "helper" {
+		// nothing but the sid goes to the helper: it reads the record, the image, the workdir and
+		// the caps itself and refuses what does not check out. --gen is not passed: the record's is used.
+		if refuseExplicit("run", f, stderr, "gen", "image", "state", "docker") {
+			return cli.ExitUsage
+		}
+		if len(args) > 0 {
+			fmt.Fprintln(stderr, "ccsbx run: in helper mode the command in the fence is fixed (claude); an argument after -- is not accepted")
+			return cli.ExitUsage
+		}
+		hargs := []string{"--", get("sid")}
+		if isTerminal(os.Stdin.Fd()) {
+			hargs = append([]string{"--tty"}, hargs...)
+		}
+		return runHelper("run", "run", hargs, stdout, stderr)
+	}
+	if err := directDockerReachable(); err != nil {
+		fmt.Fprintln(stderr, "ccsbx run:", err)
+		return cli.ExitRefused
 	}
 	d, err := daemonFrom(f)
 	if err != nil {

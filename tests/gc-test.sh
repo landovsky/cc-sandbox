@@ -7,13 +7,10 @@
 set -u
 case "${1:-}" in -h|--help|"") sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; esac
 MODE=$1; IMG=${CCSBX_TEST_IMAGE:-python:3.12-slim}; BIN=${CCSBX_BIN:-bin/ccsbx}
+export CCSBX_ROOT=direct   # these twins are DIRECT-mode checks: never let the mode resolve to helper (auto) on a machine that has ccsbx-root
 docker image inspect "$IMG" >/dev/null 2>&1 || { echo "FAIL: image $IMG not present locally (not pulling)"; exit 1; }
 mkdir -p /var/tmp/ccsbx-hello; STATE=$(mktemp -d); PIDS=()
-cleanup() {
-  for p in "${PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done; wait 2>/dev/null
-  for s in $(cat "$STATE/sids" 2>/dev/null); do docker rm -f "ccsbx-$s-g1" >/dev/null 2>&1; docker network rm "ccsbx-net-$s-g1" >/dev/null 2>&1; done
-  docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"
-}
+. "$(dirname "$0")/fence-cleanup.sh"   # cleanup: exact names only, refuses empty or foreign values
 trap cleanup EXIT
 fail() { echo "FAIL [gc/$MODE]: $*"; exit 1; }
 C=(--state "$STATE" --machine hp-ubuntu --worktree-root /var/tmp)

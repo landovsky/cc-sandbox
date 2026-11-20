@@ -92,8 +92,9 @@ type env struct {
 
 // who is the validated caller of a verb.
 type who struct {
-	uid     int // the caller (SUDO_UID, or 0 for a root login)
-	service int // the service user's uid
+	uid        int // the caller (SUDO_UID, or 0 for a root login)
+	service    int // the service user's uid
+	serviceGid int // and gid (the outbox group)
 }
 
 func (w who) mayAct(rec *start.Record) bool {
@@ -117,11 +118,11 @@ func (e *env) prelude(verb string) (who, error) {
 		}
 		w.uid = n
 	}
-	uid, _, err := e.d.LookupUser(e.cfg.ServiceUser)
+	uid, gid, err := e.d.LookupUser(e.cfg.ServiceUser)
 	if err != nil {
 		return who{}, refuse("service user %s: %v", e.cfg.ServiceUser, err)
 	}
-	w.service = uid
+	w.service, w.serviceGid = uid, gid
 	return w, nil
 }
 

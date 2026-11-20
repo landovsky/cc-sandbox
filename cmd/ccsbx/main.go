@@ -22,6 +22,7 @@ func app() *cli.App {
 		Cmds: []*cli.Command{
 			runCmd(),
 			gcCmd(),
+			stopCmd(),
 			pinCheckCmd(),
 			pinPromoteCmd(),
 			startCmd(),

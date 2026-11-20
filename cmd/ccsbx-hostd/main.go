@@ -62,6 +62,7 @@ func app() *cli.App {
 				f.Int("event-rate", 50, "fence hook events journaled per second per outbox; beyond the burst they are dropped and counted (events_shed)")
 				f.Int("event-burst", 500, "event bucket size per outbox")
 				f.Int("max-total", 20000, "requests per generation in its lifetime; beyond that they are shed")
+				f.String("root", "auto", "privilege mode: auto (helper if /usr/local/sbin/ccsbx-root is installed and root-owned, else direct), direct, or helper (panes run sudo -n ccsbx-root run; no docker for the daemon)")
 				f.String("tmux-socket", "ccsbx", "tmux server the session panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (a socket shared between uids; hostd makes it 0660)")
 				f.String("machine", hostname(), "this machine's name, stamped on journal records")
 				f.String("journal", "", "journal directory (default <state>/journal)")
@@ -160,9 +161,14 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		}
 		return a
 	}
-	sd := &start.Daemon{StateDir: abs(get("state")), Machine: get("machine"), Root: "direct", Exe: exe, Backend: "docker",
-		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Env: []string{"--state", abs(get("state")),
-			"--profiles", abs(get("profiles")), "--machine", get("machine"), "--image", get("image"), "--root", "direct"}}}
+	mode, err := start.ResolveRoot(get("root"))
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx-hostd:", err)
+		return cli.ExitRefused
+	}
+	sd := &start.Daemon{StateDir: abs(get("state")), Machine: get("machine"), Root: mode, Exe: exe, Backend: "docker",
+		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Helper: mode == "helper", Env: []string{"--state", abs(get("state")),
+			"--profiles", abs(get("profiles")), "--machine", get("machine"), "--image", get("image"), "--root", mode}}}
 	var servers []*http.Server
 	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
 	srv.Replace = func(sid, brief string) (int, error) {

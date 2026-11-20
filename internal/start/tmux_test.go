@@ -131,3 +131,28 @@ func TestNoSpawnLauncherUsesARunningServer(t *testing.T) {
 		t.Fatal("the session is not on the running server")
 	}
 }
+
+// U1c: in helper mode the pane runs the helper, through sudo, by absolute path and with nothing
+// but the sid: no ccsbx binary, no --state or --image flags that the helper would not read.
+func TestHelperPaneRunsSudoRootRunTty(t *testing.T) {
+	var got []string
+	l := &TmuxLauncher{Exe: "/opt/ccsbx", Socket: "ccsbx", Helper: true, Env: []string{"--state", "/x"},
+		Command: func(name string, args ...string) *exec.Cmd { got = args; return exec.Command("true") }}
+	if err := l.Launch(&Record{Sid: "s0abcdefgh", Gen: 2, Spec: LaunchSpec{Workdir: Workdir{Path: "/w"}}}); err != nil {
+		t.Fatal(err)
+	}
+	j := strings.Join(got, " ")
+	want := "new-session -d -s s0abcdefgh -c / " + SudoBin + " -n " + RootBin + " run --tty -- s0abcdefgh"
+	if !strings.Contains(j, want) {
+		t.Errorf("pane command not as expected:\n got %s\nwant it to contain %s", j, want)
+	}
+	if strings.Contains(j, "/opt/ccsbx") || strings.Contains(j, "--state") {
+		t.Errorf("direct-mode arguments leaked into the helper pane: %s", j)
+	}
+	// direct mode is unchanged
+	l.Helper = false
+	l.Launch(&Record{Sid: "s0abcdefgh", Gen: 2, Spec: LaunchSpec{Workdir: Workdir{Path: "/w"}}})
+	if j := strings.Join(got, " "); !strings.Contains(j, "/opt/ccsbx run --sid s0abcdefgh --gen 2 --state /x") {
+		t.Errorf("direct pane changed: %s", j)
+	}
+}

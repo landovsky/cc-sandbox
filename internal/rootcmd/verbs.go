@@ -182,7 +182,7 @@ func (e *env) run(sid string, tty bool, stdout, stderr io.Writer) (int, error) {
 		Sid: rec.Sid, Label: rec.Label, Gen: rec.Gen, Image: image, StateDir: e.cfg.RunDir,
 		Workdir: wd, GitDir: gd, Uid: rec.Uid, WorktreeRoot: root,
 		MemoryMB: p.MemoryMB, Pids: p.Pids, Cmd: append([]string{"claude"}, extra...), TTY: tty,
-		NotEvid: false, Chown: e.d.Chown, Class: backend.ClassOf(p.E2E), Seccomp: seccompFile,
+		NotEvid: false, Chown: e.d.Chown, Class: backend.ClassOf(p.E2E), Seccomp: seccompFile, OutGid: w.serviceGid, ServiceUID: w.service,
 	}
 	// docker mounts these root-owned staging paths, not the owner's paths
 	spec.MountWorkdir = filepath.Join(spec.GenDir(), "wt")

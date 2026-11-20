@@ -23,11 +23,30 @@ check() { # name, expect refuse|ok
 }
 STATE=$(mktemp -d); printf 'sab3cd9fgh2\n' > "$STATE/sids"
 check "a valid run cleans its own objects" ok
+check_calls() { # name, pattern that must (want=yes) or must not (want=no) appear in the docker calls
+  : > "$calls"; ( cleanup ) >/dev/null 2>&1
+  if [ "$3" = yes ]; then grep -q "$2" "$calls" || { echo "FAIL $1: no call matching $2"; fail=1; }
+  else ! grep -q "$2" "$calls" || { echo "FAIL $1: unexpected call matching $2: $(cat "$calls")"; fail=1; }; fi
+}
+if [ "$mode" != allow ]; then
+  STATE=$(mktemp -d); printf 'sab3cd9fgh2\n' > "$STATE/sids"; unset CLEANUP_EXTRA
+  check_calls "a test that creates no extra containers removes none" 'fwd\|canary' no
+  STATE=$(mktemp -d); printf 'sab3cd9fgh2\n' > "$STATE/sids"   # the first cleanup removed its STATE
+  CLEANUP_EXTRA="ccsbx-fwd-1 ccsbx-canary-1"; check_calls "extra containers it declared are removed by exact name" 'rm -f ccsbx-fwd-1' yes
+  for x in 'ccsbx-fwd-1 foo' '*' 'ccsbx-fwd-' 'ccsbx-fwd-1;id' 'other-1'; do
+    CLEANUP_EXTRA="$x"; STATE=$(mktemp -d); printf 'sab3cd9fgh2\n' > "$STATE/sids"; check "extra container '$x'" refuse
+  done
+  unset CLEANUP_EXTRA
+fi
 STATE=$(mktemp -d); printf '\n' > "$STATE/sids";                check "empty sid line" refuse
 STATE=$(mktemp -d); printf 'sab3cd9fgh2\n\n' > "$STATE/sids";    check "empty line after a sid" refuse
 STATE=$(mktemp -d); printf 'ab3cd9fgh2\n' > "$STATE/sids";       check "sid without the s prefix" refuse
 STATE=$(mktemp -d); printf 'sab3cd9fgh2 x\n' > "$STATE/sids";    check "sid with trailing junk" refuse
 STATE=$(mktemp -d); printf '*\n' > "$STATE/sids";                check "glob as sid" refuse
+STATE=$(mktemp -d); printf 'sab3cd9fgh2\n' > "$STATE/sids"; printf '/var/tmp/ccsbx-cc-aB3x9Z\n' > "$STATE/trash"; check "a trash dir of the exact shape" ok
+for t in '/var/tmp/ccsbx-cc-ab/../' '/var/tmp/ccsbx-cc-abc12/..' '/var/tmp/ccsbx-cc-a/b123' '/var/tmp/ccsbx-cc-*' '/var/tmp/ccsbx-cc-abc12' '/var/tmp/ccsbx-cc-abc1234' '/var/tmp/' '' '/etc'; do
+  STATE=$(mktemp -d); printf 'sab3cd9fgh2\n' > "$STATE/sids"; printf '%s\n' "$t" > "$STATE/trash"; check "trash line '$t'" refuse
+done
 STATE="";                                                         check "empty STATE" refuse
 STATE=/;                                                          check "STATE is /" refuse
 STATE=$HOME;                                                      check "STATE is the home" refuse

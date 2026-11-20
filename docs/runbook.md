@@ -140,6 +140,12 @@
   The base must be the file of the installed engine's version tag (the URL in step 8b). The last command of
   step 8b is the docker twin: it tries `chmod 4755`, `2755`, `u+s` and creating a file with mode 4755 inside
   a fence, and checks that `chmod 755` still works; it is not part of `make test`.
+- **Which mode runs (U1c).** `ccsbx` and `ccsbx-hostd` take `--root auto|direct|helper` (env `CCSBX_ROOT`).
+  `auto`, the default: helper if `/usr/local/sbin/ccsbx-root` exists, is a regular file owned by root and
+  not writable by others, else direct. In helper mode `ccsbx run`, `stop`, `gc` and hostd's pane run
+  `/usr/bin/sudo -n /usr/local/sbin/ccsbx-root <verb> <sid>`; a sudo refusal (password needed, not
+  permitted, helper missing) is reported as that with exit 2 and there is no fallback to direct. Direct
+  mode refuses with a clear error when docker's socket is unreachable (it is, after Gate M).
 - **Real bind-mount test (Gate M).** `sudo unshare -m env GOTOOLCHAIN=local /home/tomas/.local/go/bin/go test -tags rootmount -run TestRealMounter ./internal/rootcmd` (go is not on sudo's PATH; step 7b has the `go version` precheck).
 - **Known: orphaned direct-mode homes.** The node home is now keyed by owner, class and label, so
   homes made by direct mode before this change are not found again: `--resume` of such a session

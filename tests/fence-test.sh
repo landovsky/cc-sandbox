@@ -17,6 +17,7 @@ case "${1:-}" in -h|--help|"") sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 
 RULE=$1 TWIN=${2:-}
 IMG=${CCSBX_TEST_IMAGE:-python:3.12-slim}
 BIN=${CCSBX_BIN:-bin/ccsbx}
+export CCSBX_ROOT=direct   # these twins are DIRECT-mode checks: never let the mode resolve to helper (auto) on a machine that has ccsbx-root
 [ -x "$BIN" ] || { echo "FAIL: $BIN missing (make build)"; exit 1; }
 docker image inspect "$IMG" >/dev/null 2>&1 || { echo "FAIL: image $IMG not present locally (not pulling)"; exit 1; }
 
@@ -24,6 +25,7 @@ STATE=$(mktemp -d)
 mkdir -p /var/tmp/ccsbx-hello
 PIDS=()
 . "$(dirname "$0")/fence-cleanup.sh"   # cleanup: exact names only, refuses empty or foreign values
+CLEANUP_EXTRA="ccsbx-fwd-$$ ccsbx-canary-$$"   # the two containers this test (alone) creates
 trap cleanup EXIT
 
 fail() { echo "FAIL [$RULE/$TWIN]: $*"; exit 1; }

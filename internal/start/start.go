@@ -61,7 +61,10 @@ type Daemon struct {
 	MaxPerHour   int // rate_capped above this many starts by one caller in an hour
 	Backend      string
 	Socket       string // tmux -L name for the attach command; default ccsbx
-	Root         string // "direct" tonight
+	Root         string // "direct" or "helper"
+	// HelperProven: the helper has actually run on this machine and the docker group is gone. Only
+	// then does a reply claim evidence; the mere presence of ccsbx-root proves nothing (invariants 12, 14).
+	HelperProven bool
 	Launcher     Launcher
 	ReplaceWait  time.Duration // how long Replace waits for the old fence to shut down (default 15s)
 	Now          func() time.Time
@@ -208,7 +211,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		Pin:     Pin{CC: orUnpinned(d.CCVersion), Image: orUnpinned(d.Image), Channel: channel},
 		Attach:  Attach{Local: append(append([]string{"tmux"}, tmuxsock.Args(orDefault(d.Socket, "ccsbx"))...), "attach", "-t", sid), Remote: []string{"ssh", "-t", d.Machine, "ccsbx", "attach", sid}},
 		Journal: Journal{Epoch: d.epoch(), Seq: len(recs)},
-		NotEv:   d.Root != "helper",
+		NotEv:   !(d.Root == "helper" && d.HelperProven),
 	}
 	// Write the record before launching: `ccsbx run --sid` reads it.
 	if err := d.save(rec); err != nil {

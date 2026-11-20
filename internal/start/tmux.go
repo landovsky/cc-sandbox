@@ -22,6 +22,27 @@ type TmuxLauncher struct {
 	// the server is ccsbx-tmux.service's, in the host mount namespace, and a server spawned by a
 	// `new-session` from inside hostd's sandbox could not run ccsbx-root properly.
 	NoSpawn bool
+	// Helper: the pane runs `sudo -n ccsbx-root run --tty <sid>` (no docker for the caller) instead
+	// of `ccsbx run`. Env is not used then: ccsbx-root takes everything from the daemon's record.
+	Helper bool
+}
+
+// paneDir is the pane's working directory. In helper mode it is "/": ccsbx-root takes the workdir
+// from the record and never from its cwd, and a service uid that cannot enter the owner's worktree
+// would otherwise land in whatever directory tmux falls back to.
+func (t *TmuxLauncher) paneDir(r *Record) string {
+	if t.Helper {
+		return "/"
+	}
+	return r.Spec.Workdir.Path
+}
+
+// paneCmd is what the pane runs.
+func (t *TmuxLauncher) paneCmd(r *Record) []string {
+	if t.Helper {
+		return []string{SudoBin, "-n", RootBin, "run", "--tty", "--", r.Sid}
+	}
+	return append([]string{t.Exe, "run", "--sid", r.Sid, "--gen", strconv.Itoa(r.Gen)}, t.Env...)
 }
 
 // base is the fixed start of every tmux call: this server's socket and an empty config file, so
@@ -48,8 +69,7 @@ func (t *TmuxLauncher) Launch(r *Record) error {
 			return fmt.Errorf("%s (socket %s)", tmuxsock.ErrNoServer, t.Socket)
 		}
 	}
-	args := []string{"new-session", "-d", "-s", r.Sid, "-c", r.Spec.Workdir.Path, t.Exe, "run", "--sid", r.Sid, "--gen", strconv.Itoa(r.Gen)}
-	args = append(args, t.Env...)
+	args := append([]string{"new-session", "-d", "-s", r.Sid, "-c", t.paneDir(r)}, t.paneCmd(r)...)
 	args = append(args, ";", "set-option", "-g", "set-clipboard", "off", ";", "set-option", "-g", "allow-passthrough", "off",
 		// A pane is a window onto a fence, not a tmux session to drive: no status line, no prefix
 		// key (so a keystroke never reaches tmux's own command mode), no escape delay.

@@ -162,17 +162,42 @@ func (e *env) registerRelay(ctx context.Context, secret string, scope json.RawMe
 
 var sidMintRe = regexp.MustCompile(`^s[0-9a-z]{4,32}$`)
 
-// mayReach is derived from the record and never supplied: the session's manager as <machine>/<node>.
-// A record that names no manager machine (or a malformed one) gives an empty list: the relay then
-// reaches fenced sessions only. Peers are not in it.
+// maxMayReach is the hub's own limit on the list.
+const maxMayReach = 32
+
+// mayReach is derived from the record and never supplied: the session's manager first, then its peers,
+// each as <machine>/<node> with the machine the record binds that node to (msg_scope.manager.machine and
+// msg_scope.peer_machines, written from the owner's start spec, never from the fence). A node whose machine
+// is missing or malformed is left out (a node belongs to the machine its record names; a bare node would
+// be refused by the hub), so a record that names no manager machine and no placed peer gives an empty
+// list: the relay then reaches fenced sessions only. The record cannot say which peers are fenced; the hub
+// needs the entry only for an UNFENCED target, so listing a fenced peer changes nothing for it. Duplicates
+// are dropped and the list is cut at the hub's 32.
 func mayReach(scope json.RawMessage) []string {
 	var s struct {
-		Manager struct{ Node, Machine string }
+		Manager      struct{ Node, Machine string }
+		Peers        []string
+		PeerMachines map[string]string `json:"peer_machines"`
 	}
-	if json.Unmarshal(scope, &s) != nil || !mrMachine.MatchString(s.Manager.Machine) || !mrNode.MatchString(s.Manager.Node) {
-		return []string{}
+	out := []string{}
+	if json.Unmarshal(scope, &s) != nil {
+		return out
 	}
-	return []string{s.Manager.Machine + "/" + s.Manager.Node}
+	seen := map[string]bool{}
+	add := func(machine, node string) {
+		if !mrMachine.MatchString(machine) || !mrNode.MatchString(node) || len(out) >= maxMayReach {
+			return
+		}
+		if e := machine + "/" + node; !seen[e] {
+			seen[e] = true
+			out = append(out, e)
+		}
+	}
+	add(s.Manager.Machine, s.Manager.Node)
+	for _, p := range s.Peers {
+		add(s.PeerMachines[p], p)
+	}
+	return out
 }
 
 // rateLimit: one mint per generation per 10 s; --after-401 allows one more inside the window. The

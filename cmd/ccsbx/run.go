@@ -10,7 +10,6 @@ import (
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/cli"
-	"github.com/landovsky/cc-sandbox/internal/profile"
 	"github.com/landovsky/cc-sandbox/internal/settings"
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
@@ -88,7 +87,7 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "ccsbx run: gen %d is not the record's gen %d\n", gen, rec.Gen)
 		return cli.ExitRefused
 	}
-	p, err := profile.Load(d.ProfilesDir, rec.Spec.Profile)
+	p, err := d.LoadProfile(rec.Spec.Profile)
 	if err != nil {
 		fmt.Fprintln(stderr, "ccsbx run:", err)
 		return cli.ExitFail

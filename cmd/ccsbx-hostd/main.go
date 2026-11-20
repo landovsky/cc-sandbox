@@ -186,8 +186,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		return a
 	}
 	sd := &start.Daemon{StateDir: abs(get("state")), RunDir: runDir, ProfileLoader: profiles.Load, Machine: get("machine"), Root: mode, Exe: exe, Backend: "docker",
-		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Helper: mode == "helper", Env: []string{"--state", abs(get("state")),
-			"--profiles", abs("profiles"), "--machine", get("machine"), "--image", get("image"), "--root", mode}}}
+		Launcher: &start.TmuxLauncher{Exe: exe, Socket: get("tmux-socket"), NoSpawn: true, Helper: mode == "helper", Env: paneEnv(abs(get("state")), get("machine"), get("image"), mode)}}
 	var servers []*http.Server
 	srv := &daemonapi.Server{J: j, Q: q, Msg: rt, Dir: rt.Dir, MaxWait: 60 * time.Second, Info: map[string]any{"machine": get("machine"), "not_evidence": true}}
 	srv.Replace = func(sid, brief string) (int, error) {
@@ -300,6 +299,13 @@ func readToken(path string) (string, error) {
 		return "", fmt.Errorf("%s: the token must be at least 16 characters", path)
 	}
 	return t, nil
+}
+
+// paneEnv is what a direct-mode pane's `ccsbx run` is told besides the sid and generation. The profiles
+// are the ones compiled into the binary ("-"), never a directory relative to hostd's working directory:
+// hostd's cwd is not a place profiles come from.
+func paneEnv(state, machine, image, mode string) []string {
+	return []string{"--state", state, "--profiles", "-", "--machine", machine, "--image", image, "--root", mode}
 }
 
 // runDirOr is the run dir, or the state dir when none is given.

@@ -182,3 +182,12 @@ func TestHostdHasNoProfilesFlag(t *testing.T) {
 		t.Fatal("--profiles was accepted")
 	}
 }
+
+// context: a direct-mode pane started by hostd (a replaced session) must not be told to read profiles
+// from a directory relative to hostd's working directory: the profiles are the ones in the binary.
+func TestPaneEnvUsesTheEmbeddedProfiles(t *testing.T) {
+	env := strings.Join(paneEnv("/var/lib/ccsbx", "hp", "ccsbx-fence:dev", "direct"), " ")
+	if !strings.Contains(env, "--profiles -") || strings.Contains(env, "/profiles") {
+		t.Fatalf("%s", env)
+	}
+}

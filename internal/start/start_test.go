@@ -584,3 +584,17 @@ func TestResolveClientPathsResolvesSymlinksAndComputesTheGitdir(t *testing.T) {
 		t.Fatal("a missing workdir was accepted")
 	}
 }
+
+// context: a linked worktree's gitdir has the right SHAPE under /etc too; hostd must refuse it itself
+// (it must sit under a worktree root, or be <workdir>/.git), not leave it to ccsbx-root.
+func TestHelperModeRefusesAGitdirOutsideTheWorktreeRoots(t *testing.T) {
+	d, _ := newDaemon(t)
+	d.Root, d.WorktreeRoot = "helper", "/nonexistent-home/u/git"
+	s := spec(func(s *LaunchSpec) {
+		s.Workdir.Path = "/nonexistent-home/u/git/proj"
+		s.GitDir = "/etc/.git/worktrees/x"
+	})
+	if _, err := d.Start(s); err == nil || !strings.Contains(err.Error(), "not under a worktree root") {
+		t.Fatalf("%v", err)
+	}
+}

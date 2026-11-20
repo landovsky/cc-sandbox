@@ -62,3 +62,22 @@ func TestAttachToAnUnreachableServiceSocketNamesTheCommandAndExits2(t *testing.T
 		t.Fatalf("exit %d: %s", code, errb.String())
 	}
 }
+
+// context: `--profiles -` means the profiles compiled into the binary (hostd's panes use it): an
+// unknown profile is then refused with the embedded loader's message, not "no such file in a directory".
+func TestProfilesDashUsesTheEmbeddedProfiles(t *testing.T) {
+	b, _ := os.ReadFile("../../tests/specs/hello.json")
+	root, _ := os.MkdirTemp("/var/tmp", "ccsbx-prof-")
+	t.Cleanup(func() { os.RemoveAll(root) })
+	root, _ = filepath.EvalSymlinks(root)
+	wd := filepath.Join(root, "wt")
+	os.Mkdir(wd, 0o755)
+	body := strings.Replace(strings.Replace(string(b), `"dev-default"`, `"no-such-profile"`, 1), "/var/tmp/ccsbx-hello", wd, 1)
+	spec := filepath.Join(t.TempDir(), "s.json")
+	os.WriteFile(spec, []byte(body), 0o644)
+	var out, errb bytes.Buffer
+	app().Main([]string{"start", "--root", "direct", "--profiles", "-", "--launcher", "none", "--worktree-root", root, "--state", t.TempDir(), "--spec", spec}, &out, &errb)
+	if !strings.Contains(errb.String(), "not approved in this build") {
+		t.Fatalf("%s", errb.String())
+	}
+}

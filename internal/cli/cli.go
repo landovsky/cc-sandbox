@@ -43,40 +43,48 @@ type Flags struct {
 	*flag.FlagSet
 	// Getenv is os.Getenv in production; tests replace it.
 	Getenv func(string) string
+	// Prefix is the environment prefix of this program's flags; "" means "CCSBX_".
+	Prefix string
 }
 
 // EnvName is the environment variable behind a flag name: "key-file" -> CCSBX_KEY_FILE.
-func EnvName(flagName string) string {
-	return "CCSBX_" + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
+func EnvName(flagName string) string { return envName("CCSBX_", flagName) }
+
+func envName(prefix, flagName string) string {
+	if prefix == "" {
+		prefix = "CCSBX_"
+	}
+	return prefix + strings.ToUpper(strings.ReplaceAll(flagName, "-", "_"))
 }
 
-func note(name, usage string) string { return usage + " (env " + EnvName(name) + ")" }
+func (f *Flags) env(name string) string         { return envName(f.Prefix, name) }
+func (f *Flags) note(name, usage string) string { return usage + " (env " + f.env(name) + ")" }
 
 // String declares a string flag whose default is $CCSBX_<NAME> if set, else def.
 func (f *Flags) String(name, def, usage string) *string {
-	if v := f.Getenv(EnvName(name)); v != "" {
+	if v := f.Getenv(f.env(name)); v != "" {
 		def = v
 	}
-	return f.FlagSet.String(name, def, note(name, usage))
+	return f.FlagSet.String(name, def, f.note(name, usage))
 }
 
 // Bool declares a bool flag; env values 1/true/yes turn it on.
 func (f *Flags) Bool(name string, def bool, usage string) *bool {
-	if v := f.Getenv(EnvName(name)); v != "" {
+	if v := f.Getenv(f.env(name)); v != "" {
 		def = v == "1" || v == "true" || v == "yes"
 	}
-	return f.FlagSet.Bool(name, def, note(name, usage))
+	return f.FlagSet.Bool(name, def, f.note(name, usage))
 }
 
 // Int declares an int flag with an env default; a malformed env value is ignored.
 func (f *Flags) Int(name string, def int, usage string) *int {
-	if v := f.Getenv(EnvName(name)); v != "" {
+	if v := f.Getenv(f.env(name)); v != "" {
 		var n int
 		if _, err := fmt.Sscanf(v, "%d", &n); err == nil {
 			def = n
 		}
 	}
-	return f.FlagSet.Int(name, def, note(name, usage))
+	return f.FlagSet.Int(name, def, f.note(name, usage))
 }
 
 // App is the command table plus program identity.
@@ -86,6 +94,8 @@ type App struct {
 	Version string
 	Cmds    []*Command
 	Getenv  func(string) string
+	// EnvPrefix is the prefix of every flag's environment variable; "" means "CCSBX_".
+	EnvPrefix string
 }
 
 func (a *App) find(name string) *Command {
@@ -118,7 +128,7 @@ func (a *App) Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stderr, "%s: unknown command %q (try %s --help)\n", a.Name, args[0], a.Name)
 		return ExitUsage
 	}
-	fs := &Flags{FlagSet: flag.NewFlagSet(a.Name+" "+c.Name, flag.ContinueOnError), Getenv: a.Getenv}
+	fs := &Flags{FlagSet: flag.NewFlagSet(a.Name+" "+c.Name, flag.ContinueOnError), Getenv: a.Getenv, Prefix: a.EnvPrefix}
 	fs.SetOutput(stderr)
 	if c.Raw {
 		return c.Run(fs, args[1:], stdout, stderr)
@@ -152,7 +162,11 @@ func (a *App) usage(w io.Writer) {
 		fmt.Fprintf(w, "  %-14s %s\n", c.Name, c.Summary)
 	}
 	fmt.Fprintf(w, "  %-14s %s\n", "version", "print the build version")
-	fmt.Fprintf(w, "\nEvery flag also reads CCSBX_<FLAG> (dashes become underscores).\n")
+	p := a.EnvPrefix
+	if p == "" {
+		p = "CCSBX_"
+	}
+	fmt.Fprintf(w, "\nEvery flag also reads %s<FLAG> (dashes become underscores).\n", p)
 }
 
 func (a *App) cmdUsage(w io.Writer, c *Command, fs *Flags) {

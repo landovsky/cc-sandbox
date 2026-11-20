@@ -45,6 +45,8 @@ type Spec struct {
 	TTY          bool
 	NotEvid      bool // direct mode
 	Uid          int  // the host user who owns the session (record uid); the gitdir must be theirs
+	// Chown makes a helper-mode directory the fence's; nil means os.Lchown. Tests replace it.
+	Chown func(path string, uid, gid int) error
 }
 
 // Names derived from the sid and gen, so cleanup targets exactly what this run created.
@@ -115,12 +117,14 @@ func (s Spec) RunArgs() []string {
 
 // Prepare creates the per-generation directories and the home. It refuses to reuse a generation
 // directory: a second run of the same (sid, gen) would share an outbox (invariant 11).
+//
+// Direct mode (NotEvid): everything is made by the calling user, the leaves are 0777 because uid
+// 10001 in the fence is not the owner, and the 0700 parent keeps other host users out.
+// Helper mode (ccsbx-root, running as root): the parents are root-owned 0755, out/ and the home are
+// 10001:10001 0700, in/ and managed/ are root-owned 0755 (the fence reads them and can never write
+// them, with or without the read-only mount), and nothing is world-writable. Every directory is
+// created fresh with Mkdir (never followed through a symlink) before it is chowned.
 func (s Spec) Prepare() error {
-	if !s.NotEvid {
-		// helper mode: leaves must be 10001:10001 0700, made by ccsbx-root (gate M). Direct mode's
-		// 0777 leaves are not acceptable there, so refuse until that exists.
-		return fmt.Errorf("helper mode needs ccsbx-root to create 10001-owned 0700 generation dirs (not built); the 0777 leaves are direct-mode only")
-	}
 	if _, err := CheckWorkdir(s.Workdir, s.WorktreeRoot, s.StateDir); err != nil {
 		return err
 	}
@@ -133,11 +137,16 @@ func (s Spec) Prepare() error {
 			return err
 		}
 	}
+	helper := !s.NotEvid
 	g := s.GenDir()
-	if err := os.MkdirAll(filepath.Dir(g), 0o700); err != nil {
+	parent := 0o700
+	if helper {
+		parent = 0o755
+	}
+	if err := os.MkdirAll(filepath.Dir(g), os.FileMode(parent)); err != nil {
 		return err
 	}
-	if err := os.Mkdir(g, 0o700); err != nil { // fails if it exists: one outbox per generation
+	if err := os.Mkdir(g, os.FileMode(parent)); err != nil { // fails if it exists: one outbox per generation
 		return fmt.Errorf("generation dir %s: %w", g, err)
 	}
 	if err := s.prepareQuarantine(); err != nil {
@@ -145,6 +154,22 @@ func (s Spec) Prepare() error {
 	}
 	for _, d := range []string{"out", "in", "managed"} {
 		p := filepath.Join(g, d)
+		if helper {
+			mode, own := os.FileMode(0o755), 0
+			if d == "out" {
+				mode, own = 0o700, FenceUID
+			}
+			if err := os.Mkdir(p, mode); err != nil {
+				return err
+			}
+			if err := os.Chmod(p, mode); err != nil { // umask must not narrow or widen it
+				return err
+			}
+			if err := s.chown(p, own, own); err != nil {
+				return err
+			}
+			continue
+		}
 		if err := os.Mkdir(p, 0o700); err != nil {
 			return err
 		}
@@ -154,10 +179,32 @@ func (s Spec) Prepare() error {
 			return err
 		}
 	}
-	if err := os.MkdirAll(s.HomeDir(), 0o700); err != nil {
+	h := s.HomeDir()
+	if helper {
+		if err := os.MkdirAll(filepath.Dir(h), 0o755); err != nil {
+			return err
+		}
+		if err := os.Mkdir(h, 0o700); err == nil {
+			if err := os.Chmod(h, 0o700); err != nil {
+				return err
+			}
+			return s.chown(h, FenceUID, FenceUID)
+		} else if !os.IsExist(err) {
+			return err
+		}
+		return nil // a later generation: the home exists and is the fence's
+	}
+	if err := os.MkdirAll(h, 0o700); err != nil {
 		return err
 	}
-	return os.Chmod(s.HomeDir(), 0o777)
+	return os.Chmod(h, 0o777)
+}
+
+func (s Spec) chown(path string, uid, gid int) error {
+	if s.Chown != nil {
+		return s.Chown(path, uid, gid)
+	}
+	return os.Lchown(path, uid, gid)
 }
 
 // Close marks the generation's outbox closed. The directory stays for the host to read.

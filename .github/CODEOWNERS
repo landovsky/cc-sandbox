@@ -14,6 +14,7 @@
 /internal/door/         @landovsky
 /internal/approval/     @landovsky
 /internal/side/         @landovsky
+/internal/rootcmd/      @landovsky
 /cmd/ccsbx-root/        @landovsky
 /cmd/ccsbx-signer/      @landovsky
 /cmd/ccsbx-hostd/       @landovsky

@@ -43,6 +43,16 @@ func ownerAlive(stateDir, sid string, gen int) bool {
 	return true
 }
 
+// sessionsDir is where the daemon's session records are: <stateDir>/sessions unless the records
+// live elsewhere than the generation directories (ccsbx-root: records are the daemon's, the
+// generation directories are root's).
+func (r *Runner) sessionsDir(stateDir string) string {
+	if r.SessionsDir != "" {
+		return r.SessionsDir
+	}
+	return filepath.Join(stateDir, "sessions")
+}
+
 // Orphans lists containers and networks labelled ccsbx.sid whose sid has a session record under
 // stateDir and whose owning run is dead. Resources of unknown sids (another state dir, another
 // tool) are never listed: gc only touches what this state dir created.
@@ -69,7 +79,7 @@ func (r *Runner) Orphans(stateDir string) ([]Orphan, error) {
 			if err != nil {
 				continue
 			}
-			if _, err := os.Stat(filepath.Join(stateDir, "sessions", f[1]+".json")); err != nil {
+			if _, err := os.Stat(filepath.Join(r.sessionsDir(stateDir), f[1]+".json")); err != nil {
 				continue // not ours
 			}
 			if ownerAlive(stateDir, f[1], gen) {

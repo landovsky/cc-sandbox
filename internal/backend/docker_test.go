@@ -302,9 +302,9 @@ func TestMovedParsesSweepOutput(t *testing.T) {
 }
 
 // U1b-N1: the 0777 leaves are a direct-mode compromise (the fence's uid 10001 does not own them).
-// Helper mode wants 10001:10001 0700 leaves made by ccsbx-root. Until that exists, Prepare must
-// refuse in helper mode rather than quietly ship the direct-mode permissions.
-func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
+// Helper mode (ccsbx-root, as root) makes out/ and the home 10001:10001 0700, in/ and managed/
+// root-owned 0755, and nothing world-writable.
+func TestDirectModeLeavesAre0777(t *testing.T) {
 	d := spec(t)
 	if err := d.Prepare(); err != nil {
 		t.Fatal(err)
@@ -315,13 +315,52 @@ func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
 			t.Fatalf("direct mode leaf %s: %v %v", l, st, err)
 		}
 	}
+}
+
+// Helper mode (the block twin of the above): nothing is 0777 and the fence's directories are the
+// fence's, made fresh and chowned only after creation.
+func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
 	h := spec(t)
 	h.NotEvid = false // helper mode
-	if err := h.Prepare(); err == nil {
-		t.Fatal("helper mode created generation dirs with the direct-mode 0777 leaves")
+	owners := map[string][2]int{}
+	h.Chown = func(p string, uid, gid int) error { owners[p] = [2]int{uid, gid}; return nil }
+	if err := h.Prepare(); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(h.GenDir()); err == nil {
-		t.Fatal("helper mode left a generation directory behind after refusing")
+	want := map[string]struct {
+		mode os.FileMode
+		own  [2]int
+	}{
+		filepath.Join(h.GenDir(), "out"):     {0o700, [2]int{FenceUID, FenceUID}},
+		filepath.Join(h.GenDir(), "in"):      {0o755, [2]int{0, 0}},
+		filepath.Join(h.GenDir(), "managed"): {0o755, [2]int{0, 0}},
+		h.HomeDir():                          {0o700, [2]int{FenceUID, FenceUID}},
+	}
+	for p, w := range want {
+		st, err := os.Stat(p)
+		if err != nil || st.Mode().Perm() != w.mode {
+			t.Errorf("%s: %v %v, want %v", p, st, err, w.mode)
+		}
+		if owners[p] != w.own {
+			t.Errorf("%s chowned to %v, want %v", p, owners[p], w.own)
+		}
+	}
+	if st, _ := os.Stat(h.GenDir()); st.Mode().Perm()&0o022 != 0 {
+		t.Errorf("the generation dir is writable by others: %v", st.Mode())
+	}
+	// a later generation reuses the home and must not chown the fence's files again
+	h2 := h
+	h2.Gen = 2
+	owners = map[string][2]int{}
+	if err := h2.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	if _, again := owners[h.HomeDir()]; again {
+		t.Error("generation 2 chowned the existing home")
+	}
+	// the same generation twice is refused, as in direct mode
+	if err := h.Prepare(); err == nil {
+		t.Error("a generation directory was reused in helper mode")
 	}
 }
 
@@ -541,5 +580,24 @@ func TestPrepareRechecksTheRecordedGitDirOnResume(t *testing.T) {
 	s.Gen = 2
 	if err := s.Prepare(); err == nil {
 		t.Error("generation 2 mounted a gitdir whose hooks became world-writable")
+	}
+}
+
+// Stop removes exactly the container and network named from sid and gen. A fake docker records
+// its argv, so no daemon is needed.
+func TestStopRemovesExactNames(t *testing.T) {
+	d := vt(t)
+	log := filepath.Join(d, "log")
+	fake := filepath.Join(d, "docker")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\necho \"$@\" >> "+log+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Docker: fake}
+	if err := r.Stop(Spec{Sid: "s0abcdefgh", Gen: 3}); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(log)
+	if string(b) != "rm -f ccsbx-s0abcdefgh-g3\nnetwork rm ccsbx-net-s0abcdefgh-g3\n" {
+		t.Fatalf("docker was asked: %q", b)
 	}
 }

@@ -28,6 +28,9 @@ type Profile struct {
 
 var nameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,40}$`)
 
+// ValidName reports whether name is a legal profile name (it is checked before any lookup).
+func ValidName(name string) bool { return nameRe.MatchString(name) }
+
 // Validate returns the first defect, or nil.
 func (p *Profile) Validate() error {
 	if !nameRe.MatchString(p.Name) {

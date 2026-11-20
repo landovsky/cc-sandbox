@@ -20,9 +20,11 @@ import (
 // container"). Docker is called as the current user (direct mode).
 type Runner struct {
 	Docker string // docker binary, default "docker"
-	Stdin  io.Reader
-	Stdout io.Writer
-	Stderr io.Writer
+	// SessionsDir is where session records live when that is not <stateDir>/sessions (gc only).
+	SessionsDir string
+	Stdin       io.Reader
+	Stdout      io.Writer
+	Stderr      io.Writer
 	// Files written into the generation before the container starts (relative to GenDir).
 	Files map[string][]byte
 }
@@ -82,4 +84,19 @@ func (r *Runner) Run(s Spec) (int, error) {
 		return -1, err
 	}
 	return 0, nil
+}
+
+// Stop removes one generation's container and network by the exact names derived from its sid and
+// gen, and nothing else. A missing container or network is not an error: stop is idempotent.
+func (r *Runner) Stop(s Spec) error {
+	var errs []string
+	for _, a := range [][]string{{"rm", "-f", s.Container()}, {"network", "rm", s.Network()}} {
+		if out, err := exec.Command(r.docker(), a...).CombinedOutput(); err != nil && !strings.Contains(string(out), "No such") {
+			errs = append(errs, fmt.Sprintf("docker %s: %v: %s", a[0], err, strings.TrimSpace(string(out))))
+		}
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	return nil
 }

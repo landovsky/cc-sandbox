@@ -270,11 +270,31 @@ where = "hp"
 
 [[rule]]
 id = "root-wrapper-rejects"
-title = "the root wrapper rejects any call not from the daemon"
+title = "ccsbx-root refuses unpinned images, workdirs outside the roots, symlinks, unknown flags and callers who do not own the session (fake backend and stub tmux; the hp run as real root is Gate M)"
 suite = "keys"
-allow = "pending"
-block = "pending"
+allow = "tests/twin-go.sh ./internal/rootcmd TestRunAllow"
+block = "tests/twin-go.sh ./internal/rootcmd TestRunBlocks && tests/twin-go.sh ./internal/rootcmd TestRunRefusesUntrustedInputs && tests/twin-go.sh ./internal/rootcmd TestArgumentShapes && tests/twin-go.sh ./internal/rootcmd TestPrelude && tests/twin-go.sh ./internal/rootcmd TestConfigBlocks && tests/twin-go.sh ./internal/rootcmd TestGitdirAndWorkdirOwnerChecks && tests/twin-go.sh ./internal/rootcmd TestStop"
 invariants = [8]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "root-attach-as-service-uid"
+title = "ccsbx-root attach drops to the service uid before it execs tmux, for the session's owner only, with a rebuilt environment"
+suite = "keys"
+allow = "tests/twin-go.sh ./internal/rootcmd TestAttachAllow"
+block = "tests/twin-go.sh ./internal/rootcmd TestAttachBlocks && tests/twin-go.sh ./internal/rootcmd TestDropPrivsRefusesRoot"
+invariants = [8]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "helper-dirs-fence-owned"
+title = "helper mode makes the outbox and home 10001-owned 0700, in/ and managed/ root-owned, nothing world-writable"
+suite = "keys"
+allow = "tests/twin-go.sh ./internal/backend TestDirectModeLeavesAre0777"
+block = "tests/twin-go.sh ./internal/backend TestWorldWritableLeavesAreDirectModeOnly"
+invariants = [11, 12]
 backends = ["unit"]
 where = "hp"
 

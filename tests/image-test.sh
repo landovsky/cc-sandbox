@@ -70,10 +70,12 @@ scan_image() {
   [ "$(echo "$out" | sed -n 's/^find-rc=//p')" = 0 ] && [ "$(echo "$out" | grep -vc '^find-rc=')" = 0 ] || { echo "credential-like files: $(echo "$out" | head -3)"; return 1; }
   # EVERY layer, not only the final filesystem: a secret overwritten later is still in its layer.
   # The Debian base layer is pinned by digest (its content is not ours to judge: a library there carries
-  # sample strings such as AWS's documented example key), so it is skipped; every layer WE added is
-  # scanned. The base is bookworm-slim's single bottom layer: the history's oldest entry must say so.
-  echo "$hist" | tail -1 | grep -q '^# debian.sh' || { echo "the bottom layer is not the Debian base (history: $(echo "$hist" | tail -1 | cut -c1-40))"; return 1; }
-  base_ids=$(docker image inspect "$img" --format '{{index .RootFS.Layers 0}}') || { echo "cannot read the image's layers"; return 1; }
+  # sample strings such as AWS's documented example key). ONLY the layer whose diff id is the pinned
+  # BASE_DIFF_ID is skipped; the image's bottom layer must be exactly that one, or the base changed
+  # and the pin must be reviewed. Every layer WE added is scanned.
+  base_ids=$(pin BASE_DIFF_ID)
+  case "$base_ids" in sha256:[0-9a-f]*) ;; *) echo "BASE_DIFF_ID is not pinned in image/pins.env"; return 1;; esac
+  [ "$(docker image inspect "$img" --format '{{index .RootFS.Layers 0}}')" = "$base_ids" ] || { echo "the image's bottom layer is not the pinned base (BASE_DIFF_ID)"; return 1; }
   tmp=$(mktemp -d -p "$WORK"); docker save "$img" 2>/dev/null | tar -x -C "$tmp" || { echo "docker save failed"; return 1; }
   while IFS= read -r l; do
     tar -tf "$l" >/dev/null 2>&1 || continue          # config, manifests: not layers
@@ -198,6 +200,19 @@ shim_refusals() {
   refused "$img" push upstream main || return 1          # not a configured remote
   refused "$img" push origin refs/heads/x:refs/heads/main || return 1  # the plan forbids pushing main
   refused "$img" push origin main || return 1            # main as the destination
+  refused "$img" push origin work:heads/main || return 1             # git expands it to refs/heads/main
+  refused "$img" push origin work:refs/heads//main || return 1       # an empty component
+  refused "$img" push origin work:refs/heads/./main || return 1
+  refused "$img" push origin work:refs/heads/x/../main || return 1
+  refused "$img" push origin work:refs/heads/-x || return 1
+  refused "$img" push origin work:refs/tags/v1 || return 1
+  refused "$img" push -u origin main || return 1
+  refused "$img" push origin ../x || return 1
+  refused "$img" -c diff.external=/tmp/x diff || return 1
+  refused "$img" -c core.pager=/tmp/x log || return 1
+  refused "$img" -c a.textconv=/tmp/x log || return 1
+  refused "$img" diff --outpu=/tmp/pwned || return 1       # abbreviated --output
+  refused "$img" diff --ou /tmp/pwned || return 1
   refused "$img" push origin work extra || return 1
   refused "$img" push -f || return 1
   refused "$img" -C log commit -m x || return 1          # an option's value taken for the verb
@@ -227,8 +242,10 @@ line2 -x	tab '$'\x01''end' got
   got=$(echo "$req" | jq -j .message 2>/dev/null) || { echo "the request is not valid JSON: $req"; return 1; }
   [ "$got" = "$msg" ] || { echo "the message did not round-trip: [$got]"; return 1; }
   o=$(shim_run "$img" push origin main:feature)
-  echo "$o" | grep -q 'REQ:{"type":"git.push","remote":"origin","refspec":"main:feature"}' || { echo "push request is wrong: $o"; return 1; }
+  echo "$o" | grep -q 'REQ:{"type":"git.push","remote":"origin","refspec":"main:feature","set_upstream":false}' || { echo "push request is wrong: $o"; return 1; }
   o=$(shim_run "$img" push origin work); echo "$o" | grep -q '"refspec":"work"' || { echo "push work: $o"; return 1; }
+  o=$(shim_run "$img" push -u origin work); echo "$o" | grep -q '"set_upstream":true' || { echo "push -u: $o"; return 1; }
+  o=$(shim_run "$img" push --set-upstream origin work:refs/heads/feature/x); echo "$o" | grep -q '"set_upstream":true' || { echo "push --set-upstream: $o"; return 1; }
   # reads pass through, with the real output
   o=$(shim_run "$img" log --oneline); echo "$o" | grep -q 'first commit' || { echo "log: $o"; return 1; }
   o=$(shim_run "$img" status --short); echo "$o" | grep -q '^rc=0$' || { echo "status: $o"; return 1; }

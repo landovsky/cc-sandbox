@@ -29,12 +29,31 @@ IN=${CCSBX_IN:-/run/ccsbx/in}
 WAIT=${CCSBX_GIT_TIMEOUT:-120}
 refuse() { echo "git: $*" >&2; exit 1; }
 
+# clean_ref NAME: slash-separated components, none empty, '.', '..' or starting with '-'.
+clean_ref() {
+  case "$1" in ""|/*|*/|*//*) return 1;; esac
+  _old=$IFS; IFS=/; set -f
+  for _c in $1; do
+    case "$_c" in ""|.|..|-*) IFS=$_old; set +f; return 1;; esac
+  done
+  IFS=$_old; set +f
+  return 0
+}
+# check_c_value K=V: a -c setting that would run a program (convenience: the host is the boundary).
+check_c_value() {
+  _k=$(printf '%s' "${1%%=*}" | tr 'A-Z' 'a-z')
+  case "$_k" in
+    diff.external|*.textconv|*.command|core.pager|pager.*|core.fsmonitor|core.hookspath|core.sshcommand|core.askpass|core.editor|alias.*|include.path|includeif.*|credential.*|url.*)
+      refuse "-c $_k is not allowed in the fence (it can run a program)";;
+  esac
+}
 # find_verb ARGS...: sets VERB (empty if none) and NSKIP (how many words come before it).
 find_verb() {
   VERB=""; NSKIP=0
   while [ $# -gt 0 ]; do
     case "$1" in
-      -C|-c|--git-dir|--work-tree|--namespace) [ $# -ge 2 ] || refuse "option $1 needs a value"; NSKIP=$((NSKIP + 2)); shift 2;;
+      -c) [ $# -ge 2 ] || refuse "option -c needs a value"; check_c_value "$2"; NSKIP=$((NSKIP + 2)); shift 2;;
+      -C|--git-dir|--work-tree|--namespace) [ $# -ge 2 ] || refuse "option $1 needs a value"; NSKIP=$((NSKIP + 2)); shift 2;;
       --git-dir=*|--work-tree=*|--namespace=*|--no-pager|-P|--no-optional-locks|--no-replace-objects|--literal-pathspecs|--no-lazy-fetch) NSKIP=$((NSKIP + 1)); shift;;
       --version|--help|-h|-v) VERB=""; return 0;;
       -*) refuse "option '$1' before the verb is not supported in the fence";;
@@ -56,7 +75,7 @@ check_read_args() {
   for a in "$@"; do
     if [ "$skip" -gt 0 ]; then skip=$((skip - 1)); continue; fi
     case "$a" in
-      --output|--output=*|-O*|--open-files-in-pager*|--ext-diff) refuse "$a is not allowed in the fence (it writes a file or runs a program)";;
+      --output|--output=*|--ou|--ou=*|--ou[!r]*|-O*|--open-files-in-pager*|--open-f*|--ext-diff|--ext-*) refuse "$a is not allowed in the fence (it writes a file or runs a program)";;
     esac
   done
 }
@@ -92,8 +111,11 @@ case "$VERB" in
     [ -n "$msg" ] || refuse "commit: -m MESSAGE is required"
     body=$(jq -cn --arg m "$msg" --argjson a "$all" '{type:"git.commit",message:$m,all:$a}') || refuse "commit: cannot encode the message" ;;
   push)
-    remote=""; refspec=""
+    remote=""; refspec=""; upstream=false
     for a in "$@"; do
+      case "$a" in
+        -u|--set-upstream) [ -z "$remote" ] || refuse "push: $a goes before the remote"; upstream=true; continue;;
+      esac
       if [ -z "$remote" ]; then remote=$a
       elif [ -z "$refspec" ]; then refspec=$a
       else refuse "push: too many arguments"; fi
@@ -105,11 +127,21 @@ case "$VERB" in
     if [ -n "$refspec" ]; then
       printf '%s' "$refspec" | grep -Eq '^[A-Za-z0-9._/][A-Za-z0-9._/-]*(:[A-Za-z0-9._/][A-Za-z0-9._/-]*)?$' \
         || refuse "push: refspec '$refspec' is not allowed (no '+' force, no ':ref' delete, no flags; SRC or SRC:DST)"
-      dst=${refspec#*:}
-      case "${dst#refs/heads/}" in main|master) refuse "push: pushing to ${dst} is not allowed from the fence";; esac
+      src=${refspec%%:*}
+      case "$refspec" in *:*) dst=${refspec#*:};; *) dst=$src;; esac
+      clean_ref "$src" || refuse "push: source '$src' is not a clean ref name (no empty, '.', '..' or '-' components)"
+      # The destination is a bare branch name (ONE component) or refs/heads/<clean name>. Anything
+      # else, such as heads/main (git expands it to refs/heads/main) or refs/heads//main, is refused,
+      # and the check is on the NORMALISED name, not on the text.
+      case "$dst" in
+        refs/heads/*) dname=${dst#refs/heads/}; clean_ref "$dname" || refuse "push: destination '$dst' is not a clean ref name";;
+        */*) refuse "push: destination '$dst' must be a branch name or refs/heads/<name>";;
+        *) dname=$dst; clean_ref "$dname" || refuse "push: destination '$dst' is not a clean ref name";;
+      esac
+      case "$dname" in main|master) refuse "push: pushing to $dname is not allowed from the fence";; esac
     fi
     [ -z "$refspec" ] || [ -n "$remote" ] || refuse "push: a refspec needs a remote"
-    body=$(jq -cn --arg r "$remote" --arg s "$refspec" '{type:"git.push",remote:$r,refspec:$s}') ;;
+    body=$(jq -cn --arg r "$remote" --arg s "$refspec" --argjson u "$upstream" '{type:"git.push",remote:$r,refspec:$s,set_upstream:$u}') ;;
 esac
 
 # --- send it and wait for the answer -------------------------------------------------------------

@@ -36,7 +36,7 @@ pin() { sed -n "s/^$1=//p" "$pins" | tail -1; }
 args=""
 # `|| [ -n "$k" ]`: a last line without a trailing newline is still read.
 while IFS='=' read -r k v || [ -n "$k" ]; do
-  case "$k" in ''|\#*) continue;; esac
+  case "$k" in ''|\#*|BASE_DIFF_ID) continue;; esac   # BASE_DIFF_ID is for the tests, not a build arg
   args="$args --build-arg $k=$v"
 done < "$pins"
 

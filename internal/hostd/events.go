@@ -121,6 +121,15 @@ func (h *Hostd) ingestEvents(gdir string, rec *start.Record, gen string, box *ou
 	var genN int
 	fmt.Sscanf(gen, "g%d", &genN)
 	taken, consumed := 0, 0
+	now := h.Cfg.Now()
+	if box.elast.IsZero() {
+		box.etokens, box.elast = float64(h.Cfg.EventBurst), now
+	}
+	box.etokens += now.Sub(box.elast).Seconds() * h.Cfg.EventRate
+	if box.etokens > float64(h.Cfg.EventBurst) {
+		box.etokens = float64(h.Cfg.EventBurst)
+	}
+	box.elast = now
 	for consumed < len(chunk) && taken < h.Cfg.MaxEventsPerScan {
 		nl := bytes.IndexByte(chunk[consumed:], '\n')
 		if nl < 0 {
@@ -141,6 +150,12 @@ func (h *Hostd) ingestEvents(gdir string, rec *start.Record, gen string, box *ou
 			st.Reasons["events_bad_line"]++
 			continue
 		}
+		if box.etokens < 1 {
+			// Over budget: the line is consumed (so the fence can't make a backlog) and counted.
+			st.Reasons["events_shed"]++
+			continue
+		}
+		box.etokens--
 		jr, err := h.Cfg.Journal.Append(journal.Event{Sid: rec.Sid, Gen: genN, Node: rec.Spec.Label, Realm: rec.Spec.Realm, Src: "fence", Type: typ, Data: data})
 		if err != nil {
 			h.Cfg.Logf("hostd: journal append failed: %v", err)

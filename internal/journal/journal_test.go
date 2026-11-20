@@ -2,6 +2,7 @@ package journal
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -388,5 +389,138 @@ func TestIdleNotificationTypeBlock(t *testing.T) {
 	s.Append(hookG("hook.Notification", 1, `{"notification_type":"idle_prompt"}`))
 	if _, ok := s.IdleSince("s1", 1); ok {
 		t.Fatal("idle_prompt promoted a busy pane")
+	}
+}
+
+// ---- review of PR #4: a failed write must not corrupt acknowledged records; replay in time order ----
+
+// context: the disk fills mid-record (a fence can make that happen on purpose). The half line must
+// not stay: the next good append would run on from it, readers would stall at the merged line, and
+// a restart would cut the acknowledged records after it and hand their seq numbers out again.
+func TestFailedWriteIsRolledBackAndNoSeqIsReusedBlock(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	s.Append(ev("a"))
+	s.Append(ev("b"))
+	s.writeFile = func(f *os.File, b []byte) (int, error) {
+		n, _ := f.Write(b[:len(b)/2]) // ENOSPC after half a line
+		return n, os.ErrInvalid
+	}
+	if _, err := s.Append(ev("lost")); err == nil {
+		t.Fatal("a failed write was acknowledged")
+	}
+	s.writeFile = nil
+	r, err := s.Append(ev("c"))
+	if err != nil || r.Seq != 3 {
+		t.Fatalf("append after a failed write: seq %d err %v", r.Seq, err)
+	}
+	got, _ := s.After(0, "", "", 0)
+	if len(got) != 3 || got[2].Type != "c" {
+		t.Fatalf("readers stall or see the lost record: %v", seqs(got))
+	}
+	s.Close()
+	s2 := open(t, dir) // the restart must keep what was acknowledged
+	got, _ = s2.After(0, "", "", 0)
+	if len(got) != 3 || got[2].Type != "c" || got[2].Seq != 3 {
+		t.Fatalf("restart lost acknowledged records: %v", seqs(got))
+	}
+}
+
+// context: fsync fails after the whole line was written. The line is in the page cache but was
+// never acknowledged; it must not stay (two records with one seq would both replay).
+func TestFailedFsyncDoesNotLeaveADuplicateSeqBlock(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	s.Append(ev("a"))
+	s.syncFile = func(*os.File) error { return os.ErrInvalid }
+	if _, err := s.Append(ev("x")); err == nil {
+		t.Fatal("a failed fsync was acknowledged")
+	}
+	s.syncFile = nil
+	s.Append(ev("y"))
+	s.Close()
+	got, _ := open(t, dir).After(0, "", "", 0)
+	if len(got) != 2 || got[1].Type != "y" || got[1].Seq != 2 {
+		t.Fatalf("%v", seqs(got))
+	}
+}
+
+// context: a write failed AND the cut-back failed too: we no longer know what is in the file, so
+// appending more would risk the acknowledged records. Refuse everything until a reopen.
+func TestUnrecoverableWriteFailureRefusesFurtherAppends(t *testing.T) {
+	s := open(t, t.TempDir())
+	s.Append(ev("a"))
+	s.writeFile = func(f *os.File, b []byte) (int, error) {
+		f.Close() // the file is gone: neither the write nor the truncate can work
+		return 0, os.ErrInvalid
+	}
+	s.Append(ev("x"))
+	s.writeFile = nil
+	if _, err := s.Append(ev("y")); err == nil || !errors.Is(err, ErrBroken) {
+		t.Fatalf("appended to a journal in an unknown state: %v", err)
+	}
+}
+
+// context: hostd restarts just after UTC midnight. The worker's last Stop was yesterday, but today
+// it started a turn (or shows a permission menu). Replaying the newest day FIRST let yesterday win,
+// so the pane looked idle and a queued message was typed into the menu.
+func TestIdleAfterRestartAcrossMidnightUsesTheNewestEventBlock(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	s.Now = func() time.Time { return time.Date(2026, 11, 19, 23, 50, 0, 0, time.UTC) }
+	s.Append(hook("hook.Stop"))
+	s.Now = func() time.Time { return time.Date(2026, 11, 20, 0, 10, 0, 0, time.UTC) }
+	s.Append(hookG("hook.Notification", 1, `{"notification_type":"permission_prompt"}`))
+	if _, ok := s.IdleSince("s1", 1); ok {
+		t.Fatal("not idle before the restart either")
+	}
+	s.Close()
+	s2 := open(t, dir)
+	if _, ok := s2.IdleSince("s1", 1); ok {
+		t.Fatal("after the restart yesterday's Stop won: a menu would get a paste")
+	}
+}
+
+// context: the allow side of the above: today's Stop after yesterday's busy state is idle.
+func TestIdleAfterRestartAcrossMidnightAllow(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	s.Now = func() time.Time { return time.Date(2026, 11, 19, 23, 50, 0, 0, time.UTC) }
+	s.Append(hook("hook.UserPromptSubmit"))
+	s.Now = func() time.Time { return time.Date(2026, 11, 20, 0, 10, 0, 0, time.UTC) }
+	s.Append(hook("hook.Stop"))
+	s.Close()
+	if _, ok := open(t, dir).IdleSince("s1", 1); !ok {
+		t.Fatal("idle lost")
+	}
+}
+
+// context: an I/O hiccup reading the epoch file at startup must not mint a new epoch (every
+// consumer would see epoch_changed and replay from scratch).
+func TestUnreadableEpochIsNotReplaced(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	s.Close()
+	ep := filepath.Join(dir, "epoch")
+	os.Remove(ep)
+	os.Mkdir(ep, 0o700) // reading a directory fails with EISDIR, not ENOENT
+	if _, err := Open(dir, "hp-ubuntu", 0); err == nil {
+		t.Fatal("a read error made a new epoch")
+	}
+}
+
+// context: the clock stepped back across midnight, so higher seqs sit in an older-named segment;
+// the next seq after a restart must come from the maximum over all segments, not the last name.
+func TestRestartTakesTheHighestSeqOverAllSegments(t *testing.T) {
+	dir := t.TempDir()
+	s := open(t, dir)
+	s.Now = func() time.Time { return time.Date(2026, 11, 20, 0, 5, 0, 0, time.UTC) }
+	s.Append(ev("a")) // seq 1 in seg-20261120
+	s.Now = func() time.Time { return time.Date(2026, 11, 19, 23, 59, 0, 0, time.UTC) }
+	s.Append(ev("b")) // seq 2 in the OLDER-named segment
+	s.Close()
+	r, err := open(t, dir).Append(ev("c"))
+	if err != nil || r.Seq != 3 {
+		t.Fatalf("seq %d err %v", r.Seq, err)
 	}
 }

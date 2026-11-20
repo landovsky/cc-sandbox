@@ -86,7 +86,15 @@ type Store struct {
 	curDay  string
 	waiters []chan struct{}
 	hooks   map[hookKey]hookState // (sid, gen) -> where the fence says its prompt is
+	broken  error                 // set when a failed write could not be rolled back: every Append is refused
+
+	// Test seams for an injected write / fsync failure (nil: the real call).
+	writeFile func(f *os.File, b []byte) (int, error)
+	syncFile  func(f *os.File) error
 }
+
+// ErrBroken is returned by Append after a failed write that could not be rolled back.
+var ErrBroken = errors.New("journal_broken")
 
 // hookKey is per generation: a resumed session's new generation starts at its own startup
 // (trust dialog, resume picker), whatever the previous generation's last Stop said.
@@ -115,7 +123,12 @@ func Open(dir, machine string, retentionDays int) (*Store, error) {
 	}
 	s := &Store{Dir: dir, Machine: machine, RetentionDays: retentionDays}
 	ep := filepath.Join(dir, "epoch")
-	if b, err := os.ReadFile(ep); err == nil && len(bytes.TrimSpace(b)) > 0 {
+	b, rerr := os.ReadFile(ep)
+	if rerr != nil && !os.IsNotExist(rerr) {
+		// A read error is not "no epoch": minting a new one would make every consumer start over.
+		return nil, fmt.Errorf("journal epoch unreadable: %w", rerr)
+	}
+	if rerr == nil && len(bytes.TrimSpace(b)) > 0 {
 		s.epoch = strings.TrimSpace(string(b))
 	} else {
 		s.epoch = "e" + strings.ToLower(ulid.New()[16:])
@@ -130,13 +143,15 @@ func Open(dir, machine string, retentionDays int) (*Store, error) {
 	return s, nil
 }
 
-// rebuildHooks restores the per-session "last hook" from the newest segment, so a daemon
+// rebuildHooks restores the per-session "last hook" from the newest two segments (replayed in
+// time order, so a restart across UTC midnight keeps today's state, not yesterday's), so a daemon
 // restart doesn't forget that a session is mid-turn. A session with no hook event in it is
 // simply unknown, and unknown is never idle.
 func (s *Store) rebuildHooks() {
 	s.hooks = map[hookKey]hookState{}
 	segs := s.segments()
-	for i := len(segs) - 1; i >= 0 && i >= len(segs)-2; i-- {
+	// Oldest first: noteHook overwrites, so the newest record must be folded last.
+	for i := max(0, len(segs)-2); i < len(segs); i++ {
 		recs, _, _ := scan(filepath.Join(s.Dir, segs[i]))
 		for _, r := range recs {
 			s.noteHook(r)
@@ -227,14 +242,19 @@ func (s *Store) recover() error {
 		if err != nil {
 			return err
 		}
-		if i == len(segs)-1 {
-			if st, err := os.Stat(p); err == nil && st.Size() != goodLen {
-				if err := os.Truncate(p, goodLen); err != nil {
-					return err
-				}
+		if st, err := os.Stat(p); err == nil && st.Size() != goodLen {
+			if i != len(segs)-1 {
+				// Only the newest segment can have a torn tail. Cutting an older one would
+				// silently delete acknowledged records: refuse to open instead.
+				return fmt.Errorf("journal segment %s is corrupt after byte %d (not the newest segment): refusing to cut it", segs[i], goodLen)
+			}
+			if err := os.Truncate(p, goodLen); err != nil {
+				return err
 			}
 		}
-		if len(recs) > 0 && s.seq == 0 {
+		// The highest seq over ALL segments: a clock that stepped back across midnight can put
+		// higher seqs in an older-named file.
+		if len(recs) > 0 && recs[len(recs)-1].Seq > s.seq {
 			s.seq = recs[len(recs)-1].Seq
 		}
 	}
@@ -281,6 +301,9 @@ func scan(path string) (recs []Record, goodLen int64, err error) {
 func (s *Store) Append(e Event) (Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.broken != nil {
+		return Record{}, s.broken
+	}
 	t := s.now().UTC()
 	id := e.ID
 	if !ulid.Valid(id) {
@@ -303,11 +326,34 @@ func (s *Store) Append(e Event) (Record, error) {
 		}
 		s.cur, s.curDay = f, day
 	}
-	if _, err := s.cur.Write(append(b, '\n')); err != nil {
-		return rec, err
+	// Remember where the segment ends, so a failed write or fsync can be cut back: bytes of a
+	// record that was never acknowledged must not stay (the next append would run on from
+	// them, readers would stall at the merged line, and a restart would cut acknowledged
+	// records after it and reuse their seqs).
+	st, err := s.cur.Stat()
+	if err != nil {
+		return rec, s.fail(err)
 	}
-	if err := s.cur.Sync(); err != nil {
-		return rec, err
+	good := st.Size()
+	var werr error
+	if s.writeFile != nil {
+		_, werr = s.writeFile(s.cur, append(b, '\n'))
+	} else {
+		_, werr = s.cur.Write(append(b, '\n'))
+	}
+	if werr == nil {
+		if s.syncFile != nil {
+			werr = s.syncFile(s.cur)
+		} else {
+			werr = s.cur.Sync()
+		}
+	}
+	if werr != nil {
+		if terr := s.cur.Truncate(good); terr != nil {
+			s.broken = fmt.Errorf("%w: write failed (%v) and could not be rolled back (%v)", ErrBroken, werr, terr)
+			return rec, s.broken
+		}
+		return rec, werr
 	}
 	s.seq = rec.Seq
 	s.noteHook(rec)
@@ -518,4 +564,11 @@ func (s *Store) Advance(name string, seq int64, epoch, treeSHA string) (Cursor, 
 	}
 	b, _ := json.Marshal(c)
 	return c, writeAtomic(s.cursorPath(name), append(b, '\n'))
+}
+
+// fail marks the store broken: after an error we can't reason about, appending would risk
+// corrupting acknowledged records, so every Append is refused until the daemon reopens it.
+func (s *Store) fail(err error) error {
+	s.broken = fmt.Errorf("%w: %v", ErrBroken, err)
+	return s.broken
 }

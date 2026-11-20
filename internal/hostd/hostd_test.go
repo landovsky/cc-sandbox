@@ -394,7 +394,7 @@ func TestOutboxHostWriteRefusedBlock(t *testing.T) {
 		t.Skip("twin only: red in direct mode until gate M")
 	}
 	state := t.TempDir()
-	s := backend.Spec{Sid: sid, Gen: 1, Label: "x", StateDir: state, Workdir: "/srv/ccsbx-test-work"}
+	s := backend.Spec{Sid: sid, Gen: 1, Label: "x", StateDir: state, Workdir: "/srv/ccsbx-test-work", NotEvid: true}
 	if err := s.Prepare(); err != nil {
 		t.Fatal(err)
 	}

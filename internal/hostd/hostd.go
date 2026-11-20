@@ -87,6 +87,8 @@ type Config struct {
 	Journal          Journal              // nil: events.jsonl is not ingested (U3a alone)
 	MaxEventsPerScan int                  // events taken from one outbox per scan
 	MaxEventLine     int                  // bytes per events.jsonl line; longer lines are dropped
+	EventRate        float64              // fence events journaled per second per outbox; beyond: dropped and counted
+	EventBurst       int                  // event bucket size per outbox
 	Now              func() time.Time
 	Logf             func(format string, args ...any)
 }
@@ -117,6 +119,12 @@ func (c *Config) Defaults() {
 	if c.MaxEventsPerScan == 0 {
 		c.MaxEventsPerScan = 500
 	}
+	if c.EventRate == 0 {
+		c.EventRate = 50
+	}
+	if c.EventBurst == 0 {
+		c.EventBurst = 500
+	}
 	if c.MaxEventLine == 0 {
 		c.MaxEventLine = 4096
 	}
@@ -143,6 +151,8 @@ type outbox struct {
 	seen     map[string]uint64 // name -> inode already processed
 	tokens   float64
 	last     time.Time
+	etokens  float64 // fence-event budget (a fence journaling in a loop would fill the disk)
+	elast    time.Time
 	total    int
 	overflow bool
 	drained  bool
@@ -205,14 +215,21 @@ func (h *Hostd) Scan() Stats {
 		// A generation that is not the record's live one speaks for nobody: its requests are
 		// answered `stale` and never reach a handler, whether or not it left a CLOSED marker
 		// (a SIGKILLed `ccsbx run` leaves none). One pass drains it, then it is forgotten.
-		stale := genN != rec.Gen || rec.Ended != nil
+		//
+		// The record's OWN generation that has since ended is different: hostd may have been
+		// down while the session finished, and its last ccf.done / ccf.outcome / ccf.checkpoint
+		// and final hook events are real progress (invariant 28: a down daemon loses
+		// visibility, never progress). Those are drained normally; only requests that would act
+		// with live authority (msg.*, git.*, grant.*) are refused as stale.
+		stale := genN != rec.Gen
+		ended := !stale && rec.Ended != nil
 		h.loadState(gdir, box)
 		h.lifecycle(gdir, rec, box, "session.started")
-		h.scanOne(gdir, sid, gen, rec, box, stale, &st)
-		if !stale { // a dead generation's hook events are not the live node's state
+		h.scanOne(gdir, sid, gen, rec, box, stale, ended, &st)
+		if !stale { // a superseded generation's hook events are not the live node's state
 			h.ingestEvents(gdir, rec, gen, box, &st)
 		}
-		if closedErr == nil || stale {
+		if closedErr == nil || stale || ended {
 			if !stale {
 				h.ingestEvents(gdir, rec, gen, box, &st) // the final drain
 			}
@@ -224,7 +241,7 @@ func (h *Hostd) Scan() Stats {
 	return st
 }
 
-func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, stale bool, st *Stats) {
+func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, stale, ended bool, st *Stats) {
 	root, err := OpenRoot(filepath.Join(gdir, "out"))
 	if err != nil {
 		return
@@ -322,6 +339,14 @@ func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, s
 			st.Refused++
 			st.Reasons["unknown_type"]++
 			h.reply(gdir, Reply{Rid: rid, ID: id, Status: "refused", Result: map[string]string{"code": "unknown_type"}})
+			continue
+		}
+		if ended && !progressType(typ) {
+			box.seen[n] = ino
+			h.ledger(gdir, n, ino, id, "refused:stale")
+			h.reply(gdir, Reply{Rid: rid, ID: id, Status: "stale", Result: map[string]string{"code": "stale_generation"}})
+			st.Refused++
+			st.Reasons["stale"]++
 			continue
 		}
 		req := Request{
@@ -504,3 +529,7 @@ func (h *Hostd) Run(interval time.Duration, stop <-chan struct{}) {
 		}
 	}
 }
+
+// progressType: what an ended generation may still have its last words taken for. Everything
+// that would act with live authority (a message, a git write, a grant) is not here.
+func progressType(typ string) bool { return strings.HasPrefix(typ, "ccf.") }

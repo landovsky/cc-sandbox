@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/journal"
 	"github.com/landovsky/cc-sandbox/internal/start"
@@ -225,4 +226,82 @@ func TestReingestedRequestKeepsItsFirstUlid(t *testing.T) {
 	if len(f.got) != 1 || f.got[0].ID != first {
 		t.Fatalf("first %s again %+v", first, f.got)
 	}
+}
+
+// ---- review of PR #4: budget for fence events, and the last words of an ended generation ----
+
+// context: a fence appends tiny hook lines in a loop. Every journaled event is an fsync and 14 days
+// of disk, so one outbox gets a budget; the rest is dropped and counted, never queued.
+func TestFenceEventsHaveABudgetBlock(t *testing.T) {
+	f := newFixture(t, func(c *Config) { c.EventBurst = 10; c.EventRate = 1; c.MaxEventsPerScan = 10000 })
+	j := f.withJournal(t.TempDir())
+	var lines []string
+	for i := 0; i < 200; i++ {
+		lines = append(lines, `{"type":"hook.PreToolUse","data":{}}`+"\n")
+	}
+	f.appendEvents(lines...)
+	st := f.h.Scan()
+	recs, _ := j.After(0, "", "", 0)
+	fence := 0
+	for _, r := range recs {
+		if r.Src == "fence" {
+			fence++
+		}
+	}
+	if fence > 12 || st.Reasons["events_shed"] < 150 {
+		t.Fatalf("journaled %d of 200 fence events, shed %d", fence, st.Reasons["events_shed"])
+	}
+}
+
+// context: the allow side: a busy but ordinary session (a few events per second) loses nothing.
+func TestFenceEventsWithinTheBudgetAreAllJournaledAllow(t *testing.T) {
+	f := newFixture(t, nil)
+	j := f.withJournal(t.TempDir())
+	var lines []string
+	for i := 0; i < 40; i++ {
+		lines = append(lines, `{"type":"hook.PostToolUse","data":{}}`+"\n")
+	}
+	f.appendEvents(lines...)
+	f.h.Scan()
+	recs, _ := j.After(0, "", "", 0)
+	fence := 0
+	for _, r := range recs {
+		if r.Src == "fence" {
+			fence++
+		}
+	}
+	if fence != 40 {
+		t.Fatalf("journaled %d of 40", fence)
+	}
+}
+
+// context: hostd was down while the session finished (its record got Ended). The last result and the
+// final hook events are real progress (invariant 28); only requests that act with live authority
+// (a message, a git write, a grant) are refused as stale.
+func TestEndedGenerationsLastWordsAreKeptButItCannotActAllow(t *testing.T) {
+	f := newFixture(t, nil)
+	j := f.withJournal(t.TempDir())
+	f.setRecord(func(r *start.Record) { now := time.Now(); r.Ended = &now })
+	f.req("done.json", `{"type":"ccf.done"}`)
+	f.req("msg.json", `{"type":"msg.send"}`)
+	f.appendEvents(`{"type":"hook.Stop","data":{}}` + "\n")
+	f.h.Scan()
+	if len(f.got) != 1 || f.got[0].Type != "ccf.done" {
+		t.Fatalf("the final done was not handled: %+v", f.got)
+	}
+	if r, _ := f.reply("msg"); r.Status != "stale" {
+		t.Fatalf("an ended generation sent a message: %+v", r)
+	}
+	if got := types(func() []journal.Record { r, _ := j.After(0, "", "", 0); return r }()); !contains(got, "fence:hook.Stop") {
+		t.Fatalf("final events lost: %v", got)
+	}
+}
+
+func contains(l []string, s string) bool {
+	for _, x := range l {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }

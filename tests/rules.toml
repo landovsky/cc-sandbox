@@ -1807,3 +1807,54 @@ block = "tests/go-test.sh ./internal/side 'TestServeRefusesAHalfWiredConfigurati
 invariants = [12]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "m2c-remote-start-owner-only"
+title = "a remote start (POST /v1/sessions) is the owner's alone: a peer daemon, an unknown node and the local socket are refused, every refusal in the contract's one shape with its status (409 already_running carries machine and sid, 429/409 carry Retry-After), and an internal error's text never reaches the caller"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/daemonapi TestOnlyTheOwnerStartsASessionRemotely"
+block = "tests/twin-go.sh ./internal/daemonapi TestRefusalsHaveTheContractsStatusAndShape"
+invariants = [5]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "m2c-remote-caller-cannot-widen"
+title = "a remote caller cannot ask for more than the profile allows (grants, harness flags), run as another owner or on another machine, point the workdir outside the worktree root (symlink, sibling prefix, hidden home dir, ..), resume a session it did not start, or use up the owner's local budget"
+suite = "msg"
+allow = "tests/twin-go.sh ./cmd/ccsbx-hostd TestARemoteStartIsRecordedWithWhoAskedAndRetriesAreIdempotent"
+block = "tests/twin-go.sh ./internal/remotestart TestARemoteCallerCannotAskForWhatTheProfileDoesNotAllowBlock"
+invariants = [5, 15]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "m2c-one-generation-per-label"
+title = "one live generation per label across machines: any peer with the label live or reserved refuses (no tie-break), an unreachable peer or a different peer set refuses, two machines starting at once never both launch, and a LOCAL start asks the peers too"
+suite = "msg"
+allow = "tests/twin-go.sh ./cmd/ccsbx-hostd TestALocalStartAsksThePeersToo"
+block = "tests/twin-go.sh ./internal/remotestart TestTwoMachinesStartingTheSameLabelAtOnceNeverBothLaunch"
+invariants = [15]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "m2c-retry-is-idempotent"
+title = "a retry after a lost answer starts nothing and gets the first reply (brief excluded from the sameness check); a retry while still launching is told to come back, never already_running; a refused attempt leaves no trace"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/remotestart TestARetryAfterALostAnswerStartsNothingAndGetsTheFirstReply"
+block = "tests/twin-go.sh ./internal/remotestart TestARetryWhileTheFirstAttemptIsStillLaunchingIsToldToComeBackNotAlreadyRunning"
+invariants = [15]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "hostd-outbox-seen-names-bounded"
+title = "hostd's per-outbox set of handled names stops growing past the lifetime cap, so a fence creating new names without end cannot exhaust the daemon's memory"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/hostd TestTheSeenNamesSetIsBoundedWhenAFenceFloodsNewNames"
+block = "tests/twin-go.sh ./internal/hostd TestTheSeenNamesSetIsBoundedWhenAFenceFloodsNewNames"
+invariants = [13]
+backends = ["unit"]
+where = "hp"
+

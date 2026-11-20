@@ -254,6 +254,26 @@ func TestCheckBinaryRefusesWhatOthersCouldChange(t *testing.T) {
 		t.Fatal("a binary in a world-writable directory was accepted")
 	}
 	os.Chmod(dir, 0o755)
+	// a symlink at an innocent path into a directory others can write is as bad as the binary being there
+	wdir := t.TempDir()
+	os.Chmod(wdir, 0o777)
+	wbin := filepath.Join(wdir, "tailscale")
+	os.WriteFile(wbin, []byte("#!/bin/sh\n"), 0o755)
+	link := filepath.Join(dir, "ts-link")
+	os.Symlink(wbin, link)
+	if CheckBinary(link) == nil {
+		t.Fatal("a symlink into a world-writable directory was accepted")
+	}
+	// a writable directory ABOVE the binary's own (the whole chain is checked)
+	deep := filepath.Join(dir, "a", "b")
+	os.MkdirAll(deep, 0o755)
+	dbin := filepath.Join(deep, "tailscale")
+	os.WriteFile(dbin, []byte("#!/bin/sh\n"), 0o755)
+	os.Chmod(filepath.Join(dir, "a"), 0o777)
+	if CheckBinary(dbin) == nil {
+		t.Fatal("a binary below a world-writable ancestor was accepted")
+	}
+	os.Chmod(filepath.Join(dir, "a"), 0o755)
 	if CheckBinary("tailscale") == nil {
 		t.Fatal("a bare name (PATH lookup) was accepted")
 	}

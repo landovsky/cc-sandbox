@@ -194,6 +194,29 @@ func TestALocalProcessOnTheMachinesOwnTailnetAddressIsRefused(t *testing.T) {
 	}
 }
 
+// context (M1, review nit): "a connection from one of this machine's own addresses is a local process" must hold for
+// whatever address the machine really has, not only the one the connection says it arrived on.
+func TestAnAddressOfAnyLocalInterfaceCountsAsLocal(t *testing.T) {
+	addrs, _ := net.InterfaceAddrs()
+	found := false
+	for _, a := range addrs {
+		if ipn, ok := a.(*net.IPNet); ok {
+			if ip, ok := netip.AddrFromSlice(ipn.IP); ok {
+				found = true
+				if !localIP(ip.Unmap(), nil) {
+					t.Errorf("%v is this machine's own address but was not treated as local", ip)
+				}
+			}
+		}
+	}
+	if !found {
+		t.Skip("no interface addresses")
+	}
+	if localIP(netip.MustParseAddr("100.64.77.77"), nil) {
+		t.Error("an address no interface has was treated as local")
+	}
+}
+
 // context (M2): a web page in the owner's browser reaches the listener through the owner's device, so the
 // network identity says "owner". Rebinding, an Origin header, a cross-site fetch and a form-style POST are
 // what such a page can do; none may pass.

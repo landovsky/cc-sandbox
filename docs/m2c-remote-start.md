@@ -7,7 +7,7 @@ contract changes of the M2a security review (C1-C8) and the questions of the C12
 evidence.
 
 ## The call
-`POST https://<machine>:7480/v1/sessions` (the tailnet listener of M2a), `Content-Type: application/json` (any
+`POST http://<machine>:7480/v1/sessions` (the tailnet listener of M2a: plain HTTP over the tailnet's WireGuard hop, there is no TLS terminator in front of it; a client that wants `https://` needs one added, and the daemon would then see the proxy's address, not the caller's, so WhoIs could not classify it), `Content-Type: application/json` (any
 other type: `415 {"refused":"unsupported_media_type"}`), body = the LaunchSpec of plan §4.1 (at most 256 KiB),
 decoded STRICTLY: an unknown field is refused.
 
@@ -38,6 +38,7 @@ fields named below), the shape `ccsbx start --json` already prints. Clients read
 | `peer_set_mismatch` | 503 | this machine's list of peers differs from a peer's, see (3) |
 | `billing_unavailable`, `image_not_pinned`, `wrong_machine`, `bad_spec`, `request_id_reused`, `not_built` | 422 | the spec is not startable as sent; fix and resend |
 | `unsupported_media_type` | 415 | not `application/json` |
+| `internal` | 500 | the start failed on this machine for a reason that is not the caller's; the message says nothing of it (the daemon's log has it) |
 | (body unreadable, over 256 KiB, not JSON, unknown field) | 400 `bad_spec` | |
 `message` never contains the request's text (a brief can hold anything).
 
@@ -72,7 +73,11 @@ neither can start two generations.
 4. Otherwise launch. The reservation is held until the launch outcome is KNOWN: renewed while the launch runs
    (it may exceed 60 s on k8s), kept on disk, and reconciled at daemon start (a reservation with no live record
    and no launch in flight is dropped; one with a launch in flight is resolved from the record).
-Every machine must ask the same set of peers: the list is one shared setting (`--peers`), and a daemon compares
+The check runs for EVERY start, a local `ccsbx start` on the unix socket included (same reservation, same peers): otherwise a
+remote start from the Mac and a local start on hp one second apart would both launch. A local retry of a request already
+started is answered by the start's own idempotency, not refused because its label is now live.
+Every machine must ask the same set of peers: the list is one shared setting (`--peers name=url,...`: the OTHER machines, `url` their
+tailnet listener, plain http), and a daemon compares
 the hash of its list with each peer's (`/v1/info` carries `peer_set`) at start and when asking; a difference is
 `peer_set_mismatch`, so asymmetric lists cannot produce silent doubles.
 **Accepted, in writing:** one listed peer being down refuses EVERY start on EVERY machine (with hp down, the Mac

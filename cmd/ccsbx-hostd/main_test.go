@@ -290,3 +290,27 @@ func TestTailnetListenerIsOffByDefaultAndRefusesBadConfig(t *testing.T) {
 		}
 	}
 }
+
+// context (M2c): the remote start's knobs are flags (--help lists them), and a --peers list that could never work
+// (not name=url, a repeat, this machine itself, a non-http url) is a startup error, not a start that refuses forever.
+func TestRemoteStartFlagsAreListedAndABadPeerListIsRefusedAtStart(t *testing.T) {
+	_, h := runHostd("run", "--help")
+	for _, w := range []string{"-owner-user", "-peers", "-remote-max-per-hour", "-remote-per-user-minute", "-remote-per-machine-minute", "-peer-ask-timeout", "-known-machines"} {
+		if !strings.Contains(h, w) {
+			t.Errorf("--help does not list %s", w)
+		}
+	}
+	for _, peers := range []string{"mac", "mac=ftp://x", "mac=http://a,mac=http://b", "hp-ubuntu=http://self:7480", "a b=http://x"} {
+		base := []string{"run", "--state", t.TempDir(), "--local-socket", "-", "--machine", "hp-ubuntu", "--peers", peers}
+		done := make(chan int, 1)
+		go func() { c, _ := runHostd(base...); done <- c }()
+		select {
+		case c := <-done:
+			if c == 0 {
+				t.Errorf("--peers %q: started", peers)
+			}
+		case <-time.After(3 * time.Second):
+			t.Errorf("--peers %q: the daemon started", peers)
+		}
+	}
+}

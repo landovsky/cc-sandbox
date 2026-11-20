@@ -780,3 +780,26 @@ func TestFailedReplyWriteIsLoggedAndCounted(t *testing.T) {
 		t.Fatalf("not logged with the session and rid:\n%s", all)
 	}
 }
+
+// context (F3b review): the set of outbox names hostd has already handled grew with every name a fence ever created,
+// shed ones included, so a fence creating new names without end could grow the daemon's memory without end. Once an
+// outbox is over its lifetime cap the set stops growing at a fixed bound, and nothing past the cap is ever handled.
+func TestTheSeenNamesSetIsBoundedWhenAFenceFloodsNewNames(t *testing.T) {
+	f := newFixture(t, func(c *Config) { c.MaxTotal = 10; c.Burst = 1000; c.Rate = 1000; c.MaxList = 1000 })
+	for round := 0; round < 5; round++ {
+		for i := 0; i < 200; i++ {
+			f.req(fmt.Sprintf("r%02d%04d.json", round, i), `{"type":"hook.Stop"}`)
+		}
+		f.h.Scan()
+	}
+	box := f.h.boxes[f.g]
+	if box == nil {
+		t.Fatal("no outbox state")
+	}
+	if n := len(box.seen); n > 2*10 {
+		t.Fatalf("%d names remembered after 1000 new names with a cap of 10 (bound %d)", n, 20)
+	}
+	if len(f.got) > 10 {
+		t.Fatalf("%d requests handled past the lifetime cap of 10", len(f.got))
+	}
+}

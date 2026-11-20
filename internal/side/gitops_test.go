@@ -75,6 +75,8 @@ func newGitRig(t *testing.T, mut func(*GitConfig)) *gitRig {
 	os.WriteFile(filepath.Join(scratch, "run.sh"), []byte("#!/bin/sh\n"), 0o755)
 	os.MkdirAll(filepath.Join(scratch, "sub"), 0o755)
 	os.WriteFile(filepath.Join(scratch, "sub", "x.txt"), []byte("x\n"), 0o644)
+	os.MkdirAll(filepath.Join(scratch, "deep", "inner"), 0o755)
+	os.WriteFile(filepath.Join(scratch, "deep", "inner", "y.txt"), []byte("y\n"), 0o644)
 	sh(t, scratch, nil, "add", "-A")
 	sh(t, scratch, nil, "commit", "-q", "-m", "base")
 	sh(t, scratch, nil, "push", "-q", r.bare, "main")
@@ -411,7 +413,8 @@ func TestTheFenceCannotReachGitThroughTheForwarder(t *testing.T) {
 		resp.Body.Close()
 		return resp.StatusCode
 	}
-	for _, p := range []string{"/egress/git/o/r.git/git-receive-pack", "/egress/git/o/r.git/git-upload-pack", "/egress/git/o/r.git/info/refs?service=git-receive-pack", "/egress/git/other/repo.git/git-receive-pack"} {
+	for _, p := range []string{"/egress/Git/o/r.git/git-receive-pack", "/egress/GIT/o/r.git/info/refs", "/egress/gIt/o/r.git/git-upload-pack",
+		"/egress/git/o/r.git/git-receive-pack", "/egress/git/o/r.git/git-upload-pack", "/egress/git/o/r.git/info/refs?service=git-receive-pack", "/egress/git/other/repo.git/git-receive-pack"} {
 		for _, gate := range []string{"", "guess", strings.Repeat("a", 64), r.gate + "x", r.gate[:len(r.gate)-1]} {
 			m := "POST"
 			if strings.Contains(p, "info/refs") {
@@ -808,5 +811,65 @@ func TestTheSidecarUsesTheSharedNameRules(t *testing.T) {
 		if ValidBranch(b) || gitname.Branch(b) == nil {
 			t.Errorf("%q accepted: sidecar %v, shared %v", b, ValidBranch(b), gitname.Branch(b))
 		}
+	}
+}
+
+// context "the fence swaps the directory the clone has just created for a link to the sidecar's own volume, after its mkdir
+// and before its first child": os.Root refuses the escape mid-copy, the clone fails, and nothing was written outside. (The
+// earlier test planted the link before the copy began, which proves O_EXCL, not this.)
+func TestALinkSwappedInMidCopyCannotRedirectTheClone(t *testing.T) {
+	r := newGitRig(t, nil)
+	outside := filepath.Join(r.root, "side-state")
+	os.MkdirAll(outside, 0o700)
+	os.WriteFile(filepath.Join(outside, "victim"), []byte("UNTOUCHED"), 0o600)
+	swapped := false
+	r.g.hookCopyEntry = func(name string) {
+		if name == filepath.Join("sub", "x.txt") && !swapped { // sub/ now exists in /work, its child is next
+			swapped = true
+			os.RemoveAll(filepath.Join(r.work, "sub"))
+			os.Symlink(outside, filepath.Join(r.work, "sub"))
+		}
+	}
+	if err := r.g.Clone(context.Background()); err == nil || !swapped {
+		t.Fatalf("clone: %v (swapped %v)", err, swapped)
+	}
+	if es, _ := os.ReadDir(outside); len(es) != 1 {
+		t.Errorf("something was written outside the worktree: %v", es)
+	}
+}
+
+// context "the fetch takes seconds and the fence may start writing before it ends": /work is checked empty again right before
+// the copy, so a file created in between stops the clone before the sidecar touches anything.
+func TestTheWorktreeIsCheckedEmptyAgainRightBeforeTheCopy(t *testing.T) {
+	r := newGitRig(t, nil)
+	r.g.hookCopy = func() { os.WriteFile(filepath.Join(r.work, "late"), []byte("x"), 0o644) }
+	if err := r.g.Clone(context.Background()); err == nil || !strings.Contains(err.Error(), "not empty") {
+		t.Fatalf("got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(r.work, "a.txt")); err == nil {
+		t.Error("the copy started anyway")
+	}
+}
+
+// context "the fence swaps a PARENT directory for a link after the clone created it, before the clone creates the directory
+// inside it": a mkdir by path would write the new directory under the link's target; os.Root refuses it, so the outside
+// directory gains nothing.
+func TestAParentSwappedForALinkMidCopyCannotReceiveANewDirectory(t *testing.T) {
+	r := newGitRig(t, nil)
+	outside := filepath.Join(r.root, "side-state")
+	os.MkdirAll(outside, 0o700)
+	swapped := false
+	r.g.hookCopyEntry = func(name string) {
+		if name == filepath.Join("deep", "inner") && !swapped {
+			swapped = true
+			os.RemoveAll(filepath.Join(r.work, "deep"))
+			os.Symlink(outside, filepath.Join(r.work, "deep"))
+		}
+	}
+	if err := r.g.Clone(context.Background()); err == nil || !swapped {
+		t.Fatalf("clone: %v (swapped %v)", err, swapped)
+	}
+	if es, _ := os.ReadDir(outside); len(es) != 0 {
+		t.Errorf("a directory was created outside the worktree: %v", es)
 	}
 }

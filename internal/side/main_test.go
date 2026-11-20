@@ -589,7 +589,7 @@ func TestServeRefusesAHalfConfiguredGit(t *testing.T) {
 		o.Out, o.In, o.State, o.Sid, o.Gen, o.FenceUID = filepath.Join(root, "out"), filepath.Join(root, "in"), filepath.Join(root, "st"), "s", 1, os.Getuid()
 		os.MkdirAll(filepath.Join(o.Out, "requests"), 0o700)
 		os.MkdirAll(o.In, 0o700)
-		o.GitRepo, o.GitBase, o.GitBranch, o.GitURL = "o/r", "main", "ccsbx/s", "http://127.0.0.1:1/egress/git"
+		o.GitRepo, o.GitBase, o.GitBranch, o.GitURL = "o/r", "main", "ccsbx/s", "http://"+o.Config.Listen+"/egress/git" // its own listener, so only the case under test refuses
 		o.Work, o.GitDir, o.SnapshotDir = filepath.Join(root, "w"), filepath.Join(root, "g"), filepath.Join(root, "snap")
 		mut(&o)
 		if code, msg := serveCode(o); code != 2 {
@@ -606,6 +606,30 @@ func TestAFlagValueThatLooksLikeAFlagIsTheValue(t *testing.T) {
 		code := Main(append([]string{"serve", "--control", filepath.Join(t.TempDir(), "c", "c.sock")}, args...), nil, io.Discard, &errb)
 		if code != 2 || !strings.Contains(errb.String(), `bad --door "--hub-url=x"`) {
 			t.Errorf("%v: exit %d (%s)", args, code, errb.String())
+		}
+	}
+}
+
+// context "the forwarder's git secret goes to whatever answers at --git-url": a launcher whose flags disagree (another
+// loopback address or port, localhost) would hand it to something the fence could bind, so serve accepts nothing but its own
+// --listen address.
+func TestServeRefusesAGitURLThatIsNotItsOwnListener(t *testing.T) {
+	for name, gu := range map[string]string{
+		"another loopback address": "http://127.0.0.2:18081/egress/git",
+		"ipv6 loopback":            "http://[::1]:18081/egress/git",
+		"another port":             "http://127.0.0.1:18082/egress/git",
+		"localhost":                "http://localhost:18081/egress/git",
+		"no port":                  "http://127.0.0.1/egress/git",
+	} {
+		o := serveBase(t) // Listen 127.0.0.1:18081
+		root := t.TempDir()
+		o.Out, o.In, o.State, o.Sid, o.Gen, o.FenceUID = filepath.Join(root, "out"), filepath.Join(root, "in"), filepath.Join(root, "st"), "s", 1, os.Getuid()
+		os.MkdirAll(filepath.Join(o.Out, "requests"), 0o700)
+		os.MkdirAll(o.In, 0o700)
+		o.GitRepo, o.GitBase, o.GitBranch, o.GitURL = "o/r", "main", "ccsbx/s", gu
+		o.Work, o.GitDir, o.SnapshotDir = filepath.Join(root, "w"), filepath.Join(root, "g"), filepath.Join(root, "snap")
+		if code, msg := serveCode(o); code != 2 || !strings.Contains(msg, "own --listen") {
+			t.Errorf("%s: exit %d (%s)", name, code, msg)
 		}
 	}
 }

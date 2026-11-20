@@ -198,7 +198,7 @@ func ValidateRules(rules []Rule, doors map[string]*url.URL) error {
 		if len(r.Methods) == 0 || r.Path == "" || r.Path[0] != '/' {
 			return fmt.Errorf("rule %d: needs methods and an absolute path", i)
 		}
-		if first := strings.SplitN(strings.Trim(r.Path, "/"), "/", 2)[0]; first == "git" {
+		if first := strings.SplitN(strings.Trim(r.Path, "/"), "/", 2)[0]; strings.EqualFold(first, "git") {
 			return fmt.Errorf("rule %d: %q would route git, which only the sidecar's own git may reach", i, r.Path)
 		}
 		for _, m := range r.Methods {

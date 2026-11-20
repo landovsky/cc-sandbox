@@ -268,7 +268,7 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// whoever asks, so a fence that could POST git-receive-pack would skip every check the sidecar makes).
 	rules := f.cfg.Rules
 	gate := r.Header.Get(GitHeader)
-	isGit := strings.HasPrefix(rest, "/git/")
+	isGit := isGitPath(rest)
 	gated := gate != "" && f.cfg.GitSecret != "" && subtle.ConstantTimeCompare([]byte(gate), []byte(f.cfg.GitSecret)) == 1
 	switch {
 	case gate != "" && !gated:
@@ -446,4 +446,11 @@ func headerHasToken(h http.Header, k, token string) bool {
 		}
 	}
 	return false
+}
+
+// isGitPath reports whether a door path is under /git, comparing the first segment without regard to case: a door that
+// matches paths case-insensitively must not be reachable as /Git/... by a caller without the sidecar's secret.
+func isGitPath(rest string) bool {
+	first := strings.SplitN(strings.TrimPrefix(rest, "/"), "/", 2)[0]
+	return strings.EqualFold(first, "git")
 }

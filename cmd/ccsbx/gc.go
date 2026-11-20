@@ -18,11 +18,28 @@ func gcCmd() *cli.Command {
   only when the run that owns the generation is gone. A live run, and anything unknown, is left alone.`,
 		Setup: func(f *cli.Flags) {
 			f.String("state", defaultState(), "daemon state directory; only its sessions are considered")
+			f.String("root", "auto", modeFlagHelp)
 			f.String("docker", "docker", "docker binary")
 			f.Bool("dry-run", false, "list orphans, remove nothing")
 		},
 		Run: func(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 			get := func(n string) string { return f.Lookup(n).Value.String() }
+			mode, err := resolveMode(f)
+			if err != nil {
+				fmt.Fprintln(stderr, "ccsbx gc:", err)
+				return cli.ExitRefused
+			}
+			if mode == "helper" {
+				var a []string
+				if get("dry-run") == "true" {
+					a = []string{"--dry-run"}
+				}
+				return runHelper("gc", "gc", a, stdout, stderr)
+			}
+			if err := directDockerReachable(); err != nil {
+				fmt.Fprintln(stderr, "ccsbx gc:", err)
+				return cli.ExitRefused
+			}
 			r := &backend.Runner{Docker: get("docker")}
 			orphans, err := r.Orphans(get("state"))
 			if err != nil {

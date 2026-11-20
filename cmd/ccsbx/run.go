@@ -42,6 +42,28 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ccsbx run: --sid is required (see ccsbx run --help)")
 		return cli.ExitUsage
 	}
+	mode, err := resolveMode(f)
+	if err != nil {
+		fmt.Fprintln(stderr, "ccsbx run:", err)
+		return cli.ExitRefused
+	}
+	if mode == "helper" {
+		// nothing but the sid goes to the helper: it reads the record, the image, the workdir and
+		// the caps itself and refuses what does not check out. --gen is not passed: the record's is used.
+		if len(args) > 0 {
+			fmt.Fprintln(stderr, "ccsbx run: in helper mode the command in the fence is fixed (claude); an argument after -- is not accepted")
+			return cli.ExitUsage
+		}
+		hargs := []string{get("sid")}
+		if isTerminal(os.Stdin.Fd()) {
+			hargs = append([]string{"--tty"}, hargs...)
+		}
+		return runHelper("run", "run", hargs, stdout, stderr)
+	}
+	if err := directDockerReachable(); err != nil {
+		fmt.Fprintln(stderr, "ccsbx run:", err)
+		return cli.ExitRefused
+	}
 	d, err := daemonFrom(f)
 	if err != nil {
 		fmt.Fprintln(stderr, "ccsbx run:", err)

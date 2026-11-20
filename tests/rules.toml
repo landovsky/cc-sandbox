@@ -1424,3 +1424,13 @@ block = "tests/twin-go.sh ./internal/seccomp TestOverlayRemovesIoUringFromAllowE
 invariants = [11]
 backends = ["unit"]
 where = "hp"
+
+[[rule]]
+id = "helper-client"
+title = "in helper mode ccsbx run/stop/gc and hostd's pane run sudo -n ccsbx-root by absolute path with only the sid, sudo's own refusals are reported with no fallback to direct, and the mode is chosen deterministically (auto = helper iff installed, root-owned and closed to others)"
+suite = "keys"
+allow = "tests/twin-go.sh ./cmd/ccsbx TestRunStopGcGoThroughSudoToTheHelper && tests/twin-go.sh ./cmd/ccsbx TestTheModeIsChosenWithoutAFlag && tests/twin-go.sh ./internal/start TestResolveRoot"
+block = "tests/twin-go.sh ./cmd/ccsbx TestEveryRefusalIsPassedThroughAndNeverFallsBack && tests/twin-go.sh ./cmd/ccsbx TestHelperModeNeedsAnInstalledHelper && tests/twin-go.sh ./cmd/ccsbx TestHelperRunTakesNoCommandAndStopTakesOnlyASid && tests/twin-go.sh ./cmd/ccsbx TestDirectModeRefusesWhenDockerIsUnreachable && tests/twin-go.sh ./internal/start TestAutoIsDirectWithoutATrustworthyHelper && tests/twin-go.sh ./internal/start TestHelperPaneRunsSudoRootRunTty"
+invariants = [8]
+backends = ["unit"]
+where = "hp"

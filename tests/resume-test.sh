@@ -13,9 +13,8 @@ IMG=${CCSBX_TEST_IMAGE:-python:3.12-slim}; BIN=${CCSBX_BIN:-bin/ccsbx}
 docker image inspect "$IMG" >/dev/null 2>&1 || { echo "FAIL: image $IMG not present locally (not pulling)"; exit 1; }
 mkdir -p /var/tmp/ccsbx-hello
 STATE=$(mktemp -d)
-# Files the fence wrote (uid 10001) can't be removed by the host user: sweep them from a container.
-rmstate() { docker run --rm --user 0 -v "$STATE:/s" "$IMG" sh -c 'rm -rf /s/* /s/.[!.]*' >/dev/null 2>&1; rm -rf "$STATE"; }
-trap rmstate EXIT
+. "$(dirname "$0")/fence-cleanup.sh"   # rmstate (files the fence wrote) behind cleanup_guard: no empty or foreign paths
+trap 'cleanup_guard && rmstate' EXIT
 fail() { echo "FAIL: $*"; exit 1; }
 A=("$BIN" --state "$STATE" --machine hp-ubuntu --worktree-root /var/tmp)
 spec() { sed "s/lid-hello-1/$1/;s/\"resume\":null/\"resume\":$2/;s/cc-sandbox:hello/cc-sandbox:resume-$$/" tests/specs/hello.json; }

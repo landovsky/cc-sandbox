@@ -29,7 +29,7 @@ func stateFlags(f *cli.Flags) {
 	f.String("machine", hostname(), "this machine's name; a spec for another machine is refused")
 	f.String("worktree-root", home, "every worktree must be strictly inside this directory (symlinks resolved); hidden dirs of it are refused when it is the home")
 	f.String("pins", "pins.toml", "production pins file (digests that may run under any profile)")
-	f.String("root", "direct", "privilege mode: direct (dev, as the caller; results are not evidence) or helper")
+	f.String("root", "auto", modeFlagHelp)
 }
 
 func hostname() string { h, _ := os.Hostname(); return h }
@@ -43,8 +43,9 @@ func daemonFrom(f *cli.Flags) (*start.Daemon, error) {
 		}
 		return a
 	}
-	if get("root") != "direct" {
-		return nil, fmt.Errorf("--root %s: only direct mode exists until gate M", get("root"))
+	mode, err := start.ResolveRoot(get("root"))
+	if err != nil {
+		return nil, err
 	}
 	exe, err := os.Executable()
 	if err != nil {
@@ -52,7 +53,7 @@ func daemonFrom(f *cli.Flags) (*start.Daemon, error) {
 	}
 	d := &start.Daemon{
 		StateDir: abs(get("state")), ProfilesDir: abs(get("profiles")), Machine: get("machine"), Uid: os.Getuid(),
-		Backend: "docker", Root: get("root"), Exe: exe, PinsFile: abs(get("pins")), WorktreeRoot: abs(get("worktree-root")),
+		Backend: "docker", Root: mode, Exe: exe, PinsFile: abs(get("pins")), WorktreeRoot: abs(get("worktree-root")),
 	}
 	return d, nil
 }
@@ -110,7 +111,7 @@ func runStart(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	}
 	switch get("launcher") {
 	case "tmux":
-		d.Launcher = &start.TmuxLauncher{Exe: d.Exe, Socket: get("tmux-socket"), Env: env}
+		d.Launcher = &start.TmuxLauncher{Exe: d.Exe, Socket: get("tmux-socket"), Env: env, Helper: d.Root == "helper"}
 	case "none":
 		d.Launcher = start.NoLauncher{}
 	default:

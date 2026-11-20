@@ -201,6 +201,13 @@ func (s Spec) Prepare() error {
 			return err
 		}
 	}
+	if !helper {
+		// hostd writes replies ONLY into in/replies and never creates it (in helper mode ccsbx-root
+		// does): so direct mode makes it here, before the pane starts.
+		if err := os.Mkdir(filepath.Join(g, "in", "replies"), 0o755); err != nil {
+			return err
+		}
+	}
 	h := s.HomeDir()
 	if helper {
 		if err := os.MkdirAll(filepath.Dir(h), 0o711); err != nil {

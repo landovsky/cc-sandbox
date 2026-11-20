@@ -34,7 +34,7 @@ func newFixture(t *testing.T, mut func(*Config)) *fixture {
 	t.Helper()
 	state := t.TempDir()
 	f := &fixture{t: t, state: state, g: filepath.Join(state, "s", sid, "g1")}
-	for _, d := range []string{"out/requests", "in"} {
+	for _, d := range []string{"out/requests", "in/replies"} {
 		if err := os.MkdirAll(filepath.Join(f.g, d), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -653,5 +653,65 @@ func TestClosedMarkerIsLookedForInTheRunDir(t *testing.T) {
 	recs, _ := j.After(0, "", "", 0)
 	if !contains(types(recs), "host:session.ended") {
 		t.Fatalf("the end was not journaled: %v", types(recs))
+	}
+}
+
+// ---- in/replies is made by the launcher, never by hostd; an unreadable fence file is skipped ----
+
+// context: in helper mode in/ is root's (it holds session.json, written by root); only in/replies is
+// the daemon's. hostd must not create anything in in/, so with no in/replies a reply is an error and
+// nothing appears under in/.
+func TestReplyNeverCreatesTheInboxDirectories(t *testing.T) {
+	g := t.TempDir()
+	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	if err := WriteReply(g, Reply{Rid: "r1", Status: "ok"}); err == nil {
+		t.Fatal("a reply was written although in/replies does not exist")
+	}
+	if ents, _ := os.ReadDir(filepath.Join(g, "in")); len(ents) != 0 {
+		t.Fatalf("hostd created %d entries in in/", len(ents))
+	}
+	os.Mkdir(filepath.Join(g, "in", "replies"), 0o755)
+	if err := WriteReply(g, Reply{Rid: "r1", Status: "ok"}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// context: the fence can chmod its own files. A request or events file the daemon (a group member,
+// not the owner) can't open gives EACCES: it must be logged with the session and the file name,
+// answered, never retried in a loop, and never stop the other requests.
+func TestUnreadableFenceFilesAreLoggedAndSkippedNotFatal(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("root reads everything")
+	}
+	var logs []string
+	f := newFixture(t, func(c *Config) {
+		c.Logf = func(format string, a ...any) { logs = append(logs, fmt.Sprintf(format, a...)) }
+	})
+	j := f.withJournal(t.TempDir())
+	secret := f.req("locked.json", `{"type":"ccf.mark"}`)
+	os.Chmod(secret, 0o000)
+	f.req("fine.json", `{"type":"ccf.mark"}`)
+	f.appendEvents(`{"type":"hook.Stop","data":{}}` + "\n")
+	os.Chmod(filepath.Join(f.g, "out", "events.jsonl"), 0o000)
+	f.h.Scan()
+	f.h.Scan() // a second scan must not log again or loop
+	if len(f.got) != 1 || f.got[0].Rid != "fine" {
+		t.Fatalf("the readable request was not served: %+v", f.got)
+	}
+	if f.code("locked") != "refused:unreadable" {
+		t.Fatalf("reply %s", f.code("locked"))
+	}
+	all := strings.Join(logs, "\n")
+	if !strings.Contains(all, sid) || !strings.Contains(all, "locked.json") || !strings.Contains(all, "events.jsonl") {
+		t.Fatalf("the log does not name the session and files:\n%s", all)
+	}
+	if n := strings.Count(all, "events.jsonl"); n != 1 {
+		t.Fatalf("the events problem was logged %d times, not once", n)
+	}
+	recs, _ := j.After(0, "", "", 0)
+	for _, r := range recs {
+		if r.Src == "fence" {
+			t.Fatal("an unreadable events file produced events")
+		}
 	}
 }

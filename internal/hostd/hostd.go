@@ -168,6 +168,7 @@ type outbox struct {
 	elast    time.Time
 	total    int
 	overflow bool
+	logged   map[string]bool // problems already logged for this outbox (once each, not every scan)
 	drained  bool
 	state    genState
 	stateOK  bool
@@ -264,6 +265,7 @@ func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, s
 	if err != nil {
 		if err != nil {
 			st.Reasons["requests_dir_"+classify(err)]++
+			h.logOnce(box, "requests", "hostd: %s/%s: cannot list out/requests (%s): skipped", sid, gen, classify(err))
 		}
 		return
 	}
@@ -330,6 +332,10 @@ func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, s
 		data, ino, err := root.ReadFile("requests/"+n, Limits{Uid: h.Cfg.FenceUID, Max: h.Cfg.MaxBytes})
 		if err != nil {
 			code := classify(err)
+			if code == "unreadable" {
+				// Never a crash, never a retry loop: say which file of which session, answer refused.
+				h.Cfg.Logf("hostd: %s/%s: request file %s is not readable by the daemon (the fence changed its mode?): skipped", sid, gen, n)
+			}
 			box.seen[n] = ino
 			h.ledger(gdir, n, ino, id, "refused:"+code)
 			st.Refused++
@@ -385,6 +391,18 @@ func (h *Hostd) scanOne(gdir, sid, gen string, rec *start.Record, box *outbox, s
 	}
 }
 
+// logOnce logs a per-outbox problem the first time only.
+func (h *Hostd) logOnce(box *outbox, key, format string, args ...any) {
+	if box.logged == nil {
+		box.logged = map[string]bool{}
+	}
+	if box.logged[key] {
+		return
+	}
+	box.logged[key] = true
+	h.Cfg.Logf(format, args...)
+}
+
 // classify maps an error to a stable rule name; it never contains file content.
 func classify(err error) string {
 	switch err {
@@ -405,6 +423,8 @@ func classify(err error) string {
 		return "unsafe_path"
 	case strings.Contains(s, "no such file"):
 		return "gone"
+	case strings.Contains(s, "permission denied"):
+		return "unreadable" // the fence chmodded its own file (or dir) so the group can't read it
 	}
 	return "io_error"
 }
@@ -419,12 +439,13 @@ func WriteReply(gdir string, r Reply) error {
 	if !nameRe.MatchString(r.Rid + ".json") {
 		return fmt.Errorf("bad rid")
 	}
-	if st, err := os.Stat(filepath.Join(gdir, "in")); err != nil || !st.IsDir() {
-		return fmt.Errorf("no inbox")
-	}
+	// Replies go ONLY into in/replies, which the launcher (ccsbx-root, or the direct-mode Prepare)
+	// creates before the pane starts. in/ itself is root's in helper mode (it holds session.json and
+	// friends that root writes), so hostd never creates anything there: a missing in/replies is an
+	// error, not something to make.
 	dir := filepath.Join(gdir, "in", "replies")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return err
+	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+		return fmt.Errorf("no inbox (%s is missing)", dir)
 	}
 	b, _ := json.Marshal(r)
 	tmp := filepath.Join(dir, "."+r.Rid+".tmp")

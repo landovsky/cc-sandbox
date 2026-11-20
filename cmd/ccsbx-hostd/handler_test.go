@@ -30,7 +30,7 @@ func TestDoneIsQueuedThenAnsweredWhenTheCockpitApplies(t *testing.T) {
 	os.WriteFile(filepath.Join(state, "sessions", sid+".json"), b, 0o600)
 	g := filepath.Join(state, "s", sid, "g1")
 	os.MkdirAll(filepath.Join(g, "out", "requests"), 0o755)
-	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	os.MkdirAll(filepath.Join(g, "in", "replies"), 0o755)
 	os.WriteFile(filepath.Join(g, "out", "requests", "d1.json"), []byte(`{"type":"ccf.done"}`), 0o644)
 
 	d := &start.Daemon{StateDir: state}
@@ -114,7 +114,7 @@ func writeSession(t *testing.T, state, sid, label, manager string) {
 func askQuestion(t *testing.T, state, sid string) {
 	g := filepath.Join(state, "s", sid, "g1")
 	os.MkdirAll(filepath.Join(g, "out", "requests"), 0o755)
-	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	os.MkdirAll(filepath.Join(g, "in", "replies"), 0o755)
 	os.WriteFile(filepath.Join(g, "out", "requests", "q1.json"), []byte(`{"type":"ccf.question","data":{"text":"Which database?","options":["pg","sqlite"]}}`), 0o644)
 }
 
@@ -168,7 +168,7 @@ func TestOtherVerbsDoNotMessageTheManager(t *testing.T) {
 	writeSession(t, state, "s0worker1", "cc-sandbox:w1", "cc-sandbox:mgr")
 	g := filepath.Join(state, "s", "s0worker1", "g1")
 	os.MkdirAll(filepath.Join(g, "out", "requests"), 0o755)
-	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	os.MkdirAll(filepath.Join(g, "in", "replies"), 0o755)
 	os.WriteFile(filepath.Join(g, "out", "requests", "o1.json"), []byte(`{"type":"ccf.outcome","data":{"text":"x"}}`), 0o644)
 	d := &start.Daemon{StateDir: state}
 	hub := &recHub{}

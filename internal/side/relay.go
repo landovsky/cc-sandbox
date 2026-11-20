@@ -318,7 +318,8 @@ func (r *Relay) shedSummary() {
 }
 
 // Close writes the final shed summary (the slot the periodic ones leave free) if anything was shed since
-// the last one, so the journal's last word holds the lifetime total.
+// the last one, so the journal's last word holds the lifetime total. Call it through Run (which does) or after
+// the last Scan returned: it is NOT safe to call concurrently with Scan (they share the counters unlocked).
 func (r *Relay) Close() {
 	if r.shedTot > r.shedSeen && r.shedLogs < r.cfg.MaxShedLogs {
 		r.shedSummary()

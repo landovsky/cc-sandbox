@@ -1,0 +1,166 @@
+# fence-image.yml: builds the fence image `ccsbx-fence` for linux/amd64 and linux/arm64 from image/
+# (the same pins, the same Dockerfile as image/build.sh), pushes it to ghcr.io/landovsky/ccsbx-fence,
+# runs the image tests against what was pushed, and only then writes the digest down as a candidate.
+# It exists because Gate M's pins.Check accepts only OUR repo, by digest, and a local build has no such
+# digest (plan §3 U1a, R19). The digest is the artifact: nothing refers to the image by tag.
+#
+# Safety: no secret but the job's own GITHUB_TOKEN (packages: write, contents: read), no trigger from
+# a pull request, every action pinned by commit SHA (the tag is in the comment), no `latest` tag.
+# A pushed image that fails its tests stays in the registry but is never written to digest.txt and
+# the summary says it is NOT a candidate.
+name: fence-image
+
+on:
+  push:
+    branches: [main]
+    paths: ["image/**"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: fence-image
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/landovsky/ccsbx-fence
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: The pins still match the vendor's manifest and the apt snapshot exists
+        run: image/build.sh --check-pins
+
+      - name: Read the pins as build args
+        id: pins
+        run: |
+          set -eu
+          {
+            echo 'args<<PINS_EOF'
+            # every KEY=VALUE of image/pins.env except BASE_DIFF_ID (a test input, not a build arg)
+            grep -Ev '^(#|$|BASE_DIFF_ID=)' image/pins.env
+            echo 'PINS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (amd64 + arm64)
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: image
+          file: image/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          # a tag is needed to push; consumers use the digest, never this tag
+          tags: ${{ env.IMAGE }}:cand-${{ github.sha }}
+          build-args: ${{ steps.pins.outputs.args }}
+          # links the package to this repository (so later runs of this workflow may write it)
+          labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          provenance: false
+          sbom: false
+
+      - name: The pushed index lists both architectures
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -eu
+          case "$DIGEST" in sha256:[0-9a-f]*) ;; *) echo "no digest from the push: '$DIGEST'" >&2; exit 1;; esac
+          out=$(docker buildx imagetools inspect "$IMAGE@$DIGEST")
+          echo "$out"
+          echo "$out" | grep -q 'Platform: *linux/amd64'
+          echo "$out" | grep -q 'Platform: *linux/arm64'
+
+      - name: Pull the pushed amd64 image by digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -eu
+          docker pull --platform linux/amd64 "$IMAGE@$DIGEST"
+          # a local name for the tests (they build bad images FROM it and read its layers)
+          docker tag "$IMAGE@$DIGEST" ccsbx-fence:candidate
+
+      # The multi-platform builder (docker-container driver) cannot see local images; the tests build
+      # throwaway images FROM the candidate and the bad-pin build, so they use the default builder.
+      - name: Tests use the default (docker) builder
+        run: docker buildx use default
+
+      - name: "T:image-no-secret"
+        run: |
+          set -eu
+          export CCSBX_TEST_IMAGE=ccsbx-fence:candidate
+          tests/image-test.sh image-no-secret allow
+          tests/image-test.sh image-no-secret block
+
+      - name: "T:image-claude-pin"
+        run: |
+          set -eu
+          export CCSBX_TEST_IMAGE=ccsbx-fence:candidate
+          tests/image-test.sh image-claude-pin allow
+          tests/image-test.sh image-claude-pin block
+
+      - name: "T:image-git-shim"
+        run: |
+          set -eu
+          export CCSBX_TEST_IMAGE=ccsbx-fence:candidate
+          tests/image-test.sh image-git-shim allow
+          tests/image-test.sh image-git-shim block
+
+      - name: "T:image-hardening"
+        run: |
+          set -eu
+          export CCSBX_TEST_IMAGE=ccsbx-fence:candidate
+          tests/image-test.sh image-hardening allow
+          tests/image-test.sh image-hardening block
+
+      # Only reached when every step above passed: this is what makes the digest a candidate.
+      - name: Write the candidate digest
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -eu
+          printf '%s@%s\n' "$IMAGE" "$DIGEST" > digest.txt
+          {
+            echo "## fence image candidate"
+            echo
+            echo "\`$(cat digest.txt)\`"
+            echo
+            echo "linux/amd64 and linux/arm64, built from \`${GITHUB_SHA}\`, tests green on amd64"
+            echo "(image-no-secret, image-claude-pin, image-git-shim, image-hardening)."
+            echo "arm64 is built but not run by these tests."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest
+          path: digest.txt
+          if-no-files-found: error
+
+      - name: Say so when it is NOT a candidate
+        if: failure() && steps.push.outputs.digest != ''
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "## fence image: NOT a candidate"
+            echo
+            echo "\`$IMAGE@$DIGEST\` was pushed but a step failed. Do not pin it."
+          } >> "$GITHUB_STEP_SUMMARY"

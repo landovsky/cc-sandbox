@@ -19,8 +19,10 @@ u0b_users() {
   if ! have_user ccsbx-keys; then
     cmd useradd --system --home-dir "$KEYS_DIR" --create-home --shell /usr/sbin/nologin ccsbx-keys
   else note "user ccsbx-keys exists"; fi
+  # the signer's --allow-group default is ccsbx: the group must exist before the signer starts
+  have_group ccsbx || cmd groupadd --system ccsbx
   if ! have_user ccsbx; then
-    cmd useradd --system --home-dir "$STATE_DIR" --create-home --shell /usr/sbin/nologin ccsbx
+    cmd useradd --system --gid ccsbx --home-dir "$STATE_DIR" --create-home --shell /usr/sbin/nologin ccsbx
   else note "user ccsbx exists"; fi
   have_group ccsbx-clients || cmd groupadd --system ccsbx-clients
   note "ccsbx-clients may talk to hostd's local socket; it grants no root path"
@@ -44,6 +46,10 @@ u0b_keys() {
   if [ "$MODE" != install ] || [ ! -e "$(pth $KEYS_DIR/machine.key)" ]; then
     cmd runuser -u ccsbx-keys -- "$LIBEXEC/ccsbx-signer" --keys "$KEYS_DIR" --init
   fi
+  note "the signer will not serve without its scope: ONE keyring line (owners, machines, profiles, billings), written by"
+  note "  'ccsbx token pubkey' as ccsbx-keys, 0600, from the install's own values; rewritten on every run so it matches the options"
+  cmd runuser -u ccsbx-keys -- sh -c 'f=$1; shift; umask 077; "$@" > "$f.tmp" && mv "$f.tmp" "$f"' sh "$KEYS_DIR/signer.scope" \
+    /usr/local/bin/ccsbx token pubkey --key-file "$KEYS_DIR/machine.key" --owners "$(real_user)" --machines "$MACHINE" --profiles "$PROFILES" --billings "$BILLINGS"
   note "the printed PUBLIC key goes into config/machines/<machine>.json (M9); nothing secret is printed"
   note "the K8 kubeconfig arrives SOPS-encrypted to the age key; it is decrypted only by ccsbx-keys"
 }
@@ -75,6 +81,28 @@ sock_check() {
     note_check "$label: $path is $(stat -c '%U:%G %a' "$real"); run check as root or as $client to connect"
   fi
 }
+# sign_check — ask the signer for a token for one in-scope test claim and expect {"token":...}: proves the
+# scope loads, the group is allowed and the key signs, not merely that the socket accepts a connection.
+sign_probe_py='import base64,json,os,socket,sys
+claims={"sub":sys.argv[2],"billing":sys.argv[3],"profile":sys.argv[4],"aud":["ccsbx-stub"],"cnf":base64.b64encode(os.urandom(32)).decode()}
+s=socket.socket(socket.AF_UNIX); s.settimeout(5)
+try:
+    s.connect(sys.argv[1]); s.sendall(json.dumps(claims).encode()); s.shutdown(socket.SHUT_WR)
+    r=json.loads(s.makefile().read())
+except Exception as e: print(e); sys.exit(1)
+if "token" in r: sys.exit(0)
+print(r.get("error", r)); sys.exit(1)'
+sign_check() {
+  local real out sub billing profile; real="$(pth "$SIGNER_SOCK")"
+  sub="$(real_user)/$MACHINE/scheck/g1"; billing="${BILLINGS%%,*}"; profile="${PROFILES%%,*}"; profile="${profile//\*/x}"
+  if [ ! -S "$real" ]; then bad "signer signs a test claim: $SIGNER_SOCK is not a socket"; return; fi
+  if [ "$(id -u)" = 0 ] && [ -z "$PREFIX" ]; then
+    out="$(runuser -u ccsbx -- python3 -I -c "$sign_probe_py" "$real" "$sub" "$billing" "$profile" 2>&1)"
+  elif [ -n "$PREFIX" ]; then out="$(python3 -I -c "$sign_probe_py" "$real" "$sub" "$billing" "$profile" 2>&1)"
+  else note_check "signer signs a test claim: needs root (the caller must be in group ccsbx); run check as root"; return; fi
+  if [ $? -eq 0 ]; then ok "signer returned a token for the in-scope test claim ($sub, $billing, $profile)"
+  else bad "signer refused or failed the in-scope test claim: $(head -1 <<<"$out")"; fi
+}
 note_check() { printf 'note  %s\n' "$*"; }
 
 u0b_check() {
@@ -93,6 +121,7 @@ u0b_check() {
   expect "ccsbx-signer unit installed" test -f "$(pth /etc/systemd/system/ccsbx-signer.service)"
   sock_check "signer socket" "$SIGNER_SOCK" ccsbx
   sock_check "hostd socket" "$HOSTD_SOCK" "$(real_user)"
+  sign_check
 }
 
 u0b_uninstall() {

@@ -1,0 +1,38 @@
+# ccsbx-signer --help, from n1-b-signer 4158d88 (manager's copy). Why: the unit and installer flags are checked against it.
+ccsbx-signer — the machine-key signer (U0b): sign(token_claims) and nothing else
+
+Usage:
+  ccsbx-signer --keys DIR --systemd-socket          serve on the socket systemd passes in (fd 3)
+  ccsbx-signer --keys DIR --socket PATH             serve on a unix socket this process creates (tests, direct mode)
+  ccsbx-signer --keys DIR --init                    create the machine key if absent; print its PUBLIC key
+  ccsbx-signer --help
+
+One request per connection: a JSON object of claims in, {"token":...} or {"error":...} out. The
+claims are checked before the key is used: sub owner/machine, profile and billing must be inside this
+key's scope; every aud must be on --audiences; the lifetime must not exceed --max-ttl. The caller
+never sets iat. The reply holds the token only, never the key. Every signing and refusal is logged to
+stderr with the claims and without any secret. Peers outside --allow-group are refused (SO_PEERCRED).
+
+Flags: (each also CCSBX_SIGNER_<NAME>, e.g. CCSBX_SIGNER_KEYS)
+  --keys DIR          key directory: machine.key (0600, owned by the running uid) and signer.scope  (required)
+  --systemd-socket    take the listening socket from systemd: fd 3, LISTEN_FDS=1 and LISTEN_PID checked
+  --socket PATH       listen on this unix socket instead (mode 0660; refuses an existing path)
+  --init              create machine.key if absent (0600), refuse one with a wrong owner or mode, print
+                      "kid <kid>" and "public <base64>" and exit
+  --scope FILE        what the key may sign: ONE keyring line for this key with owners=, machines=,
+                      profiles= and billings= (all required; 'ccsbx token pubkey' writes it).
+                      Without a valid scope the signer will not serve.     (default KEYS/signer.scope)
+  --audiences A,B     the only audiences it signs        (default ccsbx-model,ccsbx-egress,ccsbx-stub)
+  --max-ttl D         longest token lifetime, at most 12h                   (default 12h)
+  --allow-group G     group name or numeric gid whose members may ask       (default ccsbx)
+  --max-request N     largest request in bytes                              (default 8192)
+  --timeout D         per-connection read/write deadline                    (default 5s)
+
+Recipes:
+  first install:   runuser -u ccsbx-keys -- ccsbx-signer --keys /var/lib/ccsbx-keys --init
+                   then write the scope:  ccsbx token pubkey --key-file /var/lib/ccsbx-keys/machine.key \
+                     --owners tomas --machines hp-ubuntu --profiles 'dev-*' --billings api,subscription \
+                     > /var/lib/ccsbx-keys/signer.scope        (run as ccsbx-keys)
+  ask for a token: printf '%s' '{"sub":"tomas/hp-ubuntu/sX/g1","billing":"api","profile":"dev-default",
+                     "aud":["ccsbx-model"],"cnf":"<b64 pubkey>"}' | nc -N -U /run/ccsbx-signer/sign.sock
+Exit codes: 0 ok, 1 runtime failure, 2 refused to start (bad key, scope, socket or flags).

@@ -13,7 +13,7 @@ Requires=ccsbx-signer.socket
 Type=simple
 User=ccsbx-keys
 Group=ccsbx-keys
-ExecStart=/usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --systemd-socket
+ExecStart=/usr/local/libexec/ccsbx/ccsbx-signer --keys /var/lib/ccsbx-keys --systemd-socket --allow-group ccsbx
 Restart=on-failure
 RestartSec=2
 # hardening: it reads its own key directory, writes nothing else, talks to nobody

@@ -322,6 +322,51 @@ t "R1b: no separate sudoers line for attach (the one ccsbx-root rule already cov
 d="$(fx tok)"; ins "$d" install --yes >/dev/null 2>&1
 t "R1: the installer makes hostd's token file (0600, as ccsbx) before it starts hostd" bash -c 'a="$(grep -n "listen.token" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-hostd" "$1" | cut -d: -f1)"; grep -q "umask..077" "$1" && [ "$a" -lt "$b" ]' _ "$d/rec/cmds"
 
+echo "# signer alignment (n1-b-signer 4158d88): flags, scope file, group, a real signing probe"
+shelp="$here/tests/fixtures/ccsbx-signer-help.txt"; ssrc="fixture tests/fixtures/ccsbx-signer-help.txt"
+if [ -x "$here/dist/ccsbx-signer" ] && timeout 5 "$here/dist/ccsbx-signer" --help >"$tmp/signer-real-help.txt" 2>&1 && [ -s "$tmp/signer-real-help.txt" ]; then shelp="$tmp/signer-real-help.txt"; ssrc="dist/ccsbx-signer --help"; fi
+badf="$(grep '^ExecStart=' "$sig" | grep -o ' --[a-z-]*' | tr -d ' ' | sed 's/^--//' | while read -r f; do grep -qE "(^|[[:space:]])-{1,2}$f([[:space:]]|\$)" "$shelp" || echo "$f"; done)"
+t "signer: every flag in the unit's ExecStart is a flag ccsbx-signer has ($ssrc)${badf:+: unknown: $badf}" test -z "$badf"
+d="$(fx sg)"; ins "$d" install --yes --machine hp-ubuntu --profiles 'dev-*,e2e-default' --billings api >/dev/null 2>&1; sc="$d/rec/cmds"
+badt="$(grep 'token pubkey' "$sc" | grep -o ' --[a-z-]*' | tr -d ' ' | sed 's/^--//' | sort -u | while read -r f; do grep -qE "(^|[[:space:]])-{1,2}$f([[:space:]]|\$)" "$here/tests/fixtures/ccsbx-token-help.txt" || echo "$f"; done)"
+t "signer: the installer's 'ccsbx token pubkey' flags exist in ccsbx token's usage${badt:+: unknown: $badt}" bash -c 'grep -q "token pubkey" "$1" && [ -z "$2" ]' _ "$sc" "$badt"
+t "signer: the scope is written as ccsbx-keys, from the owner, machine, profiles and billings the install was given" bash -c 'l="$(grep "token pubkey" "$1")"; grep -q "runuser -u ccsbx-keys" <<<"$l" && grep -q -- "--owners tomas" <<<"$l" && grep -q -- "--machines hp-ubuntu" <<<"$l" && grep -q -- "--billings api" <<<"$l" && grep -q "dev-" <<<"$l" && grep -q "e2e-default" <<<"$l" && grep -q "signer.scope" <<<"$l"' _ "$sc"
+t "signer: the scope exists BEFORE the signer socket is enabled (else the service exits 2)" bash -c 'a="$(grep -n "token pubkey" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-signer.socket" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$sc"
+t "signer: the machine key is made before the scope (the scope is derived from it)" bash -c 'a="$(grep -n -- "ccsbx-signer --keys /var/lib/ccsbx-keys --init" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "token pubkey" "$1" | head -1 | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$sc"
+if ! getent group ccsbx >/dev/null 2>&1; then
+  t "signer: group ccsbx is created BEFORE the signer starts (its --allow-group default)" bash -c 'a="$(grep -n "groupadd --system ccsbx$" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-signer.socket" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$sc"
+else echo "ok   - (skipped: group ccsbx exists on this host)"; fi
+for bad_arg in "--profiles|bad prof" "--machine|Bad_Host" "--billings|api;x"; do
+  d="$(fx sgbad)"; ins "$d" install --yes "${bad_arg%%|*}" "${bad_arg#*|}" >/dev/null 2>"$d/err"; rc=$?
+  t "signer: ${bad_arg%%|*} '${bad_arg#*|}' is refused (exit 3), nothing changed" bash -c '[ '"$rc"' -eq 3 ] && [ ! -s "$1" ]' _ "$d/rec/cmds"
+done
+t "signer: plan prints the scope it will write" bash -c 'grep -q "signer scope:    owners=tomas machines=hp-ubuntu profiles=dev-default,e2e-default billings=api,subscription" <<<"$1"' _ "$(CCSBX_OWNER=tomas "$inst" plan --machine hp-ubuntu 2>&1)"
+# check asks the signer to sign one in-scope claim (a stub signer on a unix socket in the fake root)
+d="$(fx sgchk)"; mkdir -p "$d/root/run/ccsbx-signer"
+cat > "$tmp/fake-signer.py" <<'PY'
+import json, socket, sys
+path, mode, seen = sys.argv[1], sys.argv[2], sys.argv[3]
+s = socket.socket(socket.AF_UNIX); s.bind(path); s.listen(1)
+c, _ = s.accept(); d = b""
+while True:
+    b = c.recv(4096)
+    if not b: break
+    d += b
+open(seen, "wb").write(d)
+c.sendall(json.dumps({"token": "x.y.z"} if mode == "ok" else {"error": "claims outside this key's scope"}).encode()); c.close()
+PY
+for mode in ok refuse; do
+  rm -f "$d/root/run/ccsbx-signer/sign.sock"
+  python3 -I "$tmp/fake-signer.py" "$d/root/run/ccsbx-signer/sign.sock" "$mode" "$d/seen-$mode" & spid=$!
+  for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$d/root/run/ccsbx-signer/sign.sock" ] && break; sleep 0.2; done
+  out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check --machine hp-ubuntu --profiles 'dev-*' --billings api 2>&1)"
+  kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
+  if [ "$mode" = ok ]; then
+    t "check: a token for the in-scope test claim is an ok line" grep -q '^ok    signer returned a token for the in-scope test claim' <<<"$out"
+    t "check: the claim it sent has the owner/machine sub, a scope profile and billing, and a cnf" bash -c 'python3 -I -c "import json,sys; c=json.load(open(sys.argv[1])); assert c[\"sub\"].startswith(\"tomas/hp-ubuntu/\") and c[\"billing\"]==\"api\" and c[\"profile\"].startswith(\"dev-\") and c[\"cnf\"] and c[\"aud\"]" "$1"' _ "$d/seen-ok"
+  else t "check: a signer that refuses the in-scope claim is a FAIL with its reason (a connect alone is not enough)" grep -q "^FAIL  signer refused or failed the in-scope test claim: claims outside" <<<"$out"; fi
+done
+
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"
 

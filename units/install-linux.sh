@@ -29,6 +29,9 @@
 #   --bin-dir DIR         built binaries + SHA256SUMS            (CCSBX_BIN_DIR, default <repo>/dist)
 #   --owner USER          the human who keeps access            (CCSBX_OWNER, default the invoking user)
 #   --allowed-roots A,B   ccsbx-root's workdir roots            (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt)
+#   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
+#   --profiles A,B        profile globs the signer may sign            (CCSBX_PROFILES, default: the names in <repo>/profiles/*.json)
+#   --billings A,B        billings the signer may sign                 (CCSBX_BILLINGS, default api,subscription)
 #   --with-deploy         also the ccsbx-deploy sudoers rule (Q12 = yes, R10c)  (CCSBX_WITH_DEPLOY=1)
 #   --backup DIR          uninstall from this backup (must be under /var/backups/ccsbx-install), not the first one
 #   --purge-keys          uninstall also deletes the keys and the ccsbx-keys user (rotate M9 first!)
@@ -49,6 +52,7 @@ case "${1:-}" in
   *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
+MACHINE="${CCSBX_MACHINE:-}"; PROFILES="${CCSBX_PROFILES:-}"; BILLINGS="${CCSBX_BILLINGS:-api,subscription}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,6 +61,9 @@ while [ $# -gt 0 ]; do
     --bin-dir) BIN_DIR="${2:?--bin-dir DIR}"; shift ;;
     --owner) CCSBX_OWNER="${2:?--owner USER}"; shift ;;
     --allowed-roots) ALLOWED_ROOTS="${2:?--allowed-roots A,B}"; shift ;;
+    --machine) MACHINE="${2:?--machine NAME}"; shift ;;
+    --profiles) PROFILES="${2:?--profiles A,B}"; shift ;;
+    --billings) BILLINGS="${2:?--billings A,B}"; shift ;;
     --with-deploy) WITH_DEPLOY=1 ;;
     --backup) RESTORE_OVERRIDE="${2:?--backup DIR}"; shift ;;
     --purge-keys) PURGE_KEYS=1 ;;
@@ -71,6 +78,15 @@ export CCSBX_OWNER VERBOSE PURGE_KEYS MODE
 
 OWNER="$(real_user)"; OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"; OWNER_HOME="${OWNER_HOME:-/home/$OWNER}"
 [ -n "$ALLOWED_ROOTS" ] || ALLOWED_ROOTS="$OWNER_HOME/git,$OWNER_HOME/wt"
+# the signer's scope (what the machine key may sign): owner, machine, profiles, billings
+[ -n "$MACHINE" ] || MACHINE="$(hostname -s 2>/dev/null)"
+if [ -z "$PROFILES" ]; then
+  for _p in "$REPO_DIR"/profiles/*.json; do [ -e "$_p" ] && PROFILES+="${PROFILES:+,}$(basename "$_p" .json)"; done
+fi
+SCOPE_ERRORS=()
+[[ "$MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || SCOPE_ERRORS+=("machine name '$MACHINE' is not a plain host name (--machine)")
+[[ "$PROFILES" =~ ^[A-Za-z0-9._*-]+(,[A-Za-z0-9._*-]+)*$ ]] || SCOPE_ERRORS+=("profiles '$PROFILES' is empty or not a comma list of names/globs (--profiles; default: <repo>/profiles/*.json)")
+[[ "$BILLINGS" =~ ^[a-z]+(,[a-z]+)*$ ]] || SCOPE_ERRORS+=("billings '$BILLINGS' is not a comma list of api,subscription,stub (--billings)")
 # split on commas only (no globbing, no word splitting); each root must be a plain absolute path
 ROOT_ERRORS=(); ALLOWED_ROOTS_TOML=""
 IFS=, read -r -a _roots <<<"$ALLOWED_ROOTS"
@@ -82,7 +98,7 @@ for _r in "${_roots[@]}"; do
 done
 ALLOWED_ROOTS_TOML="${ALLOWED_ROOTS_TOML%, }"
 RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
-export BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+export OWNER MACHINE PROFILES BILLINGS BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()
@@ -116,7 +132,7 @@ eval_gates() {
     if ! id -u "$OWNER" >/dev/null 2>&1; then gate "owner '$OWNER' does not exist"
     elif [ "$(id -u "$OWNER")" -lt 1000 ]; then gate "owner '$OWNER' is a system account (uid < 1000)"; fi
   fi
-  for e in "${ROOT_ERRORS[@]}"; do gate "$e"; done
+  for e in "${ROOT_ERRORS[@]}" "${SCOPE_ERRORS[@]}"; do gate "$e"; done
   if [ -n "${CCSBX_B9_CMD:-}" ]; then m="$(eval "$CCSBX_B9_CMD" 2>&1)" || gate "B9 missing: ${m:-$CCSBX_B9_CMD failed}"
   else m="$(default_b9)" || gate "B9 missing: $m (the native hub release, stream C)"; fi
   if [ -n "${CCSBX_P15_CMD:-}" ]; then m="$(eval "$CCSBX_P15_CMD" 2>&1)" || gate "P15 open: ${m:-$CCSBX_P15_CMD failed}"
@@ -200,6 +216,7 @@ case "$MODE" in
     echo "Nothing below is run by 'plan'. The same steps run under 'install --yes' as root."
     eval_gates; print_gates
     echo "  P15 status file: $P15_FILE"; echo "  allowed roots:   ${ALLOWED_ROOTS_TOML:-(none)}"
+    echo "  signer scope:    owners=$OWNER machines=$MACHINE profiles=$PROFILES billings=$BILLINGS"
     steps_install
     echo; echo "AFTER: reboot, then units/install-linux.sh check  and  bin/ccsbx-preflight --morning --post-M1"
     echo "UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the first backup, $BACKUP_DIR; a failed install is undone the same way)"

@@ -295,6 +295,18 @@ refused "ALL" "tomas ALL=(ALL) $N ALL"
 refused "a continuation line" "tomas ALL=(ALL) $N /usr/bin/foo, \\"
 refused "no command at all" "tomas ALL=(ALL) $N "
 
+echo "# review R1/R3: hostd's real command line, DONE only when the services are up, undo order"
+t "R1: hostd is started as 'ccsbx-hostd run' with loopback-only --listen and a token file (no ':7480')" bash -c 'l="$(grep "^ExecStart=" "$1")"; grep -q "ccsbx-hostd run " <<<"$l" && grep -q -- "--listen 127.0.0.1:7480" <<<"$l" && grep -q -- "--listen-token-file " <<<"$l" && grep -q -- "--local-socket /run/ccsbx/hostd.sock" <<<"$l" && grep -q -- "--signer /run/ccsbx-signer/sign.sock" <<<"$l" && ! grep -q -- "--listen :7480" <<<"$l"' _ "$hd"
+d="$(fx r1)"; CCSBX_TEST_POSTCHECK_RC=1 ins "$d" install --yes >"$d/out" 2>"$d/err"; rc=$?
+t "R1: a crash-looping hostd (post-install check fails) means exit 1, NOT DONE, and no DONE line" bash -c '[ '"$rc"' -eq 1 ] && grep -q "NOT DONE" "$1" && ! grep -q "^DONE" "$2"' _ "$d/err" "$d/out"
+t "R1: …and the backup stays in-progress, so uninstall is still the documented way back" grep -qx in-progress "$d/root/var/backups/ccsbx-install/original/STATE"
+d="$(fx r1ok)"; ins "$d" install --yes >"$d/out" 2>&1
+t "R1: when the services are up the install prints DONE and marks the backup complete" bash -c 'grep -q "^DONE" "$1/out" && grep -qx complete "$1/root/var/backups/ccsbx-install/original/STATE"' _ "$d"
+t "R1: plan shows the post-install check" bash -c 'grep -q "post-install check" <<<"$1"' _ "$("$inst" plan 2>&1)"
+d="$(fx r3)"; ins "$d" install --yes >/dev/null 2>&1; ins "$d" uninstall --yes >/dev/null 2>&1
+t "R3: the signer socket and service are stopped and disabled BEFORE any unit file is removed" bash -c 'c="$1"; a="$(grep -n "disable --now ccsbx-signer.socket" "$c" | head -1 | cut -d: -f1)"; b="$(grep -n "disable --now ccsbx-signer.service" "$c" | head -1 | cut -d: -f1)"; r="$(grep -n "^rm -f /etc/systemd/system/ccsbx-signer" "$c" | head -1 | cut -d: -f1)"; [ -n "$a" ] && [ -n "$b" ] && [ -n "$r" ] && [ "$a" -lt "$r" ] && [ "$b" -lt "$r" ]' _ "$d/rec/cmds"
+t "R3: hostd is stopped before its unit file is removed" bash -c 'c="$1"; a="$(grep -n "disable --now ccsbx-hostd" "$c" | tail -1 | cut -d: -f1)"; r="$(grep -n "^rm -f /etc/systemd/system/ccsbx-hostd" "$c" | head -1 | cut -d: -f1)"; [ "$a" -lt "$r" ]' _ "$d/rec/cmds"
+
 echo "# the test harness itself"
 t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"
 

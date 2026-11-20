@@ -97,7 +97,7 @@ u0_hostd() {
   put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-hostd.service"
   cmd systemctl daemon-reload
   cmd systemctl enable --now ccsbx-hostd.service
-  note "7480 only on the tailnet interface; the Mac and future-two reach hostd there"
+  note "hostd listens on 127.0.0.1:7480 only (with a token file); the firewall rule below is for the tailnet and is harmless while nothing listens there"
   cmd ufw allow in on tailscale0 to any port 7480 proto tcp comment "ccsbx hostd"
 }
 
@@ -173,7 +173,11 @@ u0_uninstall() {
   real="$(pth "$RESTORE_DIR")"
   step "U0 undo: stop the units, take away what the install added, put back what it replaced"
   note "from the FIRST backup: $RESTORE_DIR (never overwritten, so a re-run or a failed install can't spoil it)"
+  note "units are stopped and disabled BEFORE their files are removed (a disable needs the file)"
   try systemctl disable --now ccsbx-hostd.service
+  try systemctl disable --now ccsbx-signer.socket
+  try systemctl disable --now ccsbx-signer.service
+  note "this restores the state before the FIRST install; hand edits to sudoers.d since then are lost"
   note "1. paths that did not exist before the install are removed"
   while IFS= read -r p; do
     [ -n "$p" ] || continue

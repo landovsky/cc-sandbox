@@ -97,8 +97,7 @@ u0b_check() {
 
 u0b_uninstall() {
   step "U0b undo: stop the signer, remove its units (keys are kept unless --purge-keys)"
-  try systemctl disable --now ccsbx-signer.socket
-  try systemctl disable --now ccsbx-signer.service
+  note "the signer's units were stopped and disabled in the U0 undo step, before any unit file was removed"
   note "the unit files are removed or restored in the files step below"
   if [ "${PURGE_KEYS:-0}" = 1 ]; then
     note "--purge-keys: the machine key and age key are DELETED. Rotate the trusted-key list first (M9)."

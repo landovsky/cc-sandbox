@@ -166,6 +166,23 @@ EOT
   cmd mv -f /etc/sudoers.d/.91-ccsbx-deploy.new /etc/sudoers.d/91-ccsbx-deploy
   if [ -f "$BIN_DIR/ccsbx-deploy" ] || [ "$MODE" = plan ]; then cmd install -o root -g root -m 0755 "$BIN_DIR/ccsbx-deploy" /usr/local/sbin/ccsbx-deploy; fi
 }
+# DONE only when the services really came up: `enable --now` of a Type=simple unit returns 0 even for a
+# crash-looping daemon (review R1). In record mode CCSBX_TEST_POSTCHECK_RC stands in for the answer.
+post_install_check() {
+  step "post-install check: hostd and the signer must be up before DONE"
+  local i ready=1
+  if [ "$MODE" = plan ]; then note "waits up to 10 s for ccsbx-hostd and ccsbx-signer.socket to be active and their sockets to exist; otherwise install stops, no DONE"; return 0; fi
+  if [ "${EXEC%%:*}" = record ]; then rec post-install-check; ready="${CCSBX_TEST_POSTCHECK_RC:-0}"
+  else
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+      if systemctl is-active --quiet ccsbx-hostd.service && systemctl is-active --quiet ccsbx-signer.socket \
+         && [ -S "$SIGNER_SOCK" ] && [ -S "$HOSTD_SOCK" ]; then ready=0; break; fi
+      sleep 1
+    done
+  fi
+  [ "$ready" = 0 ] || die "ccsbx-hostd or the signer is not up (a crash loop?): see 'journalctl -u ccsbx-hostd -u ccsbx-signer'. NOT DONE"
+  note "up"
+}
 steps_install() {
   if [ "$MODE" = install ]; then step "back up every file the install replaces (once; never overwritten)"; backup_originals; fi
   # everything that can fail for a machine-specific reason comes BEFORE sudoers is changed
@@ -173,6 +190,7 @@ steps_install() {
   if [ "$WITH_DEPLOY" = 1 ]; then u0_deploy_rule; fi
   u0_sops; u0_lxd
   u0_sudoers; u0_groups
+  post_install_check
   if [ "$MODE" = install ]; then step "mark the install complete"; backup_state complete || die "cannot mark the backup complete"; fi
 }
 

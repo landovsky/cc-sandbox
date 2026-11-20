@@ -278,6 +278,20 @@ type KeyScope struct {
 	Billings []string
 }
 
+// Permits reports whether this key may sign the claims c: the owner and machine of its sub, its
+// profile and its billing (invariant 27). The signer uses it before it signs; doors use the same
+// rule when they verify, so the two can't drift apart.
+func (k KeyScope) Permits(c *Claims) error {
+	owner, machine, _, _, err := c.SubParts()
+	if err != nil {
+		return err
+	}
+	if !k.allows(owner, machine) || !k.allowsClaims(c) {
+		return ErrKeyScope
+	}
+	return nil
+}
+
 // allowsClaims is the profile and billing half of the scope check.
 func (k KeyScope) allowsClaims(c *Claims) bool {
 	if k.Billings != nil {

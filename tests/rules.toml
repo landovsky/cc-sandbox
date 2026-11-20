@@ -1010,3 +1010,63 @@ block = "tests/go-test.sh ./internal/fwd 'TestDoorAddressesArePinned$'"
 invariants = [4]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "signer-refuses-unscoped-claims"
+title = "the signer signs nothing outside its key's owner, machine, profile, billing and audience scope"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesUnscopedClaims$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-caps-lifetime"
+title = "the signer refuses a token lifetime over its cap"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesOverLongExpiry$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-peer-in-group"
+title = "the signer answers only peers in the ccsbx group"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesPeerOutsideTheGroup$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-request-cap"
+title = "an oversized signer request is refused unparsed"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesOversizedRequest$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-key-checked"
+title = "the signer refuses a key with a loose mode, or no scope"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestKeyModeIsChecked$'"
+block = "tests/go-test.sh ./internal/signer 'TestWontServeWithoutAScope$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-socket-from-systemd"
+title = "the signer serves only on a socket systemd handed it (LISTEN_PID, LISTEN_FDS)"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestSystemdSocketActivation$'"
+block = "tests/go-test.sh ./internal/signer 'TestSystemdSocketActivation$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"

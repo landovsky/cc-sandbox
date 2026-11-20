@@ -20,8 +20,10 @@ test: vet
 
 build:
 	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/ccsbx ./cmd/ccsbx
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o bin/ccsbx-signer ./cmd/ccsbx-signer
 	@for t in $(TARGETS); do \
 	  CGO_ENABLED=0 GOOS=$${t%/*} GOARCH=$${t#*/} $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o /dev/null ./cmd/ccsbx || exit 1; \
+	  CGO_ENABLED=0 GOOS=$${t%/*} GOARCH=$${t#*/} $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o /dev/null ./cmd/ccsbx-signer || exit 1; \
 	done
 
 dist:

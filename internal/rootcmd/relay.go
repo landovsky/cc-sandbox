@@ -16,6 +16,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -26,6 +27,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
+	"github.com/landovsky/cc-sandbox/internal/k8s"
 )
 
 const (
@@ -124,13 +126,20 @@ func (e *env) relayMint(sid, genS, pub string, after401 bool, stdout io.Writer) 
 	if err := e.rateLimit(filepath.Join(gdir, "relay-mint.stamp"), after401); err != nil {
 		return err
 	}
-	// everything checked: only now is the secret read
+	scope, err := k8s.ParseScope(rec.Spec.MsgScope) // as strictly as pod-create reads it
+	if err != nil {
+		return refuse("msg_scope of %s is not well formed: %v", sid, err)
+	}
+	// everything checked: only now is the secret read. A host with no hub refuses here, and what makes it refuse is
+	// the secret file being ABSENT (the no-hub installer deletes /etc/ccsbx/hub-admin.secret and writes no hub keys),
+	// not hub_url's default (http://127.0.0.1:4011): the secret is read, and its absence ends the verb, BEFORE
+	// anything is connected to.
 	secret, err := e.hubSecret()
 	if err != nil {
 		e.audit("relay-mint", sid, gen, pub, "no secret")
 		return &codeError{exitHub, "the hub admin secret is not usable: " + err.Error()}
 	}
-	tok, err := e.registerRelay(context.Background(), secret, rec.Spec.MsgScope, sid, gen, pub)
+	tok, err := e.registerRelay(context.Background(), secret, scope, sid, gen, pub)
 	if err != nil {
 		return err
 	}
@@ -140,7 +149,7 @@ func (e *env) relayMint(sid, genS, pub string, after401 bool, stdout io.Writer) 
 // registerRelay asks the hub for a relay principal for one generation: its public key, and what it may
 // reach from the record's scope. The secret is the caller's, already read from its trusted file. The
 // token comes back to the caller only (the verb prints it; pod-load puts it in the sidecar's payload).
-func (e *env) registerRelay(ctx context.Context, secret string, scope json.RawMessage, sid string, gen int, pub string) (string, error) {
+func (e *env) registerRelay(ctx context.Context, secret string, scope *k8s.ScopeDoc, sid string, gen int, pub string) (string, error) {
 	body, _ := json.Marshal(map[string]any{"role": "relay", "sid": sid, "gen": strconv.Itoa(gen), "pub": pub, "may_reach": mayReach(scope), "manager": managerOf(scope)})
 	code, resp, err := e.hubCall(ctx, "POST", "/v1/principals", secret, body)
 	if errors.Is(err, errHubUntrusted) {
@@ -165,14 +174,11 @@ var sidMintRe = regexp.MustCompile(`^s[0-9a-z]{4,32}$`)
 // managerOf is the session's manager as <machine>/<node> from the record's msg_scope.manager, "" when it is
 // not placed (no machine, or a malformed machine or node). The hub cannot tell the manager from the order
 // of may_reach: it allows an UNFENCED target only to this one, and a fenced one only within may_reach.
-func managerOf(scope json.RawMessage) string {
-	var s struct {
-		Manager struct{ Node, Machine string }
-	}
-	if json.Unmarshal(scope, &s) != nil || !mrMachine.MatchString(s.Manager.Machine) || !mrNode.MatchString(s.Manager.Node) {
+func managerOf(d *k8s.ScopeDoc) string {
+	if !mrMachine.MatchString(d.Manager.Machine) || !mrNode.MatchString(d.Manager.Node) {
 		return ""
 	}
-	return s.Manager.Machine + "/" + s.Manager.Node
+	return d.Manager.Machine + "/" + d.Manager.Node
 }
 
 // maxMayReach is the hub's own limit on the list.
@@ -185,17 +191,10 @@ const maxMayReach = 32
 // be refused by the hub), so a record that names no manager machine and no placed peer gives an empty
 // list: the relay then reaches fenced sessions only. The record cannot say which peers are fenced; the hub
 // needs the entry only for an UNFENCED target, so listing a fenced peer changes nothing for it. Duplicates
-// are dropped and the list is cut at the hub's 32.
-func mayReach(scope json.RawMessage) []string {
-	var s struct {
-		Manager      struct{ Node, Machine string }
-		Peers        []string
-		PeerMachines map[string]string `json:"peer_machines"`
-	}
+// are dropped and the list is cut at the hub's 32. The scope was read by k8s.ParseScope (the same strict
+// reader as the sidecar's flag): a record that is not well formed never gets here.
+func mayReach(d *k8s.ScopeDoc) []string {
 	out := []string{}
-	if json.Unmarshal(scope, &s) != nil {
-		return out
-	}
 	seen := map[string]bool{}
 	add := func(machine, node string) {
 		if !mrMachine.MatchString(machine) || !mrNode.MatchString(node) || len(out) >= maxMayReach {
@@ -206,9 +205,9 @@ func mayReach(scope json.RawMessage) []string {
 			out = append(out, e)
 		}
 	}
-	add(s.Manager.Machine, s.Manager.Node)
-	for _, p := range s.Peers {
-		add(s.PeerMachines[p], p)
+	add(d.Manager.Machine, d.Manager.Node)
+	for _, p := range d.Peers {
+		add(d.PeerMachines[p], p)
 	}
 	return out
 }
@@ -371,12 +370,50 @@ func (e *env) checkHubListener() error {
 	if len(ls) == 0 {
 		return fmt.Errorf("%w: nothing listens on port %d", errHubUntrusted, port)
 	}
+	hubIP := net.ParseIP(u.Hostname())
+	// the address must be one of this host's: the admin secret goes nowhere else
+	mine, err := e.d.LocalAddrs()
+	if err != nil {
+		return fmt.Errorf("%w: cannot read this host's addresses: %v", errHubUntrusted, err)
+	}
+	isMine := false
+	for _, a := range mine {
+		isMine = isMine || (hubIP != nil && a.Equal(hubIP))
+	}
+	if !isMine {
+		return fmt.Errorf("%w: %s is not an address of this host", errHubUntrusted, u.Hostname())
+	}
+	covered := false
 	for _, l := range ls {
 		if l.UID != uid {
 			return fmt.Errorf("%w: uid %d listens on port %d", errHubUntrusted, l.UID, port)
 		}
+		// the address the secret is sent to must be one the hub listens on, or one a wildcard listener covers:
+		// a hub on the tailnet address only does not answer on 127.0.0.1, and whoever binds that is not the hub
+		if lip := decodeProcIP(l.IP); lip != nil && (lip.IsUnspecified() || (hubIP != nil && lip.Equal(hubIP))) {
+			covered = true
+		}
+	}
+	if !covered {
+		return fmt.Errorf("%w: nobody of the hub's user listens on %s:%d (the hub's own listeners are elsewhere)", errHubUntrusted, u.Hostname(), port)
 	}
 	return nil
+}
+
+// decodeProcIP reads an address as /proc/net/tcp writes it: 8 hex digits (IPv4) or 32 (IPv6), each 32-bit
+// word in host (little-endian) byte order. nil if it is not one.
+func decodeProcIP(h string) net.IP {
+	if len(h) != 8 && len(h) != 32 {
+		return nil
+	}
+	raw, err := hex.DecodeString(h)
+	if err != nil {
+		return nil
+	}
+	for i := 0; i+4 <= len(raw); i += 4 {
+		raw[i], raw[i+1], raw[i+2], raw[i+3] = raw[i+3], raw[i+2], raw[i+1], raw[i]
+	}
+	return net.IP(raw)
 }
 
 // parseProcNet reads /proc/net/tcp or tcp6 and returns the LISTEN sockets on port.

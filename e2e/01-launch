@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
-# e2e/01-launch — hook point 1: a start call mints sid and gen, refuses what it must (plan §9 item 2).
-# Real tonight: `ccsbx start --launcher none` (the daemon's decisions, no pane). Skipped: what needs
-# the fence image, cc-tree's placement (C1) or another machine.
+# e2e/01-launch — hook point 1: a start call mints sid and gen, refuses what it must, and a fenced session really runs in
+# a fence (plan §9 item 2). Real: `ccsbx start --launcher none` (the daemon's decisions) and, with the fence image
+# present, a LIVE fenced start in direct docker mode: the pane runs `ccsbx run` in the real image, and what docker says
+# about the container is checked (uid, read-only root, no caps, no new privileges, an internal network), a second
+# start of the label is refused already_running, `ccsbx stop` removes the container and network, and a resume is the
+# same sid at gen 2. Direct mode: not evidence (invariant 14 waived). Skipped, each naming its piece: what needs
+# the cluster, the doors, root, another machine, or cc-tree's remote start (M2c is not on main).
 . "$(dirname "$0")/lib.sh"; e2e_init
 st() { "$CCSBX" start --launcher none --json "$@"; }
 spec e2e:launch lid-l1 > "$E2E_ROOT/l1.json"
 
 out="$(st --spec "$E2E_ROOT/l1.json" 2>&1)"; rc=$?
 [ $rc -eq 0 ] && ok "start under e2e-default with billing=stub answers a StartReply" || bad "start answers a StartReply" "rc=$rc $out"
-sid="$(jget sid <<<"$out" 2>/dev/null)"; gen="$(jget gen <<<"$out" 2>/dev/null)"
+sid="$(e2e_sid "$out")"; gen="$(jget gen <<<"$out" 2>/dev/null)"
 { [ -n "$sid" ] && [ "$gen" = 1 ]; } && ok "the daemon mints the sid and generation 1; the caller sent neither" || bad "daemon mints sid and gen 1" "sid=$sid gen=$gen"
 [ "$(jget not_evidence <<<"$out" 2>/dev/null)" = True ] && ok "a direct-mode reply carries not_evidence=true, so no one mistakes tonight's run for a fence proof" \
   || bad "direct-mode reply carries not_evidence=true" "$out"
@@ -26,12 +30,68 @@ out="$(st --spec "$E2E_ROOT/l3.json" 2>&1)"; rc=$?
 { [ $rc -eq 2 ] && grep -q wrong_machine <<<"$out"; } && ok "a spec for another machine is refused as wrong_machine (each daemon starts only its own sessions)" \
   || bad "wrong machine refused" "rc=$rc $out"
 
-if docker image inspect ccsbx-fence:dev >/dev/null 2>&1; then
-  skip "a second start of a live label is refused already_running" "needs a pane that stays alive; the live-pane leg is not written yet (image present, TODO)"
+spec e2e:badwork lid-l4 's#"path":"[^"]*"#"path":"/etc"#' > "$E2E_ROOT/l4.json"
+out="$(st --spec "$E2E_ROOT/l4.json" 2>&1)"; rc=$?
+{ [ $rc -eq 2 ] && grep -q bad_spec <<<"$out"; } && ok "a worktree outside the worktree roots (/etc) is refused as bad_spec: a start cannot mount a host directory the owner did not allow" \
+  || bad "a workdir outside the roots is refused" "rc=$rc $out"
+
+if have_image; then
+  # ---- a LIVE fenced start: the pane runs `ccsbx run` in the real fence image; the fence's command is `sleep`
+  spec e2e:live lid-live > "$E2E_ROOT/live.json"
+  export CCSBX_IMAGE="$E2E_IMAGE"
+  out="$("$CCSBX" start --json --spec "$E2E_ROOT/live.json" --run-cmd "sleep 120" 2>&1)"; rc=$?
+  lsid="$(e2e_sid "$out")"
+  if [ $rc -eq 0 ] && [ -n "$lsid" ]; then
+    ok "a fenced start with a pane answers a StartReply ($lsid) and launches the pane in this run's own tmux server"
+    c="ccsbx-$lsid-g1"
+    if e2e_wait 30 docker inspect "$c"; then
+      ok "the fence container $c is up under the daemon's name for it"
+      ins="$(docker inspect -f 'user={{.Config.User}} ro={{.HostConfig.ReadonlyRootfs}} capdrop={{.HostConfig.CapDrop}} sec={{.HostConfig.SecurityOpt}} net={{.HostConfig.NetworkMode}} priv={{.HostConfig.Privileged}} pid={{.HostConfig.PidMode}}' "$c" 2>&1)"
+      grep -q 'user=10001:10001' <<<"$ins" && ok "it runs as uid 10001, not root and not the owner" || bad "the fence runs as 10001" "$ins"
+      grep -q 'ro=true' <<<"$ins" && ok "its root filesystem is read-only" || bad "read-only root" "$ins"
+      grep -q 'capdrop=\[ALL\]' <<<"$ins" && ok "every Linux capability is dropped" || bad "caps dropped" "$ins"
+      grep -q 'no-new-privileges' <<<"$ins" && ok "no-new-privileges is set, so a setuid binary cannot raise it" || bad "no-new-privileges" "$ins"
+      grep -q 'priv=false' <<<"$ins" && ok "it is not privileged and shares no pid namespace with the host" || bad "not privileged" "$ins"
+      [ "$(docker network inspect -f '{{.Internal}}' "ccsbx-net-$lsid-g1" 2>&1)" = true ] && ok "its network is internal: no route out except what the forwarder gives it" \
+        || bad "the fence network is internal" "$(docker network inspect -f '{{.Internal}}' "ccsbx-net-$lsid-g1" 2>&1)"
+      sj="$(docker exec "$c" cat /run/ccsbx/in/session.json 2>&1)"
+      { [ "$(jget sid <<<"$sj" 2>/dev/null)" = "$lsid" ] && [ "$(jget gen <<<"$sj" 2>/dev/null)" = 1 ]; } \
+        && ok "in/session.json inside the fence names its own sid and generation (identity comes from the daemon's record)" || bad "in/session.json names the sid and gen" "$sj"
+      env_out="$(docker exec "$c" env 2>&1)"
+      grep -Eq '^(SSH_AUTH_SOCK|ANTHROPIC_API_KEY|GITHUB_TOKEN|DISPLAY)=' <<<"$env_out" \
+        && bad "no host credential reaches the fence's environment" "$(grep -E '^(SSH_AUTH_SOCK|ANTHROPIC_API_KEY|GITHUB_TOKEN|DISPLAY)=' <<<"$env_out" | sed 's/=.*/=…/')" \
+        || ok "no host credential variable (ssh agent, API key, GitHub token, display) reaches the fence's environment"
+      # a second start of the live label is refused
+      spec e2e:live lid-live-2 > "$E2E_ROOT/live2.json"
+      out2="$("$CCSBX" start --json --spec "$E2E_ROOT/live2.json" --run-cmd "sleep 120" 2>&1)"; rc2=$?
+      { [ $rc2 -eq 2 ] && grep -q already_running <<<"$out2"; } && ok "a second start of the live label is refused already_running, naming the live session" \
+        || bad "a second start of a live label is refused already_running" "rc=$rc2 $out2"
+      # stop removes exactly this generation's container and network
+      "$CCSBX" stop "$lsid" >/dev/null 2>&1
+      if e2e_wait 20 bash -c "! docker inspect '$c' >/dev/null 2>&1"; then ok "ccsbx stop removes the container of that generation"; else bad "ccsbx stop removes the container" "$(docker inspect -f '{{.State.Status}}' "$c" 2>&1)"; fi
+      e2e_wait 20 bash -c "! docker network inspect 'ccsbx-net-$lsid-g1' >/dev/null 2>&1" && ok "... and its network, so nothing of the session is left behind" \
+        || bad "ccsbx stop removes the network" "network ccsbx-net-$lsid-g1 is still there"
+    else
+      bad "the fence container $c came up" "$(tmux -L "e2e-$$" capture-pane -p -t "$lsid" 2>&1 | tail -5)"
+    fi
+    # resume: the same sid at generation 2, started by a spec that names it
+    spec e2e:live lid-live-r 's/"resume":null/"resume":{"sid":"'"$lsid"'"}/' > "$E2E_ROOT/resume.json"
+    outr="$("$CCSBX" start --json --spec "$E2E_ROOT/resume.json" --run-cmd "sleep 120" 2>&1)"; rcr=$?
+    { [ $rcr -eq 0 ] && [ "$(jget sid <<<"$outr" 2>/dev/null)" = "$lsid" ] && [ "$(jget gen <<<"$outr" 2>/dev/null)" = 2 ]; } \
+      && ok "a resume spec starts the SAME sid at generation 2 (the transcript home is kept, the old generation is closed)" \
+      || bad "a resume is the same sid at gen 2" "rc=$rcr $outr"
+    if e2e_wait 30 docker inspect "ccsbx-$lsid-g2"; then ok "generation 2 runs in its own container ccsbx-$lsid-g2"; else bad "generation 2 has its own container" "none after 6 s"; fi
+    "$CCSBX" stop "$lsid" >/dev/null 2>&1
+  else
+    bad "a fenced start with a pane answers a StartReply" "rc=$rc $out"
+  fi
 else
-  skip "a second start of a live label is refused already_running" "needs the fence image ccsbx-fence:dev (U1a local build) to keep a pane alive; launcher=none has no live pane"
+  skip "a fenced start runs in the real fence (uid, read-only root, no caps, internal network), is refused already_running a second time, stops clean, and resumes at gen 2" \
+    "needs the fence image $E2E_IMAGE (U1a local build; never pulled here)"
 fi
-skip "cc-tree add --start / cc-tree start launch a fenced node through the placement function" "needs C1 (cc-tree placement)"
-skip "a fenced node can never start unfenced" "needs C1"
-skip "a manager's cc-tree start reaches the target daemon" "needs C16 + M2c"
-skip "start on the Mac and on future-two" "needs gate M (Mac daemon, future-two)"
+
+skip "cc-tree add --start / cc-tree start launch a fenced node through the placement function, and a fenced node can never start unfenced" \
+  "needs the dotfiles branch with C1 (cc-tree placement); see 08-remote-start for what runs against a real daemon"
+skip "a manager's cc-tree start reaches the target daemon (POST /v1/sessions)" "needs M2c on main (G's branch n1-g-m2c; daemonapi has only GET /v1/sessions) + the dotfiles C12/C16 branch n2-f-c16"
+skip "start on the Mac and on future-two" "needs gate M (Mac daemon, future-two, the cluster)"
+skip "a start through ccsbx-hostd and ccsbx-root (helper mode, the three-user split)" "needs root: the installer (N1-D, Gate M step) and sudoers for ccsbx-root"

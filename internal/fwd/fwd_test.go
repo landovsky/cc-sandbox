@@ -430,3 +430,60 @@ func TestBodyIsHashedIntoTheProof(t *testing.T) {
 		t.Fatalf("%v %v", resp, err)
 	}
 }
+
+// context "a --routes file written for the egress door could route git (a '**' or a /git/ rule)": the sidecar's own git is the only
+// thing that may reach git, so a rules file that would route it is refused at start.
+func TestARoutesFileCannotRouteGit(t *testing.T) {
+	u, _ := url.Parse("http://127.0.0.1:1")
+	doors := map[string]*url.URL{"egress": u}
+	for _, p := range []string{"/git/**", "/git/*/*/git-receive-pack", "/git", "/Git/**", "/GIT/*/*/git-receive-pack"} {
+		if err := ValidateRules([]Rule{{Door: "egress", Methods: []string{"POST"}, Path: p}}, doors); err == nil {
+			t.Errorf("rule %q accepted", p)
+		}
+	}
+	if err := ValidateRules([]Rule{{Door: "egress", Methods: []string{"GET"}, Path: "/github/**"}}, doors); err != nil {
+		t.Errorf("the github rule: %v", err)
+	}
+	if err := ValidateRules(DefaultRules, map[string]*url.URL{"model": u, "stub": u, "egress": u}); err != nil {
+		t.Errorf("the defaults: %v", err)
+	}
+	for _, r := range DefaultRules {
+		if r.Path == "/git" || strings.HasPrefix(r.Path, "/git/") {
+			t.Errorf("a default rule routes git: %v", r)
+		}
+	}
+}
+
+// context "a launcher's --routes file has a broad rule for the egress door (/**)": that must still never route git for a
+// caller without the sidecar's secret, because the check is on the path, not on the rule list.
+func TestABroadRuleStillCannotRouteGitForTheFence(t *testing.T) {
+	r := newRig(t)
+	du, _ := url.Parse(r.door.URL)
+	f, err := New(Config{Token: r.tok, Key: r.gen, Doors: map[string]*url.URL{"egress": du}, GitSecret: "s3cret",
+		Rules: []Rule{{Door: "egress", Methods: []string{"GET", "POST"}, Path: "/**"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(f)
+	defer srv.Close()
+	before := r.hits.Load()
+	for _, c := range []struct{ gate, path string }{{"", "/egress/git/o/r.git/git-receive-pack"}, {"wrong", "/egress/git/o/r.git/git-receive-pack"},
+		{"", "/egress/Git/o/r.git/git-receive-pack"}, {"", "/egress/GIT/o/r.git/git-receive-pack"}, {"", "/egress/git"}} {
+		gate := c.gate
+		req, _ := http.NewRequest("POST", srv.URL+c.path, strings.NewReader("{}"))
+		if gate != "" {
+			req.Header.Set(GitHeader, gate)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != 403 {
+			t.Errorf("gate %q: %d", gate, resp.StatusCode)
+		}
+	}
+	if r.hits.Load() != before {
+		t.Error("the door was asked")
+	}
+}

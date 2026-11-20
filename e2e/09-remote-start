@@ -1,0 +1,73 @@
+#!/usr/bin/env bash
+# e2e/09-remote-start — cc-tree's remote start path against a REAL daemon over loopback (plan C12/C16, M2c).
+# Real: a real `ccsbx-hostd run` (direct mode, scratch state), its local unix socket (owner class) put on a loopback TCP port by
+# e2e/loopback-shim.py (the stand-in for the tailnet leg: no WhoIs, no TLS, 127.0.0.1 only), and cc-tree's own HTTP client
+# (cc_tree_fence._http, from the dotfiles checkout E2E_CCTREE, default the n2-f-c16 worktree) pointed at it with
+# CCSBX_DAEMON_URLS. What runs: cc-tree lists the sessions the daemon runs (GET /v1/sessions), sees a live fenced session
+# there, refuses to treat an unreachable daemon as "nothing is running", and, because `POST /v1/sessions` (M2c) is not on
+# main, fails CLOSED when asked to start: it says nothing was started and no session appears. The start itself is a SKIP
+# naming M2c. Direct mode: not evidence.
+. "$(dirname "$0")/lib.sh"; e2e_init
+CT="${E2E_CCTREE:-$HOME/.dotfiles/.worktrees/n2-f-c16}"; HOSTD="${CCSBX_HOSTD_BIN:-$(dirname "$CCSBX")/ccsbx-hostd}"
+if [ ! -f "$CT/bin/lib/cc_tree_fence.py" ]; then
+  skip "cc-tree's remote start path reaches a real daemon over loopback" "needs a dotfiles checkout with C12/C16 (set E2E_CCTREE; branch n2-f-c16 is not on dotfiles main)"
+  exit 0
+fi
+[ -x "$HOSTD" ] || { skip "cc-tree's remote start path reaches a real daemon over loopback" "needs bin/ccsbx-hostd (make build)"; exit 0; }
+
+S="$E2E_ROOT/dstate"; mkdir -p "$S"; export CCSBX_STATE="$S"
+"$HOSTD" run --state "$S" --run-dir "$S" --root direct --machine hp-ubuntu --interval 100ms --worktree-root /var/tmp \
+  --local-socket "$S/hostd.sock" --tmux-socket "e2e-$$" >"$E2E_ROOT/hostd.log" 2>&1 & E2E_PIDS+=("$!")
+e2e_wait 15 test -S "$S/hostd.sock" || { bad "ccsbx-hostd run comes up" "$(tail -5 "$E2E_ROOT/hostd.log")"; exit 0; }
+P="$(e2e_port)"; python3 "$E2E_DIR/loopback-shim.py" "$P" "$S/hostd.sock" >/dev/null 2>&1 & E2E_PIDS+=("$!")
+e2e_wait 10 bash -c "exec 3<>/dev/tcp/127.0.0.1/$P" && ok "a real daemon is up and its owner socket is reachable on 127.0.0.1:$P through the loopback shim (the stand-in for the tailnet leg)" \
+  || { bad "the loopback shim answers" "port $P"; exit 0; }
+
+ct() { PYTHONDONTWRITEBYTECODE=1 CCSBX_DAEMON_URLS="hp-ubuntu=http://127.0.0.1:$P,downhost=http://127.0.0.1:$(e2e_port)" CC_TREE_START_RETRIES=0 CCSBX_CONNECT_TIMEOUT=2 \
+  python3 -c "import sys,json; sys.path.insert(0,'$CT/bin/lib'); import cc_tree_fence as F
+$1" 2>&1; }
+
+out="$(ct "print(json.dumps(F._http('hp-ubuntu','GET','/v1/sessions',timeout=5)))")"
+[ "$out" = "[200, []]" ] && ok "cc-tree's own HTTP client lists the daemon's sessions through the shim: HTTP 200 and none running yet" \
+  || bad "cc-tree lists the daemon's sessions" "$out"
+
+if have_image; then
+  spec e2e:remote lid-rem > "$E2E_ROOT/rem.json"; export CCSBX_IMAGE="$E2E_IMAGE"
+  o="$("$CCSBX" start --json --spec "$E2E_ROOT/rem.json" --run-cmd "sleep 120" 2>&1)"; rsid="$(e2e_sid "$o")"
+  if [ -n "$rsid" ] && e2e_wait 30 docker inspect "ccsbx-$rsid-g1"; then
+    e2e_wait 10 bash -c "'$CCSBX' ls --state '$S' 2>&1 | grep -q '$rsid'"
+    out="$(ct "c,b=F._http('hp-ubuntu','GET','/v1/sessions',timeout=5); print(json.dumps([[r.get('sid'), r.get('label'), r.get('state')] for r in b]))")"
+    grep -q "$rsid" <<<"$out" && grep -q "e2e:remote" <<<"$out" && grep -q running <<<"$out" && ok "cc-tree sees the live fenced session ($rsid) the daemon runs, with its label and state, through the loopback leg" \
+      || bad "cc-tree sees the live fenced session through the daemon" "$out"
+    "$CCSBX" stop "$rsid" >/dev/null 2>&1
+  else
+    bad "a live fenced session for cc-tree to see" "$o"
+  fi
+else
+  skip "cc-tree sees a live fenced session through a real daemon" "needs the fence image $E2E_IMAGE (U1a local build)"
+fi
+
+out="$(ct "
+try:
+    F._http('downhost','GET','/v1/sessions',timeout=3); print('NO-ERROR')
+except Exception as e: print(type(e).__name__, str(e))")"
+grep -q "FenceError" <<<"$out" && grep -q "nothing was started" <<<"$out" && ok "an unreachable daemon is an error that says nothing was started, never 'no sessions' (cc-tree fails closed)" \
+  || bad "an unreachable daemon is an error, not an empty list" "$out"
+
+before="$("$CCSBX" events --socket "$S/hostd.sock" --after 0 --json 2>&1 | jget head 2>/dev/null)"
+out="$(ct "
+spec={'v':1,'request_id':'lid-m2c-1','label':'cc-sandbox:m2c','machine':'hp-ubuntu','realm':'e2e','profile':'e2e-default','billing':'stub','repo':'o/r','base':'main','branch':'ccsbx/m2c'}
+try:
+    print(json.dumps(F._post_start('hp-ubuntu', spec)))
+except Exception as e: print(type(e).__name__, str(e))")"
+if grep -q "FenceError\|DaemonUnsure" <<<"$out" && ! grep -q '"sid"' <<<"$out"; then
+  ok "asked to start through the daemon (POST /v1/sessions), cc-tree fails CLOSED when the daemon does not take it: an error, no StartReply, no tab"
+else
+  bad "a start the daemon does not take is an error" "$out"
+fi
+[ "$("$CCSBX" events --socket "$S/hostd.sock" --after 0 --json 2>&1 | jget head 2>/dev/null)" = "$before" ] && ok "... and the daemon's journal gained nothing: no session was started behind the error" \
+  || bad "no session was started behind the error" "journal head moved from $before"
+
+skip "a manager's cc-tree start of a fenced node on the daemon (POST /v1/sessions with {repo, base, branch}) answers a StartReply and the session runs" "needs M2c on main (G's branch n1-g-m2c, with the daemon's POST /v1/sessions); today the daemon answers: $(grep -o 'FenceError.*\|DaemonUnsure.*' <<<"$out" | head -1 | cut -c1-140)"
+skip "the same through the TAILNET listener with Tailscale WhoIs classing the caller, over TLS" "needs tailscale and a tailnet address (Gate M, ACL); the shim above skips exactly that leg"
+skip "cc-tree start places a node by its Host: and refuses an unfenced start of a fenced node" "needs C1 (cc-tree placement) on dotfiles main"

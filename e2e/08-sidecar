@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# e2e/08-sidecar — the pod sidecar's `ccsbx side serve` wiring (plan F3), run as a plain host process: no docker, no
+# cluster, no root. Real: the scripted stub as the model door and a fake git door (e2e/fake-git-door.py, git
+# http-backend on a loopback port) behind the REAL forwarder; 503 until the one load; a second load refused; a model call
+# that the stub door verifies (token + proof); the fence-facing listener answering 403 on every git path; the clone
+# into an empty worktree; a fence-side file committed from a snapshot (host trailer, no fence-chosen branch); the push of
+# the session branch only; replies the fence's uid can read; the session journal's facts without a token or a body.
+# The stand-ins are named: the fence is this script writing request files with its own uid (the sidecar's --fence-uid),
+# and the git door applies no U16 rule. Skipped: the pod itself, the egress door, the hub (04-msg has the bus leg).
+. "$(dirname "$0")/lib.sh"; e2e_init
+"$CCSBX" side --help >/dev/null 2>&1 || { skip "the sidecar's serve wiring" "ccsbx side is not in this binary"; exit 0; }
+[ -x /usr/lib/git-core/git-http-backend ] || { skip "the sidecar's git against a fake door" "git http-backend is not installed on this host"; exit 0; }
+
+S="$E2E_ROOT/side"; mkdir -p "$S"/{ctl,out/requests,in,state,git,snap,work,door/git/o,journal}; chmod 0700 "$S" "$S"/{ctl,git,snap,state,journal}
+LP="$(e2e_port)"; SP="$(e2e_port)"; DP="$(e2e_port)"
+SID=s0e2eside01; me="$(id -u)"
+
+# --- the door side: a bare repo with a base commit, served by the fake door; the stub as the model door
+D="$S/door/git/o/r.git"
+git init --bare -q -b main "$D" && git -C "$D" config http.receivepack true
+git init -q -b main "$S/scratch" && printf 'base\n' > "$S/scratch/a.txt" && printf '#!/bin/sh\n' > "$S/scratch/run.sh" && chmod 0755 "$S/scratch/run.sh" \
+  && git -C "$S/scratch" add -A && git -C "$S/scratch" -c user.name=e2e -c user.email=e2e@localhost commit -q -m base && git -C "$S/scratch" push -q "$D" main
+python3 "$E2E_DIR/fake-git-door.py" "$S/door" "$DP" "$S/door.log" >/dev/null 2>&1 & E2E_PIDS+=("$!")
+"$CCSBX" token mint --key-file "$E2E_ROOT/dev.key" --sub "tomas/hp-ubuntu/$SID/g1" --label e2e --billing stub --profile e2e-default \
+  --aud ccsbx-model --aud ccsbx-egress --ttl 1h --fwd-secrets > "$S/secrets.json" 2>"$S/mint.err" || { bad "a session token and key for the sidecar" "$(cat "$S/mint.err")"; exit 0; }
+chmod 0600 "$E2E_ROOT/dev.key" "$S/secrets.json"
+"$CCSBX" token pubkey --key-file "$E2E_ROOT/dev.key" --owners tomas --machines hp-ubuntu --profiles 'e2e-*' --billings stub > "$S/keyring"
+"$CCSBX" stub --listen "127.0.0.1:$SP" --keyring "$S/keyring" --aud ccsbx-model --state "$S/stub-state.json" >"$S/stub.log" 2>&1 & E2E_PIDS+=("$!")
+
+# --- the sidecar, wired as `side serve` is in a pod (no hub here: the bus leg is 04-msg)
+"$CCSBX" side serve --listen "127.0.0.1:$LP" --control "$S/ctl/ctl.sock" --door "model=http://127.0.0.1:$SP" --door "egress=http://127.0.0.1:$DP" \
+  --sid "$SID" --gen 1 --label e2e --full-id "tomas/hp-ubuntu/$SID/g1" --machine hp-ubuntu \
+  --journal-dir "$S/journal/j" --out "$S/out" --in "$S/in" --state "$S/state/r" --fence-uid "$me" --relay-every 100ms \
+  --git-repo o/r --git-base main --git-branch ccsbx/e2e --git-url "http://127.0.0.1:$LP/egress/git" \
+  --git-dir "$S/git/g" --snapshot-dir "$S/snap/s" --work "$S/work" >"$S/serve.log" 2>&1 & SPID=$!; E2E_PIDS+=("$SPID")
+if ! e2e_wait 15 test -S "$S/ctl/ctl.sock"; then bad "ccsbx side serve starts with its flags (control socket, forwarder, journal, relay, git)" "$(tail -5 "$S/serve.log")"; exit 0; fi
+ok "ccsbx side serve starts with the pod's flags (control socket, forwarder, session journal, outbox relay, git) and refuses nothing it was given"
+
+body='{"model":"m","messages":[{"role":"user","content":"E2E:hi"}]}'
+code="$(curl -s -o /dev/null -w '%{http_code}' -X POST -H 'content-type: application/json' -d "$body" "http://127.0.0.1:$LP/model/v1/messages")"
+[ "$code" = 503 ] && ok "before the load the forwarder answers 503 to everything: the fence can use nothing until the launcher hands the secrets over" || bad "503 before the load" "got $code"
+
+"$CCSBX" side load --control "$S/ctl/ctl.sock" < "$S/secrets.json" >"$S/load.out" 2>&1; rc=$?
+[ $rc -eq 0 ] && ok "ccsbx side load (the launcher's pods/exec stdin) loads the token and key once" || bad "side load" "rc=$rc $(cat "$S/load.out")"
+"$CCSBX" side load --control "$S/ctl/ctl.sock" < "$S/secrets.json" >"$S/load2.out" 2>&1; rc=$?
+[ $rc -eq 4 ] && ok "a second load is refused with exit 4 (already loaded): a token cannot be swapped in a running sidecar" || bad "a second load is refused with exit 4" "rc=$rc $(cat "$S/load2.out")"
+
+got="$(curl -s -X POST -H 'content-type: application/json' -d "$body" "http://127.0.0.1:$LP/model/v1/messages")"
+grep -q STUB-OK <<<"$got" && ok "a model call through the sidecar's forwarder reaches the stub door and comes back STUB-OK (the door verified the token and the body-bound proof)" \
+  || bad "a model call through the sidecar's forwarder" "$got | stub: $(tail -2 "$S/stub.log")"
+[ "$(curl -s -o /dev/null -w '%{http_code}' -X POST -d '{}' "http://127.0.0.1:$LP/model/v1/admin")" = 403 ] && ok "a route no rule allows is 403 at the forwarder, before the door is asked" || bad "an unlisted route is refused"
+
+for p in "git-receive-pack" "git-upload-pack"; do
+  c="$(curl -s -o /dev/null -w '%{http_code}' -X POST -d 'x' "http://127.0.0.1:$LP/egress/git/o/r.git/$p")"
+  [ "$c" = 403 ] && ok "the fence-facing listener answers 403 to POST …/$p: only the sidecar's own git carries the secret that opens the git routes" || bad "the fence cannot POST $p" "got $c"
+done
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H 'X-Ccsbx-Git: guess' "http://127.0.0.1:$LP/egress/git/o/r.git/info/refs?service=git-receive-pack")" = 403 ] \
+  && ok "a guessed git secret is refused too" || bad "a guessed git secret is refused"
+# the sidecar's own clone (upload-pack, with the secret) may already be in the log; no push (receive-pack) can be
+[ "$(grep -c 'receive-pack' "$S/door.log" 2>/dev/null)" = 0 ] && ok "none of those refused requests reached the door (no receive-pack in its log before the sidecar's own push)" || bad "the refused git requests never reach the door" "$(cat "$S/door.log")"
+
+# --- clone, commit, push
+if e2e_wait 30 test -e "$S/in/worktree-ready" || e2e_wait 1 test -e "$S/in/worktree-failed"; then
+  if [ -e "$S/in/worktree-ready" ]; then
+    ok "after the load the sidecar clones the repo into the EMPTY worktree and writes in/worktree-ready (the fence's start gate)"
+    [ "$(cat "$S/work/a.txt" 2>/dev/null)" = base ] && [ -x "$S/work/run.sh" ] && ok "the worktree holds the base commit's files, executable bit kept" || bad "the worktree holds the base commit" "$(ls -la "$S/work")"
+    m="$(stat -c %a "$S/in/replies" "$S/in/worktree-ready" "$S/work/a.txt" 2>/dev/null | tr '\n' ' ')"
+    [ "$m" = "755 644 664 " ] && ok "what the fence must read or write has explicit modes (in/replies 755, ready marker 644, checkout 664), whatever the sidecar's umask" || bad "explicit modes on fence-facing files" "got: $m"
+    printf 'from the fence\n' > "$S/work/new.txt"
+    ask() { printf '%s' "$2" > "$S/out/requests/$1.json"; e2e_wait 20 test -s "$S/in/replies/$1.json" && cat "$S/in/replies/$1.json"; }
+    r="$(ask c1 '{"type":"git.commit","message":"work from the e2e fence"}')"
+    [ "$(jget status <<<"$r" 2>/dev/null)" = ok ] && ok "git.commit in the outbox is committed host-side from a snapshot of the worktree (reply ok, sha $(jget result.sha <<<"$r" 2>/dev/null | cut -c1-8))" || bad "git.commit" "$r | $(tail -3 "$S/serve.log")"
+    r="$(ask p0 '{"type":"git.push","branch":"main"}')"
+    [ "$(jget status <<<"$r" 2>/dev/null)" = refused ] && ok "a push that names a branch is refused (bad_request): the fence does not choose the branch or the remote" || bad "a push naming a branch is refused" "$r"
+    r="$(ask p1 '{"type":"git.push"}')"
+    [ "$(jget status <<<"$r" 2>/dev/null)" = ok ] && ok "git.push sends the session branch through the sidecar's forwarder to the door (reply ok)" || bad "git.push" "$r | $(tail -3 "$S/serve.log")"
+    tip="$(git -C "$D" rev-parse refs/heads/ccsbx/e2e 2>&1)"
+    git -C "$D" ls-tree -r --name-only "$tip" 2>/dev/null | grep -q new.txt && ok "the door's repository has the session branch ccsbx/e2e with the fence's file" || bad "the door has the session branch" "$tip"
+    [ "$(git -C "$D" rev-parse refs/heads/main)" = "$(git -C "$S/scratch" rev-parse HEAD)" ] && ok "main at the door is untouched" || bad "main at the door is untouched"
+    git -C "$D" log -1 --format=%B "$tip" | grep -q "^Fenced-Session: $SID" && ok "the commit carries the host's Fenced-Session trailer: it was made by the sidecar, not by the fence" || bad "the host's trailer on the commit" "$(git -C "$D" log -1 --format=%B "$tip")"
+    grep -qi 'X-Ccsbx-Git' "$S/door.log" && bad "the door never sees the sidecar's internal git secret" "$(grep receive-pack "$S/door.log" | head -2)" \
+      || ok "the door saw the push (Authorization injected by the forwarder) and never the internal git secret header"
+    grep -q 'git-receive-pack' "$S/door.log" && ok "the door's log shows the push arrived through the forwarder's git route" || bad "the push reached the door" "$(cat "$S/door.log")"
+    r="$(ask m1 '{"type":"msg.send","to":{"node":"cc-sandbox:mgr"},"text":"hi"}')"
+    [ "$(jget status <<<"$r" 2>/dev/null)" = refused ] && ok "msg.send without a hub is refused (unsupported_in_pod) instead of dropped silently" || bad "msg.send without a hub" "$r"
+  else
+    bad "the sidecar clones the repo into the empty worktree" "worktree-failed: $(cat "$S/in/worktree-failed") | $(tail -3 "$S/serve.log")"
+  fi
+else
+  bad "the sidecar clones the repo after the load" "neither in/worktree-ready nor in/worktree-failed after 6 s | $(tail -3 "$S/serve.log")"
+fi
+
+# --- the journal and the logs: facts, never secrets
+kill -TERM "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null; rc=$?
+[ $rc -eq 0 ] && ok "SIGTERM ends the sidecar with exit 0 after the relay's last journal word" || bad "SIGTERM ends the sidecar cleanly" "rc=$rc $(tail -3 "$S/serve.log")"
+jf="$(cat "$S"/journal/j/seg-*.jsonl 2>/dev/null)"
+for t in fwd.loaded git.cloned git.committed git.pushed relay.forwarded; do
+  grep -q "\"type\":\"$t\"" <<<"$jf" && ok "the session journal has $t" || bad "the session journal has $t" "$(printf '%s' "$jf" | cut -c1-200 | head -5)"
+done
+tok="$(jget token < "$S/secrets.json")"; key="$(jget key < "$S/secrets.json")"
+leak=""; for needle in "${tok##*.}" "$key" "work from the e2e fence"; do for f in "$S"/journal/j/seg-*.jsonl "$S/serve.log" "$S/door.log"; do grep -qF -- "$needle" "$f" 2>/dev/null && leak="$leak ${f##*/}:${needle:0:10}"; done; done
+[ -z "$leak" ] && ok "no token signature, no key and no commit message is in the journal, the sidecar's log or the door's log" || bad "no secret or body in the journal and logs" "found:$leak"
+
+skip "the sidecar's pod: the fence and sidecar containers share the worktree, volumes and network namespace, fsGroup 10003, the fence waits for worktree-ready" "needs the cluster (gate M, future-two) and the pod spec's volumes; the pieces above are this wiring's own"
+skip "the sidecar's git through a REAL egress door (U16: protected branches, ≥300 files, ≥250 commits, token-bound branch)" "needs U15/U16 on a door instance (gate M)"
+skip "pods/exec delivers the secrets (ccsbx-root pod-load) and the relay token reaches the sidecar" "needs root + a kubeconfig + the cluster (gate M)"

@@ -20,6 +20,9 @@ import (
 const (
 	FenceUID = 10001
 	SideUID  = 10002
+	// SideEphemeralMB is the sidecar's ephemeral-storage limit. The pod's ephemeral storage is the sum of its
+	// containers' limits, and every disk-backed emptyDir is charged to it.
+	SideEphemeralMB = 1024
 	// WorkGID is the pod's fsGroup (ccsbx-work): neither user's primary group, held by both, so that what the
 	// sidecar checks out into /work the fence can write and the other way round. Any other fsGroup is refused.
 	WorkGID = 10003
@@ -134,7 +137,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 	}
 	fenceCmd := s.FenceCmd
 	if len(fenceCmd) == 0 {
-		fenceCmd = []string{"tmux", "-f", "/dev/null", "new-session", "-s", s.Sid, "claude"}
+		fenceCmd = FenceEntry(s.Sid)
 	}
 	sec := func(uid int64) *ContainerSec {
 		return &ContainerSec{
@@ -177,12 +180,12 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			InitContainers: []Container{{
 				Name: "side", Image: s.SideImage, Command: s.SideCmd, RestartPolicy: "Always",
 				Ports:           []Port{{Name: "fwd", ContainerPort: SidePort, Protocol: "TCP"}},
-				Resources:       guaranteed(256, 1, 1024),
+				Resources:       guaranteed(256, 1, SideEphemeralMB),
 				SecurityContext: sec(SideUID),
 				VolumeMounts: []VolumeMount{
 					{Name: "worktree", MountPath: "/work"}, {Name: "out", MountPath: "/run/ccsbx/out", ReadOnly: true},
 					{Name: "in", MountPath: "/run/ccsbx/in"}, {Name: "managed", MountPath: "/etc/claude-code"},
-					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "snapshot", MountPath: "/run/ccsbx/side/snapshot"},
+					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "snapshot", MountPath: "/run/ccsbx/side/snapshot"}, {Name: "gitdir", MountPath: "/run/ccsbx/side/git"},
 					{Name: "side-tmp", MountPath: "/tmp"}, {Name: "journal", MountPath: "/run/ccsbx/journal"},
 				},
 			}},
@@ -198,7 +201,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			}},
 			Volumes: []Volume{
 				vol("worktree", s.WorktreeMB, false), vol("out", 64, false), vol("in", 16, false), vol("managed", 8, false),
-				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("journal", 16, false), vol("snapshot", s.WorktreeMB, false),
+				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("journal", 16, false), vol("snapshot", s.WorktreeMB, false), vol("gitdir", s.WorktreeMB, false),
 			},
 		},
 	}
@@ -320,7 +323,7 @@ const (
 // place for the process that holds the token.
 var volumeOwner = map[string]string{
 	"worktree": "both", "out": "both", "in": "both", "managed": "both",
-	"side-state": "side", "side-tmp": "side", "journal": "side", "snapshot": "side",
+	"side-state": "side", "side-tmp": "side", "journal": "side", "snapshot": "side", "gitdir": "side",
 	"home": "fence", "tmp": "fence",
 }
 
@@ -414,6 +417,21 @@ func (c Config) CheckContract(p *Pod) error {
 		bad("no worktree volume")
 	}
 	all := append(append([]Container{}, s.InitContainers...), s.Containers...)
+	// the disk-backed volumes must fit in what the containers may use of the node's ephemeral storage
+	var diskMi, limitMi int64
+	for _, v := range vols {
+		if v.EmptyDir != nil && v.EmptyDir.Medium == "" {
+			n, _ := toMi(v.EmptyDir.SizeLimit)
+			diskMi += n
+		}
+	}
+	for _, ct := range all {
+		n, _ := toMi(ct.Resources.Limits["ephemeral-storage"])
+		limitMi += n
+	}
+	if diskMi > limitMi {
+		bad("the disk-backed volumes total %d Mi but the containers may use only %d Mi of ephemeral storage: the pod would be evicted before any volume reached its own limit", diskMi, limitMi)
+	}
 	for _, ct := range all {
 		uid := int64(FenceUID)
 		if ct.Name == "side" {
@@ -491,6 +509,9 @@ func (c Config) CheckContract(p *Pod) error {
 			if len(ct.Command) < 3 || ct.Command[0] != SideBinary || ct.Command[1] != "side" || ct.Command[2] != "serve" || len(ct.Command) > 64 {
 				bad("the sidecar runs %s side serve and nothing else (at most 64 arguments)", SideBinary)
 			}
+			// maxScope bounds the scope as the record holds it; ParseScope's re-encoding escapes <, > and & as
+			// \u003c and the like, so a worst-case scope can come out longer than it went in and cross this per-argument
+			// limit. That fails closed (the pod is refused, nothing runs), which is the right way for it to fail.
 			for _, a := range ct.Command {
 				if len(a) > maxScope+256 || strings.ContainsRune(a, 0) {
 					bad("a sidecar argument is too long or holds a NUL")
@@ -498,7 +519,11 @@ func (c Config) CheckContract(p *Pod) error {
 			}
 		}
 	}
-	// who may write what: the fence cannot write in/ or managed/, the sidecar cannot write out/
+	// who may write what: the fence cannot write in/ or managed/, the sidecar cannot write out/. These are mount
+	// flags, and they are what holds: the pod's fsGroup (WorkGID) makes every volume group-owned by a group both
+	// containers are in, with setgid directories, so a file the sidecar writes under in/ or managed/ could be
+	// group-writable and the fence, being in that group, could write it were the mount not read-only. It is read-only
+	// (checked just below, and again in the live pod), so what the sidecar writes there is the fence's to read only.
 	need := map[string]map[string]bool{"fence": {"in": true, "managed": true}, "side": {"out": true}}
 	for _, ct := range all {
 		for _, mnt := range ct.VolumeMounts {
@@ -533,3 +558,27 @@ func (c Config) repoAllowed(repo string) bool {
 	}
 	return false
 }
+
+// FenceEntry is the fence's default command: wait for the sidecar to finish cloning into /work (it writes
+// /run/ccsbx/in/worktree-ready, or worktree-failed with a reason) and only then start the session. The clone
+// is refused into a non-empty /work, so nothing may write there first. It gives up after ten minutes, and on
+// failure shows the sidecar's reason and exits.
+func FenceEntry(sid string) []string {
+	const script = `n=0; while [ ! -e /run/ccsbx/in/worktree-ready ]; do
+  if [ -e /run/ccsbx/in/worktree-failed ]; then echo "the worktree could not be made:" >&2; cat /run/ccsbx/in/worktree-failed >&2; exit 1; fi
+  n=$((n+1)); [ "$n" -gt 600 ] && { echo "the worktree was not ready after 10 minutes" >&2; exit 1; }
+  sleep 1
+done
+exec tmux -f /dev/null new-session -s "$1" claude`
+	return []string{"/bin/sh", "-c", script, "ccsbx-fence", sid}
+}
+
+// DiskVolumesMB is the sum of the sizeLimits of the pod's disk-backed volumes for a worktree of worktreeMB: the
+// worktree, the sidecar's snapshot and git directory (each as large as the worktree), and home, out, in, managed
+// and the journal. The kubelet evicts a pod whose ephemeral storage use passes the sum of its containers' limits,
+// so those limits must cover this or the pod is evicted before any one volume reaches its own limit.
+func DiskVolumesMB(worktreeMB int) int { return 3*worktreeMB + 512 + 64 + 16 + 8 + 16 }
+
+// SnapshotLimitBytes is what the sidecar may put in the snapshot volume: 90% of the volume, so a commit that
+// fills it up to the limit cannot make the pod's volume overflow and the pod be evicted.
+func SnapshotLimitBytes(worktreeMB int) int64 { return int64(worktreeMB) << 20 / 10 * 9 }

@@ -9,7 +9,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/start"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -91,14 +93,16 @@ func (p *fakePod) Load(_ context.Context, ref k8s.Ref, secrets []byte) error {
 
 type podFx struct {
 	*fx
-	pod    *fakePod
-	order  []string
-	minted []token.Claims
-	mintEr error
-	clock  time.Time
-	hub    []hubReq // what the fake hub saw
-	hubSt  int      // its answer to POST (default 201)
-	audit  strings.Builder
+	pod      *fakePod
+	order    []string
+	minted   []token.Claims
+	mintEr   error
+	clock    time.Time
+	hub      []hubReq           // what the fake hub saw
+	hubSt    int                // its answer to POST (default 201)
+	revoked  []token.RevokeBody // what the doors were told
+	revokeEr error
+	audit    strings.Builder
 }
 
 // hubTransport is the hub: it records each request (and notes it in the order) and answers.
@@ -158,7 +162,10 @@ func (f *fx) writeConfigPod(t *testing.T, side bool, extra string) {
 		}
 		return lookup(n)
 	}
-	f.d.HubListeners = func(port int) ([]TCPListener, error) { return []TCPListener{{Port: port, UID: hubUID}}, nil }
+	f.d.LocalAddrs = func() ([]net.IP, error) { return []net.IP{net.ParseIP("127.0.0.1")}, nil }
+	f.d.HubListeners = func(port int) ([]TCPListener, error) {
+		return []TCPListener{{IP: "0100007F", Port: port, UID: hubUID}}, nil
+	}
 }
 
 func (pf *podFx) wire() {
@@ -167,6 +174,11 @@ func (pf *podFx) wire() {
 	pf.d.DropPrivs = func(u, g int) error { *order = append(*order, "drop"); return dp(u, g) }
 	pf.d.NewPod = func(*Config, *k8sCtx) (PodAPI, error) { return pf.pod, nil }
 	pf.d.Hub = &http.Client{Transport: hubTransport{pf}}
+	pf.d.RevokeToken = func(_ context.Context, _ *Config, b token.RevokeBody) error {
+		*order = append(*order, "revoke-token")
+		pf.revoked = append(pf.revoked, b)
+		return pf.revokeEr
+	}
 	pf.d.Audit = &pf.audit
 	pf.d.Mint = func(_ context.Context, _ *Config, c token.Claims, register func(string) (string, error)) ([]byte, error) {
 		*order = append(*order, "mint")
@@ -432,7 +444,7 @@ func TestPodStopDeletesByNameAndRecordedUID(t *testing.T) {
 	if code, out := pf.call("pod-stop", sid); code != 0 || !strings.Contains(out, "deleted") {
 		t.Fatalf("%d %s", code, out)
 	}
-	if pf.seq() != "hub:DELETE,drop,delete" || len(pf.pod.deleted) != 1 || pf.pod.deleted[0] != [3]string{sid, "2", podUID} {
+	if pf.seq() != "hub:DELETE,drop,revoke-token,delete" || len(pf.pod.deleted) != 1 || pf.pod.deleted[0] != [3]string{sid, "2", podUID} {
 		t.Errorf("order %s deleted %v", pf.seq(), pf.pod.deleted)
 	}
 }
@@ -548,7 +560,7 @@ func TestPodStopRevokesTheRelayBeforeTheDrop(t *testing.T) {
 	if code, out := pf.call("pod-stop", sid); code != 0 {
 		t.Fatalf("%d %s", code, out)
 	}
-	if pf.seq() != "hub:DELETE,drop,delete" {
+	if pf.seq() != "hub:DELETE,drop,revoke-token,delete" {
 		t.Errorf("order %s", pf.seq())
 	}
 	// a hub that is down never stops the pod's deletion
@@ -635,6 +647,7 @@ func TestPodCreateBuildsTheSidecarCommandFromTheRecordAndConfig(t *testing.T) {
 	pf.rec.Label = "cc-sandbox:x"
 	pf.rec.Spec.MsgScope = json.RawMessage(`{"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":["p1"],"peer_machines":{"p1":"mac"}}`)
 	pf.rec.Reply.ID = "tomas/future-two/" + sid + "/g2"
+	pf.rec.Spec.Workdir = start.Workdir{Repo: "landovsky/cc-sandbox", Base: "main", Branch: "work/" + sid}
 	pf.writeRecord()
 	pf.writeConfigPod(t, true, "k8s_hub_url = \"http://hub-egress.cc-sandbox.svc:4011\"\nk8s_doors = [\"model=http://ccsp-model.cc-sandbox-doors.svc:8080\"]\n")
 	pf.wire()
@@ -645,6 +658,7 @@ func TestPodCreateBuildsTheSidecarCommandFromTheRecordAndConfig(t *testing.T) {
 	want := "/usr/local/bin/ccsbx side serve --listen 127.0.0.1:8080 --control /run/ccsbx/side/ctl/ctl.sock --state /run/ccsbx/side/state --journal-dir /run/ccsbx/journal/s " +
 		"--out /run/ccsbx/out --in /run/ccsbx/in --fence-uid 10001 --sid " + sid + " --gen 2 --label cc-sandbox:x --full-id tomas/future-two/" + sid + "/g2 --machine future-two " +
 		`--scope {"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":["p1"],"peer_machines":{"p1":"mac"}} ` +
+		"--git-repo landovsky/cc-sandbox --git-url http://127.0.0.1:8080/egress/git --git-base main --git-branch work/" + sid + " --git-dir /run/ccsbx/side/git/g --git-max-bytes 9663676416 " +
 		"--hub-url http://hub-egress.cc-sandbox.svc:4011 --door model=http://ccsp-model.cc-sandbox-doors.svc:8080"
 	if got != want {
 		t.Errorf("got  %s\nwant %s", got, want)
@@ -687,5 +701,127 @@ func TestSidecarConfigKeysAreValidated(t *testing.T) {
 	put(t, p, base+"k8s_hub_url = \"https://hub.example:4011\"\n", 0o644)
 	if _, err := LoadConfig(p, os.Getuid()); err != nil {
 		t.Errorf("a good hub URL: %v", err)
+	}
+}
+
+func TestPodLoadReadsTheScopeStrictlyToo(t *testing.T) {
+	pf := newPodFx(t)
+	pf.rec.Spec.MsgScope = json.RawMessage(`{"manager":{"node":"a","machine":"hp"},"manager":{"node":"b","machine":"mac"}}`)
+	pf.writeRecord()
+	pf.refused("a duplicate manager", "pod-load", "not well formed")
+	if len(pf.dropped) != 0 || len(pf.minted) != 0 || len(pf.hub) != 0 {
+		t.Error("acted on a scope that is not well formed")
+	}
+}
+
+// ---- the doors are told when a pod generation ends (F2x: the revoke client) ----
+
+func TestStoppingAPodRevokesItsTokenAtTheDoorsEvenIfTheDeleteFails(t *testing.T) {
+	pf := newPodFx(t)
+	if code, out := pf.call("pod-stop", sid); code != 0 {
+		t.Fatalf("%d %s", code, out)
+	}
+	if len(pf.revoked) != 1 || pf.revoked[0] != (token.RevokeBody{Owner: "tomas", Machine: "future-two", Sid: sid, Gen: 2}) {
+		t.Errorf("revoked %+v", pf.revoked)
+	}
+	// the delete fails (another pod under the name): the token is revoked all the same, first
+	pf = newPodFx(t)
+	pf.pod.delErr = &k8s.ConflictError{Namespace: "cc-sandbox", Pod: k8s.PodName(sid, 2), Why: "has another UID"}
+	pf.refused("a pod that is not ours", "pod-stop", "pod_conflict")
+	if len(pf.revoked) != 1 {
+		t.Errorf("the token was not revoked when the delete was refused: %+v", pf.revoked)
+	}
+	// a revoke that fails never fails the stop; it says so, with what to revoke by hand
+	pf = newPodFx(t)
+	pf.revokeEr = errors.New("door down")
+	code, _ := pf.call("pod-stop", sid)
+	if code != 0 || len(pf.pod.deleted) != 1 || !strings.Contains(pf.audit.String(), "token-revoke") || !strings.Contains(pf.audit.String(), "FAILED, revoke by hand") || !strings.Contains(pf.audit.String(), "sid="+sid+" gen=2") {
+		t.Errorf("exit %d deleted=%d audit %q", code, len(pf.pod.deleted), pf.audit.String())
+	}
+}
+
+func TestAPodLoadThatFailsRevokesTheTokenItMayHaveSigned(t *testing.T) {
+	pf := newPodFx(t)
+	pf.pod.loadErrs = []error{fmt.Errorf("side load refused: bad key: %w", side.ErrRefused)}
+	if code, _ := pf.call("pod-load", sid); code != 1 || len(pf.revoked) != 1 || pf.revoked[0].Sid != sid || pf.revoked[0].Gen != 2 {
+		t.Errorf("a refused load: revoked %+v", pf.revoked)
+	}
+	pf = newPodFx(t)
+	pf.mintEr = errors.New("signer refused")
+	if code, _ := pf.call("pod-load", sid); code != 1 || len(pf.revoked) != 1 {
+		t.Errorf("a failed mint: revoked %+v", pf.revoked)
+	}
+	// a hub that refuses the relay after the token was signed: the signed token is revoked too
+	pf = newPodFx(t)
+	pf.hubSt = 500
+	if code, _ := pf.call("pod-load", sid); code != 3 || len(pf.revoked) != 1 {
+		t.Errorf("a refused relay: exit %d revoked %+v", code, pf.revoked)
+	}
+	// a load that works revokes nothing
+	pf = newPodFx(t)
+	if code, _ := pf.call("pod-load", sid); code != 0 || len(pf.revoked) != 0 {
+		t.Errorf("a good load: %d revoked %+v", code, pf.revoked)
+	}
+	// a pod that never came up minted nothing: nothing to revoke here (hostd's pod-stop does it)
+	pf = newPodFx(t)
+	pf.pod.phases = []k8s.Status{{Phase: "Pending"}}
+	if code, _ := pf.call("pod-load", sid); code != 4 || len(pf.revoked) != 0 {
+		t.Errorf("never ready: %d revoked %+v", code, pf.revoked)
+	}
+}
+
+func TestRevokeDoorsAreChecked(t *testing.T) {
+	f := newFx(t)
+	p := f.dir + "/etc/c.toml"
+	base := "allowed_roots = [\"" + f.roots + "\"]\nmachine = \"m\"\n"
+	for why, extra := range map[string]string{"credentials": "revoke_doors = [\"http://u:p@x:1\"]\n", "a path": "revoke_doors = [\"http://x:1/revoke\"]\n", "ftp": "revoke_doors = [\"ftp://x\"]\n"} {
+		put(t, p, base+extra, 0o644)
+		if _, err := LoadConfig(p, os.Getuid()); err == nil {
+			t.Errorf("%s was accepted", why)
+		}
+	}
+	put(t, p, base+"revoke_doors = [\"http://100.64.0.9:8091\", \"https://doors.example:8091\"]\n", 0o644)
+	if c, err := LoadConfig(p, os.Getuid()); err != nil || len(c.RevokeDoors) != 2 {
+		t.Errorf("good doors: %v", err)
+	}
+}
+
+func TestTheEphemeralBudgetIsCheckedAtConfigLoad(t *testing.T) {
+	f := newFx(t)
+	p := f.dir + "/etc/c.toml"
+	base := "allowed_roots = [\"" + f.roots + "\"]\nmachine = \"m\"\n"
+	put(t, p, base+"k8s_ephemeral_mb = 20480\n", 0o644) // the old default: three worktree-sized volumes no longer fit
+	if _, err := LoadConfig(p, os.Getuid()); err == nil || !strings.Contains(err.Error(), "evicted") {
+		t.Errorf("a budget that cannot hold the volumes was accepted: %v", err)
+	}
+	put(t, p, base+"k8s_ephemeral_mb = 20480\nk8s_worktree_mb = 4096\n", 0o644)
+	if _, err := LoadConfig(p, os.Getuid()); err != nil {
+		t.Errorf("a smaller worktree fits the smaller budget: %v", err)
+	}
+	if Defaults().K8sEphemeralMB+k8s.SideEphemeralMB < k8s.DiskVolumesMB(Defaults().K8sWorktreeMB) {
+		t.Error("the defaults do not fit each other")
+	}
+}
+
+// N6: pod-stop with a generation refuses, touching nothing, when the session is at another one
+func TestPodStopWithAGenerationRefusesAStaleOne(t *testing.T) {
+	pf := newPodFx(t)
+	code, out := pf.call("pod-stop", sid, "1") // the record is at generation 2
+	if code != 2 || !strings.Contains(out, "another_generation") || len(pf.pod.deleted) != 0 || len(pf.hub) != 0 || len(pf.revoked) != 0 || len(pf.dropped) != 0 {
+		t.Errorf("exit %d deleted=%d hub=%d revoked=%d dropped=%d: %s", code, len(pf.pod.deleted), len(pf.hub), len(pf.revoked), len(pf.dropped), out)
+	}
+	pf = newPodFx(t)
+	if code, out := pf.call("pod-stop", sid, "2"); code != 0 || len(pf.pod.deleted) != 1 {
+		t.Errorf("the right generation: %d %s", code, out)
+	}
+	for _, bad := range []string{"0", "x", "02", "-1", "99999"} {
+		pf = newPodFx(t)
+		if code, _ := pf.call("pod-stop", sid, bad); code == 0 || len(pf.pod.deleted) != 0 {
+			t.Errorf("generation %q was taken", bad)
+		}
+	}
+	pf = newPodFx(t)
+	if code, _ := pf.call("pod-stop", sid, "2", "3"); code == 0 || len(pf.pod.deleted) != 0 {
+		t.Error("a third argument was taken")
 	}
 }

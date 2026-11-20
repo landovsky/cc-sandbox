@@ -114,6 +114,7 @@ const (
 	PeerSetMismatch  = "peer_set_mismatch"
 	RequestIDReused  = "request_id_reused"
 	Forbidden        = "forbidden"
+	Internal         = "internal" // a failure on this machine that is not the caller's spec
 	UnsupportedMedia = "unsupported_media_type"
 )
 

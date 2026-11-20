@@ -322,14 +322,24 @@ func TestResume(t *testing.T) {
 		}
 	})
 
-	t.Run("a resume whose launch fails leaves the session at its old generation", func(t *testing.T) {
-		d, _, a := first(t)
+	t.Run("a resume whose launch fails keeps the failed generation's number, ended, and a consistent full id", func(t *testing.T) {
+		d, fl, a := first(t)
 		d.Launcher = &failLauncher{fakeLauncher{alive: map[string]bool{}}}
 		if _, err := d.Start(res(a.Sid, nil)); err == nil {
 			t.Fatal("expected failure")
 		}
-		if rec, _ := d.Load(a.Sid); rec.Gen != 1 {
-			t.Fatalf("gen %d", rec.Gen)
+		rec, _ := d.Load(a.Sid)
+		if rec.Gen != 2 || rec.Ended == nil || rec.Reply.Gen != 2 || !strings.HasSuffix(rec.Reply.ID, "/g2") {
+			t.Fatalf("gen %d ended %v reply %d %s", rec.Gen, rec.Ended, rec.Reply.Gen, rec.Reply.ID)
+		}
+		if rec.RequestID != "rid-1" {
+			t.Errorf("the failed request %q must not be the record's (a retry would be answered with a success)", rec.RequestID)
+		}
+		// the number is not reused: the next resume is generation 3
+		d.Launcher = fl
+		rep, err := d.Start(res(a.Sid, func(s *LaunchSpec) { s.RequestID = "rid-after" }))
+		if err != nil || rep.Gen != 3 {
+			t.Fatalf("%+v %v", rep, err)
 		}
 	})
 }

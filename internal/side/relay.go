@@ -132,6 +132,9 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 	if fi, err := os.Lstat(rd); err != nil || !fi.IsDir() || !ownedBy(fi, cfg.OwnUID) {
 		return nil, fmt.Errorf("side relay: %s is not a plain directory of ours", rd)
 	}
+	if err := os.Chmod(rd, 0o755); err != nil { // the fence reads it: explicit, whatever the umask made of Mkdir
+		return nil, fmt.Errorf("side relay: %w", err)
+	}
 	r := &Relay{cfg: cfg, seen: map[string]bool{}, tokens: float64(cfg.Burst), last: cfg.Now()}
 	if f, err := os.Open(r.ledgerPath()); err == nil {
 		defer f.Close()
@@ -192,12 +195,7 @@ func (r *Relay) reply(rep hostd.Reply) {
 		return
 	}
 	b, _ := json.Marshal(rep)
-	tmp := filepath.Join(dir, "."+rep.Rid+".tmp")
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		r.cfg.Logf("side relay: reply to %s: %v", rep.Rid, err)
-		return
-	}
-	if err := os.Rename(tmp, filepath.Join(dir, rep.Rid+".json")); err != nil {
+	if err := writePublic(filepath.Join(dir, rep.Rid+".json"), b); err != nil {
 		r.cfg.Logf("side relay: reply to %s: %v", rep.Rid, err)
 	}
 }

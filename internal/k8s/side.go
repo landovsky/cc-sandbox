@@ -13,6 +13,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/gitname"
 	"io"
 	"net/url"
 	"regexp"
@@ -32,7 +33,10 @@ const (
 	SideState      = "/run/ccsbx/side/state"
 	SideJournalDir = "/run/ccsbx/journal/s"
 	SideOut        = "/run/ccsbx/out"
-	SideIn         = "/run/ccsbx/in"
+	// SideGitDir is one level below the git volume's mount: the volume root is the kubelet's (root, 0777) and the
+	// sidecar accepts only a directory of its own (0700), so it makes this one, as it does for state/, journal/s and snapshot/s.
+	SideGitDir = "/run/ccsbx/side/git/g"
+	SideIn     = "/run/ccsbx/in"
 )
 
 // SideInfo is what the sidecar is told about its session.
@@ -42,6 +46,10 @@ type SideInfo struct {
 	Scope                       json.RawMessage // the record's msg_scope: {manager:{node,machine},peers,peer_machines,...}
 	HubURL                      string          // the operator egress Service to the hub; "" until it exists
 	Doors                       []string        // NAME=URL, the doors the forwarder may reach
+	// the repository the sidecar clones into the empty /work after the load (F3c), from the record's workdir
+	GitRepo, GitBase, GitBranch string
+	// GitMaxBytes is what a commit's snapshot may hold (--git-max-bytes); 0 leaves the sidecar's own default
+	GitMaxBytes int64
 }
 
 var (
@@ -70,12 +78,28 @@ func SideArgv(i SideInfo) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("sidecar: msg_scope: %v", err)
 	}
+	// the same rules as the sidecar's own (internal/gitname): a bad name is refused here, at the start, not
+	// found minutes later as a pod that never gets ready
+	if err := gitname.Pair(i.GitRepo, i.GitBase, i.GitBranch); err != nil {
+		return nil, fmt.Errorf("sidecar: %v", err)
+	}
 	args := []string{SideBinary, "side", "serve",
 		"--listen", "127.0.0.1:" + strconv.Itoa(SidePort),
 		"--control", SideControl, "--state", SideState, "--journal-dir", SideJournalDir,
 		"--out", SideOut, "--in", SideIn, "--fence-uid", strconv.Itoa(FenceUID),
 		"--sid", i.Sid, "--gen", strconv.Itoa(i.Gen), "--label", i.Label, "--full-id", i.FullID,
 		"--machine", i.Machine, "--scope", scope}
+	args = append(args, "--git-repo", i.GitRepo, "--git-url", fmt.Sprintf("http://127.0.0.1:%d/egress/git", SidePort))
+	if i.GitBase != "" {
+		args = append(args, "--git-base", i.GitBase)
+	}
+	args = append(args, "--git-branch", i.GitBranch, "--git-dir", SideGitDir)
+	if i.GitMaxBytes < 0 {
+		return nil, fmt.Errorf("sidecar: git max bytes %d", i.GitMaxBytes)
+	}
+	if i.GitMaxBytes > 0 {
+		args = append(args, "--git-max-bytes", strconv.FormatInt(i.GitMaxBytes, 10))
+	}
 	if i.HubURL != "" {
 		if err := checkHTTPURL(i.HubURL); err != nil {
 			return nil, fmt.Errorf("sidecar: hub url: %v", err)
@@ -100,17 +124,17 @@ func SideArgv(i SideInfo) ([]string, error) {
 	return args, nil
 }
 
-// scopeDoc is the message scope the sidecar understands (internal/msg.Scope). The sidecar's own parser
+// ScopeDoc is the message scope the sidecar understands (internal/msg.Scope). The sidecar's own parser
 // is not the place to catch a duplicated or wrong-case key, so the launcher builds the flag from this
 // struct: what is written is exactly these fields, in this order, once each.
-type scopeDoc struct {
-	Manager      scopeNode         `json:"manager"`
+type ScopeDoc struct {
+	Manager      ScopeNode         `json:"manager"`
 	Peers        []string          `json:"peers"`
 	PeerMachines map[string]string `json:"peer_machines,omitempty"`
 	ReplyWindowS int               `json:"reply_window_s,omitempty"`
 }
 
-type scopeNode struct {
+type ScopeNode struct {
 	Node    string `json:"node"`
 	Machine string `json:"machine,omitempty"`
 }
@@ -119,39 +143,51 @@ type scopeNode struct {
 // its exact spelling (no duplicates, no "Manager", no extras, no null), and returns the compact JSON
 // of the typed struct.
 func canonicalScope(raw json.RawMessage) (string, error) {
-	if len(raw) == 0 || len(raw) > maxScope {
-		return "", fmt.Errorf("must be a JSON object of at most %d bytes", maxScope)
-	}
-	if err := strictKeys(raw, map[string]bool{"manager": true, "peers": true, "peer_machines": true, "reply_window_s": true}, false); err != nil {
+	d, err := ParseScope(raw)
+	if err != nil {
 		return "", err
-	}
-	var d scopeDoc
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(&d); err != nil {
-		return "", err
-	}
-	// the manager object is held to the same rule
-	var top map[string]json.RawMessage
-	json.Unmarshal(raw, &top)
-	if m, ok := top["manager"]; ok {
-		if err := strictKeys(m, map[string]bool{"node": true, "machine": true}, false); err != nil {
-			return "", fmt.Errorf("manager: %v", err)
-		}
-	}
-	if pm, ok := top["peer_machines"]; ok {
-		if err := strictKeys(pm, nil, true); err != nil {
-			return "", fmt.Errorf("peer_machines: %v", err)
-		}
-	}
-	if d.Peers == nil {
-		d.Peers = []string{}
 	}
 	out, err := json.Marshal(d)
 	if err != nil {
 		return "", err
 	}
 	return string(out), nil
+}
+
+// ParseScope reads a record's msg_scope as strictly as the sidecar's flag is built: a JSON object with
+// exactly the known keys, spelled exactly, each once, nothing after it. Everything that reads the scope out of a
+// record (the sidecar's flag, the relay's may_reach and manager) goes through it, so none of them sees a
+// record the others would refuse.
+func ParseScope(raw json.RawMessage) (*ScopeDoc, error) {
+	if len(raw) == 0 || len(raw) > maxScope {
+		return nil, fmt.Errorf("must be a JSON object of at most %d bytes", maxScope)
+	}
+	if err := strictKeys(raw, map[string]bool{"manager": true, "peers": true, "peer_machines": true, "reply_window_s": true}, false); err != nil {
+		return nil, err
+	}
+	var d ScopeDoc
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&d); err != nil {
+		return nil, err
+	}
+	// the manager object is held to the same rule
+	var top map[string]json.RawMessage
+	json.Unmarshal(raw, &top)
+	if m, ok := top["manager"]; ok {
+		if err := strictKeys(m, map[string]bool{"node": true, "machine": true}, false); err != nil {
+			return nil, fmt.Errorf("manager: %v", err)
+		}
+	}
+	if pm, ok := top["peer_machines"]; ok {
+		if err := strictKeys(pm, nil, true); err != nil {
+			return nil, fmt.Errorf("peer_machines: %v", err)
+		}
+	}
+	if d.Peers == nil {
+		d.Peers = []string{}
+	}
+	return &d, nil
 }
 
 // strictKeys walks one JSON object's top-level keys: each must be exactly spelled, listed (when free is

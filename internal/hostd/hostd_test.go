@@ -803,3 +803,51 @@ func TestTheSeenNamesSetIsBoundedWhenAFenceFloodsNewNames(t *testing.T) {
 		t.Fatalf("%d requests handled past the lifetime cap of 10", len(f.got))
 	}
 }
+
+// context "a generation that has ended must have its token killed at the doors": the callback runs once,
+// when the outbox is drained for the last time, with the owner and machine from the record, and not before.
+func TestOnGenerationEndIsCalledOnceWhenTheOutboxIsDrained(t *testing.T) {
+	type end struct {
+		sid, owner, machine string
+		gen                 int
+	}
+	var ends []end
+	f := newFixture(t, func(c *Config) {
+		c.OnGenerationEnd = func(sid string, gen int, owner, machine string) { ends = append(ends, end{sid, owner, machine, gen}) }
+	})
+	// the record of the fixture names no owner or machine: give it some
+	b, _ := os.ReadFile(filepath.Join(f.state, "sessions", sid+".json"))
+	var rec start.Record
+	json.Unmarshal(b, &rec)
+	rec.Spec.Owner, rec.Spec.Machine = "tomas", "hp-ubuntu"
+	b, _ = json.Marshal(rec)
+	os.WriteFile(filepath.Join(f.state, "sessions", sid+".json"), b, 0o600)
+	f.req("a.json", `{"type":"ccf.done"}`)
+	f.h.Scan()
+	if len(ends) != 0 {
+		t.Fatalf("called while the generation is running: %v", ends)
+	}
+	os.WriteFile(filepath.Join(f.g, "CLOSED"), []byte("closed\n"), 0o600)
+	f.h.Scan()
+	f.h.Scan()
+	if len(ends) != 1 || ends[0] != (end{sid, "tomas", "hp-ubuntu", 1}) {
+		t.Errorf("%v", ends)
+	}
+}
+
+// a pod generation is revoked by ccsbx-root's pod verbs: hostd's callback does not fire for it
+func TestOnGenerationEndIsNotCalledForAPodSession(t *testing.T) {
+	called := 0
+	f := newFixture(t, func(c *Config) { c.OnGenerationEnd = func(string, int, string, string) { called++ } })
+	b, _ := os.ReadFile(filepath.Join(f.state, "sessions", sid+".json"))
+	var rec start.Record
+	json.Unmarshal(b, &rec)
+	rec.Backend = "k8s"
+	b, _ = json.Marshal(rec)
+	os.WriteFile(filepath.Join(f.state, "sessions", sid+".json"), b, 0o600)
+	os.WriteFile(filepath.Join(f.g, "CLOSED"), []byte("closed\n"), 0o600)
+	f.h.Scan()
+	if called != 0 {
+		t.Error("the callback fired for a pod session")
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -55,6 +56,11 @@ type Record struct {
 	// with secrets, attach, delete) checks against the live pod.
 	Backend string `json:"backend,omitempty"`
 	PodUID  string `json:"pod_uid,omitempty"`
+	// Starting is set from a pod session's first save until its pod is loaded (or the start failed): the
+	// generation is being made, and nothing else may act on this session (a resume is refused). Starts are the
+	// times this session's generations were started, so a resume counts against the hourly cap.
+	Starting bool        `json:"starting,omitempty"`
+	Starts   []time.Time `json:"starts,omitempty"`
 }
 
 // Daemon holds the policy knobs and the state directory.
@@ -97,7 +103,16 @@ type Daemon struct {
 	// generation ends (the doors then refuse it; plan U5). Optional.
 	Revoke func(sid string, gen int)
 	// Logf receives the daemon's notices; with no Revoke it carries "token may exist for sid X gen N".
-	Logf        func(format string, a ...any)
+	Logf func(format string, a ...any)
+	// PodVerbsRevoke says ccsbx-root's pod verbs revoke a pod generation's token and relay themselves (pod-stop, and
+	// pod-load when it fails), so hostd has nothing to revoke by hand for pods and says nothing about it; their
+	// own audit lines report a revoke that failed.
+	PodVerbsRevoke bool
+	// StartLimit bounds how long a pod start may be in flight (see startingLimit); 0: 15 minutes.
+	StartLimit time.Duration
+	// PodMaxLive caps the live pod sessions on their own (a pod holds up to 32 GiB of ephemeral storage and 4 GiB of memory on the shared
+	// node, far more than a docker session): machine_full above this many. 0: only MaxLive applies.
+	PodMaxLive  int
 	ReplaceWait time.Duration // how long Replace waits for the old fence to shut down (default 15s)
 	Now         func() time.Time
 	// Exe is the ccsbx binary the pane runs ("run --sid ...").
@@ -239,7 +254,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 			return nil, refuse(NotBuilt, "a remote start needs ccsbx-root, which is not installed here")
 		}
 		if errors.Is(err, ErrCannotTell) { // root could not tell (exit 3): our side's trouble, not the caller's spec
-			return nil, refuse("internal", "the worktree check could not be made on this machine (see the daemon's log)")
+			return nil, refuse(Internal, "the worktree check could not be made on this machine (see the daemon's log)")
 		}
 		if err != nil || got != filepath.Clean(s.Workdir.Path) {
 			return nil, refuse(BadSpec, "workdir is not a git worktree root")
@@ -410,7 +425,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		// Remove, not mark ended: a retry with this request_id must not be answered with the
 		// reply of a session that never started.
 		if prev != nil {
-			_ = d.save(prev) // a failed resume leaves the session as it was
+			_ = d.save(failedGeneration(prev, rec.Gen, d.now().UTC())) // the previous generation's session, the failed one's number
 		} else {
 			_ = os.Remove(d.path("sessions", rec.Sid+".json"))
 		}
@@ -657,8 +672,23 @@ func (d *Daemon) Replace(sid, brief string) (*Record, error) {
 		return nil, err
 	}
 	if err := d.Launcher.Launch(rec); err != nil {
-		d.markEnded(&prev)
+		_ = d.save(failedGeneration(&prev, rec.Gen, d.now().UTC())) // the pane is gone and so is the number
 		return nil, fmt.Errorf("launch generation %d: %w", rec.Gen, err)
 	}
 	return rec, nil
+}
+
+// failedGeneration is the record of a session whose next generation did not come up: the session as the
+// previous generation left it (its request, spec and reply, so a retry of the failed request is not answered
+// with a success), ended, but under the NEW generation's number and full id. The number is never given back:
+// the doors refuse every token at or below a revoked generation, so the next resume must be the number after
+// this one; and the full id names the generation the record is at.
+func failedGeneration(prev *Record, gen int, now time.Time) *Record {
+	f := *prev
+	f.Gen, f.Ended, f.Starting = gen, &now, false
+	f.Reply.Gen = gen
+	if i := strings.LastIndex(f.Reply.ID, "/g"); i >= 0 {
+		f.Reply.ID = f.Reply.ID[:i] + "/g" + strconv.Itoa(gen)
+	}
+	return &f
 }

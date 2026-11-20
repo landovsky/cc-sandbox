@@ -7,8 +7,10 @@ package rootcmd
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -19,6 +21,7 @@ import (
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
+	"github.com/landovsky/cc-sandbox/internal/k8s"
 	"github.com/landovsky/cc-sandbox/internal/start"
 )
 
@@ -91,6 +94,9 @@ func (r *relayFx) reconfig(extra string) {
 			return hubUID, hubUID, nil
 		}
 		return l(n)
+	}
+	r.d.LocalAddrs = func() ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("100.101.219.96")}, nil
 	}
 	r.d.HubListeners = func(port int) ([]TCPListener, error) {
 		if r.lis != nil {
@@ -361,7 +367,10 @@ func TestTheHubMustBeOnLoopback(t *testing.T) {
 	p := filepath.Join(r.dir, "etc", "c.toml")
 	base := "allowed_roots = [\"" + r.roots + "\"]\nmachine = \"m\"\n"
 	for why, u := range map[string]string{
-		"a remote host": "http://10.0.0.5:4011", "a name": "http://hub.example:4011", "https": "https://127.0.0.1:4011",
+		"a name": "http://hub.example:4011", "https": "https://127.0.0.1:4011",
+		"localhost by name": "http://localhost:4011", "IPv6 loopback": "http://[::1]:4011", "a leading-zero octet": "http://127.0.0.01:4011",
+		"a hex address": "http://0x7f.0.0.1:4011", "a short form": "http://127.1:4011", "no port": "http://127.0.0.1", "port 0": "http://127.0.0.1:0",
+		"a port with a leading zero": "http://127.0.0.1:04011", "a mapped IPv6 literal": "http://[::ffff:127.0.0.1]:4011",
 		"userinfo": "http://u:p@127.0.0.1:4011", "a path": "http://127.0.0.1:4011/x", "none": "",
 	} {
 		put(t, p, base+"hub_url = \""+u+"\"\n", 0o644)
@@ -369,7 +378,7 @@ func TestTheHubMustBeOnLoopback(t *testing.T) {
 			t.Errorf("%s was accepted as the hub", why)
 		}
 	}
-	for _, u := range []string{"http://127.0.0.1:4011", "http://localhost:4011", "http://[::1]:4011"} {
+	for _, u := range []string{"http://127.0.0.1:4011", "http://100.101.219.96:4011", "http://192.168.1.20:4011"} { // whether it is THIS host's is checked at use
 		put(t, p, base+"hub_url = \""+u+"\"\n", 0o644)
 		if _, err := LoadConfig(p, os.Getuid()); err != nil {
 			t.Errorf("%s: %v", u, err)
@@ -534,8 +543,155 @@ func TestMayReachIsCutAtTheHubsLimit(t *testing.T) {
 		machines[n] = "mac"
 	}
 	b, _ := json.Marshal(map[string]any{"manager": map[string]string{"node": "m", "machine": "hp"}, "peers": peers, "peer_machines": machines})
-	got := mayReach(b)
+	d, err := k8s.ParseScope(b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mayReach(d)
 	if len(got) != 32 || got[0] != "hp/m" || got[31] != "mac/p30" {
 		t.Errorf("%d entries, first %q last %q", len(got), got[0], got[len(got)-1])
 	}
 }
+
+// The docker relay-mint reads the record's scope as strictly as pod-create does: a scope the sidecar's flag
+// would be refused for (duplicate or wrong-case keys, an unknown key, null, trailing data) gets no relay.
+func TestRelayMintReadsTheScopeAsStrictlyAsPodCreate(t *testing.T) {
+	for why, scope := range map[string]string{
+		"null":                       `null`,
+		"a duplicate manager":        `{"manager":{"node":"a","machine":"hp"},"manager":{"node":"b","machine":"mac"}}`,
+		"a wrong-case key":           `{"Manager":{"node":"a","machine":"hp"}}`,
+		"an unknown key":             `{"manager":{"node":"a","machine":"hp"},"extra":1}`,
+		"a duplicate key in manager": `{"manager":{"node":"a","node":"b","machine":"hp"}}`,
+		"a duplicate peer machine":   `{"manager":{"node":"a","machine":"hp"},"peers":["p"],"peer_machines":{"p":"mac","p":"hp"}}`,
+	} {
+		r := newRelayFx(t)
+		r.rec.Spec.MsgScope = json.RawMessage(scope)
+		r.writeRecord()
+		code, out := r.mint("--", sid, "2", relayPub)
+		if code != 2 || len(r.hubCalls()) != 0 || !strings.Contains(out, "not well formed") {
+			t.Errorf("%s: exit %d hub calls %d: %s", why, code, len(r.hubCalls()), out)
+		}
+	}
+}
+
+// ---- the address the secret goes to must be one the hub listens on (D's review: the hub on hp listens on the
+// tailnet address only, not on loopback) ----
+
+func TestTheSecretGoesOnlyToAnAddressTheHubListensOn(t *testing.T) {
+	const tailnet, loop, wild = "60DB6564", "0100007F", "00000000" // 100.101.219.96, 127.0.0.1, 0.0.0.0
+	const mapped, wild6 = "0000000000000000FFFF00000100007F", "00000000000000000000000000000000"
+	hub := hubUID
+	squat := os.Getuid() + 7
+	r := newRelayFx(t)
+	r.d.LocalAddrs = func() ([]net.IP, error) {
+		return []net.IP{net.ParseIP("127.0.0.1"), net.ParseIP("100.101.219.96")}, nil
+	}
+	check := func(url string, ls []TCPListener) error {
+		cfg := *r.cfg
+		cfg.HubURL = url
+		r.d.HubListeners = func(port int) ([]TCPListener, error) {
+			for i := range ls {
+				ls[i].Port = port
+			}
+			return ls, nil
+		}
+		return (&env{cfg: &cfg, d: r.d}).checkHubListener()
+	}
+	for why, c := range map[string]struct {
+		url string
+		ls  []TCPListener
+		ok  bool
+	}{
+		"the hub on the tailnet address, url the tailnet address":                     {"http://100.101.219.96:4011", []TCPListener{{IP: tailnet, UID: hub}}, true},
+		"a squatter on 127.0.0.1 while the hub is on the tailnet IP":                  {"http://100.101.219.96:4011", []TCPListener{{IP: tailnet, UID: hub}, {IP: loop, UID: squat}}, false},
+		"the hub on loopback only, url the tailnet address":                           {"http://100.101.219.96:4011", []TCPListener{{IP: loop, UID: hub}}, false},
+		"the hub on the tailnet address only, url loopback":                           {"http://127.0.0.1:4011", []TCPListener{{IP: tailnet, UID: hub}}, false},
+		"the hub on a wildcard, url the tailnet address":                              {"http://100.101.219.96:4011", []TCPListener{{IP: wild, UID: hub}}, true},
+		"the hub on the IPv6 wildcard, url the tailnet address":                       {"http://100.101.219.96:4011", []TCPListener{{IP: wild6, UID: hub}}, true},
+		"the hub on loopback, url loopback":                                           {"http://127.0.0.1:4011", []TCPListener{{IP: loop, UID: hub}}, true},
+		"the hub on a v4-mapped loopback, url loopback":                               {"http://127.0.0.1:4011", []TCPListener{{IP: mapped, UID: hub}}, true},
+		"a wildcard listener of another uid":                                          {"http://127.0.0.1:4011", []TCPListener{{IP: wild, UID: squat}}, false},
+		"the hub's uid on an address that is not the url's, plus a wildcard squatter": {"http://100.101.219.96:4011", []TCPListener{{IP: loop, UID: hub}, {IP: wild, UID: squat}}, false},
+		"an address that is not an address":                                           {"http://127.0.0.1:4011", []TCPListener{{IP: "zz", UID: hub}}, false},
+		"a foreign address, with a wildcard listener of the hub's uid":                {"http://203.0.113.9:4011", []TCPListener{{IP: wild, UID: hub}}, false},
+		"a foreign address that a listener of the hub's uid names":                    {"http://203.0.113.9:4011", []TCPListener{{IP: "09710CB0", UID: hub}}, false},
+	} {
+		if err := check(c.url, c.ls); (err == nil) != c.ok {
+			t.Errorf("%s: ok=%v want %v (%v)", why, err == nil, c.ok, err)
+		}
+	}
+}
+
+func TestProcAddressesDecode(t *testing.T) {
+	for in, want := range map[string]string{
+		"0100007F": "127.0.0.1", "60DB6564": "100.101.219.96", "00000000": "0.0.0.0",
+		"0000000000000000FFFF00000100007F": "127.0.0.1", "00000000000000000000000001000000": "::1", "00000000000000000000000000000000": "::",
+	} {
+		if got := decodeProcIP(in); got == nil || got.String() != want {
+			t.Errorf("%s decoded to %v, want %s", in, got, want)
+		}
+	}
+	for _, bad := range []string{"", "zz", "0100007", "0100007F00"} {
+		if decodeProcIP(bad) != nil {
+			t.Errorf("%q decoded", bad)
+		}
+	}
+}
+
+// the host's own addresses can not be read: nothing is sent
+func TestTheSecretIsNotSentWhenThisHostsAddressesCannotBeRead(t *testing.T) {
+	r := newRelayFx(t)
+	r.d.LocalAddrs = func() ([]net.IP, error) { return nil, errors.New("no interfaces") }
+	if code, _ := r.mint("--", sid, "2", relayPub); code != 3 || len(r.hubCalls()) != 0 {
+		t.Errorf("exit %d hub calls %d", code, len(r.hubCalls()))
+	}
+}
+
+// an address on an interface that is down is not this host's to be reached on (and D's fib_trie read drops it too)
+func TestOnlyAddressesOfInterfacesThatAreUpCount(t *testing.T) {
+	ifs := []net.Interface{
+		{Name: "lo", Flags: net.FlagUp | net.FlagLoopback},
+		{Name: "tailscale0", Flags: net.FlagUp},
+		{Name: "dummy0", Flags: 0}, // down
+	}
+	addrs := map[string]string{"lo": "127.0.0.1/8", "tailscale0": "100.101.219.96/32", "dummy0": "203.0.113.9/24"}
+	got, err := upAddrs(func() ([]net.Interface, error) { return ifs, nil }, func(i *net.Interface) ([]net.Addr, error) {
+		ip, n, _ := net.ParseCIDR(addrs[i.Name])
+		n.IP = ip
+		return []net.Addr{n}, nil
+	})
+	if err != nil || len(got) != 2 || got[0].String() != "127.0.0.1" || got[1].String() != "100.101.219.96" {
+		t.Errorf("%v %v", got, err)
+	}
+	// an interface that cannot be read is an error, not a silent skip
+	if _, err := upAddrs(func() ([]net.Interface, error) { return ifs, nil }, func(*net.Interface) ([]net.Addr, error) { return nil, errors.New("gone") }); err == nil {
+		t.Error("an unreadable interface was skipped")
+	}
+	// the real one answers, and every address it gives is an interface that is up
+	if _, err := localAddrs(); err != nil {
+		t.Error(err)
+	}
+}
+
+// D's no-hub installer: no hub keys in the config and no secret file. relay-mint refuses because the secret is
+// absent, before any connect, whatever hub_url's default says.
+func TestWithNoHubConfiguredRelayMintRefusesOnTheAbsentSecretBeforeAnyConnect(t *testing.T) {
+	r := newRelayFx(t)
+	r.writeConfig("") // no hub_url, no hub_secret, no hub_user: the defaults
+	r.d.Audit = r.audit
+	r.env["SUDO_UID"] = fmt.Sprint(svcUID)
+	r.d.Hub = &http.Client{Transport: failTransport{}} // any connect would be an error: count it instead
+	connects := 0
+	r.d.Hub = &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) { connects++; return nil, errors.New("must not connect") })}
+	if _, err := os.Stat(r.cfg.HubSecret); err == nil {
+		t.Skip("this machine has a real hub secret")
+	}
+	code, out := r.mint("--", sid, "2", relayPub)
+	if code != 3 || connects != 0 || !strings.Contains(out, "secret") {
+		t.Errorf("exit %d connects %d: %s", code, connects, out)
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(q *http.Request) (*http.Response, error) { return f(q) }

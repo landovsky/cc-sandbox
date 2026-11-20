@@ -20,12 +20,41 @@ u0_binaries() {
   cmd install -o root -g root -m 0755 "$BIN_DIR/ccsbx-signer" "$LIBEXEC/ccsbx-signer"
   cmd install -o root -g root -m 0755 "$BIN_DIR/ccsbx" /usr/local/bin/ccsbx
   note "ccsbx-root reads its allowed workdir roots from /etc/ccsbx/ccsbx-root.toml (root-owned)"
+  local HUB_TOML=""
+  if [ "$HUB_ON" = 1 ]; then HUB_TOML="hub_user = \"${OWNER}\"
+hub_url = \"${HUB_URL}\"
+hub_secret = \"/etc/ccsbx/hub-admin.secret\"
+"
+  else HUB_TOML="# hub_url, hub_user and hub_secret are NOT set: this install does not depend on the hub (no --hub-url). relay-mint and pod relays
+# refuse cleanly until the install is re-run with --hub-url at the hub's deploy gate.
+"; fi
   put /etc/ccsbx/ccsbx-root.toml 0644 root:root <<EOT
 # written by install-linux.sh (U0). Root-owned: tomas can't widen it. Edit with sudoedit.
 allowed_roots = [${ALLOWED_ROOTS_TOML}]
 machine = "${MACHINE}"
-verbs = ["run", "stop", "status", "renew", "gc", "attach", "exec-token"]
+verbs = ["run", "stop", "status", "renew", "gc", "attach", "exec-token", "pod-create", "pod-load", "pod-stop", "pod-status", "relay-mint"]
+# pod sessions (F2w) and the relay (M2b). Three users, none able to do another's job.
+launch_user = "ccsbx-launch"
+term_user = "ccsbx-term"
+signer_user = "ccsbx-keys"
+signer_socket = "/run/ccsbx-signer/launch.sock"
+kubeconfig = "/var/lib/ccsbx-launch/launcher.kubeconfig"
+k8s_machine = "${K8S_MACHINE}"
+k8s_side_image = "${SIDE_IMAGE}"
+${HUB_TOML}# the doors' owner listeners that take the signed revoke when a pod generation ends (F2x). None until the doors exist (M1): empty = the
+# verb's audit line says "no revoke_doors" and the token expires by itself (k8s_token_hours). Pass --revoke-doors at M1 and re-run install.
+revoke_doors = [${REVOKE_DOORS_TOML}]
 EOT
+  if [ "$HUB_ON" = 1 ]; then
+    note "the hub's admin secret (the shared SB_SECRET), for ccsbx-root's relay mint: the first line of $HUB_SECRET_FROM, root 0600, never printed, never leaves hp"
+    # plan never reads the file (and `plan -v` must not print it): the placeholder stands in for it
+    if [ "$MODE" = install ]; then put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"$HUB_SECRET"
+    else put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"(the secret, read from the --hub-secret-from file at install)"; fi
+  else
+    note "no --hub-url: no hub secret is read or written. A secret left by an EARLIER install with a hub is removed: ccsbx-root refuses relay-mint"
+    note "  because that file is missing (its hub_url default plays no part), so a stale one would keep the relay path half-alive"
+    cmd rm -f /etc/ccsbx/hub-admin.secret
+  fi
   note "a root-owned copy of the pins: ccsbx-root and hostd read THIS, never the owner-writable repo"
   put /etc/ccsbx/pins.toml 0644 root:root < "$REPO_DIR/pins.toml"
   note "pins.toml is empty today: only e2e candidate images run, as expected, until U1a is pinned"
@@ -107,7 +136,7 @@ u0_hostd() {
   note "ccsbx-root's run directory (it makes it itself, root-owned 0755; made here so hostd's unit can bind it read-write)"
   cmd install -d -o root -g root -m 0755 /var/lib/ccsbx-run
   note "hostd's unit gets the same roots as ccsbx-root ($WORKTREE_ROOT, as --worktree-root) and the fence image ($IMAGE, by digest) and machine name ($MACHINE)"
-  put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < <(sed -e "s|@WORKTREE_ROOT@|$WORKTREE_ROOT|g" -e "s|@IMAGE@|$IMAGE|g" -e "s|@MACHINE@|$MACHINE|g" "$UNITS_DIR/systemd/ccsbx-hostd.service")
+  put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < <(sed -e "s|@WORKTREE_ROOT@|$WORKTREE_ROOT|g" -e "s|@IMAGE@|$IMAGE|g" -e "s|@MACHINE@|$MACHINE|g" -e "s|@REVOKE_DOOR@|\"$REVOKE_DOORS\"|g" "$UNITS_DIR/systemd/ccsbx-hostd.service")
   note "the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced"
   if [ "$MODE" != install ] || [ ! -e "$(pth /var/lib/ccsbx/listen.token)" ]; then
     cmd runuser -u ccsbx -- sh -c 'umask 077; head -c 32 /dev/urandom | base64 > /var/lib/ccsbx/listen.token'
@@ -213,6 +242,7 @@ u0_uninstall() {
   note "units are stopped and disabled BEFORE their files are removed (a disable needs the file)"
   try systemctl disable --now ccsbx-hostd.service
   try systemctl disable --now ccsbx-tmux.service
+  try systemctl disable --now ccsbx-signer-launch.socket
   try systemctl disable --now ccsbx-signer.socket
   try systemctl disable --now ccsbx-signer.service
   note "this restores the state before the FIRST install; hand edits to sudoers.d since then are lost"
@@ -226,6 +256,11 @@ u0_uninstall() {
   for p in "${MANAGED_PATHS[@]}"; do
     [ -e "$real$p" ] || [ -L "$real$p" ] || continue
     cmd cp -a "$RESTORE_DIR$p" "$p"
+  done
+  note "2b. a managed path that is neither in the backup nor in ABSENT was added by a LATER installer than the one that took the first backup: removed too"
+  for p in "${MANAGED_PATHS[@]}"; do
+    if [ -e "$real$p" ] || [ -L "$real$p" ] || grep -qxF "$p" "$real/ABSENT"; then continue; fi
+    cmd rm -f "$p"
   done
   note "3. every sudoers.d file comes back as it was, then the whole config is checked"
   if [ -d "$real/etc/sudoers.d" ]; then
@@ -246,7 +281,7 @@ u0_uninstall() {
   try gpasswd -d "$(real_user)" ccsbx-clients
   try systemctl daemon-reload
   note "NOT undone, on purpose: docker/lxd membership and the lxd snap (re-add with gpasswd -a $(real_user) docker if you want invariant 14 waived again);"
-  note "  users ccsbx, ccsbx-keys and group ccsbx-clients; /var/lib/ccsbx; /etc/ccsbx and $LIBEXEC (now empty)"
+  note "  users ccsbx, ccsbx-keys, ccsbx-launch, ccsbx-term (and /var/lib/ccsbx-launch with its kubeconfig) and group ccsbx-clients; /var/lib/ccsbx; /etc/ccsbx and $LIBEXEC (now empty)"
   step "U0 undo: retire the backup so a later install starts from a fresh first backup"
   cmd mv "$RESTORE_DIR" "$RESTORE_DIR.undone-$(date +%Y%m%d-%H%M%S)"
 }

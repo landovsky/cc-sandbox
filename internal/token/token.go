@@ -328,6 +328,15 @@ func (k KeyScope) allowsClaims(c *Claims) bool {
 	return true
 }
 
+// PermitsRevoke reports whether this key may sign a revoke for a session of owner on machine: the same owner
+// and machine rule as for a token (a revoke names no profile or billing).
+func (k KeyScope) PermitsRevoke(owner, machine string) error {
+	if !k.allows(owner, machine) {
+		return ErrKeyScope
+	}
+	return nil
+}
+
 func (k KeyScope) allows(owner, machine string) bool {
 	has := func(l []string, v string) bool {
 		for _, x := range l {

@@ -74,3 +74,26 @@ func trustedFile(path string, uid int) error {
 	}
 	return nil
 }
+
+// writePublic writes a file the FENCE must be able to read (a reply, a marker in in/): created O_EXCL as a temp file
+// in the same directory, set to 0644 explicitly (the process umask is not trusted to be anything), then renamed over
+// the final name, so the fence never sees half of it. Private files of ours are never written through here.
+func writePublic(path string, data []byte) error {
+	tmp := filepath.Join(filepath.Dir(path), "."+filepath.Base(path)+".tmp")
+	os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if _, err = f.Write(data); err == nil {
+		err = f.Chmod(0o644)
+	}
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	return os.Rename(tmp, path)
+}

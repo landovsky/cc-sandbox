@@ -1077,6 +1077,7 @@ func TestPlainRepoDotGitIsDerivedAndMountedReadOnly(t *testing.T) {
 	f := newFx(t)
 	dg := filepath.Join(f.wd, ".git")
 	mk(t, dg, 0o755)
+	put(t, filepath.Join(dg, "HEAD"), "ref: refs/heads/main\n", 0o644)
 	f.rec.GitDir = dg
 	f.writeRecord()
 	st, _ := os.Stat(dg)
@@ -1097,6 +1098,7 @@ func TestPlainRepoDotGitIsDerivedAndMountedReadOnly(t *testing.T) {
 func TestPlainRepoWithAnEmptyGitDirIsRefused(t *testing.T) {
 	f := newFx(t)
 	mk(t, filepath.Join(f.wd, ".git"), 0o755)
+	put(t, filepath.Join(f.wd, ".git", "HEAD"), "ref: refs/heads/main\n", 0o644)
 	f.rec.GitDir = ""
 	f.writeRecord()
 	f.wantRefusedMsg("a plain repo with an empty gitdir", "does not match", "run", sid)
@@ -1109,6 +1111,7 @@ func TestGitDirMustEqualWhatIsDerived(t *testing.T) {
 	}{
 		{"a plain repo, another gitdir", func(f *fx) {
 			mk(f.t, filepath.Join(f.wd, ".git"), 0o755)
+			put(f.t, filepath.Join(f.wd, ".git", "HEAD"), "ref: refs/heads/main\n", 0o644)
 			mk(f.t, filepath.Join(f.roots, "git", "other"), 0o755)
 			f.rec.GitDir = filepath.Join(f.roots, "git", "other")
 		}},
@@ -1188,6 +1191,7 @@ func TestSwappedDotGitIsNotWhatGetsMounted(t *testing.T) {
 	f := newFx(t)
 	dg := filepath.Join(f.wd, ".git")
 	mk(t, dg, 0o755)
+	put(t, filepath.Join(dg, "HEAD"), "ref: refs/heads/main\n", 0o644)
 	f.rec.GitDir = dg
 	f.writeRecord()
 	st, _ := os.Stat(dg)

@@ -22,6 +22,7 @@ package fwd
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
@@ -51,8 +52,11 @@ type Config struct {
 	Rules   []Rule
 	CAFile  string // extra root CA for https doors ("" = system roots)
 	MaxBody int64  // request body cap in bytes (0 = 32 MiB)
-	Logf    func(format string, a ...any)
-	Now     func() time.Time
+	// GitSecret enables GitRules for requests that carry it in GitHeader (the sidecar's own git). Empty: git is
+	// never routed. Without the secret every /git/... path is refused whatever the rules say.
+	GitSecret string
+	Logf      func(format string, a ...any)
+	Now       func() time.Time
 	// Resolve looks a door name up, once, at New. The addresses are pinned: the dialer connects to
 	// those IPs only and never asks DNS again, so a changed answer can't send the token elsewhere.
 	// Default: the system resolver.
@@ -259,7 +263,24 @@ func (f *Forwarder) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		deny(http.StatusForbidden, "not a door route")
 		return
 	}
-	if v := Check(f.cfg.Rules, door, r.Method, rest); v != Allow {
+	// git is the sidecar's own: a request that carries its secret may use GitRules and nothing else; any other
+	// request, whatever rules were configured, never reaches a /git/ path (the forwarder injects the token for
+	// whoever asks, so a fence that could POST git-receive-pack would skip every check the sidecar makes).
+	rules := f.cfg.Rules
+	gate := r.Header.Get(GitHeader)
+	isGit := isGitPath(rest)
+	gated := gate != "" && f.cfg.GitSecret != "" && subtle.ConstantTimeCompare([]byte(gate), []byte(f.cfg.GitSecret)) == 1
+	switch {
+	case gate != "" && !gated:
+		deny(http.StatusForbidden, "not a door route")
+		return
+	case isGit && !gated, gated && !isGit:
+		deny(http.StatusForbidden, "not a door route")
+		return
+	case gated:
+		rules = GitRules
+	}
+	if v := Check(rules, door, r.Method, rest); v != Allow {
 		deny(http.StatusForbidden, "refused: "+v.String())
 		return
 	}
@@ -425,4 +446,11 @@ func headerHasToken(h http.Header, k, token string) bool {
 		}
 	}
 	return false
+}
+
+// isGitPath reports whether a door path is under /git, comparing the first segment without regard to case: a door that
+// matches paths case-insensitively must not be reachable as /Git/... by a caller without the sidecar's secret.
+func isGitPath(rest string) bool {
+	first := strings.SplitN(strings.TrimPrefix(rest, "/"), "/", 2)[0]
+	return strings.EqualFold(first, "git")
 }

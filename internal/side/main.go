@@ -77,11 +77,30 @@ fence can write (default: /work /run/ccsbx/out /home/agent; --fence-writable PAT
 CCSBX_SIDE_FENCE_WRITABLE is a space-separated list). The directories must be ours and 0700; the files
 regular, not group/other-writable, owned by us or root. serve refuses to start otherwise.
 
+Git (plan F3c; git.commit and git.push from the fence's outbox, the repo cloned into the worktree once):
+  --git-repo OWNER/NAME   enables it (needs --out, --sid, --gen, --git-url). The fence never names the repo,
+                          the branch or a remote: a git.commit carries a message, a git.push nothing.
+  --git-base REF          a branch name or a full commit id to start from            (default main)
+  --git-branch B          the session branch, the only ref ever pushed; never main/master/HEAD (required)
+  --git-url URL           the forwarder's git base, http on loopback, e.g. http://127.0.0.1:8080/egress/git
+                          (the door's paths are /egress/git/<owner>/<repo>.git/{info/refs,git-upload-pack,git-receive-pack})
+  --git-dir D             the sidecar's gitdir, made 0700               (default /run/ccsbx/side/git)
+  --work D                the worktree emptyDir the fence writes        (default /work)
+  --snapshot-dir D        staging of the clone and the copy a commit is made from, made 0700
+                          (default /run/ccsbx/side/snapshot/s)
+  --git-max-bytes N       cap on a snapshot, counting allocated blocks (default 1 GiB; set it a little under the
+                          snapshot volume's size so a full tree cannot evict the pod)
+  Protected: only main, master, HEAD and trunk are refused as the session branch here; develop, release/* and the
+  like are the door's call (U16). A --git-base of exactly 40 or 64 hex digits is a commit id, never a branch.
+  After the load the sidecar clones into the EMPTY worktree and writes in/worktree-ready (or
+  in/worktree-failed); the fence must not write /work before the first of those exists.
+
 Bus relay (msg.send to a session on another machine, through the hub, signed with the generation key):
   --hub-url URL     the hub as the pod reaches it (the operator egress Service to hp:4011); needs --out,
                     --machine and --scope. The relay token arrives in the one load as "relay_token".
 
 Recipes:
+  git on:             … --git-repo owner/name --git-base main --git-branch ccsbx/s1 --git-url http://127.0.0.1:8080/egress/git
   bus relay on:       ccsbx side serve --control … --door model=URL --sid sX --gen 1 --label L --machine hp --scope '{…}' \
                         --journal-dir /run/ccsbx/journal/s --out /run/ccsbx/out --in /run/ccsbx/in --state /run/ccsbx/side/state --hub-url http://hub:4011
   from the launcher:  ccsbx token mint … --fwd-secrets | kubectl exec -i -c side POD -- ccsbx side load --control /run/ccsbx/side/ctl/ctl.sock
@@ -135,6 +154,14 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.IntVar(&o.FenceUID, "fence-uid", int(envInt("FENCE_UID", 10001)), "")
 	fs.DurationVar(&o.RelayEvery, "relay-every", envDur("RELAY_EVERY", time.Second), "")
 	fs.StringVar(&o.HubURL, "hub-url", envOr("HUB_URL", ""), "")
+	fs.StringVar(&o.GitRepo, "git-repo", envOr("GIT_REPO", ""), "")
+	fs.StringVar(&o.GitBase, "git-base", envOr("GIT_BASE", "main"), "")
+	fs.StringVar(&o.GitBranch, "git-branch", envOr("GIT_BRANCH", ""), "")
+	fs.StringVar(&o.GitURL, "git-url", envOr("GIT_URL", ""), "")
+	fs.StringVar(&o.GitDir, "git-dir", envOr("GIT_DIR", "/run/ccsbx/side/git/g"), "")
+	fs.StringVar(&o.Work, "work", envOr("WORK", "/work"), "")
+	fs.Int64Var(&o.GitMaxBytes, "git-max-bytes", envInt("GIT_MAX_BYTES", 0), "")
+	fs.StringVar(&o.SnapshotDir, "snapshot-dir", envOr("SNAPSHOT_DIR", "/run/ccsbx/side/snapshot/s"), "")
 	var fenceW multi
 	fs.Var(&fenceW, "fence-writable", "")
 	var doorFlags multi
@@ -186,6 +213,8 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 // ServeOptions is everything `side serve` takes besides the secrets.
 type ServeOptions struct {
+	GitMaxBytes                                                    int64
+	GitRepo, GitBase, GitBranch, GitURL, GitDir, Work, SnapshotDir string
 	// wrapJournal is a test seam: it lets a test slow the relay\'s last journal write down to prove serve waits for it.
 	wrapJournal                        func(Appender) Appender
 	RoutesFile                         string
@@ -204,21 +233,32 @@ func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 	logf := o.Config.Logf
 	fail := func(format string, a ...any) int { fmt.Fprintf(stderr, "side: "+format+"\n", a...); return 2 }
 	uid := os.Getuid()
-	for name, p := range map[string]string{"--control": o.Config.Control, "--state": o.State, "--journal-dir": o.JournalDir,
-		"--routes": o.RoutesFile, "--ca-file": o.Config.CAFile} {
+	if o.GitRepo != "" {
+		o.GitDir, o.SnapshotDir = pick(o.GitDir, "/run/ccsbx/side/git/g"), pick(o.SnapshotDir, "/run/ccsbx/side/snapshot/s")
+		o.Work, o.GitBase = pick(o.Work, "/work"), pick(o.GitBase, "main")
+	}
+	if o.GitRepo != "" && (!filepath.IsAbs(o.Work) || filepath.Clean(o.Work) != o.Work || resolve(o.Work) != o.Work) {
+		return fail("--work %q must be an absolute, clean path with no symlink in it", o.Work)
+	}
+	gitPaths := map[string]string{}
+	if o.GitRepo != "" {
+		gitPaths = map[string]string{"--git-dir": o.GitDir, "--snapshot-dir": o.SnapshotDir}
+	}
+	for name, p := range mergePaths(map[string]string{"--control": o.Config.Control, "--state": o.State, "--journal-dir": o.JournalDir,
+		"--routes": o.RoutesFile, "--ca-file": o.Config.CAFile}, gitPaths) {
 		if r, bad := underAny(p, o.FenceWritable); p != "" && bad {
 			return fail("%s %s is under %s, which the fence can write", name, p, r)
 		}
 	}
 	// Each path must already be what it says: absolute, clean (no "." or ".."), and with no symlink in it, so the
 	// check above and the files opened below are about the same place and a link cannot be swapped in.
-	for name, p := range map[string]string{"--control": o.Config.Control, "--state": o.State, "--journal-dir": o.JournalDir,
-		"--routes": o.RoutesFile, "--ca-file": o.Config.CAFile} {
+	for name, p := range mergePaths(map[string]string{"--control": o.Config.Control, "--state": o.State, "--journal-dir": o.JournalDir,
+		"--routes": o.RoutesFile, "--ca-file": o.Config.CAFile}, gitPaths) {
 		if p != "" && (!filepath.IsAbs(p) || filepath.Clean(p) != p || resolve(p) != p) {
 			return fail("%s %q must be an absolute, clean path with no symlink in it", name, p)
 		}
 	}
-	for name, p := range map[string]string{"--state": o.State, "--journal-dir": o.JournalDir} {
+	for name, p := range mergePaths(map[string]string{"--state": o.State, "--journal-dir": o.JournalDir}, gitPaths) {
 		if p != "" {
 			if err := ownDir(p, uid); err != nil {
 				return fail("%s: %v", name, err)
@@ -287,6 +327,25 @@ func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 	if jr != nil && o.wrapJournal != nil {
 		jr = o.wrapJournal(jr)
 	}
+	var gitFwd func(context.Context, hostd.Request) hostd.Reply
+	var gitops *GitOps
+	if o.GitRepo != "" {
+		if o.Out == "" || o.Sid == "" || o.Gen < 1 || o.GitURL == "" || o.GitBranch == "" {
+			return fail("--git-repo needs --out, --sid, --gen, --git-url and --git-branch")
+		}
+		// the forwarder's git secret goes to whatever answers at --git-url, so it must be this sidecar's own listener and
+		// nothing else (127.0.0.2, ::1 or another port are addresses the fence could bind)
+		if gu, err := url.Parse(o.GitURL); err != nil || gu.Host != o.Config.Listen {
+			return fail("--git-url must point at this sidecar's own --listen address (%s), not %q", o.Config.Listen, o.GitURL)
+		}
+		var err error
+		gitops, err = NewGitOps(GitConfig{Repo: o.GitRepo, Base: o.GitBase, Branch: o.GitBranch, URL: o.GitURL, GitDir: o.GitDir,
+			Work: o.Work, Snapshot: o.SnapshotDir, Sid: o.Sid, Gen: o.Gen, Journal: jr, Gate: s.GitGate, MaxSnapshotBytes: o.GitMaxBytes, Logf: logf})
+		if err != nil {
+			return fail("%v", err)
+		}
+		gitFwd = gitops.Forward
+	}
 	var relay *Relay
 	if o.Out != "" {
 		fwdFn := func(context.Context, hostd.Request) hostd.Reply { return busReply("refused", "unsupported_in_pod") }
@@ -297,6 +356,9 @@ func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 				return fail("%v", err)
 			}
 			fwdFn = bus.Forward
+		}
+		if gitFwd != nil {
+			fwdFn = Route(busFwd(fwdFn, o.HubURL != ""), gitFwd)
 		}
 		rc := RelayConfig{Out: o.Out, In: o.In, State: o.State, Sid: o.Sid, Gen: o.Gen, Label: o.Label, FullID: o.FullID,
 			FenceUID: o.FenceUID, Forward: fwdFn, Journal: jr, Logf: logf}
@@ -310,6 +372,9 @@ func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 		go func() { defer close(relayDone); relay.Run(rctx, o.RelayEvery) }()
 	} else {
 		close(relayDone)
+	}
+	if gitops != nil {
+		go cloneWhenLoaded(rctx, s, gitops, o.In, logf)
 	}
 	serr := s.Serve(ctx)
 	stopRelay()
@@ -376,4 +441,49 @@ func envDur(name string, def time.Duration) time.Duration {
 		}
 	}
 	return def
+}
+
+func pick(v, def string) string {
+	if v == "" {
+		return def
+	}
+	return v
+}
+
+func mergePaths(a, b map[string]string) map[string]string {
+	out := make(map[string]string, len(a)+len(b))
+	for k, v := range a {
+		out[k] = v
+	}
+	for k, v := range b {
+		out[k] = v
+	}
+	return out
+}
+
+// busFwd is the bus's Forward, or a refusal when no hub is configured (then msg.* is unavailable in this pod).
+func busFwd(f func(context.Context, hostd.Request) hostd.Reply, have bool) func(context.Context, hostd.Request) hostd.Reply {
+	if !have {
+		return nil
+	}
+	return f
+}
+
+// cloneWhenLoaded waits for the secrets, clones once, and tells the fence's side through in/ whether the worktree is
+// ready: the fence must not write /work before one of these files exists.
+func cloneWhenLoaded(ctx context.Context, s *Server, g *GitOps, in string, logf func(string, ...any)) {
+	select {
+	case <-ctx.Done():
+		return
+	case <-s.loadCh:
+	}
+	name, body := "worktree-ready", "ok\n"
+	if err := g.Clone(ctx); err != nil {
+		logf("side git: clone failed: %v", err)
+		g.fact("git.refused", map[string]any{"op": "clone", "code": "clone_failed"})
+		name, body = "worktree-failed", cleanText(err.Error(), 200)+"\n"
+	}
+	if err := writePublic(filepath.Join(in, name), []byte(body)); err != nil {
+		logf("side git: %s: %v", name, err)
+	}
 }

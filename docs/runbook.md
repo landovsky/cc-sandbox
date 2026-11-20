@@ -745,3 +745,71 @@ builder exists (R-WT) the `repo/base/branch` form is validated but refused `not_
 
 **M2c review round (what changed).** The label check FAILS CLOSED: any trouble reading this machine's session records answers a peer with an error (`peer_unreachable` on its side) and refuses a local start; it never reads as "free". A direct-mode `ccsbx start` asks the peers too: hostd publishes `<state>/remote/peers.json` and the CLI reserves in the same directory and asks the same peers (an unreadable file refuses). A remote start needs a git worktree root (see the contract §4), is refused in helper mode until ccsbx-root can check it, and in direct mode needs `--remote-start-direct` with `--owner-user` = the user hostd runs as (helper mode: someone else): wrong combinations are usage errors at startup. In-flight starts are tracked in memory (a late renewal, a sleeping laptop or a clock step cannot end a reservation), idempotency is keyed per caller and checked against the label, and a lost reply is recovered from the session record. Two live sessions never share or nest workdirs. Residual (direct mode): between the workdir check and `docker run` the daemon does not hold the directory by file descriptor, so a session that owns an enclosing tree could swap a nested directory for a link; the overlap refusal removes the nested-session case, not the general race. Not built: the resolve-v2 per-source rate limit (a peer can make it read the records), the doors' second grants check, reconciling a launch in flight from its record (expiry is safe: Live covers a launched pane).
 
+**The hub's address (D's review).** The hub on hp listens on hp's tailnet address, not on loopback, so `hub_url` is
+`http://A.B.C.D:PORT` (an IPv4 literal in canonical form, with a port; names, IPv6, short and leading-zero forms are refused) and, when the secret is about to be sent, A.B.C.D must be one of THIS host's interface addresses. Before the admin secret is
+sent, every LISTEN socket on the port must be `hub_user`'s AND the url's own address must be one the hub listens on
+or one a wildcard listener covers: a squatter on `127.0.0.1` while the hub is on the tailnet address, or a hub that
+listens somewhere else, gets nothing.
+
+**Resume of a pod session.** A start with `resume` for a pod session is the next generation of the same session
+(same owner, label, machine and repository): the previous generation's pod is deleted first (by UID; if that
+fails the resume is refused and nothing changes), then a new pod is created and loaded as for a first start. If the
+new generation fails, the record is put back to the previous generation, ended. It replaces a generation, so it does
+not count twice against `--max-live`.
+
+**Revoke at the end of a pod generation (F2x).** The signer signs a revoke on request (`{"revoke":{"owner","machine","sid","gen"}}`
+and nothing else; same caller classes and key scope as a token: the launch user only for the pod machine, hostd only
+for the others), and `internal/revoke` posts it exactly as signed to every door in root config `revoke_doors` (the
+doors' owner listeners, `/_ccsbx/revoke`; no redirects). `pod-stop` revokes the token before it deletes the pod (whatever
+the delete does), and `pod-load` revokes it when the load or the mint fails after the signer may have signed. Never
+fatal: a failure is an audit line `token-revoke ... FAILED, revoke by hand` with the sid and generation (the token
+expires within `k8s_token_hours` anyway). With no `revoke_doors` the line says so. For docker generations hostd does it: `--signer-socket` (hostd's own signer socket) and `--revoke-door` (comma list
+of the doors' owner listeners) turn on `OnGenerationEnd`: when a generation's outbox is drained for the last time hostd
+asks the signer to sign the revoke and posts it, retrying in the background (5 s, 30 s, 2 min); a revoke that never
+works is logged with `revoke sid <s> gen <n> by hand`. With neither flag nothing is revoked.
+
+**F3c in the pod spec.** `pod-create` also gives the sidecar `--git-repo owner/name` (the record's `workdir.repo`),
+`--git-base` and `--git-branch` (the record's `workdir.base` / `.branch`, left out when empty; plain branch names only)
+and `--git-url http://127.0.0.1:8080/egress/git`. The sidecar clones into the empty `/work` after the load and writes
+`/run/ccsbx/in/worktree-ready` (or `worktree-failed` with a reason); the fence's default command waits for the first
+(10 minutes at most), shows the reason and exits on the second, and only then starts tmux and claude. The snapshot and
+git directories are the sidecar's defaults (`/run/ccsbx/side/snapshot/s`, `/run/ccsbx/side/git`).
+
+**Round F2x-2 (review).** A resume is refused while the session's start is still in flight (`starting` in the record, until the pod
+is loaded; a start hostd died in the middle of is stopped by the sweep after 15 minutes), and the cleanup of a failed start
+acts only if the record is still its own generation. A failed generation keeps its number, ended (the doors refuse every
+token at or below a revoked generation, so the next resume is the next number). A resume stops the previous generation's
+pod whenever the record names one, even an ended record; it counts against `--max-per-hour`. A pod that disappeared outside
+`pod-stop` is passed to `pod-stop` by the sweep (it revokes; an absent pod is fine). **A resume deletes the previous pod and
+its `/work` before the new one is up: unpushed work in the old pod is lost; the new pod clones the session branch.** hostd's
+revoke for docker generations skips pod sessions and remembers each generation it revoked (`<state>/revoked/<sid>-g<n>`);
+`--revoke-door` is checked at startup (http is accepted, so keep the doors on loopback or the tailnet). The sidecar's git
+directory is `/run/ccsbx/side/git/g` (a subdirectory of its volume: the volume root is the kubelet's and the sidecar accepts
+only a directory of its own). Repository, branch and base are checked by `internal/gitname`, the same rules the sidecar
+uses (branch required, at most 100 characters, never main, master, HEAD or trunk). Disk: the worktree, snapshot and git volumes are
+each as large as the worktree: size the pod's ephemeral storage for their sum plus home, out and journal (a node eviction
+comes before any one limit).
+
+**worktree-check (R-H).** `sudo -n ccsbx-root worktree-check -- <path>` is what hostd asks, read-only, before it records a REMOTE
+start's workdir in helper mode (spec: docs/m2c-remote-start.md (4b)). Exit 0 and two lines (the resolved absolute path, then the gitdir derived through the pinned descriptor; hostd records line 2 as GitDir) when
+the path is a git worktree root run would accept: strictly inside an allowed root, no symlink in it, a login user's own
+directory (never root's or a system user's), no hidden home directory, its own `.git` (a directory, or a linked worktree's
+file naming a host-owned gitdir inside a root whose back-reference names this worktree), and no overlap with a live session's
+workdir (equal, containing or inside). Exit 2: refused, with one fixed line on stderr (never the path or OS text). Exit 3: could
+not tell (a read error, an unreadable record, a config that cannot be believed). Only the service user (hostd) and root may ask;
+it writes nothing and takes no lock. Lexical and hidden-component checks come before any stat, and every answer that depends on what exists collapses to one refusal line, so the verb is not an existence oracle. The path must lie under its owner's home (owner a login uid, never the service user or nobody), and an empty `.git` directory (no HEAD) is refused. Not covered by a test (it needs root): a `.git` owned by another user, refused through the
+pinned descriptor's owner check.
+
+**F2x round 2 NITs.** `--git-max-bytes` is 90% of the snapshot volume (`SnapshotLimitBytes`), so a commit cannot overflow it and get the pod
+evicted. The containers' ephemeral-storage limits must cover every disk-backed volume together (worktree, snapshot and git
+directory are each worktree-sized, plus home, out, in, managed, journal): the pod contract and root's config check it
+(`k8s_ephemeral_mb` + 1024 for the sidecar >= `k8s.DiskVolumesMB(k8s_worktree_mb)`), so `k8s_ephemeral_mb` now defaults to
+32768. A failed resume (pod or docker) keeps the failed generation's number AND full id, ended. How long a pod start may be
+in flight follows `--pod-load-wait` (plus the create and 2 minutes): a resume is refused until then and the sweep stops what is
+left after it. A failed start's pod is deleted without holding the daemon's lock.
+
+**Pod cap and disk (R-H).** Every pod stop, including the unlocked cleanup of a failed start, names its generation
+(`pod-stop <sid> <gen>`); a mismatch is refused as another_generation and the cleanup leaves the newer record alone. 32 GiB
+ephemeral per pod is about 264 GiB at 8 live sessions (Gate M note): `--pod-max-live` (env `CCSBX_POD_MAX_LIVE`, default 4)
+caps live pod sessions separately from `--max-live`; set it to what the node's disk fits. No-hub installs: relay-mint refuses
+because `hub-admin.secret` is absent (checked before any connect); the installer removes a stale one.

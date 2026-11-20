@@ -16,12 +16,12 @@ const (
 
 func goodSpec() Spec {
 	cmd, err := SideArgv(SideInfo{Sid: "s0abcdefgh", Gen: 2, Label: "cc-sandbox:x", FullID: "tomas/future-two/s0abcdefgh/g2", Machine: "future-two",
-		Scope: []byte(`{"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":[]}`)})
+		Scope: []byte(`{"manager":{"node":"cc-sandbox:#6b3s","machine":"hp-ubuntu"},"peers":[]}`), GitRepo: "landovsky/cc-sandbox", GitBranch: "ccsbx/s0abcdefgh"})
 	if err != nil {
 		panic(err)
 	}
 	return Spec{Sid: "s0abcdefgh", Gen: 2, Label: "cc-sandbox:x", OwnerUID: 1000, FenceImage: fenceImg, SideImage: sideImg, SideCmd: cmd,
-		MemoryMB: 4096, CPU: 2, EphemeralMB: 20480, WorktreeMB: 10240}
+		MemoryMB: 4096, CPU: 2, EphemeralMB: 32768, WorktreeMB: 10240}
 }
 
 func goodPod(t *testing.T) *Pod {
@@ -57,7 +57,7 @@ func TestPodForMakesAContractPod(t *testing.T) {
 			t.Errorf("%s has env %v", c.Name, c.Env)
 		}
 	}
-	if q := p.Spec.Containers[0].Resources; q.Limits["memory"] != "4Gi" || q.Requests["cpu"] != "2" || q.Limits["ephemeral-storage"] != "20Gi" {
+	if q := p.Spec.Containers[0].Resources; q.Limits["memory"] != "4Gi" || q.Requests["cpu"] != "2" || q.Limits["ephemeral-storage"] != "32Gi" {
 		t.Errorf("%+v", q)
 	}
 	if h := p.Spec.HostUsers; h != nil {
@@ -189,6 +189,9 @@ func contractCases() []contractCase {
 		{"the sidecar over its limits", func(p *Pod) { sd(p).Resources.Limits["memory"] = "9Gi"; sd(p).Resources.Requests["memory"] = "9Gi" }, "memory"},
 		{"the fence mounting the sidecar's state", func(p *Pod) {
 			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "side-state", MountPath: "/s"})
+		}, "alone"},
+		{"the fence mounting the git directory", func(p *Pod) {
+			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "gitdir", MountPath: "/g"})
 		}, "alone"},
 		{"the fence mounting the snapshot", func(p *Pod) {
 			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "snapshot", MountPath: "/snap"})
@@ -425,5 +428,76 @@ func TestTheSharedWorktreeGroupAndTheSnapshotVolume(t *testing.T) {
 		if v.Name == "snapshot" && v.EmptyDir.SizeLimit != "2Gi" {
 			t.Errorf("snapshot %s for a 2 GiB worktree", v.EmptyDir.SizeLimit)
 		}
+	}
+}
+
+// fsGroup makes every volume group-owned by a group both containers are in, so group-write bits on what the
+// sidecar writes into in/ and managed/ (or on what the fence writes into out/) would let the other side write
+// them. Only the read-only mounts stop that, so they are what is pinned: the fence's in/ and managed/, and the
+// sidecar's out/, are read-only, and flipping any of them is refused.
+func TestTheSharedGroupDoesNotLetTheFenceWriteWhatTheSidecarWrites(t *testing.T) {
+	p := goodPod(t)
+	ro := func(c Container, vol string) bool {
+		for _, m := range c.VolumeMounts {
+			if m.Name == vol {
+				return m.ReadOnly
+			}
+		}
+		t.Fatalf("%s does not mount %s", c.Name, vol)
+		return false
+	}
+	fence, side := p.Spec.Containers[0], p.Spec.InitContainers[0]
+	if !ro(fence, "in") || !ro(fence, "managed") || !ro(side, "out") {
+		t.Fatal("a mount that the shared group would make writable is not read-only")
+	}
+	for why, flip := range map[string]func(*Pod){
+		"the fence's in/ writable":      func(p *Pod) { setRO(&p.Spec.Containers[0], "in", false) },
+		"the fence's managed/ writable": func(p *Pod) { setRO(&p.Spec.Containers[0], "managed", false) },
+		"the sidecar's out/ writable":   func(p *Pod) { setRO(&p.Spec.InitContainers[0], "out", false) },
+	} {
+		q := goodPod(t)
+		flip(q)
+		if err := DefaultConfig().CheckContract(q); err == nil {
+			t.Errorf("%s passed the contract", why)
+		}
+	}
+}
+
+func setRO(c *Container, vol string, ro bool) {
+	for i := range c.VolumeMounts {
+		if c.VolumeMounts[i].Name == vol {
+			c.VolumeMounts[i].ReadOnly = ro
+		}
+	}
+}
+
+// F3c S5: the clone's object store goes on a disk-backed volume of its own (as large as the worktree), not on the
+// 8 MiB in-memory side-state; it is the sidecar's alone, and the fence never sees it.
+func TestTheGitDirectoryIsASidecarOnlyDiskVolume(t *testing.T) {
+	p := goodPod(t)
+	var g, st *Volume
+	for i := range p.Spec.Volumes {
+		switch p.Spec.Volumes[i].Name {
+		case "gitdir":
+			g = &p.Spec.Volumes[i]
+		case "side-state":
+			st = &p.Spec.Volumes[i]
+		}
+	}
+	if g == nil || g.EmptyDir == nil || g.EmptyDir.Medium != "" || g.EmptyDir.SizeLimit != miQty(10240) {
+		t.Fatalf("gitdir %+v (disk-backed, as large as the worktree)", g)
+	}
+	if st == nil || st.EmptyDir.Medium != "Memory" || st.EmptyDir.SizeLimit != "8Mi" {
+		t.Errorf("side-state %+v must stay the small in-memory one", st)
+	}
+	for _, c := range append(append([]Container{}, p.Spec.InitContainers...), p.Spec.Containers...) {
+		for _, m := range c.VolumeMounts {
+			if m.Name == "gitdir" && (c.Name != "side" || m.MountPath != "/run/ccsbx/side/git" || m.ReadOnly) {
+				t.Errorf("%s mounts the git directory at %s", c.Name, m.MountPath)
+			}
+		}
+	}
+	if volumeOwner["gitdir"] != "side" {
+		t.Error("the git directory is not sidecar-only")
 	}
 }

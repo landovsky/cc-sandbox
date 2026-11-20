@@ -495,8 +495,7 @@ hostd's rights (tracking a fenced identity, reading hostd's frames), and the rev
   is not a regular file of the hub's user that others cannot write. A fenced manager that MOVES to another machine
   needs its workers' specs updated (their record names the old machine, so `SendRemote` ends `dropped`).
 - **Fenced to unfenced.** A relay reaches an unfenced target only if (a) that target's node is in the relay's
-  `may_reach`, fixed at mint by root from the session's record (the MANAGER only for now: Tomas's open
-  question #3cy2 decides peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held
+  `may_reach`, fixed at mint by root from the session's record (the manager, then the placed peers), and (b) a SPOKE principal tracked the entry. hostd also refuses a node held
   by more than one live entry (which of them is the manager is not for it to guess): `msg.dropped`.
 - **A spoke principal's deliver** may reach its own machine's sessions and any FENCED session (the receiving
   hostd verifies and scopes it); focus, rename, drop and read stay on its own machine.
@@ -660,8 +659,9 @@ The sidecar has a `journal` volume of its own (emptyDir, 16Mi, disk-backed, side
 `docs/relay-mint-spec.md`). Root config keys: `hub_url` (default `http://127.0.0.1:4011`, loopback only, refused
 otherwise) and `hub_secret` (default `/etc/ccsbx/hub-admin.secret`, root-owned, mode 0600, directory not
 group/other-writable; the installer creates it from the hub's admin secret, it is never copied off hp). The
-relay's `may_reach` is the record's `msg_scope.manager` as `<machine>/<node>`, empty when the record names no
-manager machine; there is no argument for it (peers are Tomas's open question #3cy2). Exit 2: refused (not
+relay's `may_reach` is the record's `msg_scope.manager`, then its `peers`, each as `<machine>/<node>` (machine from
+`manager.machine` / `peer_machines`; a node with no machine is left out; at most 32; empty when none is placed);
+there is no argument for it. Exit 2: refused (not
 the service user, stale or ended or not running or another machine's generation, rate, bad arguments), exit
 3: the hub or the secret (status code only on stderr). One audit line per mint and revoke on stderr (the first
 8 hex of sha256(pub), never a token or the secret). The relay is revoked (`DELETE /v1/principals/relay:<sid>%2F<gen>`)

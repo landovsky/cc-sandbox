@@ -287,15 +287,30 @@ func selfPath() (string, error) {
 	return filepath.EvalSymlinks(p)
 }
 
+// localAddrs are the addresses of the interfaces that are UP: net.InterfaceAddrs also lists an address on an
+// interface that is down, where nothing can be listening and the address is not this host's to be reached on.
 func localAddrs() ([]net.IP, error) {
-	as, err := net.InterfaceAddrs()
+	return upAddrs(net.Interfaces, func(i *net.Interface) ([]net.Addr, error) { return i.Addrs() })
+}
+
+func upAddrs(list func() ([]net.Interface, error), addrsOf func(*net.Interface) ([]net.Addr, error)) ([]net.IP, error) {
+	ifs, err := list()
 	if err != nil {
 		return nil, err
 	}
 	var out []net.IP
-	for _, a := range as {
-		if n, ok := a.(*net.IPNet); ok {
-			out = append(out, n.IP)
+	for i := range ifs {
+		if ifs[i].Flags&net.FlagUp == 0 {
+			continue
+		}
+		as, err := addrsOf(&ifs[i])
+		if err != nil {
+			return nil, err
+		}
+		for _, a := range as {
+			if n, ok := a.(*net.IPNet); ok {
+				out = append(out, n.IP)
+			}
 		}
 	}
 	return out, nil

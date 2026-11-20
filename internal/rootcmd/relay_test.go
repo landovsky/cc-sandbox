@@ -646,3 +646,29 @@ func TestTheSecretIsNotSentWhenThisHostsAddressesCannotBeRead(t *testing.T) {
 		t.Errorf("exit %d hub calls %d", code, len(r.hubCalls()))
 	}
 }
+
+// an address on an interface that is down is not this host's to be reached on (and D's fib_trie read drops it too)
+func TestOnlyAddressesOfInterfacesThatAreUpCount(t *testing.T) {
+	ifs := []net.Interface{
+		{Name: "lo", Flags: net.FlagUp | net.FlagLoopback},
+		{Name: "tailscale0", Flags: net.FlagUp},
+		{Name: "dummy0", Flags: 0}, // down
+	}
+	addrs := map[string]string{"lo": "127.0.0.1/8", "tailscale0": "100.101.219.96/32", "dummy0": "203.0.113.9/24"}
+	got, err := upAddrs(func() ([]net.Interface, error) { return ifs, nil }, func(i *net.Interface) ([]net.Addr, error) {
+		ip, n, _ := net.ParseCIDR(addrs[i.Name])
+		n.IP = ip
+		return []net.Addr{n}, nil
+	})
+	if err != nil || len(got) != 2 || got[0].String() != "127.0.0.1" || got[1].String() != "100.101.219.96" {
+		t.Errorf("%v %v", got, err)
+	}
+	// an interface that cannot be read is an error, not a silent skip
+	if _, err := upAddrs(func() ([]net.Interface, error) { return ifs, nil }, func(*net.Interface) ([]net.Addr, error) { return nil, errors.New("gone") }); err == nil {
+		t.Error("an unreadable interface was skipped")
+	}
+	// the real one answers, and every address it gives is an interface that is up
+	if _, err := localAddrs(); err != nil {
+		t.Error(err)
+	}
+}

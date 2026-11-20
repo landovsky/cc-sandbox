@@ -1777,3 +1777,13 @@ block = "tests/go-test.sh ./internal/side 'TestRelayJournalsEachDecisionWithTheM
 invariants = [12]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "side-serve-wires-relay-journal-bus"
+title = "`ccsbx side serve` runs the forwarder, the session journal, the outbox relay and the bus sender together, and refuses a half-wired configuration or a scope with an unplaced node before anything listens"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/side 'TestServeRunsTheForwarderTheRelayTheBusAndTheJournalTogether$'"
+block = "tests/go-test.sh ./internal/side 'TestServeRefusesAHalfWiredConfiguration$|TestScopeMustPlaceEveryNode$|TestUsageNamesTheNewFlags$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"

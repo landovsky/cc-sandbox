@@ -5,16 +5,23 @@ package side
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net/url"
 	"os"
 	"os/signal"
+	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/fwd"
+	"github.com/landovsky/cc-sandbox/internal/hostd"
+	"github.com/landovsky/cc-sandbox/internal/journal"
+	"github.com/landovsky/cc-sandbox/internal/msg"
 )
 
 // Usage is the `ccsbx side --help` text.
@@ -29,23 +36,50 @@ serve   runs as the sidecar container's main process (uid 10002). It opens the f
         loopback and a control socket (mode 0600, in a directory that must be 0700 and ours), and answers
         503 on the forwarder until the secrets arrive. It ends when the token expires or on SIGTERM.
 load    is what the launcher runs INSIDE the sidecar container through pods/exec, with the secrets on
-        stdin as {"token":"<session JWT>","key":"<base64 32-byte seed>"}. They never appear in the pod
+        stdin as {"token":"<session JWT>","key":"<base64 32-byte seed>","relay_token":"sbp1...."} (the last is
+        optional). They never appear in the pod
         spec, an argument or the environment. One load per process, only from the sidecar's own uid;
         the key must match the token's cnf, and the token must not be expired.
 
-Flags: (each also CCSBX_SIDE_<NAME>)
+Flags: (each also CCSBX_SIDE_<NAME>, the name upper-cased with - as _; CCSBX_SIDE_DOORS is a space-separated list)
   --listen ADDR     forwarder host:port, a loopback IP only        (default 127.0.0.1:8080)
   --control PATH    control socket path, in a sidecar-only volume   (required)
-  --door NAME=URL   a door this session may reach; repeatable; CCSBX_SIDE_DOORS is a space-separated list
+  --door NAME=URL   a door this session may reach; repeatable
   --routes FILE     JSON allowlist replacing the built-in one (see ccsbx fwd --help)
   --ca-file FILE    extra root CA for https doors
   --max-body N      request body cap in bytes (default 33554432)
   --allow-uid N     the uid that may load secrets (default: our own)
 
+Identity (set by the launcher in the pod spec; never read from a file the fence can write; needed by the
+journal and the relay):
+  --sid S --gen N   the session and generation these records belong to
+  --label L         the session's label, as the daemon knows it
+  --full-id ID      owner/machine/sid/gN
+  --machine M       this pod's machine as the session bus hub knows it
+  --scope JSON      who this session may message: {"manager":{"node":"..","machine":".."},"peers":[".."],
+                    "peer_machines":{"..":".."}}  (every node must be placed on a machine, or serve refuses)
+
+Session journal (plan F3; the pod mounts a sidecar-only volume at /run/ccsbx/journal):
+  --journal-dir D   records forwarder lifecycle (fwd.loaded/expired/denied) and every relay decision;
+                    empty = no journal. Needs --sid and --gen.
+
+Outbox relay (the fence's request files, read with the daemon's file checks):
+  --out D           the fence's outbox (read-only mount); empty = no relay
+  --in D            where replies go (in/replies is made here)       (required with --out)
+  --state D         the relay's ledger, in a sidecar-only volume      (required with --out)
+  --fence-uid N     the uid every request file must have              (default 10001)
+  --relay-every DUR scan interval                                     (default 1s)
+
+Bus relay (msg.send to a session on another machine, through the hub, signed with the generation key):
+  --hub-url URL     the hub as the pod reaches it (the operator egress Service to hp:4011); needs --out,
+                    --machine and --scope. The relay token arrives in the one load as "relay_token".
+
 Recipes:
+  bus relay on:       ccsbx side serve --control … --door model=URL --sid sX --gen 1 --label L --machine hp --scope '{…}' \
+                        --journal-dir /run/ccsbx/journal --out /run/ccsbx/out --in /run/ccsbx/in --state /run/ccsbx/side-state --hub-url http://hub:4011
   from the launcher:  ccsbx token mint … --fwd-secrets | kubectl exec -i -c side POD -- ccsbx side load --control /run/ccsbx/side/ctl/ctl.sock
   what the fence sees: the forwarder port only; try  curl -s localhost:8080/model/health  (503 until loaded)
-Not built yet (F3b/F3c): outbox relay, session journal, bus relay, git commit/push.
+Not built yet (F3c): git commit/push.
 `
 
 func envOr(name, def string) string {
@@ -78,8 +112,22 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	control := fs.String("control", envOr("CONTROL", ""), "")
 	routesFile := fs.String("routes", envOr("ROUTES", ""), "")
 	caFile := fs.String("ca-file", envOr("CA_FILE", ""), "")
-	maxBody := fs.Int64("max-body", 0, "")
-	allowUID := fs.Int("allow-uid", 0, "")
+	maxBody := fs.Int64("max-body", envInt("MAX_BODY", 0), "")
+	allowUID := fs.Int("allow-uid", int(envInt("ALLOW_UID", 0)), "")
+	var o ServeOptions
+	fs.StringVar(&o.Sid, "sid", envOr("SID", ""), "")
+	fs.IntVar(&o.Gen, "gen", int(envInt("GEN", 0)), "")
+	fs.StringVar(&o.Label, "label", envOr("LABEL", ""), "")
+	fs.StringVar(&o.FullID, "full-id", envOr("FULL_ID", ""), "")
+	fs.StringVar(&o.Machine, "machine", envOr("MACHINE", ""), "")
+	fs.StringVar(&o.Scope, "scope", envOr("SCOPE", ""), "")
+	fs.StringVar(&o.JournalDir, "journal-dir", envOr("JOURNAL_DIR", ""), "")
+	fs.StringVar(&o.Out, "out", envOr("OUT", ""), "")
+	fs.StringVar(&o.In, "in", envOr("IN", ""), "")
+	fs.StringVar(&o.State, "state", envOr("STATE", ""), "")
+	fs.IntVar(&o.FenceUID, "fence-uid", int(envInt("FENCE_UID", 10001)), "")
+	fs.DurationVar(&o.RelayEvery, "relay-every", envDur("RELAY_EVERY", time.Second), "")
+	fs.StringVar(&o.HubURL, "hub-url", envOr("HUB_URL", ""), "")
 	var doorFlags multi
 	fs.Var(&doorFlags, "door", "")
 	if err := fs.Parse(args[1:]); err != nil {
@@ -120,17 +168,146 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 			return 2
 		}
 	}
-	s, err := New(Config{Listen: *listen, Control: *control, Doors: doors, Rules: rules, CAFile: *caFile,
-		MaxBody: *maxBody, AllowUID: *allowUID, Logf: func(f string, a ...any) { fmt.Fprintf(stderr, f+"\n", a...) }})
+	o.Config = Config{Listen: *listen, Control: *control, Doors: doors, Rules: rules, CAFile: *caFile,
+		MaxBody: *maxBody, AllowUID: *allowUID, Logf: func(f string, a ...any) { fmt.Fprintf(stderr, f+"\n", a...) }}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	return runServe(ctx, o, stderr)
+}
+
+// ServeOptions is everything `side serve` takes besides the secrets.
+type ServeOptions struct {
+	Config                             Config
+	Sid, Label, FullID, Machine, Scope string
+	Gen                                int
+	JournalDir, Out, In, State, HubURL string
+	FenceUID                           int
+	RelayEvery                         time.Duration
+}
+
+// runServe wires the forwarder, the session journal, the outbox relay and the bus sender, runs them until ctx
+// ends or the token expires, and then lets the relay write its final journal summary before returning.
+func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
+	logf := o.Config.Logf
+	fail := func(format string, a ...any) int { fmt.Fprintf(stderr, "side: "+format+"\n", a...); return 2 }
+	var scope msg.Scope
+	if o.HubURL != "" || o.Scope != "" {
+		var err error
+		if scope, err = parseScope(o.Scope); err != nil {
+			return fail("%v", err)
+		}
+	}
+	if o.HubURL != "" && (o.Out == "" || o.Machine == "" || o.Sid == "") {
+		return fail("--hub-url needs --out, --machine and --sid")
+	}
+	if o.Out != "" && (o.In == "" || o.State == "" || o.Sid == "" || o.Gen < 1) {
+		return fail("--out needs --in, --state, --sid and --gen")
+	}
+	var js *journal.Store
+	if o.JournalDir != "" {
+		if o.Sid == "" || o.Gen < 1 {
+			return fail("--journal-dir needs --sid and --gen")
+		}
+		var err error
+		if js, err = journal.Open(o.JournalDir, o.Machine, 0); err != nil {
+			return fail("journal: %v", err)
+		}
+		defer js.Close()
+		o.Config.Journal = js
+		o.Config.Sid, o.Config.Gen = o.Sid, o.Gen
+	}
+	s, err := New(o.Config)
 	if err != nil {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
-	defer stop()
-	if err := s.Serve(ctx); err != nil {
-		fmt.Fprintln(stderr, err)
+	var relay *Relay
+	if o.Out != "" {
+		fwdFn := func(context.Context, hostd.Request) hostd.Reply { return busReply("refused", "unsupported_in_pod") }
+		if o.HubURL != "" {
+			bus, err := NewBus(BusConfig{HubURL: o.HubURL, Machine: o.Machine, Sid: o.Sid, Label: o.Label, Scope: scope,
+				Cred: s.Relay, Journal: journalOrNil(js), Logf: logf})
+			if err != nil {
+				return fail("%v", err)
+			}
+			fwdFn = bus.Forward
+		}
+		rc := RelayConfig{Out: o.Out, In: o.In, State: o.State, Sid: o.Sid, Gen: o.Gen, Label: o.Label, FullID: o.FullID,
+			FenceUID: o.FenceUID, Forward: fwdFn, Journal: journalOrNil(js), Logf: logf}
+		if relay, err = NewRelay(rc); err != nil {
+			return fail("%v", err)
+		}
+	}
+	rctx, stopRelay := context.WithCancel(ctx)
+	relayDone := make(chan struct{})
+	if relay != nil {
+		go func() { defer close(relayDone); relay.Run(rctx, o.RelayEvery) }()
+	} else {
+		close(relayDone)
+	}
+	serr := s.Serve(ctx)
+	stopRelay()
+	<-relayDone // Run writes the final shed summary before it returns
+	if serr != nil {
+		fmt.Fprintln(stderr, serr)
 		return 1
 	}
 	return 0
+}
+
+// journalOrNil keeps a nil *journal.Store from becoming a non-nil Appender.
+func journalOrNil(js *journal.Store) Appender {
+	if js == nil {
+		return nil
+	}
+	return js
+}
+
+var machineIDRe = regexp.MustCompile(`^[A-Za-z0-9._-]{1,64}$`)
+
+// parseScope reads --scope and refuses one that leaves a node unplaced: the sender reaches a node only on the
+// machine the record names, so a node with no machine would reach nobody and is a launcher bug worth failing on.
+func parseScope(raw string) (msg.Scope, error) {
+	var sc msg.Scope
+	if raw == "" {
+		return sc, errors.New("--scope is required with the bus relay")
+	}
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&sc); err != nil || dec.More() {
+		return sc, errors.New("--scope is not the scope JSON")
+	}
+	place := func(node, machine string) error {
+		if node != "" && !machineIDRe.MatchString(machine) {
+			return fmt.Errorf("--scope: node %q is not placed on a valid machine", node)
+		}
+		return nil
+	}
+	if err := place(sc.Manager.Node, sc.Manager.Machine); err != nil {
+		return sc, err
+	}
+	for _, p := range sc.Peers {
+		if err := place(p, sc.PeerMachines[p]); err != nil {
+			return sc, err
+		}
+	}
+	return sc, nil
+}
+
+func envInt(name string, def int64) int64 {
+	if v := os.Getenv("CCSBX_SIDE_" + name); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func envDur(name string, def time.Duration) time.Duration {
+	if v := os.Getenv("CCSBX_SIDE_" + name); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			return d
+		}
+	}
+	return def
 }

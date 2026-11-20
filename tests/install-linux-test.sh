@@ -10,7 +10,7 @@ set -uo pipefail
 case "${1:-}" in -h|--help) sed -n '2,7p' "$0"; exit 0;; esac
 here="$(cd "$(dirname "$0")/.." && pwd)"; inst="$here/units/install-linux.sh"; p15="$here/units/p15"
 strip="$here/units/lib/sudoers_strip.py"
-tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' EXIT
+tmp="$(mktemp -d)" || exit 2; [ -d "$tmp" ] || exit 2; trap 'rm -rf "$tmp"' EXIT
 pass=0; fail=0
 t() { local name="$1"; shift; if "$@"; then pass=$((pass+1)); echo "ok   - $name"; else fail=$((fail+1)); echo "FAIL - $name"; fi; }
 
@@ -34,7 +34,7 @@ fx() {                                   # fx NAME → a fresh fake root with su
 ins() {                                  # ins FXDIR ARGS… — run the installer inside the fake root, recording commands
   local d="$1"; shift
   CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/rec/cmds" CCSBX_BIN_DIR="$d/dist" CCSBX_P15_FILE="$d/p15.tsv" \
-  CCSBX_OWNER=tomas CCSBX_STAMP=T1 CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" "$inst" "$@"
+  CCSBX_OWNER=tomas CCSBX_BACKUP_DIR=/var/backups/ccsbx-install CCSBX_B9_CMD="${B9:-true}" "$inst" "$@"
 }
 snapshot() { (cd "$1" && find root dist -type f -o -type l | sort | xargs -r sha256sum 2>/dev/null; cat rec/cmds 2>/dev/null); }
 
@@ -91,20 +91,20 @@ t "the replacement rule is validated by visudo before it is renamed into place" 
 t "docker group removal comes after the sudoers rule and after hostd is enabled" bash -c 'g="$(grep -n "gpasswd -d tomas docker" "$1" | cut -d: -f1)"; s="$(grep -n "mv -f /etc/sudoers.d/.90-ccsbx-root.new" "$1" | cut -d: -f1)"; h="$(grep -n "enable --now ccsbx-hostd" "$1" | cut -d: -f1)"; [ "$g" -gt "$s" ] && [ "$g" -gt "$h" ]' _ "$cmds"
 t "the new sudoers file grants only ccsbx-root, to the owner and to ccsbx" bash -c 'f="$1/root/etc/sudoers.d/.90-ccsbx-root.new"; [ "$(grep -c "^[a-z].*NOPASSWD" "$f")" -eq 2 ] && ! grep "^[a-z].*NOPASSWD" "$f" | grep -qv "/usr/local/sbin/ccsbx-root$"' _ "$d"
 t "the old file lost docker, apt-get, dokku and sops (nothing else was in it)" bash -c '! grep -qE "docker|apt-get|dokku|sops" "$1/root/etc/sudoers.d/90-tomas-nopasswd"' _ "$d"
-t "the old sudoers file is backed up before it is changed" test -f "$d/root/var/backups/ccsbx-install/T1/etc/sudoers.d/90-tomas-nopasswd"
-t "the backup holds the ORIGINAL content" grep -q 'dokku' "$d/root/var/backups/ccsbx-install/T1/etc/sudoers.d/90-tomas-nopasswd"
+t "the old sudoers file is backed up before it is changed" test -f "$d/root/var/backups/ccsbx-install/original/etc/sudoers.d/90-tomas-nopasswd"
+t "the backup holds the ORIGINAL content" grep -q 'dokku' "$d/root/var/backups/ccsbx-install/original/etc/sudoers.d/90-tomas-nopasswd"
 t "the allowed-roots file lists the owner's git root" grep -q '/git"' "$d/root/etc/ccsbx/ccsbx-root.toml"
 t "the keys directory is made 0700 for ccsbx-keys" bash -c 'grep -q "chmod 0700 /var/lib/ccsbx-keys" "$1" && grep -q "chown ccsbx-keys:ccsbx-keys /var/lib/ccsbx-keys" "$1"' _ "$cmds"
 t "the signer unit has no network and no key outside its own user" bash -c 'grep -q "RestrictAddressFamilies=AF_UNIX" "$1/root/etc/systemd/system/ccsbx-signer.service" && grep -q "User=ccsbx-keys" "$1/root/etc/systemd/system/ccsbx-signer.service"' _ "$d"
 t "hostd's unit does not run as the key user" bash -c '! grep -q "ccsbx-keys" <(grep -E "^(User|Group)=" "$1/root/etc/systemd/system/ccsbx-hostd.service")' _ "$d"
 t "the firewall rule is only on the tailnet interface" grep -q 'ufw allow in on tailscale0 to any port 7480' "$cmds"
-t "the real system was not touched: the only stub calls were read-only probes (snap list)" bash -c '! grep -vE "^snap list lxd$" "$1"' _ "$calls"
+t "the real system was not touched: the only stub calls were read-only probes (snap list)" bash -c '! grep -vE "^(snap list lxd|systemctl list-unit-files lxd-installer.socket)$" "$1"' _ "$calls"
 
 echo "# uninstall puts the sudoers file back"
 ins "$d" uninstall --yes >"$d/uout" 2>"$d/uerr"; rc=$?
 t "uninstall exits 0" bash -c '[ '"$rc"' -eq 0 ] || { cat "$1" >&2; exit 1; }' _ "$d/uerr"
-t "uninstall copies the backed-up sudoers files back (recorded: the hook doesn't execute)" grep -q 'cp -a /var/backups/ccsbx-install/T1/etc/sudoers.d/. /etc/sudoers.d/' "$d/rec/cmds"
-t "…and the backup it copies from still holds the original (dokku) line" grep -q dokku "$d/root/var/backups/ccsbx-install/T1/etc/sudoers.d/90-tomas-nopasswd"
+t "uninstall copies the backed-up sudoers files back (recorded: the hook doesn't execute)" grep -q 'cp -a /var/backups/ccsbx-install/original/etc/sudoers.d/90-tomas-nopasswd /etc/sudoers.d/90-tomas-nopasswd' "$d/rec/cmds"
+t "…and the backup it copies from still holds the original (dokku) line" grep -q dokku "$d/root/var/backups/ccsbx-install/original/etc/sudoers.d/90-tomas-nopasswd"
 t "uninstall without a backup is refused" bash -c 'CCSBX_ROOT_PREFIX="$1/nope" CCSBX_EXEC="record:$1/x" CCSBX_BACKUP_DIR=/nowhere CCSBX_OWNER=tomas "$2" uninstall --yes >/dev/null 2>&1; [ $? -eq 3 ]' _ "$d" "$inst"
 
 echo "# check: read-only, and fails on a machine that was never installed"
@@ -133,6 +133,170 @@ CCSBX_P15_FILE="$f" "$p15" mark A dropped "removed" >/dev/null
 CCSBX_P15_FILE="$f" "$p15" check >/dev/null; t "marking it dropped makes check pass" test $? -eq 0
 CCSBX_P15_FILE="$f" "$p15" mark NOPE done >/dev/null 2>&1; t "marking an unknown row is refused" test $? -eq 1
 CCSBX_P15_FILE="$tmp/none" "$p15" check >/dev/null 2>&1; t "a missing status file fails check (the install stays refused)" test $? -eq 1
+
+
+echo "# review M1: hostd must be able to reach the signer's socket, and the owner hostd's"
+sig="$here/units/systemd/ccsbx-signer.service"; sck="$here/units/systemd/ccsbx-signer.socket"; hd="$here/units/systemd/ccsbx-hostd.service"
+t "the signer socket is owned ccsbx-keys, grouped like hostd's own group, mode 0660 (hostd can connect)" bash -c '
+  g="$(sed -n "s/^Group=//p" "$3")"
+  grep -q "^SocketUser=ccsbx-keys" "$2" && grep -q "^SocketGroup=$g\$" "$2" && grep -q "^SocketMode=0660" "$2" && grep -q "^DirectoryMode=0755" "$2"' _ "$sig" "$sck" "$hd"
+t "the signer no longer makes its own 0750 directory that only ccsbx-keys could enter" bash -c '! grep -q "^RuntimeDirectoryMode=0750" "$1" && ! grep -q -- "--socket-group" "$1"' _ "$sig"
+t "hostd is in the group it chgrps its own socket to (a process can only chgrp to a group it is in)" bash -c 'grep -q "^SupplementaryGroups=ccsbx-clients" "$1" && grep -q -- "--socket-group ccsbx-clients" "$1"' _ "$hd"
+t "hostd waits for the signer socket" bash -c 'grep -q "^Requires=ccsbx-signer.socket" "$1"' _ "$hd"
+d="$(fx m1)"; ins "$d" install --yes >/dev/null 2>&1
+t "install writes the socket unit and enables the SOCKET (systemd creates it as root)" bash -c 'test -f "$1/root/etc/systemd/system/ccsbx-signer.socket" && grep -q "enable --now ccsbx-signer.socket" "$1/rec/cmds"' _ "$d"
+t "check does NOT call it ok when the sockets are not there (the old check only looked at is-active)" bash -c 'out="$(CCSBX_ROOT_PREFIX="$1/root" CCSBX_EXEC="record:$1/x" CCSBX_OWNER=tomas "$2" check 2>&1)"; grep -q "^FAIL  signer socket" <<<"$out" && grep -q "^FAIL  hostd socket" <<<"$out"' _ "$d" "$inst"
+me="$(id -un)"; mkdir -p "$d/root/run/ccsbx"
+python3 -I -c 'import socket,sys,time
+s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(1); time.sleep(30)' "$d/root/run/ccsbx/hostd.sock" & lpid=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$d/root/run/ccsbx/hostd.sock" ] && break; sleep 0.2; done
+out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER="$me" "$inst" check 2>&1)"
+t "check actually CONNECTS to hostd's socket as the owner" grep -q "^ok    hostd socket: $me can connect" <<<"$out"
+kill "$lpid" 2>/dev/null; wait "$lpid" 2>/dev/null
+
+echo "# review M2: ccsbx-root runs inside hostd's sandbox, so /home must be visible to it"
+t "hostd's ProtectHome is read-only, not yes (the allowed roots are under /home)" bash -c 'grep -q "^ProtectHome=read-only" "$1" && ! grep -q "^ProtectHome=yes" "$1"' _ "$hd"
+t "the unit says which choice was made and why" grep -q 'review M2' "$hd"
+
+echo "# review M3: under sudo HOME is /root; the P15 file must come from the owner's home"
+me="$(id -un)"; myhome="$(getent passwd "$me" | cut -d: -f6)"
+out="$(HOME=/root CCSBX_OWNER="$me" "$inst" plan 2>&1)"
+t "plan resolves the P15 file from the owner's home, not /root, and prints it" bash -c 'grep -q "P15 status file: $2/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv" <<<"$1" && ! grep -q "/root/cc-tree" <<<"$1"' _ "$out" "$myhome"
+out="$(env -u CCSBX_P15_FILE HOME=/root SUDO_USER="$me" "$p15" check 2>&1)"
+t "units/p15 itself looks in the invoking user's home when HOME is /root (it finds the real file there, or names that path)" bash -c '! grep -q "/root/" <<<"$1"' _ "$out"
+
+echo "# review M4: one originals store, written once, never overwritten"
+d="$(fx m4)"; : > "$calls"
+CCSBX_TEST_VISUDO_RC=1 ins "$d" install --yes >"$d/out" 2>"$d/err"; rc=$?
+t "S10: a combined sudoers config that does not parse stops the install (exit 1)" test "$rc" -eq 1
+t "S10: …and the sudoers file is put back from the first backup, the new rule removed" bash -c 'grep -q dokku "$1/root/etc/sudoers.d/90-tomas-nopasswd" && [ ! -e "$1/root/etc/sudoers.d/90-ccsbx-root" ]' _ "$d"
+t "M4: the failed install says it is partial and how to undo it" grep -q 'PARTIAL INSTALL' "$d/err"
+t "M4: the first backup exists although the install died" test -d "$d/root/var/backups/ccsbx-install/original"
+ins "$d" uninstall --yes >"$d/uout" 2>"$d/uerr"; rc=$?
+t "M4: uninstall after the partial install works (it finds the first backup)" bash -c '[ '"$rc"' -eq 0 ] || { cat "$1" >&2; exit 1; }' _ "$d/uerr"
+t "M4: …and restores the sudoers file from it" grep -q 'cp -a /var/backups/ccsbx-install/original/etc/sudoers.d/90-tomas-nopasswd /etc/sudoers.d/90-tomas-nopasswd' "$d/rec/cmds"
+d="$(fx twice)"
+ins "$d" install --yes >/dev/null 2>&1; ins "$d" install --yes >"$d/out2" 2>&1; rc=$?
+t "M4: a second install run succeeds" test "$rc" -eq 0
+t "M4: …says the first backup was kept" grep -q 'never overwritten' "$d/out2"
+t "M4: …and the backup still holds the ORIGINAL grants (the run that stripped them did not replace it)" grep -q dokku "$d/root/var/backups/ccsbx-install/original/etc/sudoers.d/90-tomas-nopasswd"
+t "M4: the backup lists what did not exist before (so uninstall can remove it)" grep -q '^/etc/sudoers.d/90-ccsbx-root$' "$d/root/var/backups/ccsbx-install/original/ABSENT"
+
+echo "# review S1: a failed write stops the install, and nothing is changed first"
+d="$(fx s1)"; mkdir -p "$d/root/var"; : > "$d/root/var/backups"
+ins "$d" install --yes >"$d/out" 2>"$d/err"; rc=$?
+t "S1: a backup that cannot be made aborts the install (exit 1)" test "$rc" -eq 1
+t "S1: …before the sudoers file was touched" grep -q dokku "$d/root/etc/sudoers.d/90-tomas-nopasswd"
+t "S1: …and nothing was recorded as run" test ! -s "$d/rec/cmds"
+
+echo "# review S2/S3: the test hooks cannot reach a real run"
+CCSBX_EXEC="record:$tmp/y" "$inst" plan >/dev/null 2>&1; t "S2: record mode without a prefix is refused (exit 2)" test $? -eq 2
+CCSBX_B9_CMD=true "$inst" plan >/dev/null 2>&1; t "S3: CCSBX_B9_CMD alone (a stale env var, sudo -E) is refused (exit 3)" test $? -eq 3
+CCSBX_P15_CMD=true "$inst" plan >/dev/null 2>&1; t "S3: CCSBX_P15_CMD alone is refused (exit 3)" test $? -eq 3
+
+echo "# review S4: B9 must not pass when docker cannot be asked"
+b2="$tmp/bin2"; mkdir -p "$b2"
+printf '#!/bin/sh\ncase "$*" in *is-active*) exit 0;; *ExecStart*) echo /usr/bin/hub;; esac\nexit 0\n' > "$b2/systemctl"
+printf '#!/bin/sh\necho "permission denied" >&2\nexit 1\n' > "$b2/docker"; chmod +x "$b2/systemctl" "$b2/docker"
+out="$(PATH="$b2:$PATH" "$inst" plan 2>&1)"
+t "S4: docker ps failing is an UNMET B9 (it used to pass)" bash -c 'grep -q "B9 missing: cannot ask docker" <<<"$1"' _ "$out"
+
+echo "# review S5: every required binary must be listed in SHA256SUMS"
+d="$(fx unlisted)"; grep -v ' ccsbx-root$' "$d/dist/SHA256SUMS" > "$d/s" && mv "$d/s" "$d/dist/SHA256SUMS"
+ins "$d" install --yes >/dev/null 2>"$d/err"; rc=$?
+t "S5: a SHA256SUMS without a line for ccsbx-root is refused (exit 3)" bash -c '[ '"$rc"' -eq 3 ] && grep -q "does not list" "$1"' _ "$d/err"
+
+echo "# review S6: the owner and the allowed roots are validated"
+for o in root ALL 'a b' '1x'; do
+  d="$(fx owner)"; ins "$d" install --yes --owner "$o" >/dev/null 2>"$d/err"; rc=$?
+  t "S6: --owner '$o' is refused (exit 3) and nothing is changed" bash -c '[ '"$rc"' -eq 3 ] && grep -q "owner" "$1" && [ ! -s "$2" ]' _ "$d/err" "$d/rec/cmds"
+done
+for r in / rel '/a"b' '/home/*' '/x/../y' '/a b'; do
+  d="$(fx roots)"; ins "$d" install --yes --allowed-roots "$r" >/dev/null 2>"$d/err"; rc=$?
+  t "S6: --allowed-roots '$r' is refused (exit 3)" bash -c '[ '"$rc"' -eq 3 ] && grep -q "allowed root" "$1"' _ "$d/err"
+done
+d="$(fx roots2)"; ins "$d" install --yes --allowed-roots /srv/a,/srv/b >/dev/null 2>&1
+t "S6: two roots land in the root-owned policy file as two quoted entries" grep -q 'allowed_roots = \["/srv/a", "/srv/b"\]' "$d/root/etc/ccsbx/ccsbx-root.toml"
+
+echo "# review S7: uninstall undoes what the runbook says"
+d="$(fx un)"; echo "bin ccsbx-deploy" > "$d/dist/ccsbx-deploy"; (cd "$d/dist" && sha256sum ccsbx-root ccsbx-hostd ccsbx-signer ccsbx ccsbx-deploy > SHA256SUMS)
+ins "$d" install --yes --with-deploy >/dev/null 2>"$d/err"; ins "$d" uninstall --yes >"$d/uout" 2>&1; rc=$?
+t "S7: uninstall exits 0 after an install with --with-deploy" test "$rc" -eq 0
+for p in /etc/sudoers.d/91-ccsbx-deploy /usr/local/sbin/ccsbx-deploy /etc/ccsbx/ccsbx-root.toml /etc/sudoers.d/90-ccsbx-root /etc/systemd/system/ccsbx-signer.socket; do
+  t "S7: uninstall removes $p" grep -qx "rm -f $p" "$d/rec/cmds"
+done
+t "S7: uninstall removes the firewall rule and the owner's ccsbx-clients membership" bash -c 'grep -q "^ufw delete allow in on tailscale0" "$1" && grep -q "^gpasswd -d tomas ccsbx-clients" "$1"' _ "$d/rec/cmds"
+t "S7: a unit that was never written does not stop the undo (the disable is tried, failure ignored)" grep -q 'failure ignored' "$d/uout"
+t "S7: the runbook's list of what uninstall leaves matches the installer's own message" bash -c 'grep -q "NOT undone" "$1"' _ "$d/uout"
+
+echo "# review S8: a backup dir is trusted by root, so it is checked"
+d="$(fx s8)"; ins "$d" install --yes >/dev/null 2>&1
+mkdir -p "$tmp/elsewhere"; ins "$d" uninstall --yes --backup "$tmp/elsewhere" >/dev/null 2>"$d/err"; rc=$?
+t "S8: --backup outside /var/backups/ccsbx-install is refused (exit 3)" bash -c '[ '"$rc"' -eq 3 ] && grep -q "must be a directory under" "$1"' _ "$d/err"
+b="$d/root/var/backups/ccsbx-install/evil"; mkdir -p "$b"; chmod 700 "$b"; : > "$b/ABSENT"; echo 'x:x 4755' > "$b/sops.meta"
+ins "$d" uninstall --yes --backup /var/backups/ccsbx-install/evil >/dev/null 2>"$d/err"; rc=$?
+t "S8: a sops.meta with a setuid mode is refused (exit 3)" bash -c '[ '"$rc"' -eq 3 ] && grep -q "sops.meta" "$1"' _ "$d/err"
+chmod 777 "$b"; echo 'root:root 755' > "$b/sops.meta"
+ins "$d" uninstall --yes --backup /var/backups/ccsbx-install/evil >/dev/null 2>"$d/err"; rc=$?
+t "S8: a world-writable backup dir is refused (exit 3)" bash -c '[ '"$rc"' -eq 3 ] && grep -q "writable" "$1"' _ "$d/err"
+
+echo "# review S12: steps that can fail on this machine come BEFORE the sudoers change"
+d="$(fx s12)"; : > "$calls"; ins "$d" install --yes >/dev/null 2>&1; cmds="$d/rec/cmds"
+t "S12: no snap remove and no lxd-installer disable when neither exists (the probes said no)" bash -c '! grep -qE "^snap remove|lxd-installer" "$1"' _ "$cmds"
+t "S12: no chown of a sops that is not there" bash -c '! grep -q "/usr/local/bin/sops" "$1"' _ "$cmds"
+d2="$(fx s12b)"; mkdir -p "$d2/root/usr/local/bin"; ln -s /elsewhere "$d2/root/usr/local/bin/sops"
+ins "$d2" install --yes >/dev/null 2>"$d2/err"; rc=$?
+t "S12: a sops that is a symlink is refused (exit 3): chown would hit its target" bash -c '[ '"$rc"' -eq 3 ] && grep -q "symlink" "$1"' _ "$d2/err"
+d3="$(fx s12c)"; mkdir -p "$d3/root/usr/local/bin"; : > "$d3/root/usr/local/bin/sops"; ins "$d3" install --yes >/dev/null 2>&1
+t "S12: sops (when present) is chowned BEFORE the sudoers rule is renamed into place" bash -c 'a="$(grep -n "chown root:root /usr/local/bin/sops" "$1" | cut -d: -f1)"; b="$(grep -n "mv -f /etc/sudoers.d/.90-ccsbx-root.new" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$d3/rec/cmds"
+t "S12: sops.meta was recorded in the first backup" grep -q 'root:root\|[a-z]*:[a-z]* [0-9]*' "$d3/root/var/backups/ccsbx-install/original/sops.meta"
+
+echo "# review S13: the P15 gate fails closed on a file that proves nothing"
+printf 'id\tstate\twhat\taction\n' > "$tmp/hdr.tsv"; CCSBX_P15_FILE="$tmp/hdr.tsv" "$p15" check >/dev/null 2>&1; t "S13: a header-only file fails check" test $? -eq 1
+: > "$tmp/empty.tsv"; CCSBX_P15_FILE="$tmp/empty.tsv" "$p15" check >/dev/null 2>&1; t "S13: an empty file fails check" test $? -eq 1
+printf 'A5\topen\tx\ty\n' > "$tmp/nohdr.tsv"; CCSBX_P15_FILE="$tmp/nohdr.tsv" "$p15" check >/dev/null 2>&1; t "S13: a file without the header fails (its first row would be skipped)" test $? -eq 1
+
+echo "# review N3: p15 mark matches the id exactly, keeps backslashes and the file mode"
+f="$tmp/n3.tsv"; printf 'id\tstate\twhat\taction\nAB\topen\tx\ty\nA5\topen\tx\ty\n' > "$f"; chmod 640 "$f"
+CCSBX_P15_FILE="$f" "$p15" mark 'A.' done >/dev/null 2>&1; t "N3: id 'A.' is not a regex that matches AB (refused, exit 1)" test $? -eq 1
+CCSBX_P15_FILE="$f" "$p15" mark A5 done 'path C:\new\tab' >/dev/null 2>&1
+t "N3: a note with backslashes is stored as typed" grep -qF 'C:\new\tab' "$f"
+t "N3: the file mode survives the rewrite" test "$(stat -c %a "$f")" = 640
+
+echo "# review N1/N2: housekeeping"
+t "N1: the signer unit's header sentence is not split by the Why line" bash -c 'l="$(grep -n "It exposes" "$1" | cut -d: -f1)"; sed -n "$((l+1))p" "$1" | grep -q "^# sign(token_claims)"' _ "$sig"
+t "N2: the installer sets umask 077 before it writes anything" grep -q '^umask 077' "$inst"
+
+echo "# sudoers_strip.py: every line shape it must keep, strip, or refuse"
+kept() { printf '%s\n' "$2" > "$s/k"; local o; o="$("$strip" "$s/k" 2>/dev/null)"; t "keeps: $1" test "$o" = "$2"; }
+gone() { printf '%s\n' "$2" > "$s/g"; local o; o="$("$strip" "$s/g" 2>/dev/null)"; t "strips: $1" test -z "$o"; }
+refused() { printf '%s\n' "$2" > "$s/r"; "$strip" "$s/r" >/dev/null 2>&1; t "refuses (exit 3): $1" test $? -eq 3; }
+N='NOPASSWD:'
+kept "a comment that mentions the tag" "# tomas ALL=(ALL) $N /usr/bin/docker"
+kept "a Defaults line" "Defaults env_reset"
+kept "a rule with no NOPASSWD" "tomas ALL=(ALL) ALL"
+kept "another user's unrelated command" "bob ALL=(ALL) $N /usr/bin/foo"
+kept "a (user:group) runas" "tomas ALL=(ALL:ALL) $N /usr/bin/systemctl restart nginx"
+kept "a negated command" "tomas ALL=(ALL) $N !/usr/bin/su"
+kept "a host-restricted rule" "tomas hp-ubuntu=(root) $N /usr/bin/foo"
+gone "only docker" "tomas ALL=(ALL) $N /usr/bin/docker"
+gone "docker-compose (docker*)" "tomas ALL=(ALL) $N /usr/bin/docker-compose"
+gone "apt, dpkg, snap, apt-get" "tomas ALL=(ALL) $N /usr/bin/apt, /usr/bin/dpkg, /usr/bin/snap, /usr/bin/apt-get"
+gone "dokku and sops" "tomas ALL=(ALL) $N /usr/bin/dokku, /usr/local/bin/sops"
+gone "a group rule with only docker" "%admin ALL=(ALL) $N /usr/bin/docker"
+printf '%s\n' "tomas ALL=(ALL) $N /usr/bin/docker, /usr/bin/foo --bar" > "$s/m"
+t "strips only the removable part of a mixed line and keeps the arguments of the rest" test "$("$strip" "$s/m" 2>/dev/null)" = "tomas ALL=(ALL) $N /usr/bin/foo --bar"
+refused "an alias (its members are not visible)" "tomas ALL=(ALL) $N DOCKER_CMDS"
+refused "env as a wrapper" "tomas ALL=(ALL) $N /usr/bin/env docker"
+refused "sudoedit" "tomas ALL=(ALL) $N sudoedit /etc/x"
+refused "a sha256 digest entry" "tomas ALL=(ALL) $N sha256:abcd /usr/bin/docker"
+refused "two tag groups on one line" "tomas ALL=(ALL) $N /usr/bin/foo, PASSWD: /usr/bin/bar"
+refused "ALL" "tomas ALL=(ALL) $N ALL"
+refused "a continuation line" "tomas ALL=(ALL) $N /usr/bin/foo, \\"
+refused "no command at all" "tomas ALL=(ALL) $N "
+
+echo "# the test harness itself"
+t "a failed mktemp -d can't turn fx into rm -rf of a top-level dir (tmp is checked)" grep -q '\[ -d "\$tmp" \] || exit 2' "$0"
 
 echo "# $pass passed, $fail failed"
 [ "$fail" -eq 0 ]

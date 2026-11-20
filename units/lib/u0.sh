@@ -4,8 +4,9 @@
 # After this, the only way from tomas to root is `sudo -n /usr/local/sbin/ccsbx-root <verb>`
 # (verbs: run stop renew gc attach exec-token; it refuses unpinned images, workdirs outside the
 # allowed roots, symlink escapes and unknown flags), plus password sudo, which stays.
-# Order matters: every replacement is installed and verified BEFORE the groups are removed,
-# and the docker group is the LAST thing changed.
+# Order matters: every replacement is installed and verified BEFORE the groups are removed, every
+# step that can fail for a machine-specific reason (snap, sops, the lxd socket) runs BEFORE the
+# sudoers files are changed, and the docker group is the LAST thing changed.
 # shellcheck shell=bash
 
 u0_binaries() {
@@ -26,6 +27,23 @@ verbs = ["run", "stop", "renew", "gc", "attach", "exec-token"]
 EOT
 }
 
+# the combined sudoers config must parse; in record mode the answer is CCSBX_TEST_VISUDO_RC (test hook)
+visudo_all() {
+  if [ "${EXEC%%:*}" = record ]; then rec visudo -c; return "${CCSBX_TEST_VISUDO_RC:-0}"; fi
+  visudo -c >/dev/null
+}
+
+# put every sudoers file the install touched back from the first backup, and drop the new rule
+sudoers_rollback() {
+  local f b="$(pth "$BACKUP_DIR")/etc/sudoers.d" name rc=0
+  for f in "$@"; do
+    name="$(basename "$f")"
+    cp -af "$b/$name" "$f" || { printf 'install-linux: CANNOT restore %s from %s: do it by hand\n' "$f" "$b" >&2; rc=1; }
+  done
+  rm -f "$(pth /etc/sudoers.d/90-ccsbx-root)" "$(pth /etc/sudoers.d/91-ccsbx-deploy)" || rc=1
+  return $rc
+}
+
 u0_sudoers() {
   step "U0 sudoers: ccsbx-root is the only NOPASSWD grant"
   note "1. the new rule goes in a dot-named staging file (sudo ignores it), is checked, then renamed"
@@ -36,36 +54,42 @@ ccsbx ALL=(root) NOPASSWD: /usr/local/sbin/ccsbx-root
 EOT
   cmd visudo -cf /etc/sudoers.d/.90-ccsbx-root.new
   cmd mv -f /etc/sudoers.d/.90-ccsbx-root.new /etc/sudoers.d/90-ccsbx-root
-  note "2. remove the NOPASSWD grants for docker, apt-get, dokku, sops from every sudoers.d file"
+  note "2. remove the NOPASSWD grants for docker, apt, dpkg, snap, dokku, sops from every sudoers.d file"
   note "   (units/lib/sudoers_strip.py: refuses lines it can't parse, leaves everything else alone)"
+  note "3. the whole config is checked again; if it does not parse, every file changed is put back"
   case "$MODE" in
-    plan) printf '     $ for f in /etc/sudoers.d/*: sudoers_strip.py f > f.new; visudo -cf f.new; mv f.new f\n' ;;
+    plan) printf '     $ for f in /etc/sudoers.d/*: sudoers_strip.py f > f.new; visudo -cf f.new; mv f.new f\n     $ visudo -c   (on failure: restore from the first backup, stop)\n' ;;
     install)
-      local f new
+      local f new changed=()
       for f in "$(pth /etc/sudoers.d)"/*; do
         [ -f "$f" ] || continue
-        case "$(basename "$f")" in README|90-ccsbx-root|*.new) continue;; esac
+        case "$(basename "$f")" in README|90-ccsbx-root|91-ccsbx-deploy|*.new) continue;; esac
         grep -q NOPASSWD "$f" 2>/dev/null || continue
         new="$(dirname "$f")/.$(basename "$f").new"
-        backup "/etc/sudoers.d/$(basename "$f")"
-        python3 -I "$UNITS_DIR/lib/sudoers_strip.py" "$f" > "$new" || die "cannot clean $f (see above); nothing was changed in it"
-        if cmp -s "$f" "$new"; then rm -f "$new"; continue; fi
-        chmod 0440 "$new"
-        if [ "${EXEC%%:*}" = record ]; then quote visudo -cf "$new" >> "${EXEC#record:}"; echo >> "${EXEC#record:}"
-        else visudo -cf "$new" >/dev/null || die "cleaned $f does not validate; left as it was"; fi
-        mv -f "$new" "$f"; printf '     cleaned %s\n' "$f"
-      done ;;
+        python3 -I "$UNITS_DIR/lib/sudoers_strip.py" "$f" > "$new" || { rm -f "$new"; die "cannot clean $f (see above); nothing was changed in it"; }
+        if cmp -s "$f" "$new"; then rm -f "$new" || die "cannot remove $new"; continue; fi
+        chmod 0440 "$new" || die "cannot chmod $new"
+        if [ "${EXEC%%:*}" = record ]; then rec visudo -cf "$new"
+        else visudo -cf "$new" >/dev/null || { rm -f "$new"; die "cleaned $f does not validate; left as it was"; }; fi
+        mv -f "$new" "$f" || die "cannot replace $f"
+        changed+=("$f"); printf '     cleaned %s\n' "$f"
+      done
+      printf '     $ visudo -c\n'
+      if ! visudo_all; then
+        sudoers_rollback "${changed[@]}" || die "the combined sudoers config does not parse after the change, AND the restore failed: restore /etc/sudoers.d from $BACKUP_DIR/etc/sudoers.d by hand"
+        die "the combined sudoers config does not parse after the change; restored ${#changed[@]} file(s) from the first backup and removed the new rules"
+      fi ;;
   esac
 }
 
 u0_sops() {
   step "U0 sops: a root-owned binary (tomas-writable + sudo-runnable was a root path)"
-  if [ "$MODE" = install ] && [ -e "$(pth /usr/local/bin/sops)" ]; then
-    mkdir -p "$(pth "$BACKUP_DIR")"
-    stat -c '%U:%G %a' "$(pth /usr/local/bin/sops)" > "$(pth "$BACKUP_DIR")/sops.meta"
+  if [ "$MODE" = install ] && [ ! -e "$(pth /usr/local/bin/sops)" ]; then
+    note "/usr/local/bin/sops does not exist: nothing to change"
+  else
+    cmd chown root:root /usr/local/bin/sops
+    cmd chmod 0755 /usr/local/bin/sops
   fi
-  cmd chown root:root /usr/local/bin/sops
-  cmd chmod 0755 /usr/local/bin/sops
 }
 
 u0_hostd() {
@@ -80,16 +104,19 @@ u0_hostd() {
 u0_lxd() {
   step "U0 lxd: remove the accidental snap and its installer socket"
   note "closes the root path of a missing-command handler turning 'lxc' into an install"
-  if [ "$MODE" != install ] || snap list lxd >/dev/null 2>&1; then cmd snap remove lxd; fi
-  cmd systemctl disable --now lxd-installer.socket
-  if in_group "$(real_user)" lxd; then cmd gpasswd -d "$(real_user)" lxd; else note "$(real_user) is not in group lxd"; fi
+  note "each is done only if it is there: a missing lxd must not stop the install"
+  if [ "$MODE" != install ] || snap list lxd >/dev/null 2>&1; then cmd snap remove --purge lxd; else note "snap lxd is not installed"; fi
+  if [ "$MODE" != install ] || systemctl list-unit-files lxd-installer.socket 2>/dev/null | grep -q lxd-installer.socket; then
+    cmd systemctl disable --now lxd-installer.socket
+  else note "lxd-installer.socket does not exist"; fi
 }
 
-u0_docker_group() {
-  step "U0 docker group (LAST): $(real_user) leaves it; effective for new login sessions"
+u0_groups() {
+  step "U0 groups (LAST): $(real_user) leaves lxd, then docker; effective for new login sessions"
   note "running containers keep running: the daemon owns them (P14 inventory)"
   note "github-runner@N units keep docker through SupplementaryGroups=docker in their own unit:"
   note "  that is NOT changed here; it is a P15 decision (units/p15 status)"
+  if in_group "$(real_user)" lxd; then cmd gpasswd -d "$(real_user)" lxd; else note "$(real_user) is not in group lxd"; fi
   if in_group "$(real_user)" docker; then cmd gpasswd -d "$(real_user)" docker; else note "$(real_user) is not in group docker"; fi
   note "NOW: sudo reboot  (a fresh tmux server has the new groups; the old one keeps docker)"
 }
@@ -124,19 +151,61 @@ u0_check() {
   else bad "sudo -n -l failed (needs a sudo session; run check as $u)"; fi
 }
 
-u0_uninstall() {
-  step "U0 undo: put the sudoers files, sops mode and groups back from the backup"
-  note "backup: $BACKUP_DIR (the newest one unless --backup DIR). Docker/lxd are not reinstalled."
-  cmd rm -f /etc/sudoers.d/90-ccsbx-root
-  cmd systemctl disable --now ccsbx-hostd.service
-  cmd rm -f /etc/systemd/system/ccsbx-hostd.service /usr/local/sbin/ccsbx-root /usr/local/bin/ccsbx "$LIBEXEC/ccsbx-hostd"
-  note "every sudoers.d file the install changed comes back from $RESTORE_DIR"
-  if [ "$MODE" = plan ] || [ -d "$(pth "$RESTORE_DIR")/etc/sudoers.d" ]; then
-    cmd cp -a "$RESTORE_DIR/etc/sudoers.d/." /etc/sudoers.d/
+# The backup is trusted by root, so it is checked first: under the backup root, owned by root, not
+# writable by group or others, and sops.meta says only "user:group NNN" with no setuid digit.
+restore_dir_ok() {
+  local d="$1" real own mode meta
+  case "$d" in "$BACKUP_ROOT"/*) ;; *) refuse "--backup must be a directory under $BACKUP_ROOT (got $d)";; esac
+  case "$d" in *..*) refuse "no .. in the backup path";; esac
+  real="$(pth "$d")"
+  [ -d "$real" ] || refuse "no backup at $d"
+  own="$(stat -c '%u' "$real")"; mode="$(stat -c '%a' "$real")"
+  [ -n "$PREFIX" ] || [ "$own" = 0 ] || refuse "$d is not owned by root"
+  [ $(( 8#$mode & 8#022 )) -eq 0 ] || refuse "$d is writable by group or others (mode $mode)"
+  if [ -f "$real/sops.meta" ]; then
+    meta="$(cat "$real/sops.meta")"
+    [[ "$meta" =~ ^[a-z_][a-z0-9_-]*:[a-z_][a-z0-9_-]*\ [0-7]{3}$ ]] || refuse "sops.meta in $d is not 'user:group NNN': $meta"
   fi
-  note "sops gets back the owner and mode recorded in $RESTORE_DIR/sops.meta (it was the owner's, 0775)"
-  local meta="" ; [ -f "$(pth "$RESTORE_DIR")/sops.meta" ] && meta="$(cat "$(pth "$RESTORE_DIR")/sops.meta")"
-  if [ -n "$meta" ]; then cmd chown "${meta% *}" /usr/local/bin/sops; cmd chmod "${meta#* }" /usr/local/bin/sops
-  elif [ "$MODE" = plan ]; then cmd chown "$(real_user):$(real_user)" /usr/local/bin/sops; cmd chmod 0775 /usr/local/bin/sops; fi
-  note "re-add the groups only if you want invariant 14 waived again: gpasswd -a $(real_user) docker"
+}
+
+u0_uninstall() {
+  local real f rel p
+  real="$(pth "$RESTORE_DIR")"
+  step "U0 undo: stop the units, take away what the install added, put back what it replaced"
+  note "from the FIRST backup: $RESTORE_DIR (never overwritten, so a re-run or a failed install can't spoil it)"
+  try systemctl disable --now ccsbx-hostd.service
+  note "1. paths that did not exist before the install are removed"
+  while IFS= read -r p; do
+    [ -n "$p" ] || continue
+    is_managed "$p" || { note "ABSENT lists $p, which is not one of ours: ignored"; continue; }
+    cmd rm -f "$p"
+  done < "$real/ABSENT"
+  note "2. paths the install replaced come back"
+  for p in "${MANAGED_PATHS[@]}"; do
+    [ -e "$real$p" ] || [ -L "$real$p" ] || continue
+    cmd cp -a "$RESTORE_DIR$p" "$p"
+  done
+  note "3. every sudoers.d file comes back as it was, then the whole config is checked"
+  if [ -d "$real/etc/sudoers.d" ]; then
+    for f in "$real/etc/sudoers.d"/*; do
+      [ -e "$f" ] || continue
+      rel="$(basename "$f")"
+      case "$rel" in */*|"") continue;; esac
+      cmd cp -a "$RESTORE_DIR/etc/sudoers.d/$rel" "/etc/sudoers.d/$rel"
+    done
+  fi
+  if [ "${EXEC%%:*}" = record ]; then rec visudo -c; else cmd visudo -c; fi
+  note "4. sops gets back its owner and mode from $RESTORE_DIR/sops.meta"
+  if [ -f "$real/sops.meta" ]; then
+    local meta; meta="$(cat "$real/sops.meta")"
+    cmd chown "${meta% *}" /usr/local/bin/sops; cmd chmod "${meta#* }" /usr/local/bin/sops
+  else note "no sops.meta: sops was not there, nothing to restore"; fi
+  note "5. the firewall rule and the group ccsbx-clients membership"
+  try ufw delete allow in on tailscale0 to any port 7480 proto tcp
+  try gpasswd -d "$(real_user)" ccsbx-clients
+  try systemctl daemon-reload
+  note "NOT undone, on purpose: docker/lxd membership and the lxd snap (re-add with gpasswd -a $(real_user) docker if you want invariant 14 waived again);"
+  note "  users ccsbx, ccsbx-keys and group ccsbx-clients; /var/lib/ccsbx; /etc/ccsbx and $LIBEXEC (now empty)"
+  step "U0 undo: retire the backup so a later install starts from a fresh first backup"
+  cmd mv "$RESTORE_DIR" "$RESTORE_DIR.undone-$(date +%Y%m%d-%H%M%S)"
 }

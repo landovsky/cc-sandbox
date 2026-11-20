@@ -1,14 +1,16 @@
 # units/lib/u0b.sh — U0b: host keys under the `ccsbx-keys` uid, and the signer (sourced).
 # Why: an agent on hp must not be able to read the keys that sign session tokens, so they live under a uid tomas is not.
 #
-#   plan:  ccsbx-keys + ccsbx uids, the key directory (0700), the machine key, the signer unit.
-#   check: as tomas: the key directory is ccsbx-keys:700, `test -r` on each key fails, the signer runs.
+#   plan:  ccsbx-keys + ccsbx uids, the key directory (0700), the machine key, the signer unit and socket.
+#   check: the key directory is ccsbx-keys:700, `test -r` on each key fails for the owner, the signer's
+#          and hostd's sockets can really be connected to by their clients.
 # Mac (`_ccsbx` + a root LaunchDaemon) is install-mac.sh, not here.
 # shellcheck shell=bash
 
 KEYS_DIR=/var/lib/ccsbx-keys
 STATE_DIR=/var/lib/ccsbx
-LIBEXEC=/usr/local/libexec/ccsbx
+SIGNER_SOCK=/run/ccsbx-signer/sign.sock       # systemd creates it (ccsbx-signer.socket): ccsbx-keys:ccsbx 0660
+HOSTD_SOCK=/run/ccsbx/hostd.sock              # hostd makes it: ccsbx:ccsbx-clients 0660
 KEY_FILES="age.key machine.key"
 
 u0b_users() {
@@ -27,7 +29,8 @@ u0b_users() {
   cmd chmod 0700 "$KEYS_DIR"
   cmd chown ccsbx:ccsbx "$STATE_DIR"
   cmd chmod 0750 "$STATE_DIR"
-  note "the signer's socket is group ccsbx (hostd's gid), so hostd signs without any key access"
+  note "the signer's socket is made by systemd (ccsbx-signer.socket): ccsbx-keys:ccsbx 0660 in a 0755 dir,"
+  note "so hostd (group ccsbx) can connect without any access to the key directory"
 }
 
 u0b_keys() {
@@ -46,11 +49,33 @@ u0b_keys() {
 }
 
 u0b_signer() {
-  step "U0b signer service (sign(token_claims) only)"
+  step "U0b signer socket + service (sign(token_claims) only; the socket is activated by systemd)"
   put /etc/systemd/system/ccsbx-signer.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-signer.service"
+  put /etc/systemd/system/ccsbx-signer.socket 0644 root:root < "$UNITS_DIR/systemd/ccsbx-signer.socket"
   cmd systemctl daemon-reload
-  cmd systemctl enable --now ccsbx-signer.service
+  cmd systemctl enable --now ccsbx-signer.socket
 }
+
+# sock_check LABEL PATH CLIENT — can CLIENT really connect? Root tests it as CLIENT (runuser); a
+# user tests only as themself; otherwise the file mode and group are shown for the reader.
+sock_connect_py='import socket,sys
+s=socket.socket(socket.AF_UNIX); s.settimeout(3)
+try: s.connect(sys.argv[1])
+except Exception as e: print(e); sys.exit(1)'
+sock_check() {
+  local label="$1" path="$2" client="$3" real; real="$(pth "$path")"
+  if [ ! -S "$real" ]; then bad "$label: $path is not a socket (is its unit active?)"; return; fi
+  if [ "$(id -u)" = 0 ] && [ -z "$PREFIX" ] && have_user "$client"; then
+    if runuser -u "$client" -- python3 -I -c "$sock_connect_py" "$real" >/dev/null 2>&1; then ok "$label: $client can connect to $path"
+    else bad "$label: $client cannot connect to $path ($(stat -c '%U:%G %a' "$real"))"; fi
+  elif [ "$client" = "$(id -un)" ]; then
+    if python3 -I -c "$sock_connect_py" "$real" >/dev/null 2>&1; then ok "$label: $client can connect to $path"
+    else bad "$label: $client cannot connect to $path ($(stat -c '%U:%G %a' "$real"))"; fi
+  else
+    note_check "$label: $path is $(stat -c '%U:%G %a' "$real"); run check as root or as $client to connect"
+  fi
+}
+note_check() { printf 'note  %s\n' "$*"; }
 
 u0b_check() {
   echo "-- U0b host keys"
@@ -60,19 +85,24 @@ u0b_check() {
   [ "$own" = "ccsbx-keys:700" ] && ok "$KEYS_DIR is ccsbx-keys:700" || bad "$KEYS_DIR is $own (want ccsbx-keys:700)"
   local k
   for k in $KEY_FILES; do
-    if [ -r "$(pth $KEYS_DIR/$k)" ]; then bad "$k is readable by $(id -un)"; else ok "test -r $k fails for $(id -un)"; fi
+    if [ "$(id -u)" = 0 ] && [ -z "$PREFIX" ]; then note_check "$k: readability is not tested as root (it always reads); run check as $(real_user)"
+    elif [ -r "$(pth $KEYS_DIR/$k)" ]; then bad "$k is readable by $(id -un)"
+    else ok "test -r $k fails for $(id -un)"; fi
   done
-  expect "ccsbx-signer is active" systemctl is-active --quiet ccsbx-signer.service
+  expect "ccsbx-signer.socket is active" systemctl is-active --quiet ccsbx-signer.socket
   expect "ccsbx-signer unit installed" test -f "$(pth /etc/systemd/system/ccsbx-signer.service)"
+  sock_check "signer socket" "$SIGNER_SOCK" ccsbx
+  sock_check "hostd socket" "$HOSTD_SOCK" "$(real_user)"
 }
 
 u0b_uninstall() {
-  step "U0b undo: stop the signer, remove its unit (keys are kept unless --purge-keys)"
-  cmd systemctl disable --now ccsbx-signer.service
-  cmd rm -f /etc/systemd/system/ccsbx-signer.service "$LIBEXEC/ccsbx-signer"
-  cmd systemctl daemon-reload
+  step "U0b undo: stop the signer, remove its units (keys are kept unless --purge-keys)"
+  try systemctl disable --now ccsbx-signer.socket
+  try systemctl disable --now ccsbx-signer.service
+  note "the unit files are removed or restored in the files step below"
   if [ "${PURGE_KEYS:-0}" = 1 ]; then
     note "--purge-keys: the machine key and age key are DELETED. Rotate the trusted-key list first (M9)."
-    cmd userdel -r ccsbx-keys
+    try userdel -r ccsbx-keys
   else note "keys directory and the ccsbx-keys user stay (pass --purge-keys to delete them)"; fi
+  note "users ccsbx and ccsbx-clients, and /var/lib/ccsbx (the journal), stay: they hold no root path"
 }

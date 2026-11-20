@@ -5,7 +5,7 @@
 #   units/install-linux.sh plan                prints every step and the gate results; changes NOTHING; needs no root
 #   (as root) units/install-linux.sh install --yes   does it (the morning gate, R10). Refuses unless every gate is met
 #   units/install-linux.sh check               read-only: ok/FAIL per step; exit 0 only when the install is complete (after the reboot)
-#   (as root) units/install-linux.sh uninstall --yes  restores from the backup of the last install
+#   (as root) units/install-linux.sh uninstall --yes  restores from the FIRST backup (/var/backups/ccsbx-install/original)
 #
 # What it does (the same code prints it in `plan` and runs it in `install`):
 #   U0b  users ccsbx + ccsbx-keys, the 0700 key directory, the machine and age keys, the signer unit
@@ -20,7 +20,9 @@
 #   P15  every row of the P14 inventory is done or dropped (units/p15 check)
 #   bins ccsbx-root, ccsbx-hostd, ccsbx-signer, ccsbx exist in --bin-dir and match its SHA256SUMS
 #   sudoers  every sudoers.d NOPASSWD line parses (units/lib/sudoers_strip.py), so nothing is guessed
-#   tools    visudo, ufw, age-keygen, python3, runuser are installed
+#   tools    visudo, ufw, python3, runuser (and age-keygen when there is no age key yet) are installed
+#   owner    a plain login name with uid >= 1000, not root; --allowed-roots are absolute, existing, not /
+#   probes   sops is not a symlink (chown would hit its target)
 #
 # Options (each also a CCSBX_* env var):
 #   --yes                 really do it (install and uninstall)
@@ -28,12 +30,15 @@
 #   --owner USER          the human who keeps access            (CCSBX_OWNER, default the invoking user)
 #   --allowed-roots A,B   ccsbx-root's workdir roots            (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt)
 #   --with-deploy         also the ccsbx-deploy sudoers rule (Q12 = yes, R10c)  (CCSBX_WITH_DEPLOY=1)
-#   --backup DIR          uninstall from this backup, not the newest
+#   --backup DIR          uninstall from this backup (must be under /var/backups/ccsbx-install), not the first one
 #   --purge-keys          uninstall also deletes the keys and the ccsbx-keys user (rotate M9 first!)
 #   -v, --verbose         plan prints the files it would write
-# Gate overrides, for tests only: CCSBX_B9_CMD, CCSBX_P15_CMD (a command; exit 0 = met).
+# Gate overrides, for tests only: CCSBX_B9_CMD, CCSBX_P15_CMD (a command; exit 0 = met). They are honoured
+# only together with the test hook CCSBX_ROOT_PREFIX; set alone, the installer refuses (they would be eval'd as root).
+# P15's status file: CCSBX_P15_FILE, else <owner's home>/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv (never root's $HOME).
 # Exit: 0 ok, 1 a step failed / check failed, 2 usage, 3 refused (a gate is unmet).
 set -uo pipefail
+umask 077                 # nothing the installer writes is ever briefly world-readable
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 UNITS_DIR="$HERE"; REPO_DIR="$(dirname "$HERE")"
 
@@ -66,8 +71,17 @@ export CCSBX_OWNER VERBOSE PURGE_KEYS MODE
 
 OWNER="$(real_user)"; OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"; OWNER_HOME="${OWNER_HOME:-/home/$OWNER}"
 [ -n "$ALLOWED_ROOTS" ] || ALLOWED_ROOTS="$OWNER_HOME/git,$OWNER_HOME/wt"
-ALLOWED_ROOTS_TOML="$(printf '"%s", ' ${ALLOWED_ROOTS//,/ })"; ALLOWED_ROOTS_TOML="${ALLOWED_ROOTS_TOML%, }"
-RESTORE_DIR="${RESTORE_OVERRIDE:-$(readlink "$(pth "$LATEST_LINK")" 2>/dev/null || echo "$BACKUP_DIR")}"
+# split on commas only (no globbing, no word splitting); each root must be a plain absolute path
+ROOT_ERRORS=(); ALLOWED_ROOTS_TOML=""
+IFS=, read -r -a _roots <<<"$ALLOWED_ROOTS"
+for _r in "${_roots[@]}"; do
+  if [[ "$_r" =~ ^/[A-Za-z0-9._@+/-]+$ ]] && [ "$_r" != / ] && [[ "$_r" != *..* ]]; then
+    [ -n "$PREFIX" ] || [ -d "$_r" ] || ROOT_ERRORS+=("allowed root $_r does not exist")
+    ALLOWED_ROOTS_TOML+="\"$_r\", "
+  else ROOT_ERRORS+=("allowed root '$_r' is not a plain absolute path (no /, .., quotes, globs or spaces)"); fi
+done
+ALLOWED_ROOTS_TOML="${ALLOWED_ROOTS_TOML%, }"
+RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
 export BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
@@ -82,12 +96,27 @@ default_b9() {
   as_owner systemctl --user is-active --quiet "$unit" 2>/dev/null || { echo "user unit $unit is not active"; return 1; }
   exec="$(as_owner systemctl --user show -p ExecStart --value "$unit" 2>/dev/null)"
   case "$exec" in *docker*) echo "$unit still starts docker"; return 1;; esac
-  if as_owner docker ps --filter name='^session-bus$' -q 2>/dev/null | grep -q .; then echo "docker container session-bus is still running"; return 1; fi
+  if command -v docker >/dev/null 2>&1; then
+    local ps
+    ps="$(as_owner docker ps --filter name='^session-bus$' -q 2>&1)" || { echo "cannot ask docker whether session-bus runs (docker ps failed): $(head -1 <<<"$ps")"; return 1; }
+    [ -z "$ps" ] || { echo "docker container session-bus is still running"; return 1; }
+  fi
   return 0
 }
-default_p15() { "$UNITS_DIR/p15" check; }
+P15_FILE="${CCSBX_P15_FILE:-$OWNER_HOME/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv}"   # never $HOME: under sudo that is /root
+default_p15() { as_owner env CCSBX_P15_FILE="$P15_FILE" "$UNITS_DIR/p15" check; }
 eval_gates() {
-  local m f missing=""
+  local m f missing="" e unlisted
+  if [ -z "$PREFIX" ] && [ -n "${CCSBX_B9_CMD:-}${CCSBX_P15_CMD:-}" ]; then
+    refuse "CCSBX_B9_CMD / CCSBX_P15_CMD are test overrides and are set: unset them (sudo -E would pass them to root)"
+  fi
+  # the owner keeps access, so it must be a real login: root, ALL or a typo would put the rule on the wrong account
+  case "$OWNER" in ""|root|ALL|*[!a-z0-9_-]*|[!a-z_]*) gate "owner '$OWNER' is not a plain login name (run as sudo from the owner's shell, or --owner USER)";; esac
+  if [ -z "$PREFIX" ]; then
+    if ! id -u "$OWNER" >/dev/null 2>&1; then gate "owner '$OWNER' does not exist"
+    elif [ "$(id -u "$OWNER")" -lt 1000 ]; then gate "owner '$OWNER' is a system account (uid < 1000)"; fi
+  fi
+  for e in "${ROOT_ERRORS[@]}"; do gate "$e"; done
   if [ -n "${CCSBX_B9_CMD:-}" ]; then m="$(eval "$CCSBX_B9_CMD" 2>&1)" || gate "B9 missing: ${m:-$CCSBX_B9_CMD failed}"
   else m="$(default_b9)" || gate "B9 missing: $m (the native hub release, stream C)"; fi
   if [ -n "${CCSBX_P15_CMD:-}" ]; then m="$(eval "$CCSBX_P15_CMD" 2>&1)" || gate "P15 open: ${m:-$CCSBX_P15_CMD failed}"
@@ -96,9 +125,17 @@ eval_gates() {
   [ -z "$missing" ] || gate "binaries missing in $BIN_DIR:$missing (a linux build of each + SHA256SUMS in --bin-dir; see --help)"
   if [ -z "$missing" ]; then
     if [ ! -f "$BIN_DIR/SHA256SUMS" ]; then gate "no $BIN_DIR/SHA256SUMS"
+    elif unlisted="$(for f in ccsbx-root ccsbx-hostd ccsbx-signer ccsbx; do grep -Eq "^[0-9a-f]{64} [ *]${f}\$" "$BIN_DIR/SHA256SUMS" || printf ' %s' "$f"; done)"; [ -n "$unlisted" ]; then
+      gate "SHA256SUMS does not list:$unlisted (an unlisted file would pass unchecked)"
     elif ! (cd "$BIN_DIR" && sha256sum --quiet -c SHA256SUMS >/dev/null 2>&1); then gate "binaries do not match SHA256SUMS"; fi
   fi
-  for f in visudo ufw age-keygen python3 runuser; do command -v "$f" >/dev/null 2>&1 || [ -n "$PREFIX" ] || gate "tool not installed: $f"; done
+  local tools="visudo ufw python3 runuser"; [ -e "$(pth /var/lib/ccsbx-keys/age.key)" ] || tools+=" age-keygen"
+  for f in $tools; do command -v "$f" >/dev/null 2>&1 || [ -n "$PREFIX" ] || gate "tool not installed: $f"; done
+  if [ -L "$(pth /usr/local/bin/sops)" ]; then gate "/usr/local/bin/sops is a symlink: chown would change its target; replace it with the real file first"; fi
+  if [ "$WITH_DEPLOY" = 1 ]; then
+    [ -f "$BIN_DIR/ccsbx-deploy" ] && grep -Eq "^[0-9a-f]{64} [ *]ccsbx-deploy\$" "$BIN_DIR/SHA256SUMS" 2>/dev/null && (cd "$BIN_DIR" && grep -E " [ *]ccsbx-deploy\$" SHA256SUMS | sha256sum --quiet -c - >/dev/null 2>&1) \
+      || gate "--with-deploy: ccsbx-deploy is missing in $BIN_DIR, not listed in SHA256SUMS, or does not match it"
+  fi
   # sudoers: nothing may be unparseable (a dry run of the stripper; root only, the files are 0440)
   if compgen -G "$(pth /etc/sudoers.d)/*" >/dev/null; then
     for f in "$(pth /etc/sudoers.d)"/*; do
@@ -130,11 +167,13 @@ EOT
   if [ -f "$BIN_DIR/ccsbx-deploy" ] || [ "$MODE" = plan ]; then cmd install -o root -g root -m 0755 "$BIN_DIR/ccsbx-deploy" /usr/local/sbin/ccsbx-deploy; fi
 }
 steps_install() {
+  if [ "$MODE" = install ]; then step "back up every file the install replaces (once; never overwritten)"; backup_originals; fi
+  # everything that can fail for a machine-specific reason comes BEFORE sudoers is changed
   u0b_users; u0_binaries; u0b_keys; u0b_signer; u0_hostd
-  [ "$WITH_DEPLOY" = 1 ] && u0_deploy_rule
-  u0_sudoers; u0_sops; u0_lxd; u0_docker_group
-  step "record the backup for uninstall"
-  cmd ln -sfn "$BACKUP_DIR" "$LATEST_LINK"
+  if [ "$WITH_DEPLOY" = 1 ]; then u0_deploy_rule; fi
+  u0_sops; u0_lxd
+  u0_sudoers; u0_groups
+  if [ "$MODE" = install ]; then step "mark the install complete"; backup_state complete || die "cannot mark the backup complete"; fi
 }
 
 case "$MODE" in
@@ -142,9 +181,10 @@ case "$MODE" in
     echo "install-linux plan  ($(date '+%F %T'), owner=$OWNER, bin-dir=$BIN_DIR)"
     echo "Nothing below is run by 'plan'. The same steps run under 'install --yes' as root."
     eval_gates; print_gates
+    echo "  P15 status file: $P15_FILE"; echo "  allowed roots:   ${ALLOWED_ROOTS_TOML:-(none)}"
     steps_install
     echo; echo "AFTER: reboot, then units/install-linux.sh check  and  bin/ccsbx-preflight --morning --post-M1"
-    echo "UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the newest backup under $(dirname "$BACKUP_DIR"))"
+    echo "UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the first backup, $BACKUP_DIR; a failed install is undone the same way)"
     ;;
   install)
     [ "$YES" = 1 ] || refuse "install changes the system. Read 'plan', then run it as root with --yes"
@@ -152,7 +192,7 @@ case "$MODE" in
     [ "$(uname -s)" = Linux ] || refuse "this is the Linux installer (Mac: install-mac.sh)"
     eval_gates
     if [ "${#GATE_MSGS[@]}" -gt 0 ]; then print_gates >&2; refuse "${#GATE_MSGS[@]} gate(s) unmet; nothing was changed"; fi
-    echo "install-linux: all gates met; backing up to $BACKUP_DIR"
+    echo "install-linux: all gates met; the first backup goes to $BACKUP_DIR"
     steps_install
     echo; echo "DONE. NOW: reboot. Then: units/install-linux.sh check"
     ;;
@@ -165,7 +205,7 @@ case "$MODE" in
   uninstall)
     [ "$YES" = 1 ] || refuse "uninstall changes the system: add --yes"
     [ "$(id -u)" = 0 ] || [ -n "$PREFIX" ] || refuse "uninstall must run as root"
-    [ -d "$(pth "$RESTORE_DIR")" ] || refuse "no backup at $RESTORE_DIR (use --backup DIR)"
+    restore_dir_ok "$RESTORE_DIR"
     u0_uninstall; u0b_uninstall
     echo; echo "DONE. docker/lxd were not reinstalled or re-granted: that is deliberate."
     ;;

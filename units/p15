@@ -19,12 +19,19 @@
 #   units/p15 mark A5 done "runners moved to ghrunner uid"
 # Exit: 0 ok, 1 open rows (check) / not found, 2 usage.
 set -euo pipefail
-F="${CCSBX_P15_FILE:-$HOME/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv}"
+if [ -n "${CCSBX_P15_FILE:-}" ]; then F="$CCSBX_P15_FILE"
+else   # under sudo $HOME is /root: use the invoking user's home from the passwd database
+  _u="${SUDO_USER:-$(id -un)}"; _h="$(getent passwd "$_u" 2>/dev/null | cut -d: -f6)"
+  F="${_h:-$HOME}/cc-tree/cc-sandbox/nodes/4vwb/p15-status.tsv"
+fi
 usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d' | sed 's/^# \{0,1\}//'; }
 sub="${1:-status}"; [ $# -gt 0 ] && shift
 for a in "$@"; do case "$a" in -h|--help) usage; exit 0;; esac; done
 case "$sub" in -h|--help|help) usage; exit 0;; esac
 [ -f "$F" ] || { echo "p15: no status file at $F (CCSBX_P15_FILE)" >&2; exit 1; }
+# a truncated or headerless file must not pass as "every row is done": need the header and a data row
+[ "$(head -1 "$F")" = "$(printf 'id\tstate\twhat\taction')" ] || { echo "p15: $F has no header line 'id<TAB>state<TAB>what<TAB>action'" >&2; exit 1; }
+[ "$(awk -F'\t' 'NR>1 && $1!=""' "$F" | wc -l)" -ge 1 ] || { echo "p15: $F has no rows" >&2; exit 1; }
 case "$sub" in
   status)
     awk -F'\t' 'NR>1 && $1!="" { printf "%-22s %-8s %s\n", $1, $2, $3; n[$2]++ } END { printf "-- done %d, dropped %d, open %d\n", n["done"], n["dropped"], n["open"] }' "$F" ;;
@@ -36,9 +43,9 @@ case "$sub" in
   mark)
     id="${1:-}"; st="${2:-}"; shift 2 2>/dev/null || true; note="$*"
     [ -n "$id" ] && [[ "$st" =~ ^(done|dropped|open)$ ]] || { echo "usage: p15 mark ID done|dropped|open [NOTE…]" >&2; exit 2; }
-    grep -q "^$id	" "$F" || { echo "p15: no row '$id' in $F" >&2; exit 1; }
+    awk -F'\t' -v id="$id" '$1==id{f=1} END{exit !f}' "$F" || { echo "p15: no row '$id' in $F" >&2; exit 1; }
     tmp="$(mktemp "$F.XXXXXX")"
-    awk -F'\t' -v OFS='\t' -v id="$id" -v st="$st" -v note="$note" '$1==id { $2=st; if (note!="") $4=$4 " [" note "]" } { print }' "$F" > "$tmp"
-    mv "$tmp" "$F"; echo "p15: $id -> $st" ;;
+    NOTE="$note" awk -F'\t' -v OFS='\t' -v id="$id" -v st="$st" '$1==id { $2=st; if (ENVIRON["NOTE"]!="") $4=$4 " [" ENVIRON["NOTE"] "]" } { print }' "$F" > "$tmp"
+    chmod --reference="$F" "$tmp"; mv "$tmp" "$F"; echo "p15: $id -> $st" ;;
   *) echo "p15: unknown command '$sub' (status|check|mark; --help)" >&2; exit 2 ;;
 esac

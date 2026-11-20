@@ -177,7 +177,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 				VolumeMounts: []VolumeMount{
 					{Name: "worktree", MountPath: "/work"}, {Name: "out", MountPath: "/run/ccsbx/out", ReadOnly: true},
 					{Name: "in", MountPath: "/run/ccsbx/in"}, {Name: "managed", MountPath: "/etc/claude-code"},
-					{Name: "side-state", MountPath: "/run/ccsbx/side"}, {Name: "relay-cred", MountPath: "/run/ccsbx/relay"},
+					{Name: "side-state", MountPath: "/run/ccsbx/side"},
 					{Name: "side-tmp", MountPath: "/tmp"}, {Name: "journal", MountPath: "/run/ccsbx/journal"},
 				},
 			}},
@@ -193,7 +193,7 @@ func (c Config) PodFor(s Spec) (*Pod, error) {
 			}},
 			Volumes: []Volume{
 				vol("worktree", s.WorktreeMB, false), vol("out", 64, false), vol("in", 16, false), vol("managed", 8, false),
-				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("relay-cred", 1, true), vol("journal", 16, false),
+				vol("home", 512, false), vol("tmp", 512, true), vol("side-tmp", 32, true), vol("side-state", 8, true), vol("journal", 16, false),
 			},
 		},
 	}
@@ -315,7 +315,7 @@ const (
 // place for the process that holds the token.
 var volumeOwner = map[string]string{
 	"worktree": "both", "out": "both", "in": "both", "managed": "both",
-	"side-state": "side", "relay-cred": "side", "side-tmp": "side", "journal": "side",
+	"side-state": "side", "side-tmp": "side", "journal": "side",
 	"home": "fence", "tmp": "fence",
 }
 
@@ -474,6 +474,16 @@ func (c Config) CheckContract(p *Pod) error {
 		}
 		if ct.Name == "side" && (len(ct.Ports) != 1 || ct.Ports[0].ContainerPort != SidePort) {
 			bad("the sidecar declares only the forwarder port %d", SidePort)
+		}
+		if ct.Name == "side" && len(ct.Command) > 0 {
+			if len(ct.Command) < 3 || ct.Command[0] != "ccsbx" || ct.Command[1] != "side" || ct.Command[2] != "serve" || len(ct.Command) > 64 {
+				bad("the sidecar runs ccsbx side serve and nothing else (at most 64 arguments)")
+			}
+			for _, a := range ct.Command {
+				if len(a) > maxScope+256 || strings.ContainsRune(a, 0) {
+					bad("a sidecar argument is too long or holds a NUL")
+				}
+			}
 		}
 	}
 	// who may write what: the fence cannot write in/ or managed/, the sidecar cannot write out/

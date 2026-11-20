@@ -188,9 +188,6 @@ func contractCases() []contractCase {
 		{"the fence mounting the sidecar's journal", func(p *Pod) {
 			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "journal", MountPath: "/j"})
 		}, "alone"},
-		{"the fence mounting the relay credential", func(p *Pod) {
-			f(p).VolumeMounts = append(f(p).VolumeMounts, VolumeMount{Name: "relay-cred", MountPath: "/r"})
-		}, "alone"},
 		// M1: the two never share a /tmp
 		{"the sidecar mounting the fence's tmp", func(p *Pod) {
 			sd(p).VolumeMounts = append(sd(p).VolumeMounts, VolumeMount{Name: "tmp", MountPath: "/t"})

@@ -16,6 +16,7 @@ import (
 	"syscall"
 
 	"github.com/landovsky/cc-sandbox/internal/backend"
+	"github.com/landovsky/cc-sandbox/internal/k8s"
 	"github.com/landovsky/cc-sandbox/internal/tomlmini"
 )
 
@@ -60,6 +61,8 @@ type Config struct {
 	K8sTokenHours   int      // lifetime of the pod session's token (1..12)
 	K8sAudiences    []string // the token's audiences
 	SignerSocket    string   // the signer's unix socket, asked as the launch user
+	K8sHubURL       string   // the operator egress Service to the hub, handed to the sidecar as --hub-url; empty until it exists
+	K8sDoors        []string // NAME=URL doors the sidecar's forwarder may reach
 	MinUID          int      // a session record must belong to a uid at least this large (never root or a system user)
 	TrustedUID      int
 }
@@ -84,7 +87,7 @@ var configKeys = map[string]bool{
 	"allowed_roots": true, "verbs": true, "state_dir": true, "run_dir": true, "docker": true, "tmux": true,
 	"tmux_socket": true, "pins_file": true, "service_user": true, "machine": true, "base_url": true, "fetch_url": true, "min_uid": true, "seccomp_profile": true, "status": true,
 	"kubectl": true, "kubeconfig": true, "k8s_conn": true, "launch_user": true, "k8s_namespace": true,
-	"k8s_machine": true, "hub_url": true, "hub_secret": true, "hub_user": true, "term_user": true, "signer_user": true, "k8s_ready_seconds": true, "k8s_side_image": true, "k8s_cpu": true, "k8s_ephemeral_mb": true, "k8s_worktree_mb": true,
+	"k8s_machine": true, "k8s_hub_url": true, "k8s_doors": true, "hub_url": true, "hub_secret": true, "hub_user": true, "term_user": true, "signer_user": true, "k8s_ready_seconds": true, "k8s_side_image": true, "k8s_cpu": true, "k8s_ephemeral_mb": true, "k8s_worktree_mb": true,
 	"k8s_token_hours": true, "k8s_audiences": true, "signer_socket": true,
 }
 
@@ -147,7 +150,7 @@ func LoadConfig(path string, trustedUID int) (*Config, error) {
 		return out, true, nil
 	}
 	for k, dst := range map[string]*string{"state_dir": &c.StateDir, "run_dir": &c.RunDir, "docker": &c.Docker, "tmux": &c.Tmux,
-		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "seccomp_profile": &c.SeccompFile, "service_user": &c.ServiceUser, "kubectl": &c.Kubectl, "kubeconfig": &c.Kubeconfig, "k8s_conn": &c.K8sConn, "launch_user": &c.LaunchUser, "k8s_namespace": &c.K8sNamespace, "k8s_machine": &c.K8sMachine, "hub_url": &c.HubURL, "hub_secret": &c.HubSecret, "hub_user": &c.HubUser, "term_user": &c.TermUser, "signer_user": &c.SignerUser, "k8s_side_image": &c.K8sSideImage, "signer_socket": &c.SignerSocket, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
+		"tmux_socket": &c.TmuxSocket, "pins_file": &c.PinsFile, "seccomp_profile": &c.SeccompFile, "service_user": &c.ServiceUser, "kubectl": &c.Kubectl, "kubeconfig": &c.Kubeconfig, "k8s_conn": &c.K8sConn, "launch_user": &c.LaunchUser, "k8s_namespace": &c.K8sNamespace, "k8s_machine": &c.K8sMachine, "k8s_hub_url": &c.K8sHubURL, "hub_url": &c.HubURL, "hub_secret": &c.HubSecret, "hub_user": &c.HubUser, "term_user": &c.TermUser, "signer_user": &c.SignerUser, "k8s_side_image": &c.K8sSideImage, "signer_socket": &c.SignerSocket, "machine": &c.Machine, "base_url": &c.BaseURL, "fetch_url": &c.FetchURL} {
 		if err := str(k, dst); err != nil {
 			return nil, err
 		}
@@ -184,6 +187,11 @@ func LoadConfig(path string, trustedUID int) (*Config, error) {
 			}
 			*dst = int(n)
 		}
+	}
+	if ds, ok, err := list("k8s_doors"); err != nil {
+		return nil, err
+	} else if ok {
+		c.K8sDoors = ds
 	}
 	if as, ok, err := list("k8s_audiences"); err != nil {
 		return nil, err
@@ -271,6 +279,9 @@ func (c *Config) validate(roots []string) error {
 	}
 	if c.K8sMachine == "" || strings.ContainsAny(c.K8sMachine, "/ :\n") || c.K8sMachine == c.Machine {
 		return fmt.Errorf("k8s_machine %q must be a name other than this machine", c.K8sMachine)
+	}
+	if _, err := k8s.SideArgv(k8s.SideInfo{Sid: "s0config00", Gen: 1, Label: "config-check", FullID: "o/m/s0config00/g1", Machine: "m", Scope: []byte("{}"), HubURL: c.K8sHubURL, Doors: c.K8sDoors}); err != nil {
+		return fmt.Errorf("k8s_hub_url / k8s_doors: %v", err)
 	}
 	if c.K8sSideImage != "" && !sideImageRe.MatchString(c.K8sSideImage) {
 		return fmt.Errorf("k8s_side_image %q must be ghcr.io/landovsky/ccsbx@sha256:<64 hex>", c.K8sSideImage)

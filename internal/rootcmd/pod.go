@@ -147,7 +147,14 @@ func (e *env) podCreate(sid string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	spec := k8s.Spec{Sid: rec.Sid, Label: rec.Label, Gen: rec.Gen, OwnerUID: rec.Uid, FenceImage: image, SideImage: e.cfg.K8sSideImage,
+	// the sidecar's identity and scope come from the record (hostd's, shape-checked here again) and root's
+	// config, never from anything the fence can write
+	sideCmd, err := k8s.SideArgv(k8s.SideInfo{Sid: rec.Sid, Gen: rec.Gen, Label: rec.Label, FullID: rec.Reply.ID, Machine: rec.Spec.Machine,
+		Scope: rec.Spec.MsgScope, HubURL: e.cfg.K8sHubURL, Doors: e.cfg.K8sDoors})
+	if err != nil {
+		return refuse("%v", err)
+	}
+	spec := k8s.Spec{Sid: rec.Sid, Label: rec.Label, Gen: rec.Gen, OwnerUID: rec.Uid, FenceImage: image, SideImage: e.cfg.K8sSideImage, SideCmd: sideCmd,
 		MemoryMB: p.MemoryMB, CPU: e.cfg.K8sCPU, EphemeralMB: e.cfg.K8sEphemeralMB, WorktreeMB: e.cfg.K8sWorktreeMB, HostUsersFalse: true}
 	// the contract is checked here, as root, before anything is dropped or sent
 	if _, err := k8s.DefaultConfig().PodFor(spec); err != nil {

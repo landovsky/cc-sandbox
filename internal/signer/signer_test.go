@@ -5,17 +5,17 @@
 package signer
 
 import (
-	"fmt"
-	"strconv"
-	"syscall"
 	"bytes"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,14 +34,19 @@ type rig struct {
 
 // newRig makes a key, a scope (owner tomas, machine hp-ubuntu, profiles dev-*, billings api|stub)
 // and a server on a unix socket in a temp dir. mod may change the config before the server starts.
+const testPairs = "dev-default:api|stub,e2e-default:stub"
+
 func newRig(t *testing.T, mod func(*Config)) *rig {
 	t.Helper()
-	r := &rig{dir: t.TempDir()}
+	r := &rig{dir: keyDir(t)}
 	k, _, err := Init(r.dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	line := k.KeyringLineScoped([]string{"tomas"}, []string{"hp-ubuntu"}, []string{"dev-*"}, []string{"api", "stub"})
+	line, err := k.KeyringLineWithPairs([]string{"tomas"}, []string{"hp-ubuntu"}, testPairs)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(r.dir, ScopeName), []byte(line+"\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -52,7 +57,7 @@ func newRig(t *testing.T, mod func(*Config)) *rig {
 	r.key = k2
 	r.gen, _ = token.NewGenKey()
 	cfg := Config{Key: k2, Scope: sc, Audiences: []string{"ccsbx-model", "ccsbx-stub"}, MaxTTL: time.Hour,
-		AllowGID: uint32(os.Getgid()), MaxRequest: 1024, ReadTimeout: 2 * time.Second,
+		AllowUID: uint32(os.Getuid()), MaxRequest: 1024, ReadTimeout: 2 * time.Second,
 		Logf: func(f string, a ...any) {
 			r.mu.Lock()
 			defer r.mu.Unlock()
@@ -138,19 +143,31 @@ func TestSignsInScopeClaims(t *testing.T) {
 func TestRefusesUnscopedClaims(t *testing.T) {
 	r := newRig(t, nil)
 	for name, mod := range map[string]func(*token.Claims){
-		"billing above the tier": func(c *token.Claims) { c.Billing = "subscription" },
-		"profile outside":        func(c *token.Claims) { c.Profile = "prod-admin" },
-		"other machine":          func(c *token.Claims) { c.Sub = "tomas/mac/sX/g1" },
-		"other owner":            func(c *token.Claims) { c.Sub = "eve/hp-ubuntu/sX/g1" },
-		"audience off the list":  func(c *token.Claims) { c.Aud = []string{"ccsbx-model", "ccsbx-admin"} },
-		"caller sets iat":        func(c *token.Claims) { c.Iat = 1 },
+		"billing above the tier":   func(c *token.Claims) { c.Billing = "subscription" },
+		"profile outside":          func(c *token.Claims) { c.Profile = "prod-admin" },
+		"profile not in a pair":    func(c *token.Claims) { c.Profile = "dev-x" },
+		"dev-default+subscription": func(c *token.Claims) { c.Billing = "subscription" },
+		"e2e-default+api":          func(c *token.Claims) { c.Profile, c.Billing = "e2e-default", "api" },
+		"other machine":            func(c *token.Claims) { c.Sub = "tomas/mac/sX/g1" },
+		"other owner":              func(c *token.Claims) { c.Sub = "eve/hp-ubuntu/sX/g1" },
+		"audience off the list":    func(c *token.Claims) { c.Aud = []string{"ccsbx-model", "ccsbx-admin"} },
+		"caller sets iat":          func(c *token.Claims) { c.Iat = 1 },
 	} {
 		if out := r.ask(t, r.claims(mod)); out.Token != "" || out.Error == "" {
 			t.Fatalf("%s: signed: %+v", name, out)
 		}
 	}
-	if out := r.ask(t, []byte(`{"sub":"tomas/hp-ubuntu/sX/g1","billing":"api","profile":"dev-x","aud":["ccsbx-model"],"admin":true}`)); out.Token != "" {
-		t.Fatal("an unknown field was accepted")
+	// Unknown fields (a kid, a jti, anything) are refused even when the rest is valid: the body is a
+	// real claim set plus one extra field, so only the unknown-field check can refuse it.
+	var withKid map[string]any
+	json.Unmarshal(r.claims(nil), &withKid)
+	withKid["kid"] = "x"
+	b, _ := json.Marshal(withKid)
+	if out := r.ask(t, b); out.Token != "" || out.Error != "bad request" {
+		t.Fatalf("an unknown field was accepted: %+v", out)
+	}
+	if out := r.ask(t, r.claims(func(c *token.Claims) { c.Billing = "stub" })); out.Token == "" {
+		t.Fatalf("allow twin: dev-default+stub is a listed pair: %+v", out)
 	}
 }
 
@@ -168,19 +185,81 @@ func TestRefusesOverLongExpiry(t *testing.T) {
 	}
 }
 
-// context "only the ccsbx group may ask": a peer outside the allowed group gets no token. The kernel
-// supplies the peer's uid and gid (SO_PEERCRED), so this runs over a real socket as this user.
-func TestRefusesPeerOutsideTheGroup(t *testing.T) {
-	r := newRig(t, nil) // allowed gid is this process's own gid
+// context "only hostd's uid may ask": the kernel supplies the peer's uid (SO_PEERCRED), so this runs
+// over a real socket as this user. Another uid is refused; so is the right uid with the wrong primary
+// gid when a gid is required. Group membership in /etc/group is not consulted at all.
+func TestRefusesPeerThatIsNotTheAllowedUser(t *testing.T) {
+	r := newRig(t, nil)
 	if out := r.ask(t, r.claims(nil)); out.Token == "" {
 		t.Fatalf("allow twin: %+v", out)
 	}
-	r2 := newRig(t, func(c *Config) { c.AllowGID = 59999 }) // a group nobody here is in
+	r2 := newRig(t, func(c *Config) { c.AllowUID = uint32(os.Getuid()) + 1 })
 	if out := r2.ask(t, r2.claims(nil)); out.Token != "" {
-		t.Fatal("a peer outside the group was served")
+		t.Fatal("a peer with another uid was served")
 	}
-	if !strings.Contains(r2.log(), "peer not in the allowed group") {
+	if !strings.Contains(r2.log(), "peer is not the allowed caller") {
 		t.Fatalf("refusal not logged: %s", r2.log())
+	}
+	wrong := uint32(os.Getgid()) + 1
+	r3 := newRig(t, func(c *Config) { c.AllowGID = &wrong })
+	if out := r3.ask(t, r3.claims(nil)); out.Token != "" {
+		t.Fatal("a peer with the wrong gid was served")
+	}
+}
+
+// context "the hostd client writes its request and waits for the reply": it does not close its write
+// side. The signer must answer at once, not after its deadline.
+func TestClientThatDoesNotHalfClose(t *testing.T) {
+	r := newRig(t, nil)
+	c, err := net.Dial("unix", r.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(1500 * time.Millisecond)) // far below the rig's 2s server deadline
+	c.Write(r.claims(nil))
+	var out reply
+	if err := json.NewDecoder(c).Decode(&out); err != nil || out.Token == "" {
+		t.Fatalf("no reply without a half-close: %v %+v", err, out)
+	}
+}
+
+// context "a client that stalls": half a request and silence ends in a 'timeout' reply, not a hang
+// and not a misleading 'too large'.
+func TestStalledClientTimesOut(t *testing.T) {
+	r := newRig(t, func(c *Config) { c.ReadTimeout = 300 * time.Millisecond })
+	c, err := net.Dial("unix", r.sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(2 * time.Second))
+	c.Write([]byte(`{"sub":`))
+	var out reply
+	json.NewDecoder(c).Decode(&out)
+	if out.Error != "timeout" || out.Token != "" {
+		t.Fatalf("%+v", out)
+	}
+}
+
+// context "a log line is JSON whatever the caller sends": control bytes and a huge sub don't break
+// the line or fill the log.
+func TestLogLinesAreJSON(t *testing.T) {
+	r := newRig(t, nil)
+	r.ask(t, r.claims(func(c *token.Claims) { c.Sub = "tomas/hp-ubuntu/s\x00\a\v" + strings.Repeat("x", 2000) + "/g1" }))
+	n := 0
+	for _, l := range strings.Split(strings.TrimSpace(r.log()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(l), &m); err != nil {
+			t.Fatalf("not JSON: %q", l)
+		}
+		if len(l) > 1500 {
+			t.Fatalf("log line of %d bytes", len(l))
+		}
+		n++
+	}
+	if n == 0 {
+		t.Fatal("nothing logged")
 	}
 }
 
@@ -196,10 +275,18 @@ func TestRefusesOversizedRequest(t *testing.T) {
 	}
 }
 
-// context "the key file is wrong": mode 0644 (anyone could have read it) is refused at load and by
-// --init; a key made by --init is 0600 and a second --init changes nothing.
-func TestKeyModeIsChecked(t *testing.T) {
-	dir := t.TempDir()
+// writeScope puts a valid scope for k in dir (as --write-scope would).
+func writeScope(t *testing.T, dir string) {
+	t.Helper()
+	if _, err := WriteScope(dir, "", []string{"tomas"}, []string{"hp-ubuntu"}, testPairs); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// context "a normal install": --init makes a 0600 key in a 0700 directory, --write-scope a scope, and
+// the signer loads both. A second --init changes nothing.
+func TestKeyFileAccepted(t *testing.T) {
+	dir := keyDir(t)
 	k, created, err := Init(dir)
 	if err != nil || !created {
 		t.Fatal(err, created)
@@ -211,94 +298,220 @@ func TestKeyModeIsChecked(t *testing.T) {
 	if err != nil || created2 || k2.KID != k.KID {
 		t.Fatalf("second init: %v %v", err, created2)
 	}
-	os.Chmod(filepath.Join(dir, KeyName), 0o644)
-	if _, _, err := Init(dir); err == nil {
-		t.Fatal("--init accepted a 0644 key")
-	}
-	os.WriteFile(filepath.Join(dir, ScopeName), []byte(k.KeyringLine([]string{"tomas"}, []string{"hp-ubuntu"})+"\n"), 0o600)
-	if _, _, err := load(dir, ""); err == nil {
-		t.Fatal("the signer loaded a 0644 key")
-	}
-	os.Chmod(filepath.Join(dir, KeyName), 0o600)
-	if _, _, err := load(dir, ""); err != nil {
-		t.Fatalf("allow twin: %v", err)
+	writeScope(t, dir)
+	if _, sc, err := load(dir, ""); err != nil || sc.Pairs["dev-default"] == nil {
+		t.Fatalf("load: %v", err)
 	}
 }
 
-// context "no scope, no signing": a missing scope file, a scope without tier limits, or a scope for
-// another key stops the signer from starting.
+// context "the key file is wrong": a mode other than exactly 0600 (0644 anyone could read; 0400 is
+// not what the installer made), a symlink to a good key elsewhere, a key owned by someone else and a
+// key directory that is not 0700 are all refused by --init and by the signer at start. Each is a
+// case only these checks catch.
+func TestKeyFileIsChecked(t *testing.T) {
+	dir := keyDir(t)
+	Init(dir)
+	writeScope(t, dir)
+	key := filepath.Join(dir, KeyName)
+	for _, mode := range []os.FileMode{0o644, 0o400, 0o660} {
+		os.Chmod(key, mode)
+		if _, _, err := Init(dir); err == nil {
+			t.Fatalf("--init accepted a key with mode %04o", mode)
+		}
+		if _, _, err := load(dir, ""); err == nil {
+			t.Fatalf("the signer loaded a key with mode %04o", mode)
+		}
+	}
+	os.Chmod(key, 0o600)
+
+	// a symlink to another, perfectly good 0600 key file
+	other := filepath.Join(t.TempDir(), "elsewhere.key")
+	b, _ := os.ReadFile(key)
+	os.WriteFile(other, b, 0o600)
+	os.Remove(key)
+	os.Symlink(other, key)
+	if _, _, err := load(dir, ""); err == nil {
+		t.Fatal("the signer followed a symlink for the key")
+	}
+	os.Remove(key)
+	os.WriteFile(key, b, 0o600)
+	if _, _, err := load(dir, ""); err != nil {
+		t.Fatalf("allow twin: %v", err)
+	}
+
+	// owner: play another uid (no root needed)
+	runUID = func() int { return os.Getuid() + 1 }
+	_, err := readKey(key) // the key alone, so the directory check can't be what catches it
+	runUID = os.Getuid
+	if err == nil {
+		t.Fatal("the signer read a key owned by another uid")
+	}
+
+	// the directory
+	os.Chmod(dir, 0o755)
+	_, _, err = load(dir, "")
+	os.Chmod(dir, 0o700)
+	if err == nil {
+		t.Fatal("the signer used a 0755 key directory")
+	}
+}
+
+// context "the scope is the signing policy": a scope file that group or others can write, one owned by
+// another uid, or one that is a symlink is refused, since whoever can edit it decides what is signed.
+func TestScopeFileIsChecked(t *testing.T) {
+	dir := keyDir(t)
+	Init(dir)
+	writeScope(t, dir)
+	sc := filepath.Join(dir, ScopeName)
+	os.Chmod(sc, 0o666)
+	if _, _, err := load(dir, ""); err == nil {
+		t.Fatal("a world-writable scope was accepted")
+	}
+	os.Chmod(sc, 0o600)
+	runUID = func() int { return os.Getuid() + 1 }
+	_, err := readScope(sc)
+	runUID = os.Getuid
+	if err == nil && os.Getuid() != 0 {
+		t.Fatal("a scope owned by another uid was accepted")
+	}
+	b, _ := os.ReadFile(sc)
+	os.Remove(sc)
+	other := filepath.Join(t.TempDir(), "scope")
+	os.WriteFile(other, b, 0o600)
+	os.Symlink(other, sc)
+	if _, _, err := load(dir, ""); err == nil {
+		t.Fatal("a symlinked scope was accepted")
+	}
+	// --scope in a directory anyone can write into
+	loose := t.TempDir()
+	os.Chmod(loose, 0o777)
+	os.WriteFile(filepath.Join(loose, "s"), b, 0o600)
+	if _, _, err := load(dir, filepath.Join(loose, "s")); err == nil {
+		t.Fatal("a scope in a world-writable directory was accepted")
+	}
+}
+
+// context "no scope, no signing": a missing scope file, a scope without pairs (the older flat form),
+// or a scope for another key stops the signer from starting.
 func TestWontServeWithoutAScope(t *testing.T) {
-	dir := t.TempDir()
+	dir := keyDir(t)
 	k, _, _ := Init(dir)
 	if _, _, err := load(dir, ""); err == nil {
 		t.Fatal("loaded with no scope file")
 	}
-	os.WriteFile(filepath.Join(dir, ScopeName), []byte(k.KID+" "+base64.StdEncoding.EncodeToString(k.Public)+" owners=tomas machines=hp-ubuntu\n"), 0o600)
+	flat := k.KeyringLineScoped([]string{"tomas"}, []string{"hp-ubuntu"}, []string{"dev-*"}, []string{"api"})
+	os.WriteFile(filepath.Join(dir, ScopeName), []byte(flat+"\n"), 0o600)
 	if _, _, err := load(dir, ""); err == nil {
-		t.Fatal("loaded a scope with no profiles/billings")
+		t.Fatal("loaded a scope with no pairs")
 	}
-	other := t.TempDir()
+	other := keyDir(t)
 	k3, _, _ := Init(other)
-	os.WriteFile(filepath.Join(dir, ScopeName), []byte(k3.KeyringLine([]string{"tomas"}, []string{"hp-ubuntu"})+"\n"), 0o600)
+	l3, _ := k3.KeyringLineWithPairs([]string{"tomas"}, []string{"hp-ubuntu"}, testPairs)
+	os.WriteFile(filepath.Join(dir, ScopeName), []byte(l3+"\n"), 0o600)
 	if _, _, err := load(dir, ""); err == nil {
 		t.Fatal("loaded another key's scope")
 	}
 }
 
 // context "systemd hands the socket over as fd 3": a fake LISTEN_FDS/LISTEN_PID with a real
-// listening socket works; the wrong pid, a count other than 1 and an fd that isn't a socket don't.
-func TestSystemdSocketActivation(t *testing.T) {
-	sd, _ := os.MkdirTemp("", "sg")
-	defer os.RemoveAll(sd)
-	l0, err := net.Listen("unix", filepath.Join(sd, "s"))
+// listening socket is taken.
+func TestSystemdSocketAccepted(t *testing.T) {
+	fd, cleanup := listeningFD(t)
+	defer cleanup()
+	pid := os.Getpid()
+	l, err := SystemdListener(envOf(map[string]string{"LISTEN_PID": itoa(pid), "LISTEN_FDS": "1"}), pid, dupFD(t, fd))
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer l0.Close()
-	f, _ := l0.(*net.UnixListener).File()
-	defer f.Close()
-	fd := int(f.Fd())
-	env := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
-	pid := os.Getpid()
-	good := map[string]string{"LISTEN_PID": itoa(pid), "LISTEN_FDS": "1"}
-	l, err := SystemdListener(env(good), pid, dupFD(t, fd))
-	if err != nil {
-		t.Fatalf("allow twin: %v", err)
-	}
 	l.Close()
+}
+
+// context "a stray environment must not make the signer serve": the wrong pid, a count other than 1
+// and an fd that isn't a socket are refused.
+func TestSystemdSocketRefusals(t *testing.T) {
+	fd, cleanup := listeningFD(t)
+	defer cleanup()
+	pid := os.Getpid()
 	for name, m := range map[string]map[string]string{
 		"wrong pid":   {"LISTEN_PID": itoa(pid + 1), "LISTEN_FDS": "1"},
 		"two sockets": {"LISTEN_PID": itoa(pid), "LISTEN_FDS": "2"},
 		"none":        {"LISTEN_PID": itoa(pid), "LISTEN_FDS": "0"},
 		"unset":       {},
 	} {
-		if l, err := SystemdListener(env(m), pid, dupFD(t, fd)); err == nil {
+		if l, err := SystemdListener(envOf(m), pid, dupFD(t, fd)); err == nil {
 			l.Close()
 			t.Fatalf("%s: accepted", name)
 		}
 	}
 	devnull, _ := os.Open(os.DevNull)
 	defer devnull.Close()
-	if l, err := SystemdListener(env(good), pid, int(devnull.Fd())); err == nil {
+	if l, err := SystemdListener(envOf(map[string]string{"LISTEN_PID": itoa(pid), "LISTEN_FDS": "1"}), pid, int(devnull.Fd())); err == nil {
 		l.Close()
 		t.Fatal("an fd that is not a socket was accepted")
 	}
 }
 
+func envOf(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
+
+func listeningFD(t *testing.T) (int, func()) {
+	t.Helper()
+	sd, _ := os.MkdirTemp("", "sg")
+	l0, err := net.Listen("unix", filepath.Join(sd, "s"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	f, _ := l0.(*net.UnixListener).File()
+	return int(f.Fd()), func() { f.Close(); l0.Close(); os.RemoveAll(sd) }
+}
+
+// context "--write-scope: the key is read by the signer only": it writes the scope (0600, with the
+// pairs), prints the line, never prints the seed, and refuses missing owners or a bad pair.
+func TestWriteScopeCommand(t *testing.T) {
+	dir := keyDir(t)
+	var out, errb bytes.Buffer
+	Main([]string{"--keys", dir, "--init"}, &out, &errb)
+	out.Reset()
+	args := []string{"--keys", dir, "--write-scope", "--owners", "tomas", "--machines", "hp-ubuntu", "--pairs", testPairs}
+	if Main(args, &out, &errb) != 0 || !strings.Contains(out.String(), "pairs="+testPairs) {
+		t.Fatalf("%s %s", out.String(), errb.String())
+	}
+	seed, _ := os.ReadFile(filepath.Join(dir, KeyName))
+	if strings.Contains(out.String(), strings.TrimSpace(string(seed))) {
+		t.Fatal("the seed was printed")
+	}
+	if fi, _ := os.Stat(filepath.Join(dir, ScopeName)); fi.Mode().Perm() != 0o600 {
+		t.Fatalf("scope mode %v", fi.Mode().Perm())
+	}
+	if _, _, err := load(dir, ""); err != nil {
+		t.Fatal(err)
+	}
+	for name, a := range map[string][]string{
+		"no owners":       {"--keys", dir, "--write-scope", "--machines", "hp-ubuntu", "--pairs", testPairs},
+		"bad billing":     {"--keys", dir, "--write-scope", "--owners", "tomas", "--machines", "hp-ubuntu", "--pairs", "dev-default:free"},
+		"glob in profile": {"--keys", dir, "--write-scope", "--owners", "tomas", "--machines", "hp-ubuntu", "--pairs", "dev-*:api"},
+		"no pairs":        {"--keys", dir, "--write-scope", "--owners", "tomas", "--machines", "hp-ubuntu"},
+	} {
+		if Main(a, &out, &errb) != 2 {
+			t.Fatalf("%s: accepted", name)
+		}
+	}
+}
+
 // context "--help and the environment": every flag is listed with its env twin, --help starts
-// nothing, and CCSBX_SIGNER_* reaches the same code path as a flag.
+// nothing, CCSBX_SIGNER_* reaches the same code path as a flag, and a value that doesn't parse stops
+// the signer instead of quietly using the default (a typo'd MAX_TTL must not mean 12h).
 func TestHelpAndEnv(t *testing.T) {
 	var out, errb bytes.Buffer
 	if Main([]string{"--help"}, &out, &errb) != 0 {
 		t.Fatal("help")
 	}
-	for _, fl := range []string{"--keys", "--systemd-socket", "--socket", "--init", "--scope", "--audiences", "--max-ttl",
-		"--allow-group", "--max-request", "--timeout", "CCSBX_SIGNER_"} {
+	for _, fl := range []string{"--keys", "--systemd-socket", "--socket", "--init", "--write-scope", "--owners", "--machines",
+		"--pairs", "--scope", "--audiences", "--max-ttl", "--allow-user", "--allow-group", "--max-request", "--timeout", "CCSBX_SIGNER_"} {
 		if !strings.Contains(out.String(), fl) {
 			t.Errorf("--help lacks %s", fl)
 		}
 	}
-	dir := t.TempDir()
+	dir := keyDir(t)
 	t.Setenv("CCSBX_SIGNER_KEYS", dir)
 	t.Setenv("CCSBX_SIGNER_INIT", "1")
 	out.Reset()
@@ -308,6 +521,18 @@ func TestHelpAndEnv(t *testing.T) {
 	t.Setenv("CCSBX_SIGNER_INIT", "")
 	if Main([]string{"--systemd-socket"}, &out, &errb) != 2 {
 		t.Fatal("served with no scope file")
+	}
+	for k, v := range map[string]string{"MAX_TTL": "1hr", "MAX_REQUEST": "lots", "TIMEOUT": "soon", "SYSTEMD_SOCKET": "maybe", "INIT": "yes please"} {
+		t.Setenv("CCSBX_SIGNER_"+k, v)
+		errb.Reset()
+		if Main([]string{"--socket", filepath.Join(dir, "x")}, &out, &errb) != 2 || !strings.Contains(errb.String(), "CCSBX_SIGNER_"+k) {
+			t.Fatalf("%s=%q was not refused: %s", k, v, errb.String())
+		}
+		t.Setenv("CCSBX_SIGNER_"+k, "")
+	}
+	writeScope(t, dir)
+	if _, err := New(Config{Key: &token.Key{}, Audiences: []string{"a"}, MaxTTL: time.Hour, MaxRequest: -1, ReadTimeout: time.Second}); err == nil {
+		t.Fatal("a negative --max-request was replaced by a default")
 	}
 }
 
@@ -324,3 +549,7 @@ func dupFD(t *testing.T, fd int) int {
 	}
 	return n
 }
+
+// keyDir is a not-yet-existing key directory; Init makes it 0700 (t.TempDir() itself is 0775 under a
+// 002 umask, which the signer rightly refuses).
+func keyDir(t *testing.T) string { return filepath.Join(t.TempDir(), "keys") }

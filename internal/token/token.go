@@ -276,6 +276,10 @@ type KeyScope struct {
 	Machines []string
 	Profiles []string
 	Billings []string
+	// Pairs, when set, is the exact rule: a profile NAME (no globs) and the billings it may be signed
+	// with. An unknown profile, or a billing outside its own list, is refused (invariant 18: nothing
+	// switches a session onto another billing). The signer's scope always carries it.
+	Pairs map[string][]string
 }
 
 // Permits reports whether this key may sign the claims c: the owner and machine of its sub, its
@@ -294,6 +298,12 @@ func (k KeyScope) Permits(c *Claims) error {
 
 // allowsClaims is the profile and billing half of the scope check.
 func (k KeyScope) allowsClaims(c *Claims) bool {
+	if k.Pairs != nil {
+		bs, ok := k.Pairs[c.Profile]
+		if !ok || !contains(bs, c.Billing) {
+			return false
+		}
+	}
 	if k.Billings != nil {
 		ok := false
 		for _, b := range k.Billings {
@@ -341,6 +351,12 @@ func LoadPublicKeyring(path string) (Keyring, error) {
 	if err != nil {
 		return nil, err
 	}
+	return ParsePublicKeyring(b, path)
+}
+
+// ParsePublicKeyring is LoadPublicKeyring on bytes already read; name is only for messages. The
+// signer reads its scope file through an fd it has checked, then parses it here.
+func ParsePublicKeyring(b []byte, path string) (Keyring, error) {
 	ring := Keyring{}
 	for i, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
@@ -371,8 +387,19 @@ func LoadPublicKeyring(path string) (Keyring, error) {
 				if sc.Billings = splitList(v); len(sc.Billings) == 0 {
 					return nil, fmt.Errorf("token: keyring %s:%d: billings= is empty (leave it out to allow all)", path, i+1)
 				}
+			case "pairs":
+				p, err := ParsePairs(v)
+				if err != nil {
+					return nil, fmt.Errorf("token: keyring %s:%d: %w", path, i+1, err)
+				}
+				sc.Pairs = p
 			default:
 				return nil, fmt.Errorf("token: keyring %s:%d: unknown field %q", path, i+1, k)
+			}
+		}
+		for _, pat := range sc.Profiles { // a typo'd glob would fail closed but silently
+			if !validGlob(pat) {
+				return nil, fmt.Errorf("token: keyring %s:%d: bad profile pattern %q", path, i+1, pat)
 			}
 		}
 		if len(sc.Owners) == 0 || len(sc.Machines) == 0 {
@@ -474,3 +501,66 @@ func splitList(v string) []string {
 	}
 	return out
 }
+
+func contains(l []string, s string) bool {
+	for _, x := range l {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+// ParsePairs reads "dev-default:api|stub,e2e-default:stub": exact profile names, each with the
+// billings it may be signed with. Names are letters, digits, '-', '_' and '.', so a glob or a
+// separator can't hide in one; billings must be api, subscription or stub.
+func ParsePairs(s string) (map[string][]string, error) {
+	out := map[string][]string{}
+	for _, item := range splitList(s) {
+		name, bs, ok := strings.Cut(item, ":")
+		if !ok || name == "" || bs == "" {
+			return nil, fmt.Errorf("pairs: %q is not profile:billing|billing", item)
+		}
+		for _, r := range name {
+			if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.') {
+				return nil, fmt.Errorf("pairs: profile name %q has a character outside [A-Za-z0-9._-]", name)
+			}
+		}
+		if _, dup := out[name]; dup {
+			return nil, fmt.Errorf("pairs: profile %q listed twice", name)
+		}
+		for _, b := range strings.Split(bs, "|") {
+			if b != "api" && b != "subscription" && b != "stub" {
+				return nil, fmt.Errorf("pairs: %q: billing %q is not api, subscription or stub", item, b)
+			}
+			out[name] = append(out[name], b)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("pairs: empty")
+	}
+	return out, nil
+}
+
+// KeyringLineWithPairs is the scope line the signer writes for its own key: owners, machines and
+// the exact profile→billings pairs. profiles= and billings= are derived (the names, and the union of
+// their billings) so a door that reads the line with the older fields sees the same limits.
+func (k *Key) KeyringLineWithPairs(owners, machines []string, pairs string) (string, error) {
+	p, err := ParsePairs(pairs)
+	if err != nil {
+		return "", err
+	}
+	var names, union []string
+	for _, item := range splitList(pairs) { // keep the caller's order
+		name, _, _ := strings.Cut(item, ":")
+		names = append(names, name)
+		for _, b := range p[name] {
+			if !contains(union, b) {
+				union = append(union, b)
+			}
+		}
+	}
+	return k.KeyringLineScoped(owners, machines, names, union) + " pairs=" + pairs, nil
+}
+
+func validGlob(pat string) bool { _, err := path.Match(pat, ""); return err == nil }

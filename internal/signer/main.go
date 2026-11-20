@@ -25,44 +25,98 @@ Usage:
   ccsbx-signer --keys DIR --systemd-socket          serve on the socket systemd passes in (fd 3)
   ccsbx-signer --keys DIR --socket PATH             serve on a unix socket this process creates (tests, direct mode)
   ccsbx-signer --keys DIR --init                    create the machine key if absent; print its PUBLIC key
+  ccsbx-signer --keys DIR --write-scope --owners O --machines M --pairs P     write DIR/signer.scope
   ccsbx-signer --help
 
-One request per connection: a JSON object of claims in, {"token":...} or {"error":...} out. The
-claims are checked before the key is used: sub owner/machine, profile and billing must be inside this
-key's scope; every aud must be on --audiences; the lifetime must not exceed --max-ttl. The caller
-never sets iat. The reply holds the token only, never the key. Every signing and refusal is logged to
-stderr with the claims and without any secret. Peers outside --allow-group are refused (SO_PEERCRED).
+Protocol: one request per connection. The client sends ONE JSON object of claims (sub, billing, profile,
+aud, cnf; optional label, exp, routes, repos, branch, placed_by) and may then wait: the signer reads exactly
+one JSON value, at most --max-request bytes, so the client need not close its write side. The reply is
+{"token":...} or {"error":...}, then the connection closes. The caller never sets iat or kid; unknown
+fields are refused. Claims are checked before the key is used: sub owner/machine and the profile→billing
+pair must be inside the scope; every aud must be on --audiences; the lifetime must not exceed --max-ttl.
+The reply holds the token only, never the key. Every signing and refusal is logged to stderr as JSON, with
+the claims and without any secret. Only the process whose uid is --allow-user may ask (SO_PEERCRED).
 
-Flags: (each also CCSBX_SIGNER_<NAME>, e.g. CCSBX_SIGNER_KEYS)
-  --keys DIR          key directory: machine.key (0600, owned by the running uid) and signer.scope  (required)
+Flags: (each also CCSBX_SIGNER_<NAME>, e.g. CCSBX_SIGNER_KEYS; a value that does not parse is an error, never a default)
+  --keys DIR          key directory, owned by the running uid, mode 0700: machine.key (0600) and signer.scope (required)
   --systemd-socket    take the listening socket from systemd: fd 3, LISTEN_FDS=1 and LISTEN_PID checked
   --socket PATH       listen on this unix socket instead (mode 0660; refuses an existing path)
-  --init              create machine.key if absent (0600), refuse one with a wrong owner or mode, print
+  --init              create machine.key if absent (0600), refuse a wrong owner, mode or symlink, print
                       "kid <kid>" and "public <base64>" and exit
-  --scope FILE        what the key may sign: ONE keyring line for this key with owners=, machines=,
-                      profiles= and billings= (all required; 'ccsbx token pubkey' writes it).
-                      Without a valid scope the signer will not serve.     (default KEYS/signer.scope)
+  --write-scope       write the scope file for this key (atomic, 0600) and print its line; needs --owners,
+                      --machines and --pairs. Only this binary ever opens machine.key.
+  --owners A,B        owners the key may sign for                                  (with --write-scope)
+  --machines X,Y      machines the key may sign for                                (with --write-scope)
+  --pairs P           exact profile→billing pairs: dev-default:api|stub,e2e-default:stub   (with --write-scope)
+                      a profile not listed, or a billing not listed for it, is never signed
+  --scope FILE        scope file: ONE line for this key with owners=, machines=, profiles=, billings= and
+                      pairs= (written by --write-scope); owned by root or the running uid, not group/other
+                      writable. Without a valid scope the signer will not serve.     (default KEYS/signer.scope)
   --audiences A,B     the only audiences it signs        (default ccsbx-model,ccsbx-egress,ccsbx-stub)
-  --max-ttl D         longest token lifetime, at most 12h                   (default 12h)
-  --allow-group G     group name or numeric gid whose members may ask       (default ccsbx)
-  --max-request N     largest request in bytes                              (default 8192)
-  --timeout D         per-connection read/write deadline                    (default 5s)
+  --max-ttl D         longest token lifetime, at most 12h                          (default 12h)
+  --allow-user U      user name or numeric uid allowed to ask: the exact uid, not group membership (default ccsbx)
+  --allow-group G     optional: the caller's primary gid must ALSO be this group (name or gid)  (default: not checked)
+  --max-request N     largest request in bytes                                     (default 8192)
+  --timeout D         per-connection read and write deadline                       (default 5s)
 
 Recipes:
   first install:   runuser -u ccsbx-keys -- ccsbx-signer --keys /var/lib/ccsbx-keys --init
-                   then write the scope:  ccsbx token pubkey --key-file /var/lib/ccsbx-keys/machine.key \
-                     --owners tomas --machines hp-ubuntu --profiles 'dev-*' --billings api,subscription \
-                     > /var/lib/ccsbx-keys/signer.scope        (run as ccsbx-keys)
+                   runuser -u ccsbx-keys -- ccsbx-signer --keys /var/lib/ccsbx-keys --write-scope \
+                     --owners tomas --machines hp-ubuntu --pairs 'dev-default:api|stub,e2e-default:stub'
   ask for a token: printf '%s' '{"sub":"tomas/hp-ubuntu/sX/g1","billing":"api","profile":"dev-default",
-                     "aud":["ccsbx-model"],"cnf":"<b64 pubkey>"}' | nc -N -U /run/ccsbx-signer/sign.sock
-Exit codes: 0 ok, 1 runtime failure, 2 refused to start (bad key, scope, socket or flags).
+                     "aud":["ccsbx-model"],"cnf":"<base64url pubkey, no padding>"}' | nc -U /run/ccsbx-signer/sign.sock
+Exit codes: 0 ok, 1 runtime failure, 2 refused to start (bad key, scope, socket, flag or environment value).
 `
+
+type envErr struct{ errs []string }
+
+func (e *envErr) bad(name, v string, err error) {
+	e.errs = append(e.errs, fmt.Sprintf("CCSBX_SIGNER_%s=%q: %v", name, v, err))
+}
 
 func envOr(name, def string) string {
 	if v := os.Getenv("CCSBX_SIGNER_" + name); v != "" {
 		return v
 	}
 	return def
+}
+
+func (e *envErr) boolean(name string) bool {
+	v := os.Getenv("CCSBX_SIGNER_" + name)
+	if v == "" {
+		return false
+	}
+	b, err := strconv.ParseBool(v)
+	if err != nil {
+		e.bad(name, v, err)
+	}
+	return b
+}
+
+func (e *envErr) dur(name string, def time.Duration) time.Duration {
+	v := os.Getenv("CCSBX_SIGNER_" + name)
+	if v == "" {
+		return def
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		e.bad(name, v, err)
+		return def
+	}
+	return d
+}
+
+func (e *envErr) integer(name string, def int) int {
+	v := os.Getenv("CCSBX_SIGNER_" + name)
+	if v == "" {
+		return def
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		e.bad(name, v, err)
+		return def
+	}
+	return n
 }
 
 // Main is `ccsbx-signer`.
@@ -73,18 +127,30 @@ func Main(args []string, stdout, stderr io.Writer) int {
 			return 0
 		}
 	}
+	var ee envErr
 	fs := flag.NewFlagSet("ccsbx-signer", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	keys := fs.String("keys", envOr("KEYS", ""), "")
-	sysd := fs.Bool("systemd-socket", envOr("SYSTEMD_SOCKET", "") == "1", "")
+	sysd := fs.Bool("systemd-socket", ee.boolean("SYSTEMD_SOCKET"), "")
 	sock := fs.String("socket", envOr("SOCKET", ""), "")
-	init_ := fs.Bool("init", envOr("INIT", "") == "1", "")
+	init_ := fs.Bool("init", ee.boolean("INIT"), "")
+	writeScope := fs.Bool("write-scope", ee.boolean("WRITE_SCOPE"), "")
+	owners := fs.String("owners", envOr("OWNERS", ""), "")
+	machines := fs.String("machines", envOr("MACHINES", ""), "")
+	pairs := fs.String("pairs", envOr("PAIRS", ""), "")
 	scope := fs.String("scope", envOr("SCOPE", ""), "")
 	auds := fs.String("audiences", envOr("AUDIENCES", "ccsbx-model,ccsbx-egress,ccsbx-stub"), "")
-	ttl := fs.Duration("max-ttl", durEnv("MAX_TTL", token.MaxLifetime), "")
-	group := fs.String("allow-group", envOr("ALLOW_GROUP", "ccsbx"), "")
-	maxReq := fs.Int("max-request", intEnv("MAX_REQUEST", 8192), "")
-	timeout := fs.Duration("timeout", durEnv("TIMEOUT", 5*time.Second), "")
+	ttl := fs.Duration("max-ttl", ee.dur("MAX_TTL", token.MaxLifetime), "")
+	user_ := fs.String("allow-user", envOr("ALLOW_USER", "ccsbx"), "")
+	group := fs.String("allow-group", envOr("ALLOW_GROUP", ""), "")
+	maxReq := fs.Int("max-request", ee.integer("MAX_REQUEST", 8192), "")
+	timeout := fs.Duration("timeout", ee.dur("TIMEOUT", 5*time.Second), "")
+	if len(ee.errs) > 0 {
+		for _, m := range ee.errs {
+			fmt.Fprintln(stderr, "ccsbx-signer:", m)
+		}
+		return 2
+	}
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -104,6 +170,15 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		}
 		return 0
 	}
+	if *writeScope {
+		line, err := WriteScope(*keys, *scope, splitCSV(*owners), splitCSV(*machines), *pairs)
+		if err != nil {
+			fmt.Fprintln(stderr, "ccsbx-signer:", err)
+			return 2
+		}
+		fmt.Fprintln(stdout, line)
+		return 0
+	}
 	if *sysd == (*sock != "") {
 		fmt.Fprintln(stderr, "ccsbx-signer: give exactly one of --systemd-socket and --socket")
 		return 2
@@ -113,13 +188,22 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, err)
 		return 2
 	}
-	gid, err := groupID(*group)
+	uid, err := userID(*user_)
 	if err != nil {
 		fmt.Fprintln(stderr, "ccsbx-signer:", err)
 		return 2
 	}
+	var gid *uint32
+	if *group != "" {
+		g, err := groupID(*group)
+		if err != nil {
+			fmt.Fprintln(stderr, "ccsbx-signer:", err)
+			return 2
+		}
+		gid = &g
+	}
 	logf := func(f string, a ...any) { fmt.Fprintf(stderr, f+"\n", a...) }
-	srv, err := New(Config{Key: k, Scope: sc, Audiences: splitCSV(*auds), MaxTTL: *ttl, AllowGID: gid,
+	srv, err := New(Config{Key: k, Scope: sc, Audiences: splitCSV(*auds), MaxTTL: *ttl, AllowUID: uid, AllowGID: gid,
 		MaxRequest: *maxReq, ReadTimeout: *timeout, Logf: logf})
 	if err != nil {
 		fmt.Fprintln(stderr, err)
@@ -135,7 +219,7 @@ func Main(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, "ccsbx-signer:", err)
 		return 2
 	}
-	logf(`{"signer":"serving","kid":%q,"allow_gid":%d}`, k.KID, gid)
+	srv.logJSON("signer", "serving", "kid", k.KID, "allow_uid", uid)
 	if err := srv.Serve(l); err != nil {
 		fmt.Fprintln(stderr, "ccsbx-signer:", err)
 		return 1
@@ -182,6 +266,19 @@ func listenUnix(path string) (net.Listener, error) {
 	return l, nil
 }
 
+// userID resolves a user name or a number to a uid.
+func userID(u string) (uint32, error) {
+	if n, err := strconv.ParseUint(u, 10, 32); err == nil {
+		return uint32(n), nil
+	}
+	us, err := user.Lookup(u)
+	if err != nil {
+		return 0, fmt.Errorf("--allow-user %q: %w", u, err)
+	}
+	n, err := strconv.ParseUint(us.Uid, 10, 32)
+	return uint32(n), err
+}
+
 // groupID resolves a group name or a number to a gid.
 func groupID(g string) (uint32, error) {
 	if n, err := strconv.ParseUint(g, 10, 32); err == nil {
@@ -203,20 +300,4 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
-}
-
-func durEnv(name string, def time.Duration) time.Duration {
-	if v := os.Getenv("CCSBX_SIGNER_" + name); v != "" {
-		if d, err := time.ParseDuration(v); err == nil {
-			return d
-		}
-	}
-	return def
-}
-
-func intEnv(name string, def int) int {
-	if n, err := strconv.Atoi(os.Getenv("CCSBX_SIGNER_" + name)); err == nil {
-		return n
-	}
-	return def
 }

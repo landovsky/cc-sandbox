@@ -455,3 +455,51 @@ func TestTwoDoorsCannotShareAStateFile(t *testing.T) {
 		t.Fatalf("temp files left behind: %v", left)
 	}
 }
+
+// context "invariant 18: nothing switches a session onto another billing": with exact pairs in the
+// key's scope, a door and the signer both refuse a profile with a billing it wasn't paired with, and
+// a profile that isn't listed.
+func TestPairsPairProfileWithBilling(t *testing.T) {
+	k := newKey(t)
+	line, err := k.KeyringLineWithPairs([]string{"tomas"}, []string{"hp-ubuntu"}, "dev-default:api|stub,e2e-default:stub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ring, err := ParsePublicKeyring([]byte(line+"\n"), "t")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := NewVerifier(ring, "ccsbx-model")
+	g, _ := NewGenKey()
+	try := func(profile, billing string) error {
+		c := claimsFor("tomas/hp-ubuntu/sP/g1", g, "ccsbx-model")
+		c.Profile, c.Billing = profile, billing
+		tok, err := Mint(k, c, t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, _ := SignProof(g, "POST", "/x", "ccsbx-model", tok, nil, t0)
+		_, err = v.Verify(tok, p, "POST", "/x", nil, t0)
+		return err
+	}
+	if err := try("dev-default", "api"); err != nil {
+		t.Fatalf("allow twin: %v", err)
+	}
+	if err := try("e2e-default", "stub"); err != nil {
+		t.Fatalf("allow twin: %v", err)
+	}
+	for _, tc := range [][2]string{{"dev-default", "subscription"}, {"e2e-default", "api"}, {"dev-other", "api"}} {
+		if err := try(tc[0], tc[1]); err != ErrKeyScope {
+			t.Fatalf("%v: %v", tc, err)
+		}
+	}
+	for _, bad := range []string{"dev-*:api", "dev-default:free", "dev-default", "a:api,a:stub", ""} {
+		if _, err := ParsePairs(bad); err == nil {
+			t.Fatalf("pairs %q accepted", bad)
+		}
+	}
+	// a malformed profile glob in a keyring line is refused at load, not silently matched to nothing
+	if _, err := ParsePublicKeyring([]byte(k.KeyringLineScoped([]string{"tomas"}, []string{"m"}, []string{"dev-[x"}, []string{"api"})+"\n"), "t"); err == nil {
+		t.Fatal("a broken profile pattern was accepted")
+	}
+}

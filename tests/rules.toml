@@ -1013,10 +1013,10 @@ where = "any"
 
 [[rule]]
 id = "signer-refuses-unscoped-claims"
-title = "the signer signs nothing outside its key's owner, machine, profile, billing and audience scope"
+title = "the signer signs nothing outside its key's scope: owner, machine, exact profile-billing pairs, audience"
 suite = "keys"
 allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
-block = "tests/go-test.sh ./internal/signer 'TestRefusesUnscopedClaims$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesUnscopedClaims$|TestPairsPairProfileWithBilling$'"
 invariants = [12, 27]
 backends = ["unit"]
 where = "any"
@@ -1032,31 +1032,41 @@ backends = ["unit"]
 where = "any"
 
 [[rule]]
-id = "signer-peer-in-group"
-title = "the signer answers only peers in the ccsbx group"
+id = "signer-peer-is-hostd"
+title = "the signer answers only the allowed uid, from SO_PEERCRED"
 suite = "keys"
 allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
-block = "tests/go-test.sh ./internal/signer 'TestRefusesPeerOutsideTheGroup$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesPeerThatIsNotTheAllowedUser$'"
 invariants = [12, 27]
 backends = ["unit"]
 where = "any"
 
 [[rule]]
 id = "signer-request-cap"
-title = "an oversized signer request is refused unparsed"
+title = "an oversized or stalled signer request is refused, and a client need not half-close"
 suite = "keys"
-allow = "tests/go-test.sh ./internal/signer 'TestSignsInScopeClaims$'"
-block = "tests/go-test.sh ./internal/signer 'TestRefusesOversizedRequest$'"
+allow = "tests/go-test.sh ./internal/signer 'TestClientThatDoesNotHalfClose$'"
+block = "tests/go-test.sh ./internal/signer 'TestRefusesOversizedRequest$|TestStalledClientTimesOut$'"
 invariants = [12, 27]
 backends = ["unit"]
 where = "any"
 
 [[rule]]
 id = "signer-key-checked"
-title = "the signer refuses a key with a loose mode, or no scope"
+title = "the signer refuses a key or key directory with a loose mode, another owner or a symlink"
 suite = "keys"
-allow = "tests/go-test.sh ./internal/signer 'TestKeyModeIsChecked$'"
-block = "tests/go-test.sh ./internal/signer 'TestWontServeWithoutAScope$'"
+allow = "tests/go-test.sh ./internal/signer 'TestKeyFileAccepted$'"
+block = "tests/go-test.sh ./internal/signer 'TestKeyFileIsChecked$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-scope-required"
+title = "the signer will not serve without a valid scope file it can trust"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestKeyFileAccepted$'"
+block = "tests/go-test.sh ./internal/signer 'TestWontServeWithoutAScope$|TestScopeFileIsChecked$'"
 invariants = [12, 27]
 backends = ["unit"]
 where = "any"
@@ -1065,8 +1075,18 @@ where = "any"
 id = "signer-socket-from-systemd"
 title = "the signer serves only on a socket systemd handed it (LISTEN_PID, LISTEN_FDS)"
 suite = "keys"
-allow = "tests/go-test.sh ./internal/signer 'TestSystemdSocketActivation$'"
-block = "tests/go-test.sh ./internal/signer 'TestSystemdSocketActivation$'"
+allow = "tests/go-test.sh ./internal/signer 'TestSystemdSocketAccepted$'"
+block = "tests/go-test.sh ./internal/signer 'TestSystemdSocketRefusals$'"
+invariants = [12, 27]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "signer-env-is-strict"
+title = "a CCSBX_SIGNER_ value that does not parse stops the signer, never a default"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/signer 'TestWriteScopeCommand$'"
+block = "tests/go-test.sh ./internal/signer 'TestHelpAndEnv$'"
 invariants = [12, 27]
 backends = ["unit"]
 where = "any"

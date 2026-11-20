@@ -10,8 +10,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os/user"
-	"strconv"
 	"strings"
 	"time"
 
@@ -19,9 +17,10 @@ import (
 )
 
 // Wire format. Request: one JSON object of claims (sub, label, billing, profile, aud, routes,
-// repos, branch, placed_by, cnf, exp), then the client half-closes or just waits. Reply: one JSON
-// object, {"token": "..."} or {"error": "..."}; then the connection is closed. iat is the signer's
-// own clock, never the caller's.
+// repos, branch, placed_by, cnf, exp). The signer reads exactly one JSON value (at most
+// --max-request bytes), so a client need not close its write side and may simply wait for the reply.
+// Reply: one JSON object, {"token": "..."} or {"error": "..."}; then the connection is closed. iat
+// is the signer's own clock, never the caller's.
 type reply struct {
 	Token string `json:"token,omitempty"`
 	Error string `json:"error,omitempty"`
@@ -33,20 +32,24 @@ type Config struct {
 	Scope       token.KeyScope
 	Audiences   []string      // the only audiences a token may name
 	MaxTTL      time.Duration // longest exp-iat the signer will sign (at most token.MaxLifetime)
-	AllowGID    uint32        // peers must be this group, or a member of it
+	AllowUID    uint32        // the one caller: hostd's uid (exact, from SO_PEERCRED)
+	AllowGID    *uint32       // when set, the caller's primary gid must be this too
 	MaxRequest  int           // bytes
 	ReadTimeout time.Duration
+	MaxConns    int // concurrent connections (default 64)
 	Now         func() time.Time
 	Logf        func(format string, a ...any)
-	// Member reports whether uid belongs to group gid. nil means look it up in the system's groups.
-	Member func(uid, gid uint32) bool
 }
 
 // Server answers signing requests.
-type Server struct{ cfg Config }
+type Server struct {
+	cfg Config
+	sem chan struct{}
+}
 
-// New checks the configuration. A signer with no audience list, or a lifetime cap above the token
-// maximum, would sign more than the plan allows, so it is refused at start.
+// New checks the configuration. A signer with no audience list, a lifetime cap above the token
+// maximum, or a non-positive size or timeout would sign or wait more than the plan allows, so it is
+// refused at start rather than quietly replaced by a default.
 func New(cfg Config) (*Server, error) {
 	if cfg.Key == nil {
 		return nil, errors.New("signer: no key")
@@ -58,10 +61,13 @@ func New(cfg Config) (*Server, error) {
 		return nil, fmt.Errorf("signer: --max-ttl must be in (0, %s]", token.MaxLifetime)
 	}
 	if cfg.MaxRequest <= 0 {
-		cfg.MaxRequest = 8192
+		return nil, errors.New("signer: --max-request must be positive")
 	}
 	if cfg.ReadTimeout <= 0 {
-		cfg.ReadTimeout = 5 * time.Second
+		return nil, errors.New("signer: --timeout must be positive")
+	}
+	if cfg.MaxConns <= 0 {
+		cfg.MaxConns = 64
 	}
 	if cfg.Now == nil {
 		cfg.Now = time.Now
@@ -69,32 +75,27 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	if cfg.Member == nil {
-		cfg.Member = systemMember
-	}
-	return &Server{cfg: cfg}, nil
+	return &Server{cfg: cfg, sem: make(chan struct{}, cfg.MaxConns)}, nil
 }
 
-// systemMember looks uid up in the system's user and group files.
-func systemMember(uid, gid uint32) bool {
-	u, err := user.LookupId(strconv.FormatUint(uint64(uid), 10))
-	if err != nil {
-		return false
-	}
-	gs, err := u.GroupIds()
-	if err != nil {
-		return false
-	}
-	want := strconv.FormatUint(uint64(gid), 10)
-	for _, g := range gs {
-		if g == want {
-			return true
+// logJSON writes one log line built with json.Marshal (valid JSON whatever the caller sent), with
+// every string field cut to 200 bytes. It never takes a token or key.
+func (s *Server) logJSON(kv ...any) {
+	m := map[string]any{}
+	for i := 0; i+1 < len(kv); i += 2 {
+		v := kv[i+1]
+		if str, ok := v.(string); ok && len(str) > 200 {
+			v = str[:200] + "…"
 		}
+		m[kv[i].(string)] = v
 	}
-	return false
+	b, _ := json.Marshal(m)
+	s.cfg.Logf("%s", b)
 }
 
-// Serve accepts connections until the listener closes. Each is handled on its own goroutine.
+// Serve accepts connections until the listener closes. Each is handled on its own goroutine, at most
+// MaxConns at a time. A failing Accept (for example no free descriptors) is retried after a pause
+// instead of ending the signer.
 func (s *Server) Serve(l net.Listener) error {
 	for {
 		c, err := l.Accept()
@@ -102,42 +103,80 @@ func (s *Server) Serve(l net.Listener) error {
 			if errors.Is(err, net.ErrClosed) {
 				return nil
 			}
-			return err
+			s.logJSON("signer", "accept-error", "err", err.Error())
+			time.Sleep(100 * time.Millisecond)
+			continue
 		}
-		go s.handle(c)
+		s.sem <- struct{}{}
+		go func() {
+			defer func() { <-s.sem }()
+			s.handle(c)
+		}()
 	}
+}
+
+// countingReader reports how many bytes were read, to tell "too large" from "malformed".
+type countingReader struct {
+	r io.Reader
+	n int
+}
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	c.n += n
+	return n, err
 }
 
 func (s *Server) handle(c net.Conn) {
 	defer c.Close()
-	c.SetDeadline(s.cfg.Now().Add(s.cfg.ReadTimeout))
+	// Deadlines use the real clock (cfg.Now is for claims only), and reading and writing have their own.
+	c.SetReadDeadline(time.Now().Add(s.cfg.ReadTimeout))
 	uid, gid, err := peerCred(c)
-	if err != nil || !(gid == s.cfg.AllowGID || s.cfg.Member(uid, s.cfg.AllowGID)) {
-		s.cfg.Logf(`{"signer":"refused","why":"peer not in the allowed group","peer_uid":%d,"peer_gid":%d}`, uid, gid)
-		write(c, reply{Error: "refused"}) // no detail to a peer that shouldn't be here
-		return
-	}
-	// One byte over the cap is enough to know it is too big, without reading the rest.
-	body, err := io.ReadAll(io.LimitReader(c, int64(s.cfg.MaxRequest)+1))
-	if err != nil || len(body) > s.cfg.MaxRequest {
-		s.cfg.Logf(`{"signer":"refused","why":"request too large or unreadable","peer_uid":%d}`, uid)
-		write(c, reply{Error: "request too large"})
-		return
-	}
-	tok, cl, err := s.Sign(body)
 	if err != nil {
-		s.cfg.Logf(`{"signer":"refused","why":%q,"peer_uid":%d,"sub":%q,"profile":%q,"billing":%q}`,
-			err.Error(), uid, cl.Sub, cl.Profile, cl.Billing)
-		write(c, reply{Error: err.Error()})
+		s.logJSON("signer", "refused", "why", "peer credentials unavailable", "err", err.Error())
+		s.send(c, reply{Error: "refused"})
+		return
+	}
+	if uid != s.cfg.AllowUID || (s.cfg.AllowGID != nil && gid != *s.cfg.AllowGID) {
+		s.logJSON("signer", "refused", "why", "peer is not the allowed caller", "peer_uid", uid, "peer_gid", gid)
+		s.send(c, reply{Error: "refused"}) // no detail to a peer that shouldn't be here
+		return
+	}
+	// Read exactly one JSON value, at most MaxRequest bytes (one more is read to notice an excess).
+	cr := &countingReader{r: io.LimitReader(c, int64(s.cfg.MaxRequest)+1)}
+	var raw json.RawMessage
+	err = json.NewDecoder(cr).Decode(&raw)
+	if cr.n > s.cfg.MaxRequest {
+		s.logJSON("signer", "refused", "why", "request too large", "peer_uid", uid)
+		s.send(c, reply{Error: "request too large"})
+		return
+	}
+	if err != nil {
+		why, msg := "malformed request", "bad request"
+		var ne net.Error
+		if errors.As(err, &ne) && ne.Timeout() {
+			why, msg = "timeout waiting for the request", "timeout"
+		}
+		s.logJSON("signer", "refused", "why", why, "peer_uid", uid)
+		s.send(c, reply{Error: msg})
+		return
+	}
+	tok, cl, err := s.Sign(raw)
+	if err != nil {
+		s.logJSON("signer", "refused", "why", err.Error(), "peer_uid", uid, "sub", cl.Sub, "profile", cl.Profile, "billing", cl.Billing)
+		s.send(c, reply{Error: err.Error()})
 		return
 	}
 	// The log carries the claims and never the token or the key.
-	s.cfg.Logf(`{"signer":"signed","peer_uid":%d,"sub":%q,"label":%q,"profile":%q,"billing":%q,"aud":%q,"exp":%d}`,
-		uid, cl.Sub, cl.Label, cl.Profile, cl.Billing, strings.Join(cl.Aud, ","), cl.Exp)
-	write(c, reply{Token: tok})
+	s.logJSON("signer", "signed", "peer_uid", uid, "sub", cl.Sub, "label", cl.Label, "profile", cl.Profile,
+		"billing", cl.Billing, "aud", strings.Join(cl.Aud, ","), "exp", cl.Exp)
+	s.send(c, reply{Token: tok})
 }
 
-func write(c net.Conn, r reply) { json.NewEncoder(c).Encode(r) }
+func (s *Server) send(c net.Conn, r reply) {
+	c.SetWriteDeadline(time.Now().Add(s.cfg.ReadTimeout))
+	json.NewEncoder(c).Encode(r)
+}
 
 // Sign validates the claims in body and signs them. It is the whole policy: unknown fields, a sub
 // or key scope that doesn't permit it, an audience off the list, or a lifetime over the cap are

@@ -102,7 +102,7 @@ home directories) and be a git WORKTREE ROOT (its own `.git` at exactly that pat
 subdirectory of one, not a plain directory); else `bad_spec` with a fixed message (no path or OS text). It must not equal,
 contain or sit inside another live session's workdir. In HELPER mode hostd cannot look inside the owner's home, so a remote
 start asks root (`ccsbx-root worktree-check`, §4b; built: n1-a-wc) and is refused `not_built` only when no checker is installed; direct mode needs `--remote-start-direct` and `--owner-user` = the user hostd runs as. Nothing can point the fence at `~/.ssh`,
-`~` or another repo. A remote start has no gitdir (git verbs are unavailable to it until H1 resolves one).
+`~` or another repo. A remote start carries no gitdir from the caller; in helper mode root derives it (§4b), in direct mode the daemon does.
 
 ### (4b) The helper-mode worktree check: the call hostd makes (R-H, cc-sandbox:#6w6t; A builds ccsbx-root's side to this)
 hostd calls it (wired: `rootWorktreeCheck`); with no helper installed a remote start in helper mode is refused `not_built`. Note: root requires the path to hold NO symlink, so hostd passes the path exactly as the spec carries it and the answer must be that same path. hostd cannot look inside the owner's home, so it asks root, read-only:
@@ -116,14 +116,17 @@ hostd calls it (wired: `rootWorktreeCheck`); with no helper installed a remote s
   path (a directory that is a git directory, or a `.git` file whose `gitdir:` target is host-owned and inside an allowed root), not a symlink; it does
   not equal, contain or sit inside another live session's workdir (root reads the run dir). The same rules `ccsbx-root run` applies at launch,
   so a path that passes here is one the run will accept.
-- **stdout on success:** one line, the resolved absolute path (what hostd records and mounts). Nothing else. stderr: one short fixed line per
+- **stdout on success: TWO lines, `<path>\n<gitdir>\n`:** the resolved absolute path (what hostd records and mounts), then the gitdir root
+  root derived (an absolute path, or an empty line when none). hostd records the second line as the session's `GitDir` (a caller never supplies one:
+  "a remote start carries no gitdir from the caller; root derives it and it is mounted read-only"); `ccsbx-root run` compares its own derivation
+  with the record, so a path that passes here is one the run accepts. Nothing else on stdout. stderr: one short fixed line per
   refusal, with no path and no OS text.
 - **Exit codes:** `0` the path is a git worktree root under `allowed_roots`; `2` refused: bad arguments, not under a root, not a directory, no own
   `.git`, a `.git` that is a symlink or not host-owned, overlaps a live session's workdir; `3` could not tell (a read error, the config unreadable): hostd
   treats it as a refusal (`internal`), never as "ok".
 - **hostd's side:** called once per remote start, after the shape and policy checks and BEFORE any record is written or any peer is asked, with a 5 s
-  timeout; any exit but 0, a timeout, or a stdout that is not exactly one absolute path inside the spec's root is `bad_spec` ("workdir is not a git
-  worktree root"), with a fixed message. The returned path replaces `workdir.path` in the record. It runs only for remote starts (`started_by` set); local
+  bound (SIGTERM at the deadline, 1 s WaitDelay, fixed environment: a stalled helper cannot hold the daemon lock); any exit but 0, a timeout, or a stdout that is not `<path>` or `<path>\n<gitdir>` with the first line the path asked about is `bad_spec` ("workdir is not a git
+  worktree root"), with a fixed message. The returned path replaces `workdir.path` in the record. Dead-pane records are ended before root is asked (root counts `Ended == nil` records as live). A missing helper is `not_built`, any other failure `bad_spec`. It runs only for remote starts (`started_by` set); local
   helper-mode starts keep the client-side `ResolveClientPaths`.
 - **Tests A owes:** each refusal above (symlink out, sibling prefix, plain directory, repo subdirectory, parent of repos, `.git` symlink, foreign-owned `.git`,
   overlap) exits 2 with no path in stderr; a good worktree exits 0 with exactly one line; a root-owned config error exits 3; extra arguments, options or stdin are exit 2.

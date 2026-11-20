@@ -70,7 +70,7 @@ type Daemon struct {
 	Uid           int    // the caller's uid (from the OS, never from the spec)
 	// WorktreeCheck asks root whether a path is a git worktree root under allowed_roots (helper mode, remote starts only):
 	// it returns the resolved path, or an error for ANY doubt. nil: remote starts are refused in helper mode.
-	WorktreeCheck func(path string) (string, error)
+	WorktreeCheck func(path string) (resolved, gitdir string, err error)
 	StartedBy     string // a remote caller's stamped identity, recorded with the session (M2c); "" for a local start
 	Image         string // fence image reference recorded in the pin
 	PinsFile      string // pins.toml; missing means no production pins
@@ -227,10 +227,21 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 		if d.WorktreeCheck == nil {
 			return nil, refuse(NotBuilt, "a remote start needs the worktree check that helper mode cannot make here")
 		}
-		got, err := d.WorktreeCheck(s.Workdir.Path)
+		// a record whose pane died but is not marked ended would count as a live session on this very workdir
+		// (root counts Ended == nil): end the dead ones first, under the lock this Start already holds
+		for _, r := range recs {
+			if r.Backend != "k8s" && r.Ended == nil && !d.Launcher.Alive(r.Sid) {
+				d.markEnded(r)
+			}
+		}
+		got, gitdir, err := d.WorktreeCheck(s.Workdir.Path)
+		if errors.Is(err, ErrNoHelper) {
+			return nil, refuse(NotBuilt, "a remote start needs ccsbx-root, which is not installed here")
+		}
 		if err != nil || got != filepath.Clean(s.Workdir.Path) {
 			return nil, refuse(BadSpec, "workdir is not a git worktree root")
 		}
+		s.GitDir = gitdir // derived by root, never from the caller: `ccsbx-root run` compares it with its own derivation
 	}
 	if d.Root == "helper" {
 		// hostd runs as the service uid and cannot enter the owner's home (0750): it never touches the
@@ -464,6 +475,9 @@ func (d *Daemon) Load(sid string) (*Record, error) {
 	var r Record
 	return &r, json.Unmarshal(b, &r)
 }
+
+// ErrNoHelper: ccsbx-root is not installed, so no worktree check can be made (the start is not_built, not bad_spec).
+var ErrNoHelper = errors.New("ccsbx-root is not installed")
 
 // overlaps: a and b are the same directory, or one is inside the other.
 func overlaps(a, b string) bool {

@@ -789,3 +789,15 @@ func TestParallelSendsAfterAnExpiryMintOnceAndNeverShareAKeyMidSignature(t *test
 		t.Fatalf("minted %d times: the burst did not share one re-mint", calls)
 	}
 }
+
+// context (R-H review S3): the worktree check runs while hostd holds the daemon lock. A helper that stalls and IGNORES the
+// termination signal while holding stdout open must not keep hostd waiting beyond the bound.
+func TestAStalledSignalIgnoringHelperCannotHoldTheCallerPastItsBound(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "stall.sh")
+	os.WriteFile(script, []byte("#!/bin/sh\ntrap '' TERM\nsleep 30 &\nwait\n"), 0o755)
+	t0 := time.Now()
+	_, err := runBounded(500*time.Millisecond, script)
+	if err == nil || time.Since(t0) > 4*time.Second {
+		t.Fatalf("err=%v after %v", err, time.Since(t0))
+	}
+}

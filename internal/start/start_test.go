@@ -6,6 +6,7 @@ package start
 import (
 	"errors"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/profiles"
 	"os"
 	"os/exec"
 	"os/user"
@@ -676,15 +677,20 @@ func TestOverlappingWorkdirsOfLiveSessionsAreRefused(t *testing.T) {
 func TestAHelperModeRemoteStartAsksRootAndRefusesOnAnyDoubt(t *testing.T) {
 	d, _ := newDaemon(t)
 	d.Root, d.StartedBy = "helper", "owner:tomas@example.com@mac"
+	helperImage(d)
 	d.WorktreeRoot = filepath.Dir(spec(nil).Workdir.Path)
 	p := spec(nil).Workdir.Path
 	if _, err := d.Start(spec(nil)); code(err) != NotBuilt {
 		t.Fatalf("no checker: %v", err)
 	}
-	for name, chk := range map[string]func(string) (string, error){
-		"root refuses":              func(string) (string, error) { return "", errors.New("exit 2") },
-		"root cannot tell":          func(string) (string, error) { return "", errors.New("exit 3") },
-		"root answers another path": func(string) (string, error) { return "/etc", nil },
+	d.WorktreeCheck = func(string) (string, string, error) { return "", "", ErrNoHelper }
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "r-nohelper" })); code(err) != NotBuilt {
+		t.Fatalf("no helper installed must be not_built, not bad_spec: %v", err)
+	}
+	for name, chk := range map[string]func(string) (string, string, error){
+		"root refuses":              func(string) (string, string, error) { return "", "", errors.New("exit 2") },
+		"root cannot tell":          func(string) (string, string, error) { return "", "", errors.New("exit 3") },
+		"root answers another path": func(string) (string, string, error) { return "/etc", "", nil },
 	} {
 		d.WorktreeCheck = chk
 		if _, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "r-" + name })); code(err) != BadSpec {
@@ -692,12 +698,56 @@ func TestAHelperModeRemoteStartAsksRootAndRefusesOnAnyDoubt(t *testing.T) {
 		}
 	}
 	asked := ""
-	d.WorktreeCheck = func(q string) (string, error) { asked = q; return q, nil }
-	_, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "r-ok" }))
+	d.WorktreeCheck = func(q string) (string, string, error) { asked = q; return q, filepath.Join(q, ".git"), nil }
+	rep, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "r-ok"; s.Profile, s.Billing = "e2e-default", "stub" }))
 	if asked != p {
 		t.Fatalf("root was asked about %q, not the spec's path %q (err %v)", asked, p, err)
 	}
-	if err != nil && code(err) == NotBuilt {
-		t.Fatalf("an approved path was still refused as not built: %v", err)
+	if err != nil {
+		t.Fatalf("an approved path was refused: %v", err)
 	}
+	// the gitdir root derived is what the record keeps: `ccsbx-root run` compares it with its own derivation
+	if rec, lerr := d.Load(rep.Sid); lerr != nil || rec.GitDir != filepath.Join(p, ".git") {
+		t.Fatalf("the record's gitdir is %q (%v), want the one root derived", rec.GitDir, lerr)
+	}
+}
+
+// context (R-H review S4): a session whose pane died but whose record is not marked ended counts as live to root, so a
+// remote resume or restart on the same workdir would be refused as an overlap. The dead record is ended BEFORE root is asked.
+func TestAStaleLiveRecordIsEndedBeforeRootIsAsked(t *testing.T) {
+	d, fl := newDaemon(t)
+	d.Root, d.StartedBy = "helper", "owner:tomas@example.com@mac"
+	helperImage(d)
+	d.WorktreeRoot = filepath.Dir(spec(nil).Workdir.Path)
+	d.WorktreeCheck = func(q string) (string, string, error) { return q, filepath.Join(q, ".git"), nil }
+	first, err := d.Start(spec(func(s *LaunchSpec) { s.Profile, s.Billing = "e2e-default", "stub" }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for sid := range fl.alive {
+		fl.alive[sid] = false // the pane died; the record still says live
+	}
+	sawLive := false
+	d.WorktreeCheck = func(q string) (string, string, error) {
+		if r, _ := d.Load(first.Sid); r != nil && r.Ended == nil {
+			sawLive = true
+		}
+		return q, filepath.Join(q, ".git"), nil
+	}
+	if _, err := d.Start(spec(func(s *LaunchSpec) {
+		s.RequestID = "r2"
+		s.Label = "cc-sandbox:again"
+		s.Profile, s.Billing = "e2e-default", "stub"
+	})); err != nil {
+		t.Fatal(err)
+	}
+	if sawLive {
+		t.Fatal("root was asked while the dead session's record still said live")
+	}
+}
+
+// helperImage makes helper mode's start acceptable to the image pin check: an e2e profile may run a candidate digest of our repo.
+func helperImage(d *Daemon) {
+	d.Image = "ghcr.io/landovsky/ccsbx-fence@sha256:" + strings.Repeat("a", 64)
+	d.ProfileLoader = profiles.Load
 }

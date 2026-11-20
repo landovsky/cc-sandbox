@@ -86,17 +86,26 @@
 - **Who:** Tomas, with sudo. `plan` and `check` need no root.
 - **Steps:**
   1. `units/install-linux.sh plan`: prints every step, changes nothing. Read it.
-  2. `sudo units/install-linux.sh install --yes`. It checks the refusals first, takes a backup of
-     what it changes under `/var/backups/ccsbx-install/<timestamp>/`, and does the steps in the
-     order `plan` printed. It stops at the first failed step and says which.
+  2. `sudo units/install-linux.sh install --yes`. It checks the refusals first, then copies every
+     file it will replace to `/var/backups/ccsbx-install/original/` (once; never overwritten), and
+     does the steps in the order `plan` printed. Steps that can fail on this machine come before the
+     sudoers change, and the whole sudoers config is re-checked after it. It stops at the first
+     failed step, says which, and says `PARTIAL INSTALL` with the undo command.
   3. `sudo reboot` (group changes apply to new login sessions only).
   4. `units/install-linux.sh check`.
 - **Check:** `check` exits 0 after the reboot and prints one `ok`/`FAIL` line per step. Before the
   install it exits non-zero and names what is still open.
-- **Rollback:** `sudo units/install-linux.sh uninstall --yes` restores the backup (sudoers lines,
-  sops owner and mode, group membership), removes the `ccsbx*` users and units it created, and
-  keeps the keys directory unless `--purge-keys`. `lxd` and the snap are not reinstalled: that
-  path was an accident.
+- **Rollback:** `sudo units/install-linux.sh uninstall --yes`, also after a failed or repeated
+  install: it always restores from the FIRST backup (`/var/backups/ccsbx-install/original/`).
+  **It undoes:** the units (hostd, signer, signer socket), the sudoers rules `90-ccsbx-root` and
+  `91-ccsbx-deploy`, `ccsbx-root`, `ccsbx-deploy`, `ccsbx`, `/etc/ccsbx/ccsbx-root.toml`; every
+  `sudoers.d` file as it was (then `visudo -c`); sops's owner and mode; the firewall rule for 7480;
+  the owner's `ccsbx-clients` membership. The backup is then renamed `original.undone-<time>`.
+  **It does NOT undo:** docker/lxd group membership (re-add with `gpasswd -a tomas docker` to
+  waive invariant 14 again), the lxd snap, the users `ccsbx` and `ccsbx-keys`, the group
+  `ccsbx-clients`, `/var/lib/ccsbx` (the journal) and the keys directory (`--purge-keys` deletes the
+  keys and `ccsbx-keys`: rotate M9 first). `--backup DIR` must be under `/var/backups/ccsbx-install/`,
+  root-owned and not group- or world-writable.
 
 ## 4. Night auto-start and stop
 <!-- procedure: NB4 -->

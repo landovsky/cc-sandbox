@@ -450,3 +450,47 @@ func TestTheRemoteHourlyBudgetIsSeparateFromTheLocalOne(t *testing.T) {
 		t.Fatalf("a LOCAL start was refused because remote starts used up the remote budget: %v", err)
 	}
 }
+
+// context (C6, C12 review): a remote workdir.path is checked exactly as a local one: symlinks resolved, strictly
+// inside a configured root, no hidden home directories. Each case is a way a remote caller could point the fence at
+// something that is not a worktree: a symlink out of the root, a sibling that merely starts with the root's name, a
+// dot-directory such as ~/.ssh, the root itself.
+func TestARemoteWorkdirIsHeldToTheWorktreeRootBlock(t *testing.T) {
+	_, _, svc := remoteRig(t)
+	me := remotestart.Caller{StartedBy: "owner:tomas@example.com@mac-tomas", Machine: "mac"}
+	root := "/var/tmp"
+	inside := wdir(t) // a real directory under the root
+	outside, _ := os.MkdirTemp(os.TempDir(), "ccsbx-outside-")
+	t.Cleanup(func() { os.RemoveAll(outside) })
+	link := filepath.Join(inside, "escape")
+	if err := os.Symlink(outside, link); err != nil {
+		t.Fatal(err)
+	}
+	sibling := root + "2" // /var/tmp2: starts with the root's name, is not inside it
+	os.MkdirAll(sibling, 0o700)
+	t.Cleanup(func() { os.RemoveAll(sibling) })
+	home, _ := os.UserHomeDir()
+	hidden := filepath.Join(home, ".ssh") // outside the root, as a hidden home directory is
+	n := 0
+	try := func(path string) *start.Refusal {
+		n++
+		body := strings.NewReplacer(`"r1"`, fmt.Sprintf(`"rw%d"`, n), "cc-sandbox:x", fmt.Sprintf("cc-sandbox:w%d", n)).Replace(fmt.Sprintf(specOf, "tomas", path))
+		_, ref := svc.Start(context.Background(), me, []byte(body))
+		return ref
+	}
+	for name, p := range map[string]string{
+		"a symlink out of the root":           link,
+		"a sibling that starts with the root": sibling,
+		"a hidden directory (~/.ssh-like)":    hidden,
+		"the root itself":                     root,
+		"a path with ..":                      inside + "/../../etc",
+		"a relative path":                     "tmp/x",
+	} {
+		if ref := try(p); ref == nil || ref.Code != start.BadSpec {
+			t.Errorf("%s: %v", name, ref)
+		}
+	}
+	if ref := try(inside); ref != nil {
+		t.Fatalf("a directory inside the root was refused: %v", ref)
+	}
+}

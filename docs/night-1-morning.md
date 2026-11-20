@@ -40,6 +40,7 @@ Run on hp in `~/git/cc-sandbox` unless a step says otherwise. Order matters: the
 | 5 | Keep the restart=no containers (table above) | `docker update --restart unless-stopped messaging-hub-db-1` (and any other you want kept) |
 | 6 | B9: the hub is native | stream C's release is live and `systemctl --user is-active session-bus-hub.service` says `active` (unit name assumed; `CCSBX_B9_UNIT` overrides). The install refuses otherwise |
 | 7 | Build the binaries the installer wants | `ccsbx-root`, `ccsbx-hostd`, `ccsbx-signer`, `ccsbx` for linux/amd64 in `dist/` with a `SHA256SUMS` (`make dist` does not yet produce them: `_GAP:_` stream A) |
+| 7b | Root-only test of `ccsbx-root`'s bind mount (**PR #8 must be merged first**) | from `~/git/cc-sandbox`: `sudo unshare -m go test -tags rootmount -run TestRealMounter ./internal/rootcmd`. It must **PASS**; if it does not, stop here |
 | 8 | The root install (sudo, password) | `sudo units/install-linux.sh install --yes` (add `--with-deploy` only if Q12 = yes) |
 | 9 | Reboot | `sudo reboot`, then open tmux again |
 | 10 | The install is complete | `units/install-linux.sh check` (exit 0) |
@@ -81,6 +82,7 @@ Step 8 in detail (changed after the PR #2 review):
   `subscription` until a profile allows it; override with `--machine` and `--pairs`; `plan` prints it).
   Only the signer opens `machine.key`. `check` asks the signer, as uid `ccsbx`, for a token for one in-scope
   test claim (api + dev-default), so it needs root;
+- `ccsbx-root` runs with a clean environment: the sudoers file has `Defaults!/usr/local/sbin/ccsbx-root env_reset,!setenv`, so `sudo -E` and `VAR=x` do not reach it;
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
@@ -224,8 +226,10 @@ GATES (install refuses while any is unmet)
      $ systemctl disable --now lxd-installer.socket
 
 [08] U0 sudoers: ccsbx-root is the only NOPASSWD grant
+     # ccsbx-root runs with a CLEAN environment: 'Defaults!/usr/local/sbin/ccsbx-root env_reset,!setenv' (the caller's env is reset and
+     #   cannot be passed through, so no sudo -E and no VAR=x reaches it)
      # 1. the new rule goes in a dot-named staging file (sudo ignores it), is checked, then renamed
-     write /etc/sudoers.d/.90-ccsbx-root.new  (mode 0440, root:root, 3 lines)
+     write /etc/sudoers.d/.90-ccsbx-root.new  (mode 0440, root:root, 5 lines)
      $ visudo -cf /etc/sudoers.d/.90-ccsbx-root.new
      $ mv -f /etc/sudoers.d/.90-ccsbx-root.new /etc/sudoers.d/90-ccsbx-root
      # 2. remove the NOPASSWD grants for docker, apt, dpkg, snap, dokku, sops from every sudoers.d file

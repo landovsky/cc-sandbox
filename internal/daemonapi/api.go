@@ -24,8 +24,10 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/user"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/landovsky/cc-sandbox/internal/journal"
@@ -277,7 +279,24 @@ func (s *Server) cursor(w http.ResponseWriter, r *http.Request) {
 }
 
 // ListenUnix listens on a unix socket with mode 0600, replacing a stale socket file.
-func ListenUnix(path string) (net.Listener, error) {
+func ListenUnix(path string) (net.Listener, error) { return ListenUnixGroup(path, "") }
+
+// ListenUnixGroup is ListenUnix, except that with a group name the socket is chgrp'ed to it and
+// made 0660, so members of that group (the owner's own user, when hostd runs as a service uid) can
+// connect. It fails closed: an unknown group, or a chgrp that is refused, means no listener at all,
+// never a socket with the wrong group. The socket is created under umask 077 so it is never
+// connectable by anyone between creation and the chmod.
+func ListenUnixGroup(path, group string) (net.Listener, error) {
+	gid := -1
+	if group != "" {
+		g, err := user.LookupGroup(group)
+		if err != nil {
+			return nil, fmt.Errorf("--socket-group %q: %v", group, err)
+		}
+		if gid, err = strconv.Atoi(g.Gid); err != nil {
+			return nil, fmt.Errorf("--socket-group %q: bad gid %q", group, g.Gid)
+		}
+	}
 	if st, err := os.Lstat(path); err == nil {
 		if st.Mode()&os.ModeSocket == 0 {
 			return nil, fmt.Errorf("%s exists and is not a socket", path)
@@ -288,12 +307,24 @@ func ListenUnix(path string) (net.Listener, error) {
 		}
 		_ = os.Remove(path)
 	}
+	old := syscall.Umask(0o077)
 	l, err := net.Listen("unix", path)
+	syscall.Umask(old)
 	if err != nil {
 		return nil, err
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	mode := os.FileMode(0o600)
+	if gid >= 0 {
+		if err := os.Chown(path, -1, gid); err != nil {
+			l.Close()
+			_ = os.Remove(path)
+			return nil, fmt.Errorf("--socket-group %q: chgrp %s: %v", group, path, err)
+		}
+		mode = 0o660
+	}
+	if err := os.Chmod(path, mode); err != nil {
 		l.Close()
+		_ = os.Remove(path)
 		return nil, err
 	}
 	return l, nil

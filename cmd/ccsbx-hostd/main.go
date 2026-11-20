@@ -43,7 +43,10 @@ func app() *cli.App {
   curl --unix-socket <state>/hostd.sock -d '{"seq":41,"epoch":"E","tree_sha":"<sha>"}' http://d/v1/cursors/production
   ccsbx-hostd run --listen 127.0.0.1:7481 --listen-token-file ~/.config/ccsbx/api-token
     curl -H "Authorization: Bearer $(cat ~/.config/ccsbx/api-token)" http://127.0.0.1:7481/v1/info
-  The unix socket is mode 0600 (owner class: also deliver and lease steal). The loopback port is
+  The local unix socket is mode 0600 (owner class: also deliver and lease steal), or 0660 and
+  chgrp'ed with --socket-group GROUP (fails closed if the group is unknown or the chgrp refused).
+  --signer PATH: the signer's unix socket; hostd signs tokens only through it and never reads a key.
+  Every flag also reads CCSBX_<FLAG> (--local-socket: CCSBX_LOCAL_SOCKET). Unknown flags are fatal. The loopback port is
   token-protected and read/cockpit only.
   Direct mode (dev): the outbox is writable by the host, so T:outbox-host-write-refused is red
   until gate M, and every result is "not evidence". Requests are never echoed: refusals carry
@@ -61,7 +64,10 @@ func app() *cli.App {
 				f.String("machine", hostname(), "this machine's name, stamped on journal records")
 				f.String("journal", "", "journal directory (default <state>/journal)")
 				f.Int("retention-days", 14, "journal retention; values below 14 are refused")
-				f.String("socket", "", "unix socket for the daemon API, mode 0600 (default <state>/hostd.sock; '-' disables)")
+				f.String("local-socket", "", "unix socket for local clients (ccsbx, cc-tree): the daemon API incl. owner operations; mode 0600, or 0660 with --socket-group (default <state>/hostd.sock; '-' disables)")
+				f.String("socket", "", "old name of --local-socket (kept; --local-socket wins)")
+				f.String("socket-group", "", "chgrp the local socket to this group and make it 0660 (the owner's user must be in it); an unknown group or a refused chgrp stops the daemon")
+				f.String("signer", "", "the signer's unix socket: hostd connects there for every token signing and never reads a key file; checked at start (a missing socket is an error, not a hang)")
 				f.String("listen", "", "also serve the journal/cockpit API on this loopback address, e.g. 127.0.0.1:7481; needs --listen-token-file; no deliver, no steal there")
 				f.String("listen-token-file", "", "file (mode 0600) holding the bearer token the --listen address requires")
 				f.Int("lease-ttl", 90, "cockpit lease TTL in seconds (one holder per realm)")
@@ -86,6 +92,12 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	if err != nil || iv <= 0 {
 		fmt.Fprintf(stderr, "ccsbx-hostd: --interval %q is not a positive duration\n", get("interval"))
 		return cli.ExitUsage
+	}
+	if sg := get("signer"); sg != "" {
+		if err := checkSigner(sg); err != nil {
+			fmt.Fprintf(stderr, "ccsbx-hostd: --signer: %v\n", err)
+			return cli.ExitFail
+		}
 	}
 	d := &start.Daemon{StateDir: get("state")}
 	tm := &msg.Tmux{Socket: get("tmux-socket")}
@@ -155,7 +167,10 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		}
 		return rec.Gen, nil
 	}
-	sock := get("socket")
+	sock := get("local-socket")
+	if sock == "" {
+		sock = get("socket")
+	}
 	if sock == "" {
 		sock = filepath.Join(get("state"), "hostd.sock")
 	}
@@ -171,7 +186,7 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		return true
 	}
 	if sock != "-" {
-		l, err := daemonapi.ListenUnix(sock)
+		l, err := daemonapi.ListenUnixGroup(sock, get("socket-group"))
 		if !serve(l, err, "unix:"+sock, srv.Handler()) {
 			return cli.ExitFail
 		}
@@ -207,6 +222,23 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		hs.Close()
 	}
 	return cli.ExitOK
+}
+
+// checkSigner dials the signer's socket with a short timeout, so a signer that is not up is a
+// clear error at start rather than a hang or a later failure at the first signing.
+func checkSigner(path string) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("signer socket %s: %v", path, err)
+	}
+	if st.Mode()&os.ModeSocket == 0 {
+		return fmt.Errorf("%s is not a unix socket", path)
+	}
+	c, err := net.DialTimeout("unix", path, 2*time.Second)
+	if err != nil {
+		return fmt.Errorf("cannot connect to the signer at %s: %v", path, err)
+	}
+	return c.Close()
 }
 
 // readToken reads the bearer token for the TCP listener. The file must be private (0600 or

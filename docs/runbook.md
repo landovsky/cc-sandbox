@@ -588,3 +588,17 @@ are local-only**: 403 `forbidden` on the tailnet even to the owner, still served
 means for a cockpit on the OTHER machine: it cannot lease, stream events or type into this machine's panes over
 the tailnet; it runs against its own machine's socket until M2d gives these a per-device secret. (`attach` is
 tmux, not an API route.) hostd also warns at start when `--owner-devices` lists this machine.
+
+## Attaching to a pod session (F5)
+
+`ccsbx attach <sid>` is unchanged for the owner; `ccsbx-root attach` reads the session record, and when it
+says `backend: "k8s"` it execs `kubectl exec -it -c fence <pod> -- tmux attach-session -t =<sid>:` as the
+keys user (`ccsbx-keys`) instead of tmux as the service user. Config keys in `/etc/ccsbx/ccsbx-root.toml`
+(defaults in brackets): `kubectl` [/usr/local/bin/kubectl, root-owned], `kubeconfig`
+[/var/lib/ccsbx-keys/launcher.kubeconfig, owned by the keys user or root, mode without group/other write,
+in a directory likewise], `k8s_conn` [/etc/ccsbx/k8s-conn.json, root-owned JSON with `server`, `ca_file`,
+`token_file`; the server and CA are put on kubectl's command line, so the kubeconfig cannot redirect it],
+`keys_user` [ccsbx-keys, never the service user or the caller], `k8s_namespace` [cc-sandbox]. Before kubectl
+is exec'd the pod's live UID (read with the keys user's token) must equal the `pod_uid` the launcher recorded
+when it created the pod; otherwise: `pod_conflict`, and the owner deletes exactly the named pod. The launcher
+(not built yet) is what writes `backend` and `pod_uid`. Not run against a cluster (Gate M).

@@ -472,3 +472,53 @@ func TestTheFenceNeverSeesAnEchoInA1xxOrATrailer(t *testing.T) {
 		t.Fatalf("the fence read a token or a Location in a 1xx or trailer:\\n%.600s", raw)
 	}
 }
+
+// context "a door sends a trailer it never announced": resp.Trailer is nil when the response arrives and is
+// filled in at the end of the body, so the scrub has to wrap every body, not only announced-trailer ones.
+func TestTheFenceNeverSeesAnUnannouncedTrailer(t *testing.T) {
+	r := newRig(t, nil)
+	tok, in := r.secrets(time.Hour)
+	if err := Load(r.ctl, in); err != nil {
+		t.Fatal(err)
+	}
+	r.door.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		w.Write([]byte("body"))
+		w.(http.Flusher).Flush()
+		w.Header().Set(http.TrailerPrefix+"X-Late", q.Header.Get("Authorization"))
+	})
+	c, err := net.Dial("tcp", r.port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.SetDeadline(time.Now().Add(5 * time.Second))
+	io.WriteString(c, "POST /model/v1/messages HTTP/1.1\r\nHost: x\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}")
+	b, _ := io.ReadAll(c)
+	if !strings.Contains(string(b), "body") || strings.Contains(string(b), tok) {
+		t.Fatalf("response (must carry the body and no token):\n%.500s", b)
+	}
+}
+
+// countingReader is a stream that looks endless but ends at a fixed bound, so a client that ignores its cap
+// fails the assertion instead of eating memory until something kills it.
+type countingReader struct{ n int }
+
+func (c *countingReader) Read(p []byte) (int, error) {
+	if c.n >= 4*MaxSecrets {
+		return 0, io.EOF
+	}
+	c.n += len(p)
+	return len(p), nil
+}
+
+// context "a launcher pipes an endless stream into `side load`": the client stops reading at the cap
+// instead of buffering it all.
+func TestLoadClientStopsReadingAtTheCap(t *testing.T) {
+	cr := &countingReader{}
+	if err := Load("/nonexistent/ctl.sock", cr); err == nil || !strings.Contains(err.Error(), "too large") {
+		t.Fatalf("got %v", err)
+	}
+	if cr.n > MaxSecrets+64<<10 {
+		t.Fatalf("read %d bytes of an endless stream", cr.n)
+	}
+}

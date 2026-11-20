@@ -65,6 +65,9 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 	if cfg.Forward == nil {
 		return nil, errors.New("side relay: no upstream to forward to")
 	}
+	if cfg.FenceUID <= 0 {
+		return nil, errors.New("side relay: FenceUID is required (the uid every request file must have)")
+	}
 	if cfg.Sid == "" || cfg.Gen < 1 {
 		return nil, errors.New("side relay: sid and gen are required (identity comes from here, not from a request file)")
 	}
@@ -91,6 +94,15 @@ func NewRelay(cfg RelayConfig) (*Relay, error) {
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
+	}
+	// In the pod, in/ is an emptyDir only the sidecar can write (the fence mounts it read-only), so the
+	// sidecar makes in/replies itself, and checks that what it finds there is its own plain directory.
+	rd := filepath.Join(cfg.In, "replies")
+	if err := os.Mkdir(rd, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
+		return nil, fmt.Errorf("side relay: %w", err)
+	}
+	if fi, err := os.Lstat(rd); err != nil || !fi.IsDir() || !ownedBy(fi, os.Getuid()) {
+		return nil, fmt.Errorf("side relay: %s is not a plain directory of ours", rd)
 	}
 	r := &Relay{cfg: cfg, seen: map[string]bool{}, tokens: float64(cfg.Burst), last: cfg.Now()}
 	if f, err := os.Open(r.ledgerPath()); err == nil {
@@ -178,11 +190,15 @@ func (r *Relay) Scan(ctx context.Context) RelayStats {
 	shed := r.cfg.ShedReplies
 	for _, n := range names {
 		rid, ok := hostd.RequestRid(n)
-		if !ok || r.seen[n] || ctx.Err() != nil {
+		if !ok || ctx.Err() != nil {
+			continue
+		}
+		if r.seen[n] {
 			continue
 		}
 		if r.total >= r.cfg.MaxTotal {
-			r.seen[n] = true
+			// Past the lifetime cap the name is NOT remembered: the fence picks names, and a set that
+			// grew with them would be a way to run the sidecar out of memory.
 			st.Shed++
 			continue
 		}
@@ -190,7 +206,7 @@ func (r *Relay) Scan(ctx context.Context) RelayStats {
 		id := ulid.New() // minted here; the fence never picks an id
 		if r.tokens < 1 {
 			r.seen[n] = true
-			r.ledger(n, "", "shed")
+			r.ledger(n, id, "shed")
 			if shed > 0 {
 				shed--
 				r.reply(refusal(rid, id, "rate_capped"))

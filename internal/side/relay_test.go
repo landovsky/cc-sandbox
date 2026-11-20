@@ -3,8 +3,10 @@ package side
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -160,11 +162,12 @@ func TestRelayShedsAFlood(t *testing.T) {
 func TestRelayNeedsAnIdentityAndAnUpstream(t *testing.T) {
 	r := newRelayRig(t)
 	for name, mut := range map[string]func(*RelayConfig){
-		"no sid":      func(c *RelayConfig) { c.Sid = "" },
-		"no upstream": func(c *RelayConfig) { c.Forward = nil },
-		"relative in": func(c *RelayConfig) { c.In = "in" },
+		"no sid":       func(c *RelayConfig) { c.Sid = "" },
+		"no upstream":  func(c *RelayConfig) { c.Forward = nil },
+		"relative in":  func(c *RelayConfig) { c.In = "in" },
+		"no fence uid": func(c *RelayConfig) { c.FenceUID = 0 },
 	} {
-		cfg := RelayConfig{Out: r.out, In: r.in, State: r.state, Sid: "s", Gen: 1, Forward: func(context.Context, hostd.Request) hostd.Reply { return hostd.Reply{} }}
+		cfg := RelayConfig{Out: r.out, In: r.in, State: r.state, Sid: "s", Gen: 1, FenceUID: 1, Forward: func(context.Context, hostd.Request) hostd.Reply { return hostd.Reply{} }}
 		mut(&cfg)
 		if _, err := NewRelay(cfg); err == nil {
 			t.Errorf("%s: accepted", name)
@@ -195,5 +198,65 @@ func TestRelayLifetimeCap(t *testing.T) {
 	st := r.relay(func(c *RelayConfig) { c.MaxTotal = 3 }).Scan(context.Background())
 	if st.Accepted != 3 || st.Shed != 2 {
 		t.Fatalf("stats %+v", st)
+	}
+}
+
+var ulidRe = regexp.MustCompile(`^[0-9A-HJKMNP-TV-Z]{26}$`)
+
+// context "the M4 queue and the journal key on the request id": the fence must not be able to choose it,
+// neither through the file name nor through an "id" field in the body.
+func TestRelayMintsTheRequestIDItself(t *testing.T) {
+	r := newRelayRig(t)
+	r.put("01ABCDEFGHJKMNPQRSTVWXYZ00.json", `{"type":"msg.send","id":"01ABCDEFGHJKMNPQRSTVWXYZ99"}`)
+	r.put("second.json", `{"type":"msg.send"}`)
+	r.relay(nil).Scan(context.Background())
+	if len(r.forwarded) != 2 {
+		t.Fatalf("forwarded %d", len(r.forwarded))
+	}
+	a, b := r.forwarded[0], r.forwarded[1]
+	for _, q := range r.forwarded {
+		if !ulidRe.MatchString(q.ID) || q.ID == q.Rid || strings.HasSuffix(q.ID, "99") {
+			t.Errorf("id %q (rid %q) is not minted by the relay", q.ID, q.Rid)
+		}
+	}
+	if a.ID == b.ID {
+		t.Error("two requests got the same id")
+	}
+}
+
+// context "the fence picks request names and can recreate thousands per scan": past the lifetime cap
+// the relay must not remember names, or its memory grows with the fence's choices until it is killed.
+func TestRelayMemoryStaysBoundedPastTheCap(t *testing.T) {
+	r := newRelayRig(t)
+	x := r.relay(func(c *RelayConfig) { c.MaxTotal = 5 })
+	for round := 0; round < 3; round++ {
+		for i := 0; i < 20; i++ {
+			r.put(fmt.Sprintf("n%d-%d.json", round, i), `{"type":"msg.send"}`)
+		}
+		x.Scan(context.Background())
+	}
+	if len(x.seen) > 5 {
+		t.Fatalf("seen holds %d names with a cap of 5", len(x.seen))
+	}
+}
+
+// context "in a pod nothing else makes in/replies": the volume root is 0777 and root-owned, so the
+// relay makes the directory itself, or every reply is dropped.
+func TestRelayMakesItsOwnReplyDirectory(t *testing.T) {
+	r := newRelayRig(t)
+	os.RemoveAll(filepath.Join(r.in, "replies"))
+	os.Chmod(r.in, 0o777)
+	r.put("a.json", `{"type":"msg.send"}`)
+	r.relay(nil).Scan(context.Background())
+	if rep := r.replyOf("a"); rep.Status != "ok" {
+		t.Fatalf("%+v", rep)
+	}
+	// a planted symlink in its place is refused, not followed
+	r2 := newRelayRig(t)
+	os.RemoveAll(filepath.Join(r2.in, "replies"))
+	os.Symlink(t.TempDir(), filepath.Join(r2.in, "replies"))
+	if _, err := NewRelay(RelayConfig{Out: r2.out, In: r2.in, State: r2.state, Sid: "s", Gen: 1, FenceUID: 1,
+		Forward: func(context.Context, hostd.Request) hostd.Reply { return hostd.Reply{} }}); err == nil {
+		t.Fatal("a symlinked in/replies was accepted")
 	}
 }

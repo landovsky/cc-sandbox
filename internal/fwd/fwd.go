@@ -322,6 +322,9 @@ type scrubbingTransport struct {
 }
 
 func (t *scrubbingTransport) scrub(h map[string][]string) {
+	if h == nil {
+		return
+	}
 	delete(h, "Location")
 	delete(h, "Set-Cookie")
 	if t.token == "" {
@@ -348,9 +351,9 @@ func (t *scrubbingTransport) RoundTrip(req *http.Request) (*http.Response, error
 		return resp, err
 	}
 	t.scrub(resp.Header)
-	if resp.Trailer != nil {
-		resp.Body = &scrubBody{ReadCloser: resp.Body, resp: resp, t: t}
-	}
+	// Always wrapped: a door can send a trailer it never announced, and then resp.Trailer is nil here and
+	// only filled in at EOF.
+	resp.Body = &scrubBody{ReadCloser: resp.Body, resp: resp, t: t}
 	return resp, nil
 }
 

@@ -9,6 +9,7 @@ import (
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -647,5 +648,91 @@ func TestJournalNeedsAnIdentity(t *testing.T) {
 	u, _ := url.Parse("http://127.0.0.1:1")
 	if _, err := New(Config{Listen: "127.0.0.1:8080", Control: "/run/side/ctl.sock", Doors: map[string]*url.URL{"m": u}, Journal: &lockedJournal{}}); err == nil {
 		t.Fatal("a journal without sid and gen was accepted")
+	}
+}
+
+// withRelay returns the rig's secrets payload with a relay_token added.
+func withRelay(t *testing.T, in *bytes.Buffer, rt string) *bytes.Buffer {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(in.Bytes(), &m); err != nil {
+		t.Fatal(err)
+	}
+	m["relay_token"] = rt
+	b, _ := json.Marshal(m)
+	return bytes.NewBuffer(b)
+}
+
+// context "the pod's bus sender needs a relay credential and the generation key, from the one load": the
+// token arrives with the other secrets, the sender can read it back with the key that matches the token's
+// cnf, and neither the log nor the journal ever holds it (the journal gets a hash).
+func TestRelayTokenArrivesInTheOneLoadAndStaysOutOfLogsAndJournal(t *testing.T) {
+	const rt = "sbp1.RELAY-CREDENTIAL-abc123"
+	j := &lockedJournal{}
+	var logs []string
+	var lm sync.Mutex
+	r := newRig(t, func(c *Config) {
+		c.Journal, c.Sid, c.Gen = j, "sSIDE1", 1
+		c.Logf = func(f string, a ...any) { lm.Lock(); logs = append(logs, fmt.Sprintf(f, a...)); lm.Unlock() }
+	})
+	if _, ok := r.srv.Relay(); ok {
+		t.Fatal("a relay credential before any load")
+	}
+	_, in := r.secrets(time.Hour)
+	if err := Load(r.ctl, withRelay(t, in, rt)); err != nil {
+		t.Fatal(err)
+	}
+	cred, ok := r.srv.Relay()
+	if !ok || cred.Token != rt || token.CnfOf(cred.Key.Public) != token.CnfOf(r.gk.Public) {
+		t.Fatalf("relay credential %+v ok=%v", cred, ok)
+	}
+	lm.Lock()
+	defer lm.Unlock()
+	all := strings.Join(logs, "\n")
+	for _, e := range j.evs {
+		all += "\n" + string(e.Data)
+	}
+	if strings.Contains(all, "RELAY-CREDENTIAL") {
+		t.Fatalf("the relay token leaked:\n%s", all)
+	}
+	if ld := j.of("fwd.loaded"); len(ld) != 1 || !strings.Contains(string(ld[0].Data), `"relay":true`) || !strings.Contains(string(ld[0].Data), `"relay_hash":"`) {
+		t.Fatalf("fwd.loaded %+v", ld)
+	}
+}
+
+// context "a load without a relay token is the fence-only case": it still works, and the sender sees none.
+func TestALoadWithoutARelayTokenStillWorks(t *testing.T) {
+	r := newRig(t, nil)
+	_, in := r.secrets(time.Hour)
+	if err := Load(r.ctl, in); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := r.srv.Relay(); ok {
+		t.Fatal("a relay credential appeared from nowhere")
+	}
+}
+
+// context "the launcher hands over something that is not a relay credential": refused before anything is
+// installed, so the one load is not burned and the launcher can retry with the right payload.
+func TestAMalformedRelayTokenIsRefusedAndDoesNotSpendTheLoad(t *testing.T) {
+	r := newRig(t, nil)
+	for name, rt := range map[string]string{
+		"no prefix":  "eyJhbGciOi.x.y",
+		"whitespace": "sbp1.abc def",
+		"newline":    "sbp1.abc\n",
+		"non-ascii":  "sbp1.abcé",
+		"too large":  "sbp1." + strings.Repeat("a", MaxRelayToken),
+	} {
+		_, in := r.secrets(time.Hour)
+		if err := Load(r.ctl, withRelay(t, in, rt)); err == nil || !strings.Contains(err.Error(), "relay_token") {
+			t.Errorf("%s: got %v", name, err)
+		}
+	}
+	if r.srv.Loaded() {
+		t.Fatal("a refused payload loaded the sidecar")
+	}
+	_, in := r.secrets(time.Hour)
+	if err := Load(r.ctl, withRelay(t, in, "sbp1.fine")); err != nil {
+		t.Fatalf("the retry with a good token: %v", err)
 	}
 }

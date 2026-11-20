@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"encoding/base32"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
 	"os"
@@ -267,7 +268,11 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 			return nil, refuse(BadSpec, "resume: workdir must be the same, the transcript is keyed by it")
 		}
 		// a commit (or a fence) holds the session: a new generation must not start now
-		if rel, err := d.TrySessionLock(old.Sid); err != nil {
+		// A missing lock file (helper mode) is "not held": nothing has ever run under ccsbx-root for
+		// this session, and the fence this start launches creates and takes the lock itself.
+		if rel, err := d.TrySessionLock(old.Sid); errors.Is(err, ErrNoLockFile) {
+			// not busy
+		} else if err != nil {
 			return nil, refuse(SessionBusy, "resume: %v", err)
 		} else {
 			rel()

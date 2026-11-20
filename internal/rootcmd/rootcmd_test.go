@@ -1323,8 +1323,24 @@ func TestRunLockFileIsRootsAndNotALink(t *testing.T) {
 	if !heldDuringRun {
 		t.Error("the session lock was not held while the fence ran")
 	}
-	if st, err := os.Stat(filepath.Join(f.run, "locks", sid+".lock")); err != nil || st.Mode().Perm() != 0o644 {
-		t.Errorf("%v %v", st, err)
+	if st, err := os.Stat(filepath.Join(f.run, "locks", sid+".lock")); err != nil || st.Mode().Perm() != 0o640 {
+		t.Errorf("the lock file is %v %v, want 0640", st, err)
+	}
+	// NEW-S1: another local user must not be able to open the lock (a read-only descriptor holds a
+	// flock) or list the sids: directory 0710, files 0640, both root:<service group>
+	h := newFx(t)
+	owners := map[string][2]int{}
+	h.d.Chown = func(p string, u, g int) error { owners[filepath.Base(p)] = [2]int{u, g}; return nil }
+	if c, out := h.call("run", sid); c != 7 {
+		t.Fatalf("%d %s", c, out)
+	}
+	if st, err := os.Stat(filepath.Join(h.run, "locks")); err != nil || st.Mode().Perm() != 0o710 {
+		t.Errorf("the lock directory is %v %v, want 0710 (not listable, not open to others)", st, err)
+	}
+	for _, name := range []string{"locks", sid + ".lock"} {
+		if owners[name] != [2]int{0, svcGID} {
+			t.Errorf("%s is owned by %v, want root:<service group> %d", name, owners[name], svcGID)
+		}
 	}
 	// a symlink planted at the lock file is refused, not followed
 	g := newFx(t)

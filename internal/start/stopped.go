@@ -36,8 +36,13 @@ func (p stoppedProof) Hold() (func(), error) {
 	if d.Runtime == nil {
 		return nil, fmt.Errorf("session %s: no way to ask whether its container is running (refusing)", p.sid)
 	}
-	// one question: the runtime answers for the generation and the one before it. In helper mode
-	// this also makes ccsbx-root create the session's lock file.
+	// One question: the runtime answers for the generation and the one before it. It is asked BEFORE
+	// the lock is taken, on purpose and not by oversight: in helper mode this is also what makes
+	// ccsbx-root create the session's lock file (the daemon may only open it), and root's status
+	// reads a lock that is already held as "running", so asking after taking it would always say so.
+	// The window between the answer and the lock cannot be used to start a fence: a fence takes the
+	// same lock, and a container left behind by a fence that has just exited is removed (deferred)
+	// before root lets go of its lock.
 	running, err := d.Runtime.Running(p.sid, r.Gen)
 	if err != nil {
 		return nil, fmt.Errorf("session %s: cannot tell whether it is running: %v", p.sid, err)

@@ -16,7 +16,8 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/tomlmini"
 )
 
-// Verbs is every verb there is. The config's `verbs` can only switch some of them off.
+// Verbs is every verb there is. The config's `verbs` lists the ones that are on (and `status = "off"`
+// turns that one off by itself); nothing outside this list can be switched on.
 var Verbs = []string{"run", "stop", "renew", "gc", "attach", "exec-token", "status"}
 
 // Config is the policy. TrustedUID is who must own the files root believes; it is 0 in production

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -183,5 +184,44 @@ func TestHelperModeLockFileIsOpenedReadOnlyAndNeverCreated(t *testing.T) {
 	os.Symlink("/etc/hostname", d.lockPath("s0abcdefgh"))
 	if _, err := d.TrySessionLock("s0abcdefgh"); err == nil {
 		t.Error("a symlinked lock file was followed")
+	}
+}
+
+// NEW-S2: in helper mode a session whose lock file root has not made yet (recorded before the lock
+// existed, or its first run was refused, or it never ran) is NOT busy: resume must work, and the
+// fence it launches creates and takes the lock itself. The proof, which reads the worktree, still
+// refuses without the file.
+func TestHelperModeResumeWorksWithoutALockFile(t *testing.T) {
+	d, fl := newDaemon(t)
+	d.Root, d.RunDir, d.Runtime = "helper", t.TempDir(), &fakeRuntime{}
+	d.Image = "ghcr.io/landovsky/ccsbx-fence@sha256:" + strings.Repeat("a", 64)
+	os.WriteFile(d.PinsFile, []byte("[[pin]]\nref = \""+d.Image+"\"\ncc = \"2.1\"\n"), 0o644)
+	rep, err := d.Start(spec(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fl.mu.Lock()
+	fl.alive[rep.Sid] = false
+	fl.mu.Unlock()
+	if _, err := os.Stat(d.lockPath(rep.Sid)); err == nil {
+		t.Fatal("the test needs a session with no lock file")
+	}
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.RequestID = "rid-2"; s.Resume = &Resume{Sid: rep.Sid} })); err != nil {
+		t.Errorf("a resume was refused because root's lock file is missing: %v", err)
+	}
+	fl.mu.Lock()
+	fl.alive[rep.Sid] = false // the resumed generation's pane is gone again
+	fl.mu.Unlock()
+	if _, err := d.StoppedProof(rep.Sid).Hold(); err == nil || !strings.Contains(err.Error(), "no lock file") {
+		t.Errorf("the proof was given without a lock file: %v", err)
+	}
+	// but a lock file that IS held still refuses the resume
+	os.MkdirAll(filepath.Dir(d.lockPath(rep.Sid)), 0o755)
+	f, _ := os.OpenFile(d.lockPath(rep.Sid), os.O_RDWR|os.O_CREATE, 0o640)
+	defer f.Close()
+	syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	_, err = d.Start(spec(func(s *LaunchSpec) { s.RequestID = "rid-3"; s.Resume = &Resume{Sid: rep.Sid} }))
+	if r, ok := err.(*Refusal); !ok || r.Code != SessionBusy {
+		t.Errorf("a held lock did not refuse the resume: %v", err)
 	}
 }

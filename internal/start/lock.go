@@ -22,6 +22,10 @@ import (
 // ErrBusy: the session's lock is held (a generation is running, or a commit is in progress).
 var ErrBusy = errors.New("session is busy: a generation is running or a commit is in progress")
 
+// ErrNoLockFile: helper mode, and root has not made the session's lock file yet (no generation has
+// been started for it by ccsbx-root, and ccsbx-root status has not been asked).
+var ErrNoLockFile = errors.New("no lock file yet (ccsbx-root creates it)")
+
 func (d *Daemon) lockPath(sid string) string {
 	return filepath.Join(d.runRoot(), "locks", sid+".lock")
 }
@@ -38,7 +42,7 @@ func (d *Daemon) TrySessionLock(sid string) (func(), error) {
 		// root's file in root's directory: never create or follow anything here
 		f, err = os.OpenFile(p, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 		if os.IsNotExist(err) {
-			return nil, fmt.Errorf("no lock file %s yet (ccsbx-root creates it)", p)
+			return nil, fmt.Errorf("%w: %s", ErrNoLockFile, p)
 		}
 	} else {
 		if err = os.MkdirAll(filepath.Dir(p), 0o700); err == nil {

@@ -1,3 +1,7 @@
+// Tests from the U5 review. They guard against a key signing for a machine it does not own, one
+// machine moving another's generation counter, a proof reused on another door or body, and a door that
+// holds a seed or keeps serving when it cannot persist a revocation.
+
 package token
 
 import (

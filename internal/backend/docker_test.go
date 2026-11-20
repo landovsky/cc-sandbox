@@ -1,3 +1,6 @@
+// Tests for the docker backend. They guard against the fence's run arguments (mounts, network,
+// env, one outbox per generation, per-node home, worktree bounds) drifting from what the plan says.
+
 package backend
 
 import (

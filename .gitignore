@@ -1,3 +1,4 @@
+# .gitignore keeps spike output, bytecode and the built binary out of git, so a commit holds source only.
 spike/.state/
 spike/results/*.log
 __pycache__/

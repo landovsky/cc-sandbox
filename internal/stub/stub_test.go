@@ -1,3 +1,6 @@
+// Tests for the scripted stub through the real path (fence client, forwarder, gated stub). They guard
+// against the stub serving a real profile, a prompt shaping a tool call, and a listener beyond loopback (C18).
+
 package stub
 
 import (

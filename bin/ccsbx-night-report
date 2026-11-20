@@ -5,7 +5,8 @@ Rows are the night's pieces (the children of every "N1-<letter>" stream node in 
 streams that have no children), with: state, test, why.  Below the table: the window and the
 spend (7-day subscription window used, and the change since the night's baseline).  Read-only:
 it reads <CC_TREE_REPO>/<tree>/tree.md and runs `cc-tree limits`; nothing is written except
-the baseline with --snapshot.
+the baseline with --snapshot.  It exists so the morning starts with one table of what the night
+built and what it cost, instead of a hunt through the tree.
 
 Recipes:
   ccsbx-night-report --dry-run             print the table (also what you get with no flag)

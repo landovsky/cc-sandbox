@@ -1,3 +1,6 @@
+// Tests for start, resume and spec parsing. They guard against a caller-supplied started_by, a resume that
+// changes the sid or skips the generation bump, and a failed launch leaving a live record.
+
 package start
 
 import (

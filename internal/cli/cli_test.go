@@ -1,3 +1,6 @@
+// Tests for the flag, env and help layer. They guard against a --help that starts the command, and
+// against help text that lacks the flags and env variables a next agent needs to run it.
+
 package cli
 
 import (

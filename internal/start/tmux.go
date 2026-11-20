@@ -1,3 +1,6 @@
+// tmux.go is the launcher that puts a session in its own tmux window. It exists so a started session
+// is visible and attachable, with the tmux server hardened in the same invocation (U2).
+
 package start
 
 import (

@@ -1,3 +1,6 @@
+// Tests for the forwarder. They guard against the fence injecting or seeing a credential, reaching a
+// non-door or a decision path, a redirect leaking a location, and the proof not binding the body (P2).
+
 package fwd
 
 import (

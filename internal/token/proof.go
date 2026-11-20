@@ -1,3 +1,6 @@
+// proof.go is proof of possession and the door-side Verifier. It exists so a token copied out of a
+// fence is useless without the generation key, and so revoked or superseded generations stay dead.
+
 package token
 
 import (

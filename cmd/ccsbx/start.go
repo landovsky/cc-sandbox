@@ -1,3 +1,6 @@
+// start.go is `ccsbx start`: it asks the (direct-mode) daemon to mint a session and records it.
+// It exists so the sid, generation and refusals are decided in one place, not by each caller.
+
 package main
 
 import (

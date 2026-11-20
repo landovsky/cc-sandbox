@@ -1,3 +1,6 @@
+// Tests for the settings compiler. They guard against a worktree file overriding managed settings,
+// a deny rule lost under bypass mode, a first-run prompt in a fresh fence, and a real token in settings.
+
 package settings
 
 import (

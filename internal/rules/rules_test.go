@@ -1,3 +1,6 @@
+// Tests for the rule catalogue. They guard against a rule with only one twin, a catalogue row that
+// does not parse, and a meta-test that stops being able to go red (invariant 23).
+
 package rules
 
 import (

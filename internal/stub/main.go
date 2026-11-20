@@ -1,3 +1,6 @@
+// main.go is `ccsbx stub`: flags and the loopback-only listener. It exists so the scripted model can
+// run as a door behind the forwarder in local mode and nowhere else.
+
 package stub
 
 import (

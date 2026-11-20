@@ -1,3 +1,6 @@
+// run.go runs a Spec through docker and returns the container's exit code. It exists so the
+// backend has one place that shells out, which the tests can replace with a fake docker.
+
 package backend
 
 import (

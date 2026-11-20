@@ -1,3 +1,6 @@
+// main.go is `ccsbx fwd`: flag parsing, reading the secrets from stdin and serving. It exists so the
+// token and key arrive on stdin only, never in a flag or the environment where the fence could read them.
+
 package fwd
 
 import (

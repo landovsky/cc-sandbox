@@ -1,3 +1,6 @@
+// start.go is the direct-mode start daemon: it mints sid and gen, checks the spec against the profile
+// and pins, and keeps the session records. It exists so every start or refusal is decided in one place (U2).
+
 package start
 
 import (

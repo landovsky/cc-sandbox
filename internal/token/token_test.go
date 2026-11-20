@@ -1,3 +1,6 @@
+// Tests for the session token. They guard against a copied, forged, expired, unknown-key or
+// old-generation token being accepted, and against alg=none or cross-domain signatures (U5).
+
 package token
 
 import (

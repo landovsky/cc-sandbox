@@ -4,6 +4,7 @@
 Runs the legs of one machine set, keeps the result of the night as JSON, and prints (or sends) ONE
 table of at most 70 columns: a row per leg, and under it the name of every red test, so a forced
 red twin is in the morning message by name.  Results of a direct-mode run are "not evidence".
+It exists so a block that stops blocking is found the next morning, not when it is needed.
 
 Recipes:
   ccsbx-nightly-selftest --dry-run                 list the legs and their commands, run nothing

@@ -1,3 +1,6 @@
+// pin.go wires `ccsbx pin-check` and `ccsbx pin-promote` to internal/pins. It exists so the harness
+// and image pins (invariant 26) can be checked and promoted from the CLI, never by hand edit.
+
 package main
 
 import (

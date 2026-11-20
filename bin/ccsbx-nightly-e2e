@@ -6,6 +6,7 @@ Runs `make e2e` (e2e/run: ONE TAP stream, includes e2e/00-standalone and, when i
 70 columns: a row per e2e script, every failing line by name, the skip count, and the streak of
 green nights.  The plan's bar is three green nights in a row; a night with skips is green but
 is labelled so, because a skip is a piece that is not built yet, not a pass.
+It exists so the e2e bar is judged by a run nobody has to remember to start.
 
 Recipes:
   ccsbx-nightly-e2e --dry-run               show the command and the files, run nothing

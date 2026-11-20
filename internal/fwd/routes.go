@@ -1,3 +1,6 @@
+// routes.go is the forwarder's per-door method and path allowlist. It exists so the fence can reach
+// only what a door is meant to serve, with decision and admin paths never routable (default deny).
+
 package fwd
 
 import (

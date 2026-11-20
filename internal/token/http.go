@@ -1,3 +1,6 @@
+// http.go is the middleware a door wraps its handler in. It exists so token and proof checks happen
+// before any door code runs, and so the credential headers never reach that code.
+
 package token
 
 import (

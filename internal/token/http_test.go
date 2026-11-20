@@ -1,3 +1,6 @@
+// Test for the door middleware. It guards against a request reaching the handler without a valid
+// token and proof, or the handler receiving the credential headers.
+
 package token
 
 import (

@@ -1,3 +1,6 @@
+// settings.go is `ccsbx settings`: it compiles a profile into managed-settings.json and managed-mcp.json (U17).
+// It exists so a reviewer can see exactly what a fenced session is configured with, without starting one.
+
 package main
 
 import (

@@ -1,3 +1,6 @@
+// cmd.go is `ccsbx token`: mint, verify, kid and pubkey on top of the package. It exists so tests and
+// the forwarder's launcher can make tokens without writing code, and so doors get a public keyring only.
+
 package token
 
 import (

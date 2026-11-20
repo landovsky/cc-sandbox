@@ -3,25 +3,16 @@
 package main
 
 import (
-	"fmt"
 	"io"
 	"os"
 
 	"github.com/landovsky/cc-sandbox/internal/cli"
+	"github.com/landovsky/cc-sandbox/internal/fwd"
+	"github.com/landovsky/cc-sandbox/internal/stub"
+	"github.com/landovsky/cc-sandbox/internal/token"
 )
 
 var version = "dev"
-
-// exitNotBuilt is returned by commands whose piece has not landed yet, so a caller can tell
-// "not built" from "failed" (1) and "refused" (2).
-const exitNotBuilt = 70
-
-func notBuilt(piece string) func(*cli.Flags, []string, io.Writer, io.Writer) int {
-	return func(_ *cli.Flags, _ []string, _, stderr io.Writer) int {
-		fmt.Fprintf(stderr, "ccsbx: not built yet (piece %s)\n", piece)
-		return exitNotBuilt
-	}
-}
 
 func app() *cli.App {
 	return &cli.App{
@@ -37,11 +28,21 @@ func app() *cli.App {
 			selftestCmd(),
 			settingsCmd(),
 			{
-				Name:    "steering-check",
-				Summary: "flag changes to steering files in a diff (H1)",
-				Setup:   func(f *cli.Flags) { f.String("base", "main", "base ref to diff against") },
-				Run:     notBuilt("H1"),
+				Name: "fwd", Raw: true,
+				Summary: "the per-session forwarder: holds the token, signs door calls (P2)",
+				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return fwd.Main(a, os.Stdin, o, e) },
 			},
+			{
+				Name: "stub", Raw: true,
+				Summary: "scripted model stub, local mode, e2e-* profiles only (C18)",
+				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return stub.Main(a, o, e) },
+			},
+			{
+				Name: "token", Raw: true,
+				Summary: "mint and verify session tokens, dev key file (U5)",
+				Run:     func(_ *cli.Flags, a []string, o, e io.Writer) int { return token.Main(a, o, e) },
+			},
+			steeringCheckCmd(),
 		},
 	}
 }

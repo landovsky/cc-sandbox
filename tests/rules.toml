@@ -92,11 +92,21 @@ where = "hp"
 id = "no-token-in-fence"
 title = "no door token or key exists anywhere in the fence"
 suite = "fence"
-allow = "pending"
-block = "pending"
+allow = "tests/fence-test.sh no-token-in-fence allow"
+block = "tests/fence-test.sh no-token-in-fence block"
 invariants = [2, 26]
 backends = ["docker", "k8s"]
 where = "hp"
+
+[[rule]]
+id = "fence-cleanup-guard"
+title = "the fence tests' cleanup refuses empty or foreign values before any docker call"
+suite = "fence"
+allow = "tests/fence-cleanup-test.sh allow"
+block = "tests/fence-cleanup-test.sh block"
+invariants = [23]
+backends = ["unit"]
+where = "any"
 
 [[rule]]
 id = "fence-sees-only-fwd"
@@ -272,8 +282,8 @@ where = "hp"
 id = "token-copied"
 title = "a token copied out of its fence is refused (PoP)"
 suite = "keys"
-allow = "pending"
-block = "pending"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestTokenCopied$|TestMiddlewareEndToEnd$'"
 invariants = [8]
 backends = ["unit"]
 where = "any"
@@ -282,8 +292,8 @@ where = "any"
 id = "token-after-exit"
 title = "a token is refused after its session exits"
 suite = "keys"
-allow = "pending"
-block = "pending"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestTokenAfterExit$|TestRevokeEndpoint$'"
 invariants = [8]
 backends = ["unit"]
 where = "any"
@@ -292,8 +302,8 @@ where = "any"
 id = "token-gen-bump"
 title = "a token of an old generation is refused"
 suite = "keys"
-allow = "pending"
-block = "pending"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestTokenGenBump$'"
 invariants = [8, 11]
 backends = ["unit"]
 where = "any"
@@ -302,8 +312,8 @@ where = "any"
 id = "token-unknown-kid"
 title = "a token signed by an unknown key id is refused"
 suite = "keys"
-allow = "pending"
-block = "pending"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestTokenUnknownKID$'"
 invariants = [8]
 backends = ["unit"]
 where = "any"
@@ -312,9 +322,9 @@ where = "any"
 id = "key-signs-foreign-machine"
 title = "a machine key cannot sign for another machine"
 suite = "keys"
-allow = "pending"
-block = "pending"
-invariants = [8]
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestKeySignsForeignMachine$|TestGenerationStateIsPerMachine$'"
+invariants = [12, 27]
 backends = ["unit"]
 where = "any"
 
@@ -322,69 +332,129 @@ where = "any"
 id = "mac-key-above-mac-max"
 title = "a Mac key cannot sign above the mac-max tier"
 suite = "keys"
-allow = "pending"
-block = "pending"
-invariants = [8]
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestKeyScopedByProfileAndBilling$'"
+invariants = [12, 27]
 backends = ["unit"]
-where = "mac"
+where = "any"
 
 [[rule]]
 id = "git-hooks-off"
 title = "host git runs with hooks disabled"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestHooksOffAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestHooksOffBlock"
+invariants = [24, 25]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-dotgit-redirect"
 title = "a .git redirect in the worktree is not followed"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestDotgitRedirectAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestDotgitRedirectBlock"
+invariants = [24, 25]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-gitattributes-filter"
 title = "a gitattributes filter does not run on the host"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestGitattributesFilterAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestGitattributesFilterBlock"
+invariants = [24, 25]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-submodule-ignored"
 title = "a submodule in the worktree is ignored by host git"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestSubmoduleIgnoredAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestSubmoduleIgnoredBlock"
+invariants = [24, 25]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "git-steering-flag"
-title = "a steering flag (-c, --exec-path) from the fence is refused"
+title = "a commit that touches steering files (also via symlinks, ignored or uncommitted files) names them in a trailer the agent cannot forge"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
-backends = ["docker"]
+allow = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagBlock && tests/twin-go.sh ./internal/gitroute TestGlobalOptionsAreNotVerbs"
+invariants = [24, 25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-nested-repo"
+title = "host git never runs inside an agent-made nested repo, and never records one"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestNestedRepoAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestNestedRepoStatusBlock && tests/twin-go.sh ./internal/gitroute TestEmbeddedRepoIsNotRecorded"
+invariants = [24, 25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-version-and-probe"
+title = "git older than 2.41, or one that ignores GIT_ATTR_SOURCE, is refused with the remedy"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestVersionGate"
+block = "tests/twin-go.sh ./internal/gitroute TestOldGitIsRefused"
+invariants = [24]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-commit-scan"
+title = "a commit is refused for symlinks out of the worktree, special files and oversized trees among what git would add; Commit needs a stopped-fence proof and nothing worktree-derived goes to the fence; the live-fence race blocks F3/C22"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestScanSkipsIgnoredTrees"
+block = "tests/twin-go.sh ./internal/gitroute TestCommitScanRefusals && tests/twin-go.sh ./internal/gitroute TestCommitNeedsAStoppedFence && tests/twin-go.sh ./internal/gitroute TestNoWorktreeContentGoesToTheFence"
+invariants = [24]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-steering-links-ignored"
+title = "steering symlinks, edits behind them, and ignored or uncommitted steering files are reported"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestIsSteeringSegments"
+block = "tests/twin-go.sh ./internal/gitroute TestSteeringSymlinks && tests/twin-go.sh ./internal/gitroute TestSteeringSymlinkChains && tests/twin-go.sh ./internal/gitroute TestSteeringIgnoredAndUntracked"
+invariants = [25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-trailer-injection"
+title = "file names and messages cannot forge trailers or write to the terminal"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestSteeringFlagAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestTrailerAndTerminalInjection"
+invariants = [25]
+backends = ["unit"]
+where = "hp"
+
+[[rule]]
+id = "git-config-gpg-timeout"
+title = "gpg placeholders, config includes and hung git processes are stopped"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestHooksOffAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestConfigIncludesRefused && tests/twin-go.sh ./internal/gitroute TestGpgPlaceholders && tests/twin-go.sh ./internal/gitroute TestGitTimeout && tests/twin-go.sh ./internal/gitroute TestDiffDriverLayers"
+invariants = [24]
+backends = ["unit"]
 where = "hp"
 
 [[rule]]
 id = "fence-cannot-commit"
 title = "the fence cannot commit; commits go through the outbox"
 suite = "git"
-allow = "pending"
-block = "pending"
-invariants = [12]
+allow = "tests/fence-test.sh fence-cannot-commit allow"
+block = "tests/fence-test.sh fence-cannot-commit block"
+invariants = [24, 25]
 backends = ["docker"]
 where = "hp"
 
@@ -602,21 +672,21 @@ where = "hp"
 id = "fwd-only-doors"
 title = "the forwarder relays only to doors"
 suite = "doors"
-allow = "pending"
-block = "pending"
+allow = "tests/go-test.sh ./internal/fwd 'TestForwardsWithTokenAndProof$'"
+block = "tests/go-test.sh ./internal/fwd 'TestAllowlistIsDefaultDeny$'"
 invariants = [4]
-backends = ["docker", "k8s"]
-where = "hp"
+backends = ["unit"] # go test only; no fence crossed yet (P2 backend wiring not built)
+where = "any"
 
 [[rule]]
 id = "fwd-cannot-reach-non-door"
 title = "the forwarder cannot reach a non-door address"
 suite = "doors"
-allow = "pending"
-block = "pending"
+allow = "tests/go-test.sh ./internal/fwd 'TestForwardsWithTokenAndProof$'"
+block = "tests/go-test.sh ./internal/fwd 'TestCannotReachNonDoor$'"
 invariants = [4]
-backends = ["docker", "k8s"]
-where = "hp"
+backends = ["unit"] # go test only; no fence crossed yet (P2 backend wiring not built)
+where = "any"
 
 [[rule]]
 id = "msg-in-scope"
@@ -752,11 +822,11 @@ where = "hp"
 id = "approve-via-fwd"
 title = "an approval sent through the forwarder is refused (403)"
 suite = "approvals"
-allow = "pending"
-block = "pending"
+allow = "tests/go-test.sh ./internal/fwd 'TestForwardsWithTokenAndProof$'"
+block = "tests/go-test.sh ./internal/fwd 'TestApproveViaFwd$'"
 invariants = [14]
-backends = ["docker", "k8s"]
-where = "hp"
+backends = ["unit"] # go test only; no fence crossed yet (P2 backend wiring not built)
+where = "any"
 
 [[rule]]
 id = "approve-decide-twice"
@@ -975,5 +1045,68 @@ suite = "fence"
 allow = "tests/twin-go.sh ./internal/backend TestOneOutboxPerGeneration"
 block = "tests/twin-go.sh ./internal/backend TestWorldWritableLeavesAreDirectModeOnly"
 invariants = [11, 14]
+backends = ["unit"]
+where = "any"
+
+# Added by the night-1 review of PR #1 (U5-S1, U5-S2, U5-S3, P2-S1): each has a block twin that
+# was red with its guard removed and green with it in place.
+
+[[rule]]
+id = "proof-bound-to-request"
+title = "a proof is bound to its door, token and body: replayed elsewhere or with another body it is refused"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestProofBoundToDoorTokenAndBody$'"
+invariants = [8]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "gitdir-host-owned"
+title = "a gitdir is mounted into a fence only if the host owns it (and its config, info, hooks, commondir) and no other group or the world can write it"
+suite = "fence"
+allow = "tests/twin-go.sh ./internal/backend TestGitDirFromRecordAllow"
+block = "tests/twin-go.sh ./internal/backend TestGitDirMustBeHostOwned"
+invariants = [2, 4, 25]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "door-holds-public-keys-only"
+title = "a door loads a scoped public keyring, never a signing seed"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestDoorsLoadPublicKeysOnly$'"
+invariants = [12]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "revocation-fails-closed"
+title = "a door that cannot persist a revocation refuses requests, and the revocation survives a restart"
+suite = "keys"
+allow = "tests/go-test.sh ./internal/token 'TestTokenAccepted$'"
+block = "tests/go-test.sh ./internal/token 'TestRevocationFailsClosed$'"
+invariants = [8, 17]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "fwd-door-addresses-pinned"
+title = "the forwarder resolves each door once and dials only those addresses"
+suite = "doors"
+allow = "tests/go-test.sh ./internal/fwd 'TestForwardsWithTokenAndProof$'"
+block = "tests/go-test.sh ./internal/fwd 'TestDoorAddressesArePinned$'"
+invariants = [4]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "git-args-allowlist"
+title = "host git runs only allowlisted read flags by exact name (no -F, --pathspec-from-file, branch -f, symbolic-ref, cat-file --filters, abbreviations); the gitdir must be host-owned with no info/attributes; renames can't hide a steering file"
+suite = "git"
+allow = "tests/twin-go.sh ./internal/gitroute TestArgsAllowlistAllow"
+block = "tests/twin-go.sh ./internal/gitroute TestArgsAllowlistBlock"
+invariants = [24, 25]
 backends = ["unit"]
 where = "any"

@@ -1,3 +1,6 @@
+// start.go is the direct-mode start daemon: it mints sid and gen, checks the spec against the profile
+// and pins, and keeps the session records. It exists so every start or refusal is decided in one place (U2).
+
 package start
 
 import (
@@ -191,7 +194,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 			return nil, err
 		}
 		// First start only: the worktree has not been written by an agent of this session yet.
-		gd, err := backend.ResolveGitDir(rw)
+		gd, err := backend.ResolveGitDir(rw, d.Uid)
 		if err != nil {
 			return nil, refuse(BadSpec, "workdir git metadata: %v", err)
 		}

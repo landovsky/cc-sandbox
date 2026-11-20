@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """ccsbx-harness-bump: the weekly harness-bump job (plan §3 O6).
 
+Why it exists: the harness version is pinned and never auto-updates (invariant 26), so a Claude Code
+release that weakens a block must never reach the pins unless the allow/block suite proves it safe.
+
+
 Finds a newer Claude Code version, builds a candidate fence image for it (H2's candidate channel),
 runs the allow/block suite against that candidate, and opens a PR that moves the pin ONLY if the
 suite is green.  A red or broken run opens no PR and sends a Telegram that names the failing

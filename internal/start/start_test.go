@@ -1,3 +1,6 @@
+// Tests for start, resume and spec parsing. They guard against a caller-supplied started_by, a resume that
+// changes the sid or skips the generation bump, and a failed launch leaving a live record.
+
 package start
 
 import (
@@ -427,5 +430,25 @@ func TestWorkdirOutsideRootIsRefused(t *testing.T) {
 		if _, err := d.Start(spec(func(s *LaunchSpec) { s.Workdir.Path = p })); code(err) != BadSpec {
 			t.Errorf("%s: %v", p, err)
 		}
+	}
+}
+
+// H1-N3: the steering check must not fall back to a gitdir inside a worktree that a session record
+// names (the agent may have written it).
+func TestSessionForWorkdir(t *testing.T) {
+	d, _ := newDaemon(t)
+	rep, err := d.Start(spec(nil))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wt := filepath.Join(d.WorktreeRoot, "wt")
+	if sid, ok := SessionForWorkdir(d.StateDir, wt); !ok || sid != rep.Sid {
+		t.Fatalf("worktree of a session not recognised: %q %v", sid, ok)
+	}
+	if _, ok := SessionForWorkdir(d.StateDir, d.WorktreeRoot); ok {
+		t.Fatal("a directory that is not a session's worktree was matched")
+	}
+	if _, ok := SessionForWorkdir(t.TempDir(), wt); ok {
+		t.Fatal("matched in an empty state dir")
 	}
 }

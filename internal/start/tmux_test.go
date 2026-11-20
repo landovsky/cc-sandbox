@@ -1,3 +1,6 @@
+// Test for the tmux launcher. It guards against the hardening (empty config, no prefix, no status line)
+// being applied in a second call, which would leave a window in which the server runs with defaults.
+
 package start
 
 import (

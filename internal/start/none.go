@@ -1,3 +1,6 @@
+// none.go is the launcher that records a session and starts nothing. It exists so tests and
+// debugging can drive `ccsbx run` by hand without a tmux pane.
+
 package start
 
 // NoLauncher records the session and starts nothing. Tests and debugging use it, then run

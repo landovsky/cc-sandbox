@@ -1,3 +1,6 @@
+// Tests for the pin gate. They guard against an unpinned harness or image starting a session, and
+// against a promotion without a green result on every required host (invariant 26).
+
 package pins
 
 import (

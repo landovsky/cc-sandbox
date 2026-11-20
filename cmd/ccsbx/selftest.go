@@ -1,3 +1,6 @@
+// selftest.go is `ccsbx selftest`: it runs the allow/block table in tests/rules.toml on a backend and
+// reports it. It exists because a security rule counts only while both its twins run (invariant 23, U19a).
+
 package main
 
 import (

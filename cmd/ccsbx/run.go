@@ -1,3 +1,6 @@
+// run.go is `ccsbx run`: it runs one fence generation on the docker backend, in the foreground. It
+// exists so recording a session (start) and running its container stay separate steps (U1b).
+
 package main
 
 import (
@@ -84,7 +87,7 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 	tty := isTerminal(os.Stdin.Fd())
 	spec := backend.Spec{
 		Sid: rec.Sid, Label: rec.Label, Gen: rec.Gen, Image: get("image"), StateDir: d.StateDir,
-		Workdir: rec.Spec.Workdir.Path, GitDir: rec.GitDir, WorktreeRoot: d.WorktreeRoot,
+		Workdir: rec.Spec.Workdir.Path, GitDir: rec.GitDir, Uid: rec.Uid, WorktreeRoot: d.WorktreeRoot,
 		MemoryMB: p.MemoryMB, Pids: p.Pids, Cmd: cmd, TTY: tty, NotEvid: d.Root != "helper",
 	}
 	if spec.NotEvid {

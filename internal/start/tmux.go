@@ -18,6 +18,10 @@ type TmuxLauncher struct {
 	Socket  string   // tmux -L name, "ccsbx"
 	Env     []string // extra args after `run`, e.g. --state, --profiles, so run finds the same state
 	Command func(name string, args ...string) *exec.Cmd
+	// NoSpawn: connect to a tmux server that is already running and never start one. hostd sets it:
+	// the server is ccsbx-tmux.service's, in the host mount namespace, and a server spawned by a
+	// `new-session` from inside hostd's sandbox could not run ccsbx-root properly.
+	NoSpawn bool
 }
 
 // base is the fixed start of every tmux call: this server's socket and an empty config file, so
@@ -37,6 +41,13 @@ func (t *TmuxLauncher) cmd(args ...string) *exec.Cmd {
 // agent controls the pane's output). One invocation, because a pane that exits at once takes
 // the server with it, and a second call would find no server.
 func (t *TmuxLauncher) Launch(r *Record) error {
+	if t.NoSpawn {
+		// `new-session` starts a server when there is none, so prove one is up first.
+		out, err := tmuxsock.Run(t.cmd("list-sessions"))
+		if !tmuxsock.Up(out, err) {
+			return fmt.Errorf("%s (socket %s)", tmuxsock.ErrNoServer, t.Socket)
+		}
+	}
 	args := []string{"new-session", "-d", "-s", r.Sid, "-c", r.Spec.Workdir.Path, t.Exe, "run", "--sid", r.Sid, "--gen", strconv.Itoa(r.Gen)}
 	args = append(args, t.Env...)
 	args = append(args, ";", "set-option", "-g", "set-clipboard", "off", ";", "set-option", "-g", "allow-passthrough", "off",

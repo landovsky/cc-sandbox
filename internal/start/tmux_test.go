@@ -78,3 +78,56 @@ func TestLauncherTmuxCallsTimeOut(t *testing.T) {
 		t.Fatalf("alive or slow: %s", time.Since(t0))
 	}
 }
+
+// context: the tmux server is ccsbx-tmux.service's, in the host mount namespace. A `new-session` from
+// hostd would start a server of its own inside hostd's sandbox (where panes can't run ccsbx-root
+// properly), so with NoSpawn a missing server is an error with a clear message, and nothing is started.
+func TestNoSpawnLauncherNeverStartsAServer(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("no tmux")
+	}
+	dir, _ := os.MkdirTemp("/tmp", "nsp")
+	defer os.RemoveAll(dir)
+	sock, marker := filepath.Join(dir, "t.sock"), filepath.Join(dir, "ran")
+	exe := filepath.Join(dir, "pane.sh")
+	os.WriteFile(exe, []byte("#!/bin/sh\ntouch "+marker+"\nsleep 5\n"), 0o755)
+	tl := &TmuxLauncher{Exe: exe, Socket: sock, NoSpawn: true}
+	rec := &Record{Sid: "sabc123", Gen: 1}
+	rec.Spec.Workdir.Path = dir
+	err := tl.Launch(rec)
+	if err == nil || !strings.Contains(err.Error(), "start ccsbx-tmux.service") {
+		t.Fatalf("no server must be a clear error: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, e := os.Stat(sock); e == nil {
+		t.Fatal("a tmux server was started (its socket exists)")
+	}
+	if _, e := os.Stat(marker); e == nil {
+		t.Fatal("the pane command ran")
+	}
+}
+
+// context: the allow side: with a server already up (the unit's), NoSpawn launches into it.
+func TestNoSpawnLauncherUsesARunningServer(t *testing.T) {
+	if _, err := exec.LookPath("tmux"); err != nil {
+		t.Skip("no tmux")
+	}
+	dir, _ := os.MkdirTemp("/tmp", "nsp")
+	defer os.RemoveAll(dir)
+	sock := filepath.Join(dir, "t.sock")
+	defer exec.Command("tmux", "-S", sock, "kill-server").Run()
+	if out, err := exec.Command("tmux", "-S", sock, "-f", "/dev/null", "new-session", "-d", "-s", "unit", "sleep", "30").CombinedOutput(); err != nil {
+		t.Fatalf("%v %s", err, out)
+	}
+	exe := filepath.Join(dir, "pane.sh")
+	os.WriteFile(exe, []byte("#!/bin/sh\nsleep 30\n"), 0o755)
+	tl := &TmuxLauncher{Exe: exe, Socket: sock, NoSpawn: true}
+	rec := &Record{Sid: "sabc123", Gen: 1}
+	rec.Spec.Workdir.Path = dir
+	if err := tl.Launch(rec); err != nil {
+		t.Fatal(err)
+	}
+	if !tl.Alive("sabc123") {
+		t.Fatal("the session is not on the running server")
+	}
+}

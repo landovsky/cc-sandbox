@@ -57,6 +57,9 @@ func (t *Tmux) Alive(sid string) bool {
 func (t *Tmux) Deliver(sid, line string) error {
 	buf := "ccsbx-msg-" + sid
 	if out, err := t.runIn(line, "load-buffer", "-b", buf, "-"); err != nil {
+		if tmuxsock.NoServer(out) {
+			return fmt.Errorf("%s", tmuxsock.ErrNoServer)
+		}
 		return fmt.Errorf("load-buffer: %v: %s", err, out)
 	}
 	if out, err := t.run("paste-buffer", "-d", "-p", "-b", buf, "-t", "="+sid+":"); err != nil {

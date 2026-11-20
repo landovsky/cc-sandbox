@@ -37,6 +37,8 @@ type gitRig struct {
 	doorHits int
 	key      *token.Key
 	doorURL  string
+	gate     string
+	doorSaw  []http.Header
 }
 
 func sh(t *testing.T, dir string, env []string, args ...string) string {
@@ -70,6 +72,8 @@ func newGitRig(t *testing.T, mut func(*GitConfig)) *gitRig {
 	sh(t, root, nil, "init", "-q", "-b", "main", scratch)
 	os.WriteFile(filepath.Join(scratch, "a.txt"), []byte("base\n"), 0o644)
 	os.WriteFile(filepath.Join(scratch, "run.sh"), []byte("#!/bin/sh\n"), 0o755)
+	os.MkdirAll(filepath.Join(scratch, "sub"), 0o755)
+	os.WriteFile(filepath.Join(scratch, "sub", "x.txt"), []byte("x\n"), 0o644)
 	sh(t, scratch, nil, "add", "-A")
 	sh(t, scratch, nil, "commit", "-q", "-m", "base")
 	sh(t, scratch, nil, "push", "-q", r.bare, "main")
@@ -88,12 +92,17 @@ func newGitRig(t *testing.T, mut func(*GitConfig)) *gitRig {
 	backend := &cgi.Handler{Path: "/usr/lib/git-core/git-http-backend", Env: []string{"GIT_PROJECT_ROOT=" + filepath.Join(root, "doors"),
 		"GIT_HTTP_EXPORT_ALL=1", "REMOTE_USER=door", "PATH=/usr/bin:/bin", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"}}
 	ring := key.Ring([]string{"tomas"}, []string{"hp-ubuntu"})
-	counted := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) { r.doorHits++; backend.ServeHTTP(w, q) })
+	counted := http.HandlerFunc(func(w http.ResponseWriter, q *http.Request) {
+		r.doorHits++
+		r.doorSaw = append(r.doorSaw, q.Header.Clone())
+		backend.ServeHTTP(w, q)
+	})
 	door := httptest.NewServer(token.NewVerifier(ring, "ccsbx-egress").Middleware(counted, nil))
 	t.Cleanup(door.Close)
 	du, _ := url.Parse(door.URL)
 	r.key, r.doorURL = key, door.URL
-	f, err := fwd.New(fwd.Config{Token: tok, Key: gen, Doors: map[string]*url.URL{"egress": du}, MaxBody: 8 << 20})
+	r.gate = "gate-" + filepath.Base(root)
+	f, err := fwd.New(fwd.Config{Token: tok, Key: gen, Doors: map[string]*url.URL{"egress": du}, MaxBody: 8 << 20, GitSecret: r.gate})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +114,7 @@ func newGitRig(t *testing.T, mut func(*GitConfig)) *gitRig {
 	os.MkdirAll(r.work, 0o755)
 	os.MkdirAll(filepath.Dir(r.snap), 0o700)
 	cfg := GitConfig{Repo: "o/r", Base: "main", Branch: "ccsbx/s1", URL: fs.URL + "/egress/git", GitDir: filepath.Join(root, "side", "git"),
-		Work: r.work, Snapshot: r.snap, Sid: "s0worker", Gen: 1, Journal: r.j, Timeout: 30 * time.Second}
+		Work: r.work, Snapshot: r.snap, Sid: "s0worker", Gen: 1, Journal: r.j, Timeout: 30 * time.Second, Gate: func() string { return r.gate }}
 	if mut != nil {
 		mut(&cfg)
 	}
@@ -271,20 +280,15 @@ func TestCloneRefusesAWorktreeTheFenceHasWritten(t *testing.T) {
 }
 
 // context "a hostile worktree at commit time": a FIFO would hang a reader, a link out of the tree would read a
-// host file, a .git inside would redirect git, an oversized file or too many entries would fill the sidecar's
+// host file, an oversized file or too many entries would fill the sidecar's
 // memory or disk. Each refuses the commit, leaves nothing at the door, and nothing hangs.
 func TestAHostileWorktreeNeverBecomesACommit(t *testing.T) {
 	cases := map[string]struct {
 		mut   func(*GitConfig)
 		plant func(work string)
 	}{
-		"fifo":          {nil, func(w string) { syscall.Mkfifo(filepath.Join(w, "pipe"), 0o644) }},
-		"link out":      {nil, func(w string) { os.Symlink("../../../../etc/passwd", filepath.Join(w, "pw")) }},
-		"absolute link": {nil, func(w string) { os.Symlink("/etc/passwd", filepath.Join(w, "pw")) }},
-		"nested .git dir": {nil, func(w string) {
-			os.MkdirAll(filepath.Join(w, "sub", ".git"), 0o755)
-			os.WriteFile(filepath.Join(w, "sub", ".git", "config"), []byte("[core]\n"), 0o644)
-		}},
+		"link out":       {nil, func(w string) { os.Symlink("../../../../etc/passwd", filepath.Join(w, "pw")) }},
+		"absolute link":  {nil, func(w string) { os.Symlink("/etc/passwd", filepath.Join(w, "pw")) }},
 		"oversized file": {func(c *GitConfig) { c.MaxFileBytes = 1024 }, func(w string) { os.WriteFile(filepath.Join(w, "big"), make([]byte, 4096), 0o644) }},
 		"too many files": {func(c *GitConfig) { c.MaxFiles = 6 }, func(w string) {
 			for i := 0; i < 20; i++ {
@@ -387,46 +391,384 @@ func TestAnAlreadyMovedBranchIsRejectedNotForced(t *testing.T) {
 	}
 }
 
-// context "git's other HTTP paths (dumb protocol, objects, a different repo's receive-pack under another door
-// prefix) are not routes": the forwarder answers 403 before the door is asked.
-func TestOnlyTheSmartGitRoutesAreOpen(t *testing.T) {
+// context "the forwarder the fence uses injects the token for whoever asks": so no /git/ path may be reachable from it,
+// whatever the fence sends. Only the sidecar's own git carries the secret, and then only the three smart routes work, and the
+// secret never reaches the door.
+func TestTheFenceCannotReachGitThroughTheForwarder(t *testing.T) {
 	r := newGitRig(t, nil)
+	r.clone()
 	before := r.doorHits
-	for _, c := range []struct{ method, p string }{
-		{"GET", "/egress/git/o/r.git/HEAD"}, {"GET", "/egress/git/o/r.git/objects/info/packs"}, {"PUT", "/egress/git/o/r.git/info/refs"},
-		{"DELETE", "/egress/git/o/r.git/git-receive-pack"}, {"GET", "/egress/git/o/r.git/git-receive-pack"}, {"GET", "/egress/git/o/r.git/info/refs/extra"},
-		{"POST", "/egress/gitx/o/r.git/git-receive-pack"},
-	} {
-		req, _ := http.NewRequest(c.method, r.fwdURL+c.p, strings.NewReader("{}"))
+	do := func(method, p, gate string) int {
+		req, _ := http.NewRequest(method, r.fwdURL+p, strings.NewReader("{}"))
+		if gate != "" {
+			req.Header.Set("X-Ccsbx-Git", gate)
+		}
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
 		resp.Body.Close()
-		if resp.StatusCode != 403 {
-			t.Errorf("%s %s: %d", c.method, c.p, resp.StatusCode)
+		return resp.StatusCode
+	}
+	for _, p := range []string{"/egress/git/o/r.git/git-receive-pack", "/egress/git/o/r.git/git-upload-pack", "/egress/git/o/r.git/info/refs?service=git-receive-pack", "/egress/git/other/repo.git/git-receive-pack"} {
+		for _, gate := range []string{"", "guess", strings.Repeat("a", 64), r.gate + "x", r.gate[:len(r.gate)-1]} {
+			m := "POST"
+			if strings.Contains(p, "info/refs") {
+				m = "GET"
+			}
+			if code := do(m, p, gate); code != 403 {
+				t.Errorf("%s %s with gate %q: %d", m, p, gate, code)
+			}
 		}
 	}
+	// the gate header alone opens nothing but git, and git only by its three routes
+	for _, c := range []struct{ method, p string }{
+		{"GET", "/egress/git/o/r.git/HEAD"}, {"GET", "/egress/git/o/r.git/objects/info/packs"}, {"PUT", "/egress/git/o/r.git/info/refs"},
+		{"DELETE", "/egress/git/o/r.git/git-receive-pack"}, {"GET", "/egress/git/o/r.git/git-receive-pack"}, {"GET", "/egress/git/o/r.git/info/refs/extra"},
+		{"GET", "/egress/github/repos/o/r"}, {"POST", "/egress/gitx/o/r.git/git-receive-pack"},
+	} {
+		if code := do(c.method, c.p, r.gate); code != 403 {
+			t.Errorf("with the gate, %s %s: %d", c.method, c.p, code)
+		}
+	}
+	// a wrong secret is refused even on a path the fence may normally use: a guess is never half-accepted
+	if code := do("GET", "/egress/github/repos/o/r", "guess"); code != 403 {
+		t.Errorf("a wrong gate on an ordinary route: %d", code)
+	}
 	if r.doorHits != before {
-		t.Errorf("the door was asked %d times", r.doorHits-before)
+		t.Errorf("the door was asked %d times by requests that had to be refused", r.doorHits-before)
+	}
+	// the sidecar's own git (which sends the gate) works, and the door never sees the gate
+	os.WriteFile(filepath.Join(r.work, "n"), []byte("n"), 0o644)
+	if rep := r.req("git.commit", `{"message":"m"}`); rep.Status != "ok" {
+		t.Fatal(rep)
+	}
+	if rep := r.req("git.push", `{}`); rep.Status != "ok" {
+		t.Fatal(rep)
+	}
+	for _, h := range r.doorSaw {
+		for k, v := range h {
+			if strings.EqualFold(k, "X-Ccsbx-Git") || strings.Contains(strings.Join(v, ""), r.gate) {
+				t.Errorf("the door saw the gate in %s", k)
+			}
+		}
 	}
 }
 
-// context "the checkout needs group write for the fence but nothing else of ours does": the umask is widened only
-// around the checkout and is the process's own again afterwards.
-func TestTheUmaskIsOnlyWidenedAroundTheCheckout(t *testing.T) {
-	old := syscall.Umask(0o077)
-	defer syscall.Umask(old)
+// context "H1 refuses these too, but the snapshot is the first thing that touches the fence's tree and it runs in
+// the sidecar's own memory and disk": its caps and refusals stand on their own, without H1 behind them.
+func TestTheSnapshotRefusesOnItsOwnWhatItShouldNotCopy(t *testing.T) {
+	for name, c := range map[string]struct {
+		mut   func(*GitConfig)
+		plant func(w string)
+		want  string
+	}{
+		"entries": {func(c *GitConfig) { c.MaxFiles = 5 }, func(w string) {
+			for i := 0; i < 9; i++ {
+				os.WriteFile(filepath.Join(w, fmt.Sprint("f", i)), nil, 0o644)
+			}
+		}, "more than 5 entries"},
+		"total bytes": {func(c *GitConfig) { c.MaxSnapshotBytes = 100 }, func(w string) {
+			os.WriteFile(filepath.Join(w, "a"), make([]byte, 80), 0o644)
+			os.WriteFile(filepath.Join(w, "b"), make([]byte, 80), 0o644)
+		}, "over 100 bytes"},
+		"file bytes": {func(c *GitConfig) { c.MaxFileBytes = 10 }, func(w string) { os.WriteFile(filepath.Join(w, "a"), make([]byte, 80), 0o644) }, "the cap is 10"},
+		"depth": {func(c *GitConfig) { c.MaxDepth = 3 }, func(w string) {
+			os.MkdirAll(filepath.Join(w, "a", "b", "c", "d"), 0o755)
+			os.WriteFile(filepath.Join(w, "a", "b", "c", "d", "f"), []byte("x"), 0o644)
+		}, "nested more than 3 levels"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newGitRig(t, c.mut)
+			r.clone()
+			c.plant(r.work)
+			if _, err := r.g.snapshot(context.Background()); err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("got %v, want %q", err, c.want)
+			}
+		})
+	}
+}
+
+// context "a directory the listing named is swapped for a link to the sidecar's own state before the copy reads it": os.Root
+// refuses the path, so the copy fails and nothing of the target is in the snapshot. (A link that was a link at the Lstat is
+// only ever recreated as a link, never read through.)
+func TestTheSnapshotNeverReadsThroughALinkSwappedInAfterTheListing(t *testing.T) {
 	r := newGitRig(t, nil)
 	r.clone()
-	if now := syscall.Umask(0o077); now != 0o077 {
-		t.Fatalf("the umask is %o after the clone", now)
+	secretDir := filepath.Join(r.root, "side-state")
+	os.MkdirAll(secretDir, 0o700)
+	os.WriteFile(filepath.Join(secretDir, "f"), []byte("LEDGER-CONTENT"), 0o600)
+	os.Mkdir(filepath.Join(r.work, "d"), 0o755)
+	os.WriteFile(filepath.Join(r.work, "d", "f"), []byte("innocent"), 0o644)
+	os.Symlink(secretDir, filepath.Join(r.work, "l")) // a link out that was already a link
+	r.g.hookEntry = func(p string) {
+		if p == "d/f" { // the fence swaps the directory between the listing and the copy
+			os.RemoveAll(filepath.Join(r.work, "d"))
+			os.Symlink(secretDir, filepath.Join(r.work, "d"))
+		}
+	}
+	_, err := r.g.snapshot(context.Background())
+	if err == nil {
+		t.Fatal("the swapped directory was copied through")
+	}
+	filepath.Walk(r.snap, func(p string, fi os.FileInfo, err error) error {
+		if err == nil && fi.Mode().IsRegular() {
+			if b, _ := os.ReadFile(p); strings.Contains(string(b), "LEDGER") {
+				t.Errorf("%s holds a file read through a link", p)
+			}
+		}
+		return nil
+	})
+}
+
+// context "an ordinary project has trees git ignores (node_modules, build output) that hold hard links, sockets and huge
+// files": none of it may block or fill a commit, so only what git would commit is copied.
+func TestIgnoredTreesNeverEnterTheSnapshot(t *testing.T) {
+	r := newGitRig(t, func(c *GitConfig) { c.MaxFiles = 50; c.MaxFileBytes = 4096; c.MaxSnapshotBytes = 1 << 20 })
+	r.clone()
+	os.WriteFile(filepath.Join(r.work, ".gitignore"), []byte("node_modules/\ntarget/\n"), 0o644)
+	nm := filepath.Join(r.work, "node_modules", "pkg")
+	os.MkdirAll(nm, 0o755)
+	os.WriteFile(filepath.Join(nm, "a.js"), []byte("a"), 0o644)
+	os.Link(filepath.Join(nm, "a.js"), filepath.Join(nm, "b.js")) // a hard-link store
+	syscall.Mkfifo(filepath.Join(nm, "pipe"), 0o644)
+	for i := 0; i < 200; i++ { // more entries than the cap
+		os.WriteFile(filepath.Join(nm, fmt.Sprint("f", i)), nil, 0o644)
+	}
+	os.MkdirAll(filepath.Join(r.work, "target"), 0o755)
+	os.WriteFile(filepath.Join(r.work, "target", "huge.bin"), make([]byte, 1<<20), 0o644) // over the per-file cap
+	os.WriteFile(filepath.Join(r.work, "real.txt"), []byte("r"), 0o644)
+	if rep := r.req("git.commit", `{"message":"m"}`); rep.Status != "ok" {
+		t.Fatalf("%+v", rep)
+	}
+	if rep := r.req("git.push", `{}`); rep.Status != "ok" {
+		t.Fatalf("%+v", rep)
+	}
+	tree := r.door("ls-tree", "-r", "--name-only", "refs/heads/ccsbx/s1")
+	if !strings.Contains(tree, "real.txt") || !strings.Contains(tree, ".gitignore") || strings.Contains(tree, "node_modules") || strings.Contains(tree, "target") {
+		t.Errorf("tree at the door:\n%s", tree)
 	}
 }
 
-// context "the fence plants a .git file that redirects git to a gitdir of its own, with a hook in it": git is
-// told its GIT_DIR and never discovers, so the redirect is ignored, the hook never runs, and no .git entry is
-// ever committed (the change next to it still is).
+// context "a nested .git (file, link or directory) makes git read a path the fence chose, outside the snapshot, while it
+// commits": none is ever copied, the commit still succeeds, and the journal says how many were skipped. A .git file that
+// points at a gitdir whose HEAD is a FIFO must not hang the commit.
+func TestANestedDotGitIsNeverCopied(t *testing.T) {
+	r := newGitRig(t, nil)
+	r.clone()
+	fifoDir := filepath.Join(r.work, "trap")
+	os.Mkdir(fifoDir, 0o755)
+	os.MkdirAll(filepath.Join(r.work, "a", ".git"), 0o755) // a .git directory that is not a repo
+	os.WriteFile(filepath.Join(r.work, "a", ".git", "config"), []byte("[core]\n"), 0o644)
+	os.WriteFile(filepath.Join(r.work, "a", "keep.txt"), []byte("k"), 0o644)
+	os.Mkdir(filepath.Join(r.work, "b"), 0o755)
+	os.WriteFile(filepath.Join(r.work, "b", ".git"), []byte("gitdir: "+fifoDir+"\n"), 0o644) // a .git file pointing at a path of the fence's choice
+	os.Mkdir(filepath.Join(r.work, "c"), 0o755)
+	os.Symlink(r.g.cfg.GitDir, filepath.Join(r.work, "c", ".git")) // a link to the sidecar's own gitdir
+	os.WriteFile(filepath.Join(r.work, "c", "also.txt"), []byte("c"), 0o644)
+	nested := filepath.Join(r.work, "vendored") // a REAL nested repository: git lists it as "vendored/"
+	sh(t, r.root, nil, "init", "-q", "-b", "main", nested)
+	os.WriteFile(filepath.Join(nested, "inner.txt"), []byte("i"), 0o644)
+	sh(t, nested, nil, "add", "-A")
+	sh(t, nested, nil, "commit", "-q", "-m", "inner")
+	syscall.Mkfifo(filepath.Join(r.work, "pipe"), 0o644) // a FIFO next to real work: never listed, never a hang
+	done := make(chan hostd.Reply, 1)
+	go func() { done <- r.req("git.commit", `{"message":"m"}`) }()
+	select {
+	case rep := <-done:
+		if rep.Status != "ok" {
+			t.Fatalf("%+v", rep)
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("commit hung")
+	}
+	if rep := r.req("git.push", `{}`); rep.Status != "ok" {
+		t.Fatalf("%+v", rep)
+	}
+	tree := r.door("ls-tree", "-r", "--name-only", "refs/heads/ccsbx/s1")
+	if strings.Contains(tree, ".git") || strings.Contains(tree, "inner.txt") || strings.Contains(tree, "pipe") || !strings.Contains(tree, "a/keep.txt") || !strings.Contains(tree, "c/also.txt") {
+		t.Errorf("tree at the door: %s", tree)
+	}
+	found := false
+	for _, e := range r.j.evs {
+		if e.Type == "git.committed" && strings.Contains(string(e.Data), `"skipped":1`) {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("the skipped nested repository is not journalled: %+v", r.j.evs)
+	}
+}
+
+// context "the fence swaps a directory in /work for a link to the sidecar's own volume while the clone copies the
+// checkout in (or has put a link where a file goes)": the copy creates everything through os.Root with O_EXCL, so the
+// clone fails, and nothing was written outside /work.
+func TestTheCloneCannotBeRedirectedOutOfTheWorktree(t *testing.T) {
+	for name, plant := range map[string]func(r *gitRig, outside string){
+		"directory swapped for a link": func(r *gitRig, outside string) { os.Symlink(outside, filepath.Join(r.work, "sub")) },
+		"file replaced by a link": func(r *gitRig, outside string) {
+			os.Symlink(filepath.Join(outside, "victim"), filepath.Join(r.work, "a.txt"))
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			r := newGitRig(t, nil)
+			outside := filepath.Join(r.root, "side-state")
+			os.MkdirAll(outside, 0o700)
+			os.WriteFile(filepath.Join(outside, "victim"), []byte("UNTOUCHED"), 0o600)
+			r.g.hookCopy = func() { plant(r, outside) } // after the emptiness check, before the files are created
+			if err := r.g.Clone(context.Background()); err == nil {
+				t.Fatal("the clone went through a planted link")
+			}
+			if es, _ := os.ReadDir(outside); len(es) != 1 {
+				t.Errorf("something was written outside the worktree: %v", es)
+			}
+			if b, _ := os.ReadFile(filepath.Join(outside, "victim")); string(b) != "UNTOUCHED" {
+				t.Errorf("the victim was rewritten: %q", b)
+			}
+		})
+	}
+}
+
+// context "git is run on a gitdir the sidecar made, but a config include or info/attributes could appear in it": H1's repo
+// check runs before every command, fetch and push too, so a tampered gitdir stops the push.
+func TestGitIsRefusedOnATamperedGitDirBeforeEveryCommand(t *testing.T) {
+	r := newGitRig(t, nil)
+	r.clone()
+	os.WriteFile(filepath.Join(r.work, "n"), []byte("n"), 0o644)
+	if rep := r.req("git.commit", `{"message":"m"}`); rep.Status != "ok" {
+		t.Fatal(rep)
+	}
+	cfg, _ := os.OpenFile(filepath.Join(r.g.cfg.GitDir, "config"), os.O_APPEND|os.O_WRONLY, 0)
+	cfg.WriteString("[include]\n\tpath = /etc/hostname\n")
+	cfg.Close()
+	if rep := r.req("git.push", `{}`); rep.Status == "ok" {
+		t.Fatalf("pushed from a gitdir with an include: %+v", rep)
+	}
+	if r.door("branch", "--list", "ccsbx/*") != "" {
+		t.Error("something was pushed")
+	}
+}
+
+// context "a push is asked for while a commit's snapshot is being made": the snapshot is held open by a seam, the push
+// is busy, and the commit then finishes normally.
+func TestAPushIsBusyWhileARealSnapshotIsBeingMade(t *testing.T) {
+	r := newGitRig(t, nil)
+	r.clone()
+	os.WriteFile(filepath.Join(r.work, "n"), []byte("n"), 0o644)
+	inSnap, release := make(chan struct{}), make(chan struct{})
+	r.g.hookSnapshot = func() { close(inSnap); <-release }
+	done := make(chan hostd.Reply, 1)
+	go func() { done <- r.req("git.commit", `{"message":"m"}`) }()
+	<-inSnap
+	if rep := r.req("git.push", `{}`); rcode(rep) != "busy" {
+		t.Errorf("push during a snapshot: %+v", rep)
+	}
+	if rep := r.req("git.commit", `{"message":"again"}`); rcode(rep) != "busy" {
+		t.Errorf("second commit during a snapshot: %+v", rep)
+	}
+	close(release)
+	if rep := <-done; rep.Status != "ok" {
+		t.Fatalf("the first commit: %+v", rep)
+	}
+}
+
+// context "the sidecar container restarts (its volumes do not) or the first fetch fails": a restart finds the work done
+// and carries on without touching /work; a failure before anything reached /work leaves the gitdir empty so a retry can
+// start clean.
+func TestARestartCarriesOnAndAFailedCloneCanBeRetried(t *testing.T) {
+	r := newGitRig(t, nil)
+	r.clone()
+	os.WriteFile(filepath.Join(r.work, "n"), []byte("n"), 0o644)
+	if rep := r.req("git.commit", `{"message":"before the restart"}`); rep.Status != "ok" {
+		t.Fatal(rep)
+	}
+	again, err := NewGitOps(r.g.cfg) // a new process, the same volumes
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := again.Clone(context.Background()); err != nil {
+		t.Fatalf("a restarted sidecar must carry on, not fail on a non-empty worktree: %v", err)
+	}
+	r.g = again
+	os.WriteFile(filepath.Join(r.work, "m"), []byte("m"), 0o644)
+	if rep := r.req("git.commit", `{"message":"after"}`); rep.Status != "ok" {
+		t.Fatalf("after the restart: %+v", rep)
+	}
+	if rep := r.req("git.push", `{}`); rep.Status != "ok" {
+		t.Fatalf("push after the restart: %+v", rep)
+	}
+
+	// a clone that fails at the fetch leaves nothing behind
+	f := newGitRig(t, func(c *GitConfig) { c.Base = "no-such-branch" })
+	if err := f.g.Clone(context.Background()); err == nil {
+		t.Fatal("a missing base cloned")
+	}
+	if es, _ := os.ReadDir(f.g.cfg.GitDir); len(es) != 0 {
+		t.Errorf("a failed clone left %d entries in the gitdir", len(es))
+	}
+	if es, _ := os.ReadDir(f.work); len(es) != 0 {
+		t.Errorf("a failed clone left %d entries in the worktree", len(es))
+	}
+	cfg := f.g.cfg
+	cfg.Base = "main"
+	retry, _ := NewGitOps(cfg)
+	if err := retry.Clone(context.Background()); err != nil {
+		t.Fatalf("the retry: %v", err)
+	}
+}
+
+// context "a fence plants a .git file that names a directory whose HEAD is a FIFO, because git opens it to decide whether the
+// directory is a repository": the live listing stalls, so it has its own short deadline. The commit is refused, the lock is
+// released (a push is not busy afterwards), and once the trap is gone the next commit works.
+func TestAGitFileAtAFifoStallsTheListingOnlyBrieflyAndOnlyThatCommit(t *testing.T) {
+	r := newGitRig(t, func(c *GitConfig) { c.ListTimeout = time.Second })
+	r.clone()
+	trap := filepath.Join(r.work, "trap")
+	os.Mkdir(trap, 0o755)
+	syscall.Mkfifo(filepath.Join(trap, "HEAD"), 0o644)
+	os.Mkdir(filepath.Join(r.work, "b"), 0o755)
+	os.WriteFile(filepath.Join(r.work, "b", ".git"), []byte("gitdir: "+trap+"\n"), 0o644)
+	os.WriteFile(filepath.Join(r.work, "real"), []byte("r"), 0o644)
+	start := time.Now()
+	rep := r.req("git.commit", `{"message":"m"}`)
+	if rep.Status == "ok" || time.Since(start) > 15*time.Second {
+		t.Fatalf("%+v after %v", rep, time.Since(start))
+	}
+	if rep := r.req("git.push", `{}`); rcode(rep) == "busy" {
+		t.Error("the lock was not released")
+	}
+	os.RemoveAll(filepath.Join(r.work, "b"))
+	os.RemoveAll(trap)
+	if rep := r.req("git.commit", `{"message":"m"}`); rep.Status != "ok" {
+		t.Fatalf("after the trap is gone: %+v", rep)
+	}
+}
+
+// context "a fence provokes refusals in a loop": the journal gets a bounded number of git.refused facts and then ONE fact that
+// the rest are not written, so a silent journal is never mistaken for a quiet session.
+func TestRefusalFactsAreBoundedAndSaySoOnce(t *testing.T) {
+	r := newGitRig(t, func(c *GitConfig) { c.MaxFacts = 3 })
+	r.clone()
+	for i := 0; i < 10; i++ {
+		r.req("git.push", `{"branch":"main"}`)
+	}
+	refused, suppressed := 0, 0
+	for _, e := range r.j.evs {
+		switch e.Type {
+		case "git.refused":
+			refused++
+		case "git.facts_suppressed":
+			suppressed++
+		}
+	}
+	if refused != 3 || suppressed != 1 {
+		t.Fatalf("%d refused facts and %d suppression notes, want 3 and 1", refused, suppressed)
+	}
+}
+
+// context "the fence plants a TOP-LEVEL .git file that redirects git to a gitdir of its own, with hooks in it": git is told its
+// GIT_DIR and never discovers, so the redirect is ignored, no hook runs, and no .git entry is committed (the change next to it
+// still is).
 func TestAGitFileInTheWorktreeNeverRedirectsOrRunsAnything(t *testing.T) {
 	r := newGitRig(t, nil)
 	r.clone()
@@ -450,65 +792,5 @@ func TestAGitFileInTheWorktreeNeverRedirectsOrRunsAnything(t *testing.T) {
 	files := r.door("ls-tree", "-r", "--name-only", "refs/heads/ccsbx/s1")
 	if strings.Contains(files, ".git\n") || strings.HasSuffix(files, ".git") || !strings.Contains(files, "real.txt") {
 		t.Errorf("tree at the door: %q", files)
-	}
-}
-
-// context "H1 refuses these too, but the snapshot is the first thing that touches the fence's tree and it runs in
-// the sidecar's own memory and disk": its caps and refusals stand on their own, without H1 behind them.
-func TestTheSnapshotRefusesOnItsOwnWhatItShouldNotCopy(t *testing.T) {
-	for name, c := range map[string]struct {
-		mut   func(*GitConfig)
-		plant func(w string)
-		want  string
-	}{
-		"entries": {func(c *GitConfig) { c.MaxFiles = 5 }, func(w string) {
-			for i := 0; i < 9; i++ {
-				os.WriteFile(filepath.Join(w, fmt.Sprint("f", i)), nil, 0o644)
-			}
-		}, "more than 5 entries"},
-		"total bytes": {func(c *GitConfig) { c.MaxSnapshotBytes = 100 }, func(w string) {
-			os.WriteFile(filepath.Join(w, "a"), make([]byte, 80), 0o644)
-			os.WriteFile(filepath.Join(w, "b"), make([]byte, 80), 0o644)
-		}, "over 100 bytes"},
-		"file bytes":  {func(c *GitConfig) { c.MaxFileBytes = 10 }, func(w string) { os.WriteFile(filepath.Join(w, "a"), make([]byte, 80), 0o644) }, "the cap is 10"},
-		"nested .git": {nil, func(w string) { os.MkdirAll(filepath.Join(w, "d", ".git"), 0o755) }, "a .git inside"},
-		"fifo":        {nil, func(w string) { syscall.Mkfifo(filepath.Join(w, "p"), 0o644) }, "not a regular file"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			r := newGitRig(t, c.mut)
-			c.plant(r.work)
-			if _, err := r.g.snapshot(); err == nil || !strings.Contains(err.Error(), c.want) {
-				t.Fatalf("got %v, want %q", err, c.want)
-			}
-		})
-	}
-}
-
-// context "a link inside the worktree that leaves it must never be followed by the copy": os.Root refuses it, so a
-// link to the sidecar's own state (which exists in the sidecar's mount namespace) is a link in the snapshot and
-// nothing more; its target is never read into it.
-func TestTheSnapshotNeverReadsThroughALinkOutOfTheTree(t *testing.T) {
-	r := newGitRig(t, nil)
-	secret := filepath.Join(r.root, "side-state-secret")
-	os.WriteFile(secret, []byte("LEDGER-CONTENT"), 0o600)
-	os.Symlink(secret, filepath.Join(r.work, "l"))
-	os.Mkdir(filepath.Join(r.work, "d"), 0o755)
-	os.Symlink(r.root, filepath.Join(r.work, "d", "dirlink"))
-	if _, err := r.g.snapshot(); err != nil {
-		t.Fatal(err)
-	}
-	filepath.Walk(r.snap, func(p string, fi os.FileInfo, err error) error {
-		if err == nil && fi.Mode().IsRegular() {
-			if b, _ := os.ReadFile(p); strings.Contains(string(b), "LEDGER") {
-				t.Errorf("%s holds a file read through a link", p)
-			}
-		}
-		return nil
-	})
-	if fi, err := os.Lstat(filepath.Join(r.snap, "l")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
-		t.Errorf("the link should be a link in the snapshot: %v", err)
-	}
-	if es, _ := os.ReadDir(filepath.Join(r.snap, "d")); len(es) != 1 || !strings.Contains(es[0].Name(), "dirlink") {
-		t.Errorf("the directory link was followed: %v", es)
 	}
 }

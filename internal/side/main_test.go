@@ -460,6 +460,8 @@ func TestTrustedFileChecksTypeModeAndOwner(t *testing.T) {
 // proof": after the load the sidecar clones into the empty worktree and says so in in/, a commit and a push asked
 // for through the outbox land on the door's session branch, main is untouched, and msg.* without a hub is refused.
 func TestServeClonesThenCommitsAndPushesThroughItsOwnForwarder(t *testing.T) {
+	old := syscall.Umask(0o077) // a restrictive process umask must not make anything the fence reads unreadable
+	defer syscall.Umask(old)
 	g := newGitRig(t, nil)
 	root, err := os.MkdirTemp("", "servegit")
 	if err != nil {
@@ -536,6 +538,23 @@ func TestServeClonesThenCommitsAndPushesThroughItsOwnForwarder(t *testing.T) {
 	if rep := ask("p1", `{"type":"git.push"}`); rep.Status != "ok" {
 		t.Fatalf("push: %+v", rep)
 	}
+	// what the FENCE reads and writes must have explicit modes, whatever the umask: the test runs as the fence's uid, so
+	// the modes themselves are what is asserted (a reply at 0600 or in/replies at 0700 would lock the fence out)
+	mode := func(p string) os.FileMode {
+		fi, err := os.Stat(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fi.Mode().Perm()
+	}
+	for p, want := range map[string]os.FileMode{
+		filepath.Join(in, "replies"): 0o755, filepath.Join(in, "replies", "c1.json"): 0o644, filepath.Join(in, "worktree-ready"): 0o644,
+		filepath.Join(work, "a.txt"): 0o664, filepath.Join(work, "run.sh"): 0o775, filepath.Join(work, "sub"): 0o775, filepath.Join(work, "sub", "x.txt"): 0o664,
+	} {
+		if got := mode(p); got != want {
+			t.Errorf("%s is %o, want %o", p, got, want)
+		}
+	}
 	if rep := ask("m1", `{"type":"msg.send","to":{"node":"x"},"text":"hi"}`); rep.Status != "refused" {
 		t.Fatalf("msg.send without a hub: %+v", rep)
 	}
@@ -548,6 +567,9 @@ func TestServeClonesThenCommitsAndPushesThroughItsOwnForwarder(t *testing.T) {
 	cancel()
 	if code := <-done; code != 0 {
 		t.Fatalf("exit %d", code)
+	}
+	if now := syscall.Umask(0o077); now != 0o077 {
+		t.Errorf("serve changed the process umask to %o", now)
 	}
 }
 

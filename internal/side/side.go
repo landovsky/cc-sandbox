@@ -21,6 +21,7 @@ package side
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -120,6 +121,7 @@ type Server struct {
 	failed  chan error    // the forwarder died
 	fwdp    atomic.Pointer[fwd.Forwarder]
 	relay   atomic.Pointer[RelayCred]
+	gitGate string // this process's capability for the forwarder's git routes: only the sidecar's own git has it
 	failLog appendFailures
 	logs    int // fwd.denied summaries written (Serve's goroutine only)
 	lastDen int64
@@ -162,7 +164,11 @@ func New(cfg Config) (*Server, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	return &Server{cfg: cfg, loadCh: make(chan struct{}), failed: make(chan error, 1)}, nil
+	gate := make([]byte, 16)
+	if _, err := rand.Read(gate); err != nil {
+		return nil, err
+	}
+	return &Server{cfg: cfg, loadCh: make(chan struct{}), failed: make(chan error, 1), gitGate: hex.EncodeToString(gate)}, nil
 }
 
 // notLoaded answers while there are no secrets. Same body for every path: the fence learns only that
@@ -302,6 +308,10 @@ func (s *Server) fatal(err error) {
 	}
 }
 
+// GitGate is the secret the sidecar's own git sends in fwd.GitHeader. It is made at start, kept in memory, and never
+// written anywhere the fence can read.
+func (s *Server) GitGate() string { return s.gitGate }
+
 // Loaded reports whether the secrets are in (tests and health).
 func (s *Server) Loaded() bool { return s.loaded.Load() }
 
@@ -391,7 +401,7 @@ func (s *Server) load(sec secrets) error {
 		return errors.New("the token has expired")
 	}
 	f, err := fwd.New(fwd.Config{Token: sec.Token, Key: gk, Doors: s.cfg.Doors, Rules: s.cfg.Rules,
-		CAFile: s.cfg.CAFile, MaxBody: s.cfg.MaxBody, Logf: s.cfg.Logf, Now: s.cfg.Now, Resolve: s.cfg.Resolve})
+		CAFile: s.cfg.CAFile, MaxBody: s.cfg.MaxBody, GitSecret: s.gitGate, Logf: s.cfg.Logf, Now: s.cfg.Now, Resolve: s.cfg.Resolve})
 	if err != nil {
 		return err
 	}

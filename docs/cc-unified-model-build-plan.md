@@ -467,8 +467,15 @@ adopt it when they build M1/U16. The forwarder's door prefix is `/egress`, so th
 | `GET` | `/git/<owner>/<repo>.git/info/refs?service=git-receive-pack` | ref advertisement for a push |
 | `POST` | `/git/<owner>/<repo>.git/git-receive-pack` | the push (U16: parse the pack's commands; refuse deletes, protected branches, refs outside the token's branch, ≥ 300 files, ≥ 250 commits) |
 
+- **The fence never reaches these routes.** The forwarder the fence uses injects the token for whoever asks, so a
+  fence that could POST `git-receive-pack` would skip every check the sidecar makes. The forwarder therefore refuses
+  every `/git/` path unless the request carries the sidecar's per-process secret in `X-Ccsbx-Git` (made at start, kept
+  in memory, sent only by the sidecar's own git; the forwarder strips `x-ccsbx-*` before the door sees the request).
+  The git routes are not in the default rules, and a `--routes` file naming `/git/` is refused. (Git 2.43 cannot speak
+  HTTP over a unix socket, and a second loopback port would be visible to the fence, so the capability rides on the one
+  forwarder port.) The door may still give sidecar git its own audience later; nothing here depends on it.
 - Nothing else of git's HTTP protocol is routed (no dumb-protocol paths such as `HEAD` or `objects/...`): the
-  forwarder's built-in rules answer 403 before the door is asked.
+  forwarder answers 403 before the door is asked.
 - `<repo>.git` is one path segment; `<owner>` and `<repo>` are `[A-Za-z0-9._-]`, as the sidecar validates them.
 - Request bodies carry a `Content-Length` (the sidecar sets `http.postBuffer` above the forwarder's body cap), because
   the proof is bound to the body's hash.

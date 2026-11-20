@@ -37,8 +37,17 @@ var DefaultRules = []Rule{
 	{Door: "egress", Methods: []string{"GET"}, Path: "/github/**"},
 	{Door: "egress", Methods: []string{"POST"}, Path: "/github/repos/*/*/pulls"},
 	{Door: "egress", Methods: []string{"POST"}, Path: "/github/repos/*/*/issues/*/comments"},
-	// git over smart HTTP, owner/<repo>.git as two segments (F3c; the door's U16 rules decide what a push may do):
-	// the ref advertisement, a fetch, and a push. Nothing else of git's HTTP protocol (no dumb-protocol paths).
+}
+
+// GitHeader carries the sidecar's own capability for the git routes. Only the sidecar's git sends it, and the
+// forwarder strips every x-ccsbx-* header before the door sees the request.
+const GitHeader = "X-Ccsbx-Git"
+
+// GitRules are the git smart-HTTP routes of the egress door (F3c), owner/<repo>.git as two segments. They are NOT in
+// DefaultRules: the forwarder the fence reaches must never route git, because it injects the token for any caller
+// and a fence that could POST git-receive-pack would bypass every check the sidecar makes. They apply only to a
+// request that carries the sidecar's secret (Config.GitSecret), and to nothing else.
+var GitRules = []Rule{
 	{Door: "egress", Methods: []string{"GET"}, Path: "/git/*/*/info/refs"},
 	{Door: "egress", Methods: []string{"POST"}, Path: "/git/*/*/git-upload-pack"},
 	{Door: "egress", Methods: []string{"POST"}, Path: "/git/*/*/git-receive-pack"},
@@ -188,6 +197,9 @@ func ValidateRules(rules []Rule, doors map[string]*url.URL) error {
 		}
 		if len(r.Methods) == 0 || r.Path == "" || r.Path[0] != '/' {
 			return fmt.Errorf("rule %d: needs methods and an absolute path", i)
+		}
+		if first := strings.SplitN(strings.Trim(r.Path, "/"), "/", 2)[0]; first == "git" {
+			return fmt.Errorf("rule %d: %q would route git, which only the sidecar's own git may reach", i, r.Path)
 		}
 		for _, m := range r.Methods {
 			if m == "*" || strings.EqualFold(m, "CONNECT") {

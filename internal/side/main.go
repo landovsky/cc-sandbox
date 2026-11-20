@@ -86,7 +86,12 @@ Git (plan F3c; git.commit and git.push from the fence's outbox, the repo cloned 
                           (the door's paths are /egress/git/<owner>/<repo>.git/{info/refs,git-upload-pack,git-receive-pack})
   --git-dir D             the sidecar's gitdir, made 0700               (default /run/ccsbx/side/git)
   --work D                the worktree emptyDir the fence writes        (default /work)
-  --snapshot-dir D        where a commit copies the worktree, made 0700 (default /run/ccsbx/side/snapshot/s)
+  --snapshot-dir D        staging of the clone and the copy a commit is made from, made 0700
+                          (default /run/ccsbx/side/snapshot/s)
+  --git-max-bytes N       cap on a snapshot, counting allocated blocks (default 1 GiB; set it a little under the
+                          snapshot volume's size so a full tree cannot evict the pod)
+  Protected: only main, master, HEAD and trunk are refused as the session branch here; develop, release/* and the
+  like are the door's call (U16). A --git-base of exactly 40 or 64 hex digits is a commit id, never a branch.
   After the load the sidecar clones into the EMPTY worktree and writes in/worktree-ready (or
   in/worktree-failed); the fence must not write /work before the first of those exists.
 
@@ -153,8 +158,9 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	fs.StringVar(&o.GitBase, "git-base", envOr("GIT_BASE", "main"), "")
 	fs.StringVar(&o.GitBranch, "git-branch", envOr("GIT_BRANCH", ""), "")
 	fs.StringVar(&o.GitURL, "git-url", envOr("GIT_URL", ""), "")
-	fs.StringVar(&o.GitDir, "git-dir", envOr("GIT_DIR", "/run/ccsbx/side/git"), "")
+	fs.StringVar(&o.GitDir, "git-dir", envOr("GIT_DIR", "/run/ccsbx/side/git/g"), "")
 	fs.StringVar(&o.Work, "work", envOr("WORK", "/work"), "")
+	fs.Int64Var(&o.GitMaxBytes, "git-max-bytes", envInt("GIT_MAX_BYTES", 0), "")
 	fs.StringVar(&o.SnapshotDir, "snapshot-dir", envOr("SNAPSHOT_DIR", "/run/ccsbx/side/snapshot/s"), "")
 	var fenceW multi
 	fs.Var(&fenceW, "fence-writable", "")
@@ -207,6 +213,7 @@ func Main(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 
 // ServeOptions is everything `side serve` takes besides the secrets.
 type ServeOptions struct {
+	GitMaxBytes                                                    int64
 	GitRepo, GitBase, GitBranch, GitURL, GitDir, Work, SnapshotDir string
 	// wrapJournal is a test seam: it lets a test slow the relay\'s last journal write down to prove serve waits for it.
 	wrapJournal                        func(Appender) Appender
@@ -227,8 +234,11 @@ func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 	fail := func(format string, a ...any) int { fmt.Fprintf(stderr, "side: "+format+"\n", a...); return 2 }
 	uid := os.Getuid()
 	if o.GitRepo != "" {
-		o.GitDir, o.SnapshotDir = pick(o.GitDir, "/run/ccsbx/side/git"), pick(o.SnapshotDir, "/run/ccsbx/side/snapshot/s")
+		o.GitDir, o.SnapshotDir = pick(o.GitDir, "/run/ccsbx/side/git/g"), pick(o.SnapshotDir, "/run/ccsbx/side/snapshot/s")
 		o.Work, o.GitBase = pick(o.Work, "/work"), pick(o.GitBase, "main")
+	}
+	if o.GitRepo != "" && (!filepath.IsAbs(o.Work) || filepath.Clean(o.Work) != o.Work || resolve(o.Work) != o.Work) {
+		return fail("--work %q must be an absolute, clean path with no symlink in it", o.Work)
 	}
 	gitPaths := map[string]string{}
 	if o.GitRepo != "" {
@@ -323,10 +333,9 @@ func runServe(ctx context.Context, o ServeOptions, stderr io.Writer) int {
 		if o.Out == "" || o.Sid == "" || o.Gen < 1 || o.GitURL == "" || o.GitBranch == "" {
 			return fail("--git-repo needs --out, --sid, --gen, --git-url and --git-branch")
 		}
-		syscall.Umask(0o077) // everything the sidecar writes is private; Clone widens it for the checkout only
 		var err error
 		gitops, err = NewGitOps(GitConfig{Repo: o.GitRepo, Base: o.GitBase, Branch: o.GitBranch, URL: o.GitURL, GitDir: o.GitDir,
-			Work: o.Work, Snapshot: o.SnapshotDir, Sid: o.Sid, Gen: o.Gen, Journal: jr, Logf: logf})
+			Work: o.Work, Snapshot: o.SnapshotDir, Sid: o.Sid, Gen: o.Gen, Journal: jr, Gate: s.GitGate, MaxSnapshotBytes: o.GitMaxBytes, Logf: logf})
 		if err != nil {
 			return fail("%v", err)
 		}
@@ -469,7 +478,7 @@ func cloneWhenLoaded(ctx context.Context, s *Server, g *GitOps, in string, logf 
 		g.fact("git.refused", map[string]any{"op": "clone", "code": "clone_failed"})
 		name, body = "worktree-failed", cleanText(err.Error(), 200)+"\n"
 	}
-	if err := os.WriteFile(filepath.Join(in, name), []byte(body), 0o644); err != nil {
+	if err := writePublic(filepath.Join(in, name), []byte(body)); err != nil {
 		logf("side git: %s: %v", name, err)
 	}
 }

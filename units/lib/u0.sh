@@ -20,6 +20,14 @@ u0_binaries() {
   cmd install -o root -g root -m 0755 "$BIN_DIR/ccsbx-signer" "$LIBEXEC/ccsbx-signer"
   cmd install -o root -g root -m 0755 "$BIN_DIR/ccsbx" /usr/local/bin/ccsbx
   note "ccsbx-root reads its allowed workdir roots from /etc/ccsbx/ccsbx-root.toml (root-owned)"
+  local HUB_TOML=""
+  if [ "$HUB_ON" = 1 ]; then HUB_TOML="hub_user = \"${OWNER}\"
+hub_url = \"${HUB_URL}\"
+hub_secret = \"/etc/ccsbx/hub-admin.secret\"
+"
+  else HUB_TOML="# hub_url, hub_user and hub_secret are NOT set: this install does not depend on the hub (no --hub-url). relay-mint and pod relays
+# refuse cleanly until the install is re-run with --hub-url at the hub's deploy gate.
+"; fi
   put /etc/ccsbx/ccsbx-root.toml 0644 root:root <<EOT
 # written by install-linux.sh (U0). Root-owned: tomas can't widen it. Edit with sudoedit.
 allowed_roots = [${ALLOWED_ROOTS_TOML}]
@@ -30,20 +38,19 @@ launch_user = "ccsbx-launch"
 term_user = "ccsbx-term"
 signer_user = "ccsbx-keys"
 signer_socket = "/run/ccsbx-signer/launch.sock"
-hub_user = "${OWNER}"
 kubeconfig = "/var/lib/ccsbx-launch/launcher.kubeconfig"
 k8s_machine = "${K8S_MACHINE}"
 k8s_side_image = "${SIDE_IMAGE}"
-hub_url = "${HUB_URL}"
-hub_secret = "/etc/ccsbx/hub-admin.secret"
-# the doors' owner listeners that take the signed revoke when a pod generation ends (F2x). None until the doors exist (M1): empty = the
+${HUB_TOML}# the doors' owner listeners that take the signed revoke when a pod generation ends (F2x). None until the doors exist (M1): empty = the
 # verb's audit line says "no revoke_doors" and the token expires by itself (k8s_token_hours). Pass --revoke-doors at M1 and re-run install.
 revoke_doors = [${REVOKE_DOORS_TOML}]
 EOT
-  note "the hub's admin secret (the shared SB_SECRET), for ccsbx-root's relay mint: the first line of $HUB_SECRET_FROM, root 0600, never printed, never leaves hp"
-  # plan never reads the file (and `plan -v` must not print it): the placeholder stands in for it
-  if [ "$MODE" = install ]; then put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"$HUB_SECRET"
-  else put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"(the secret, read from the --hub-secret-from file at install)"; fi
+  if [ "$HUB_ON" = 1 ]; then
+    note "the hub's admin secret (the shared SB_SECRET), for ccsbx-root's relay mint: the first line of $HUB_SECRET_FROM, root 0600, never printed, never leaves hp"
+    # plan never reads the file (and `plan -v` must not print it): the placeholder stands in for it
+    if [ "$MODE" = install ]; then put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"$HUB_SECRET"
+    else put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"(the secret, read from the --hub-secret-from file at install)"; fi
+  else note "no --hub-url: no hub secret is read or written"; fi
   note "a root-owned copy of the pins: ccsbx-root and hostd read THIS, never the owner-writable repo"
   put /etc/ccsbx/pins.toml 0644 root:root < "$REPO_DIR/pins.toml"
   note "pins.toml is empty today: only e2e candidate images run, as expected, until U1a is pinned"

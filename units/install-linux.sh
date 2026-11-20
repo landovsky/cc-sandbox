@@ -16,7 +16,8 @@
 #
 # GATES. `install` REFUSES (exit 3) while any is unmet; `plan` shows which are:
 #   B9   the hub is a native release under a systemd user unit (not the docker container `session-bus`),
-#        because leaving the docker group would otherwise orphan the live hub
+#        because leaving the docker group would otherwise orphan the live hub. ONLY WITH --hub-url: without it the install does not
+#        depend on the hub and B9 is skipped with a note (the container keeps running; the owner manages it with sudo docker)
 #   P15  every row of the P14 inventory is done or dropped (units/p15 check)
 #   bins ccsbx-root, ccsbx-hostd, ccsbx-signer, ccsbx exist in --bin-dir and match its SHA256SUMS
 #   sudoers  every sudoers.d NOPASSWD line parses (units/lib/sudoers_strip.py), so nothing is guessed
@@ -41,10 +42,13 @@
 #   (rotating SB_SECRET: re-run `install --yes`: it copies the new first line again; the other steps are idempotent)
 #   --revoke-doors U,V    the doors' owner-listener base URLs that take a token revoke (F2x); written as revoke_doors in ccsbx-root.toml and as
 #                         hostd's --revoke-door (CCSBX_REVOKE_DOORS, default EMPTY: there are no doors before M1, and nothing is revoked without them)
-#   --hub-url URL         where the hub is: http://A.B.C.D:PORT, an IPv4 literal (CCSBX_HUB_URL, REQUIRED; written to ccsbx-root.toml as hub_url). On hp
+#   --hub-url URL         where the hub is: http://A.B.C.D:PORT, an IPv4 literal (CCSBX_HUB_URL, OPTIONAL; written to ccsbx-root.toml as hub_url, with hub_user and hub_secret). On hp
 #                         today the hub listens on the tailnet address only (http://100.101.219.96:4011), not on loopback. The B9 gate checks the url
-#                         against the live listeners: every listener on the port must be the owner's, and one must have that address
-#   --hub-secret-from F   the owner's file holding the hub's shared secret (the hub's SB_SECRET), (CCSBX_HUB_SECRET_FROM, default
+#                         against the live listeners: every listener on the port must be the owner's, and one must have that address.
+#                         WITHOUT it the install does not depend on the hub: hub_url, hub_user and hub_secret stay unset, no hub secret is read or
+#                         written, the B9 gate (native hub + listener rule) is skipped with a note, and relay-mint and pod relays refuse cleanly
+#                         (the sidecar starts without a hub url; its bus answers relay_unavailable). Re-run the install with it at the hub's deploy gate
+#   --hub-secret-from F   (needs --hub-url) the owner's file holding the hub's shared secret (the hub's SB_SECRET), (CCSBX_HUB_SECRET_FROM, default
 #                         ~owner/.config/session-bus/secret). Its FIRST LINE is copied to /etc/ccsbx/hub-admin.secret, root 0600, for
 #                         ccsbx-root's relay mint; never printed. Must be a regular file (no symlink). Verify it at Gate M (night-1-morning.md, 8c)
 #   --k8s-machine NAME    the machine pod sessions run on; the signer's keys peer (ccsbx-launch) signs only for it  (CCSBX_K8S_MACHINE, default future-two)
@@ -69,7 +73,7 @@ case "${1:-}" in
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
 MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"; IMAGE="${CCSBX_IMAGE:-}"; SIDE_IMAGE="${CCSBX_SIDE_IMAGE:-}"; HUB_URL="${CCSBX_HUB_URL:-}"; REVOKE_DOORS="${CCSBX_REVOKE_DOORS:-}"
-HUB_SECRET_FROM="${CCSBX_HUB_SECRET_FROM:-}"; K8S_MACHINE="${CCSBX_K8S_MACHINE:-future-two}"
+HUB_SECRET_FROM="${CCSBX_HUB_SECRET_FROM:-}"; HUB_SECRET_FROM_GIVEN="${CCSBX_HUB_SECRET_FROM:+1}"; K8S_MACHINE="${CCSBX_K8S_MACHINE:-future-two}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -84,7 +88,7 @@ while [ $# -gt 0 ]; do
     --side-image) SIDE_IMAGE="${2:?--side-image REF}"; shift ;;
     --revoke-doors) REVOKE_DOORS="${2:?--revoke-doors URL,URL}"; shift ;;
     --hub-url) HUB_URL="${2:?--hub-url http://A.B.C.D:PORT}"; shift ;;
-    --hub-secret-from) HUB_SECRET_FROM="${2:?--hub-secret-from FILE}"; shift ;;
+    --hub-secret-from) HUB_SECRET_FROM="${2:?--hub-secret-from FILE}"; HUB_SECRET_FROM_GIVEN=1; shift ;;
     --k8s-machine) K8S_MACHINE="${2:?--k8s-machine NAME}"; shift ;;
     --with-deploy) WITH_DEPLOY=1 ;;
     --backup) RESTORE_OVERRIDE="${2:?--backup DIR}"; shift ;;
@@ -151,7 +155,11 @@ if [ -z "$IMAGE" ]; then ROOT_ERRORS+=("no fence image: pass --image ghcr.io/lan
 elif [[ "$IMAGE" != *@sha256:* ]]; then ROOT_ERRORS+=("image '$IMAGE' is a tag: hostd and ccsbx-root refuse every start of a tag (image_not_pinned); use ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex>")
 elif ! [[ "$IMAGE" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("image '$IMAGE' is not ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the only repo a candidate may come from)"); fi
 # the hub's address: an IPv4 literal, with a port (no host names: nothing to resolve or trick)
-[[ "$HUB_URL" =~ ^http://((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]):[1-9][0-9]{0,4}$ ]] || ROOT_ERRORS+=("no hub url: pass --hub-url http://A.B.C.D:PORT (a canonical IPv4 literal, no leading zeros; on hp today http://100.101.219.96:4011, the hub is on the tailnet address, not loopback); got '${HUB_URL}'")
+if [ -n "$HUB_URL" ]; then
+  [[ "$HUB_URL" =~ ^http://((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]):[1-9][0-9]{0,4}$ ]] || ROOT_ERRORS+=("hub url '$HUB_URL' is not http://A.B.C.D:PORT (a canonical IPv4 literal, no leading zeros; on hp today http://100.101.219.96:4011, the hub is on the tailnet address, not loopback)")
+elif [ -n "${HUB_SECRET_FROM_GIVEN:-}" ]; then ROOT_ERRORS+=("--hub-secret-from needs --hub-url: without the hub the install writes no hub secret")
+fi
+HUB_ON=0; [ -z "$HUB_URL" ] || HUB_ON=1
 # the doors' revoke URLs: empty, or a comma list of plain base URLs (they land in a systemd ExecStart and a TOML list, so no quotes, spaces or paths)
 REVOKE_DOORS_TOML=""
 if [ -n "$REVOKE_DOORS" ]; then
@@ -171,7 +179,7 @@ elif ! [[ "$SIDE_IMAGE" =~ ^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$ ]]; th
 MANAGED_PATHS+=(/etc/ccsbx/pins.toml)
 [ -f "$REPO_DIR/pins.toml" ] || ROOT_ERRORS+=("no $REPO_DIR/pins.toml to install as /etc/ccsbx/pins.toml")
 RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
-export OWNER MACHINE PAIRS IMAGE SIDE_IMAGE HUB_URL REVOKE_DOORS REVOKE_DOORS_TOML WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+export OWNER MACHINE PAIRS IMAGE SIDE_IMAGE HUB_URL HUB_ON REVOKE_DOORS REVOKE_DOORS_TOML WORKTREE_ROOT BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()
@@ -224,7 +232,7 @@ P15_FILE="${CCSBX_P15_FILE:-$OWNER_HOME/cc-tree/cc-sandbox/nodes/4vwb/p15-status
 default_p15() { as_owner env CCSBX_P15_FILE="$P15_FILE" "$UNITS_DIR/p15" check; }
 eval_gates() {
   local m f missing="" e unlisted
-  load_hub_secret
+  if [ "$HUB_ON" = 1 ]; then load_hub_secret; else note "no --hub-url: the install does not depend on the hub (hub_url, hub_user and hub_secret stay unset; relay-mint and pod relays refuse until it is re-run with --hub-url)"; fi
   local sp; while IFS= read -r sp; do [ -z "$sp" ] || gate "$sp"; done < <(svc_users_check)
   if [ -z "$PREFIX" ] && [ -n "${CCSBX_B9_CMD:-}${CCSBX_P15_CMD:-}" ]; then
     refuse "CCSBX_B9_CMD / CCSBX_P15_CMD are test overrides and are set: unset them (sudo -E would pass them to root)"
@@ -236,7 +244,8 @@ eval_gates() {
     elif [ "$(id -u "$OWNER")" -lt 1000 ]; then gate "owner '$OWNER' is a system account (uid < 1000)"; fi
   fi
   for e in "${ROOT_ERRORS[@]}" "${SCOPE_ERRORS[@]}"; do gate "$e"; done
-  if [ -n "${CCSBX_B9_CMD:-}" ]; then m="$(eval "$CCSBX_B9_CMD" 2>&1)" || gate "B9 missing: ${m:-$CCSBX_B9_CMD failed}"
+  if [ "$HUB_ON" != 1 ]; then note "B9 skipped (no --hub-url): the hub stays as it is. It is NOT checked: if it is still the docker container, it keeps running after the reboot but the owner can no longer manage it without sudo docker (P15)"
+  elif [ -n "${CCSBX_B9_CMD:-}" ]; then m="$(eval "$CCSBX_B9_CMD" 2>&1)" || gate "B9 missing: ${m:-$CCSBX_B9_CMD failed}"
   else m="$(default_b9)" || gate "B9 missing: $m (the native hub release, stream C)"; fi
   if [ -n "${CCSBX_P15_CMD:-}" ]; then m="$(eval "$CCSBX_P15_CMD" 2>&1)" || gate "P15 open: ${m:-$CCSBX_P15_CMD failed}"
   else m="$(default_p15 2>&1)" || gate "P15 open: $(head -1 <<<"$m") (run units/p15 status)"; fi
@@ -311,7 +320,7 @@ post_install_check() {
 steps_install() {
   if [ "$MODE" = install ]; then step "back up every file the install replaces (once; never overwritten)"; backup_originals; fi
   # the read happened in eval_gates (as the owner); in record mode it is logged here, once the gates and the backup have passed, so a refusal records nothing
-  if [ "$MODE" = install ] && [ "${EXEC%%:*}" = record ]; then rec runuser -u "$OWNER" -- python3 -I -c "$hub_secret_py" "$HUB_SECRET_FROM"; fi
+  if [ "$HUB_ON" = 1 ] && [ "$MODE" = install ] && [ "${EXEC%%:*}" = record ]; then rec runuser -u "$OWNER" -- python3 -I -c "$hub_secret_py" "$HUB_SECRET_FROM"; fi
   # everything that can fail for a machine-specific reason comes BEFORE sudoers is changed
   u0b_users; u0_binaries; u0b_keys; u0b_signer; u0_hostd
   if [ "$WITH_DEPLOY" = 1 ]; then u0_deploy_rule; fi

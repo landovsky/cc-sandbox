@@ -1387,10 +1387,10 @@ where = "hp"
 
 [[rule]]
 id = "fence-no-setid-chmod"
-title = "the fence cannot set setuid/setgid bits (seccomp rule on chmod, fchmod, fchmodat, fchmodat2; ccsbx-root refuses a profile without it), and the host clears the bits a fence left (tests/seccomp-setuid-test.sh is the docker twin, run at Gate M)"
+title = "the fence cannot set setuid/setgid bits (chmod, fchmod, fchmodat, fchmodat2 and the creating calls open, openat, creat, mknod, mknodat are allowed only with mode & 06000 == 0, openat2 is refused, everything else falls to the EPERM default; ccsbx-root refuses a profile without that), and the host clears the bits a fence left (tests/seccomp-setuid-test.sh is the docker twin, run at Gate M)"
 suite = "keys"
-allow = "tests/twin-go.sh ./internal/seccomp TestOverlayAddsEightRulesAndKeepsTheBase && tests/twin-go.sh ./internal/backend TestStripSetidLeavesTheOwnersFiles"
-block = "tests/twin-go.sh ./internal/seccomp TestVerifyRefusesWeakenedProfiles && tests/twin-go.sh ./internal/seccomp TestOverlayRefusesAPermissiveBase && tests/twin-go.sh ./internal/backend TestStripSetidClearsPlantedBits && tests/twin-go.sh ./internal/backend TestRunArgsSeccomp"
+allow = "tests/twin-go.sh ./internal/seccomp TestOverlayLeavesNoUnconditionalAllowOfTheGuardedCalls && tests/twin-go.sh ./internal/seccomp TestOverlayKeepsTheRestOfTheBase && tests/twin-go.sh ./internal/backend TestStripSetidLeavesTheOwnersFiles"
+block = "tests/twin-go.sh ./internal/seccomp TestVerifyRefusesWeakenedProfiles && tests/twin-go.sh ./internal/seccomp TestOverlayRefusesABaseThatDoesNotDenyByDefault && tests/twin-go.sh ./internal/backend TestStripSetidClearsPlantedBits && tests/twin-go.sh ./internal/backend TestRunArgsSeccomp"
 invariants = [11]
 backends = ["unit"]
 where = "hp"

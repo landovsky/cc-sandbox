@@ -17,12 +17,17 @@ import (
 func seccompCmd() *cli.Command {
 	return &cli.Command{
 		Name:    "seccomp-profile",
-		Summary: "add the no-setuid/setgid-chmod rule to Docker's default seccomp profile (Gate M step)",
-		Recipes: `  ccsbx seccomp-profile --base default.json --out /tmp/seccomp.json
+		Summary: "make Docker's default seccomp profile refuse setuid/setgid modes (Gate M step)",
+		Recipes: `  V=$(docker version --format '{{.Server.Version}}')
+  curl -fsSL -o default.json https://raw.githubusercontent.com/moby/moby/v$V/profiles/seccomp/default.json
+  ccsbx seccomp-profile --base default.json --out /tmp/seccomp.json
   sudo install -o root -g root -m 0644 /tmp/seccomp.json /etc/ccsbx/seccomp.json
   ccsbx seccomp-profile --verify /etc/ccsbx/seccomp.json     # what ccsbx-root checks before each run
-  --base is the default profile of the installed docker version (moby's profiles/seccomp/default.json
-  at that version). A base that allows everything by default is refused.`,
+  --base is moby's profiles/seccomp/default.json at the tag of the installed docker engine (URL above).
+  The tool removes chmod, fchmod, fchmodat, fchmodat2, open, openat, creat, mknod, mknodat and openat2
+  from every allow entry, adds the first nine back allowed only when (mode & 06000) == 0, and refuses
+  openat2 (ENOSYS): a mode with a setuid or setgid bit then falls to the default action, which must be
+  an EPERM denial. A base that does not deny by default is refused. --verify checks exactly that.`,
 		Setup: func(f *cli.Flags) {
 			f.String("base", "", "Docker's default seccomp profile (JSON) to extend")
 			f.String("out", "-", "where to write the result; - is stdout")

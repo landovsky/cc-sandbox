@@ -37,6 +37,9 @@ func stopCmd() *cli.Command {
 				return cli.ExitRefused
 			}
 			if mode == "helper" {
+				if refuseExplicit("stop", f, stderr, "state", "docker") {
+					return cli.ExitUsage
+				}
 				return runHelper("stop", "stop", []string{"--", args[0]}, stdout, stderr)
 			}
 			if err := directDockerReachable(); err != nil {

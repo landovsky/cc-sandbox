@@ -61,6 +61,9 @@ type Spec struct {
 	// OutGid is the group of the service user (ccsbx) that owns hostd: helper mode makes out/
 	// 10001:OutGid 02770 so hostd can read what the fence writes there (the files inherit the group).
 	OutGid int
+	// ServiceUID is the service user's uid: helper mode makes in/replies theirs (hostd writes its
+	// replies there and nowhere else), while in/ itself and managed/ stay root's.
+	ServiceUID int
 	// Class is "e2e" or "prod": part of the home's key.
 	Class string
 	// MountWorkdir and MountGitDir, when set, are the host paths docker mounts instead of Workdir and
@@ -182,12 +185,15 @@ func (s Spec) Prepare() error {
 		if helper {
 			mode, own, grp := os.FileMode(0o755), 0, 0
 			if d == "out" {
-				// 10001 writes, the service group reads (setgid: new files take its group). The
-				// daemon still requires every file's uid to be 10001.
+				// 10001 writes, the service group can read and traverse but NOT create, rename or
+				// delete (02750): new files take the group (setgid), and a file the fence makes with
+				// the default umask 022 is group-readable. A file it makes unreadable to the group
+				// is unreadable to the daemon, which tolerates that. The daemon still requires every
+				// file's uid to be 10001.
 				if s.OutGid <= 0 {
 					return fmt.Errorf("helper mode needs the service user's gid for the outbox (OutGid)")
 				}
-				mode, own, grp = os.ModeSetgid|0o770, FenceUID, s.OutGid
+				mode, own, grp = os.ModeSetgid|0o750, FenceUID, s.OutGid
 			}
 			if err := os.Mkdir(p, mode); err != nil {
 				return err
@@ -197,6 +203,24 @@ func (s Spec) Prepare() error {
 			}
 			if err := s.chown(p, own, grp); err != nil {
 				return err
+			}
+			if d == "in" {
+				// in/ is root's (the fence reads it, nobody but root can replace what root wrote
+				// there); only in/replies belongs to the daemon, which cannot rename or delete the
+				// files in in/ itself. A service uid is required so the directory exists as intended.
+				if s.ServiceUID <= 0 || s.OutGid <= 0 {
+					return fmt.Errorf("helper mode needs the service user's uid and gid for in/replies")
+				}
+				rp := filepath.Join(p, "replies")
+				if err := os.Mkdir(rp, 0o755); err != nil {
+					return err
+				}
+				if err := os.Chmod(rp, 0o755); err != nil {
+					return err
+				}
+				if err := s.chown(rp, s.ServiceUID, s.OutGid); err != nil {
+					return err
+				}
 			}
 			continue
 		}

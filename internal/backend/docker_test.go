@@ -324,6 +324,7 @@ func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
 	h := spec(t)
 	h.NotEvid = false // helper mode
 	h.OutGid = 4243
+	h.ServiceUID = 4242
 	owners := map[string][2]int{}
 	h.Chown = func(p string, uid, gid int) error { owners[p] = [2]int{uid, gid}; return nil }
 	if err := h.Prepare(); err != nil {
@@ -333,10 +334,11 @@ func TestWorldWritableLeavesAreDirectModeOnly(t *testing.T) {
 		mode os.FileMode
 		own  [2]int
 	}{
-		filepath.Join(h.GenDir(), "out"):     {os.ModeSetgid | 0o770, [2]int{FenceUID, 4243}},
-		filepath.Join(h.GenDir(), "in"):      {0o755, [2]int{0, 0}},
-		filepath.Join(h.GenDir(), "managed"): {0o755, [2]int{0, 0}},
-		h.HomeDir():                          {0o700, [2]int{FenceUID, FenceUID}},
+		filepath.Join(h.GenDir(), "out"):           {os.ModeSetgid | 0o750, [2]int{FenceUID, 4243}},
+		filepath.Join(h.GenDir(), "in"):            {0o755, [2]int{0, 0}},
+		filepath.Join(h.GenDir(), "in", "replies"): {0o755, [2]int{4242, 4243}},
+		filepath.Join(h.GenDir(), "managed"):       {0o755, [2]int{0, 0}},
+		h.HomeDir():                                {0o700, [2]int{FenceUID, FenceUID}},
 	}
 	for p, w := range want {
 		st, err := os.Stat(p)
@@ -653,6 +655,7 @@ func TestHelperModeNeverBuildsTheContainerSweep(t *testing.T) {
 	h := spec(t)
 	h.NotEvid = false
 	h.OutGid = 4243
+	h.ServiceUID = 4242
 	defer func() {
 		if recover() == nil {
 			t.Error("SweepArgs was built in helper mode")
@@ -674,6 +677,7 @@ func TestSweepHomeGo(t *testing.T) {
 	s := spec(t)
 	s.NotEvid = false
 	s.OutGid = 4243
+	s.ServiceUID = 4242
 	s.Chown = func(string, int, int) error { return nil }
 	if err := s.Prepare(); err != nil {
 		t.Fatal(err)
@@ -728,6 +732,7 @@ func TestSweepHomeGoParentSymlink(t *testing.T) {
 	s := spec(t)
 	s.NotEvid = false
 	s.OutGid = 4243
+	s.ServiceUID = 4242
 	s.Chown = func(string, int, int) error { return nil }
 	if err := s.Prepare(); err != nil {
 		t.Fatal(err)
@@ -780,6 +785,7 @@ func TestHelperRunHasNoSweepContainerAndStagesFirst(t *testing.T) {
 	s := spec(t)
 	s.NotEvid = false
 	s.OutGid = 4243
+	s.ServiceUID = 4242
 	s.Chown = func(string, int, int) error { return nil }
 	var order []string
 	r := &Runner{Docker: fake, Stage: func(Spec) (func(), error) {
@@ -806,6 +812,7 @@ func TestHelperRunHasNoSweepContainerAndStagesFirst(t *testing.T) {
 	s2 := spec(t)
 	s2.NotEvid = false
 	s2.OutGid = 4243
+	s2.ServiceUID = 4242
 	s2.Chown = func(string, int, int) error { return nil }
 	os.Remove(log)
 	r2 := &Runner{Docker: fake, Stage: func(Spec) (func(), error) { return nil, os.ErrPermission }}
@@ -826,6 +833,7 @@ func TestHelperRunSweepsTheHomeInGo(t *testing.T) {
 	s := spec(t)
 	s.NotEvid = false
 	s.OutGid = 4243
+	s.ServiceUID = 4242
 	s.Chown = func(string, int, int) error { return nil }
 	os.MkdirAll(s.HomeDir(), 0o700)
 	os.WriteFile(filepath.Join(s.HomeDir(), ".bashrc"), []byte("evil"), 0o644)
@@ -950,5 +958,62 @@ func TestHelperPrepareNeedsTheOutboxGroup(t *testing.T) {
 	h.Chown = func(string, int, int) error { return nil }
 	if err := h.Prepare(); err == nil || !strings.Contains(err.Error(), "OutGid") {
 		t.Fatalf("a helper-mode Prepare without the service gid was accepted: %v", err)
+	}
+}
+
+// The service user (hostd) can read and traverse the helper-mode outbox but not write it: it must
+// not be able to create, rename or delete the files the fence leaves there.
+func TestServiceGroupCanReadButNotWriteTheOutbox(t *testing.T) {
+	h := spec(t)
+	h.NotEvid = false
+	h.OutGid = 4243
+	h.ServiceUID = 4242
+	h.Chown = func(string, int, int) error { return nil }
+	if err := h.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(filepath.Join(h.GenDir(), "out"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := st.Mode()
+	if m&0o050 != 0o050 {
+		t.Errorf("the service group cannot read and traverse the outbox: %v", m)
+	}
+	if m&0o020 != 0 || m&0o002 != 0 {
+		t.Errorf("the service group (or anyone) can write the outbox: %v", m)
+	}
+	if m&0o700 != 0o700 {
+		t.Errorf("the fence (the owner) cannot write its outbox: %v", m)
+	}
+	if m&os.ModeSetgid == 0 {
+		t.Error("new files would not take the service group")
+	}
+}
+
+// in/ stays root's (nothing the daemon can rename or delete among what root wrote there); only
+// in/replies is the service user's, and Prepare refuses without the service ids.
+func TestHelperInDirIsRootsAndRepliesIsTheServices(t *testing.T) {
+	h := spec(t)
+	h.NotEvid, h.OutGid, h.ServiceUID = false, 4243, 4242
+	owners := map[string][2]int{}
+	h.Chown = func(p string, u, g int) error { owners[p] = [2]int{u, g}; return nil }
+	if err := h.Prepare(); err != nil {
+		t.Fatal(err)
+	}
+	in, rep := filepath.Join(h.GenDir(), "in"), filepath.Join(h.GenDir(), "in", "replies")
+	if owners[in] != [2]int{0, 0} || owners[rep] != [2]int{4242, 4243} {
+		t.Errorf("owners %v", owners)
+	}
+	for _, p := range []string{in, rep} {
+		if st, err := os.Stat(p); err != nil || st.Mode().Perm() != 0o755 {
+			t.Errorf("%s: %v %v", p, st, err)
+		}
+	}
+	g := spec(t)
+	g.NotEvid, g.OutGid = false, 4243
+	g.Chown = func(string, int, int) error { return nil }
+	if err := g.Prepare(); err == nil || !strings.Contains(err.Error(), "service user") {
+		t.Errorf("a helper Prepare without the service uid was accepted: %v", err)
 	}
 }

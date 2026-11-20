@@ -40,7 +40,7 @@ func (t *TmuxLauncher) paneDir(r *Record) string {
 // paneCmd is what the pane runs.
 func (t *TmuxLauncher) paneCmd(r *Record) []string {
 	if t.Helper {
-		return []string{SudoBin, "-n", RootBin, "run", "--tty", r.Sid}
+		return []string{SudoBin, "-n", RootBin, "run", "--tty", "--", r.Sid}
 	}
 	return append([]string{t.Exe, "run", "--sid", r.Sid, "--gen", strconv.Itoa(r.Gen)}, t.Env...)
 }

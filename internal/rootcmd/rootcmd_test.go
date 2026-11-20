@@ -372,6 +372,9 @@ func TestRunAllow(t *testing.T) {
 	if s.Sid != sid || s.Gen != 2 || s.Image != goodImage || s.NotEvid || s.Uid != os.Getuid() || s.TTY {
 		t.Errorf("%+v", s)
 	}
+	if s.ServiceUID != svcUID {
+		t.Errorf("in/replies would be made for uid %d, want the service user's %d", s.ServiceUID, svcUID)
+	}
 	if s.OutGid != svcGID {
 		t.Errorf("the outbox group is %d, want the service user's %d", s.OutGid, svcGID)
 	}

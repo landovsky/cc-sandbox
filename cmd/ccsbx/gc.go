@@ -30,6 +30,9 @@ func gcCmd() *cli.Command {
 				return cli.ExitRefused
 			}
 			if mode == "helper" {
+				if refuseExplicit("gc", f, stderr, "state", "docker") {
+					return cli.ExitUsage
+				}
 				var a []string
 				if get("dry-run") == "true" {
 					a = []string{"--dry-run"}

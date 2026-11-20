@@ -25,6 +25,7 @@ STATE=$(mktemp -d)
 mkdir -p /var/tmp/ccsbx-hello
 PIDS=()
 . "$(dirname "$0")/fence-cleanup.sh"   # cleanup: exact names only, refuses empty or foreign values
+CLEANUP_EXTRA="ccsbx-fwd-$$ ccsbx-canary-$$"   # the two containers this test (alone) creates
 trap cleanup EXIT
 
 fail() { echo "FAIL [$RULE/$TWIN]: $*"; exit 1; }

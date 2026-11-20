@@ -252,3 +252,28 @@ func TestRunValidatesTheSidItSends(t *testing.T) {
 		t.Error("sudo or the helper was called with a bad sid")
 	}
 }
+
+// Helper mode refuses a flag only direct mode uses, rather than ignoring it: the caller must not
+// believe it chose the image, the generation, the state or docker. The same flags set by the
+// environment (a default) are not "explicit" and do not trip it.
+func TestHelperModeRefusesExplicitDirectOnlyFlags(t *testing.T) {
+	s := newStubs(t)
+	for _, a := range [][]string{
+		{"run", "--root", "helper", "--sid", stubSid, "--gen", "2"}, {"run", "--root", "helper", "--sid", stubSid, "--image", "x"},
+		{"run", "--root", "helper", "--sid", stubSid, "--state", "/x"}, {"run", "--root", "helper", "--sid", stubSid, "--docker", "/usr/bin/docker"},
+		{"gc", "--root", "helper", "--state", "/x"}, {"gc", "--root", "helper", "--docker", "d"},
+		{"stop", "--root", "helper", "--state", "/x", stubSid}, {"stop", "--root", "helper", "--docker", "d", stubSid},
+	} {
+		code, out := run(a...)
+		if code != 64 || !strings.Contains(out, "not accepted in helper mode") {
+			t.Errorf("%v: exit %d %s", a, code, out)
+		}
+	}
+	if _, err := os.Stat(s.log); err == nil {
+		t.Error("the helper was called with a flag it must not take")
+	}
+	t.Setenv("CCSBX_STATE", t.TempDir()) // set by the environment, not on the command line
+	if code, out := run("gc", "--root", "helper"); code != 0 {
+		t.Errorf("an env-set state tripped the refusal: %d %s", code, out)
+	}
+}

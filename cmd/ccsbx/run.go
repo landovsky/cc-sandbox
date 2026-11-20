@@ -55,6 +55,9 @@ func runRun(f *cli.Flags, args []string, stdout, stderr io.Writer) int {
 	if mode == "helper" {
 		// nothing but the sid goes to the helper: it reads the record, the image, the workdir and
 		// the caps itself and refuses what does not check out. --gen is not passed: the record's is used.
+		if refuseExplicit("run", f, stderr, "gen", "image", "state", "docker") {
+			return cli.ExitUsage
+		}
 		if len(args) > 0 {
 			fmt.Fprintln(stderr, "ccsbx run: in helper mode the command in the fence is fixed (claude); an argument after -- is not accepted")
 			return cli.ExitUsage

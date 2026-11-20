@@ -8,6 +8,7 @@ package main
 
 import (
 	"bytes"
+	"flag"
 	"fmt"
 	"io"
 	"net"
@@ -142,4 +143,23 @@ func runHelper(cmdName, verb string, args []string, stdout, stderr io.Writer) in
 		return 128 + int(ws.Signal())
 	}
 	return ee.ExitCode()
+}
+
+// refuseExplicit is exit 64 when the caller named, on the command line, a flag that only direct
+// mode uses. In helper mode root decides the image, the generation, the state and docker; a flag
+// that is silently ignored would let the caller think it had chosen them.
+func refuseExplicit(cmdName string, f *cli.Flags, stderr io.Writer, names ...string) bool {
+	var bad []string
+	f.Visit(func(fl *flag.Flag) {
+		for _, n := range names {
+			if fl.Name == n {
+				bad = append(bad, "--"+n)
+			}
+		}
+	})
+	if len(bad) == 0 {
+		return false
+	}
+	fmt.Fprintf(stderr, "ccsbx %s: %s is not accepted in helper mode: ccsbx-root takes it from the daemon's record and its own config (use --root direct for a dev run)\n", cmdName, strings.Join(bad, ", "))
+	return true
 }

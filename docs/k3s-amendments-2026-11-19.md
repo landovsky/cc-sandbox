@@ -228,7 +228,7 @@ dropped, given A1 (no door or hostd is left in `cc-sandbox` for the launcher to 
 | 6 | no PVC, ephemeral, CSI, hostPath, configMap or downwardAPI volumes; **only `emptyDir`** | `!has(object.spec.volumes) \|\| object.spec.volumes.all(v, has(v.emptyDir))` | the agent gets no data it wasn't handed by the sidecar; closes the PVC hole |
 | 7 | every `emptyDir` has a `sizeLimit` | `…all(v, has(v.emptyDir.sizeLimit))` | K9 enforced, not just documented |
 | 8 | containers: exactly one, named `fence`; initContainers: at most one, named `side`, `restartPolicy: Always` (a native sidecar); no ephemeralContainers | `object.spec.containers.size() == 1 && object.spec.containers[0].name == 'fence' && (!has(object.spec.initContainers) \|\| (object.spec.initContainers.size() <= 1 && object.spec.initContainers.all(c, c.name == 'side' && has(c.restartPolicy) && c.restartPolicy == 'Always'))) && !has(object.spec.ephemeralContainers)` | doc 5 F2 shape; nothing else rides in a session pod |
-| 9 | `shareProcessNamespace` absent or false; `hostUsers` absent or true (PSA covers host*) | `!has(object.spec.shareProcessNamespace) \|\| object.spec.shareProcessNamespace == false` | the fence can't see or ptrace the sidecar's token |
+| 9 | `shareProcessNamespace` absent or false; `hostUsers` absent or true (**relaxed by k3s `39cf29b`: `hostUsers: false` is now allowed**; PSA covers host*) | `!has(object.spec.shareProcessNamespace) \|\| object.spec.shareProcessNamespace == false` | the fence can't see or ptrace the sidecar's token |
 | 10 | `dnsPolicy: None`, and `dnsConfig` with no nameservers or only `127.0.0.1` | `has(object.spec.dnsPolicy) && object.spec.dnsPolicy == 'None' && (!has(object.spec.dnsConfig) \|\| !has(object.spec.dnsConfig.nameservers) \|\| object.spec.dnsConfig.nameservers.all(n, n == '127.0.0.1'))` | defence in depth on top of the no-DNS NetPol |
 | 11 | images in digest form from our two repos: `^ghcr\.io/<owner>/(ccsbx-fence\|ccsbx)@sha256:[0-9a-f]{64}$`, for containers and initContainers (**applies to every pod in `cc-sandbox`**, launcher or not); and no pod in `cc-sandbox` carries `role` `door` or `hostd` | `object.spec.containers.all(c, c.image.matches('^ghcr\\.io/<owner>/(ccsbx-fence\|ccsbx)@sha256:[0-9a-f]{64}$'))` + the same for initContainers | no tag-only or foreign image; the watchdog pod is the one exception (it keeps its own image rule) |
 | 12 | `pods/exec` and `pods/attach` by the launcher only into pods named `ccsbx-s-*` (CONNECT) | `request.name.startsWith('ccsbx-s-')` on resource `pods`, subresources `exec`, `attach`, operation `CONNECT` | the launcher never execs into a non-session pod (the watchdog, a test pod) |
@@ -250,8 +250,9 @@ dropped, given A1 (no door or hostd is left in `cc-sandbox` for the launcher to 
 Also, `kubectl exec` into the watchdog pod is refused. The F2 reference pod is admitted.
 
 **LIVE: k3s `1e76dc1` (devops:#5dxt, merged; PriorityClass `ccsbx-session` and the scoped quotas
-exist; k3s's check 139/0).** A tightening of the rules above for launcher-created pods. Only the
-last row (`hostUsers`) is still **COMING**:
+exist; k3s's check 139/0).** A tightening of the rules above for launcher-created pods. The last row
+(`hostUsers`) is **LIVE since k3s `39cf29b`** (Tomas approved it 2026-11-20; rule 9 now refuses only
+`shareProcessNamespace`):
 
 | Change | Rule | Why |
 |---|---|---|
@@ -259,7 +260,7 @@ last row (`hostUsers`) is still **COMING**:
 | no `runtimeClassName`, no finalizers | new | no `runtimeClassName`: a session can't pick a runtime with weaker isolation than the default. No finalizers: a session pod can't block its own deletion (cleanup and quota stay in the launcher's hands) |
 | `terminationGracePeriodSeconds` at most 60 (unset = 30 is fine) | new | a stopping session can't hold the node's resources for long |
 | ephemeral containers (`kubectl debug`) refused in **both namespaces, for everyone** | widens rule 8 | `kubectl debug` would inject a container that bypasses the pod spec's fences (and could reach the sidecar's token); attach is exec only |
-| **COMING:** `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | with `hostUsers: false` a session's uid 0 maps to an unprivileged host uid, so a container escape on future-two's shared kernel lands as nobody, not as host root. Required only after a test pod proves it on future-two (k3s version, idmapped mount of the session volume); requiring it is Tomas's call |
+| **LIVE (k3s `39cf29b`):** `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | with `hostUsers: false` a session's uid 0 maps to an unprivileged host uid, so a container escape on future-two's shared kernel lands as nobody, not as host root. Required only after a test pod proves it on future-two (k3s version, idmapped mount of the session volume); requiring it is Tomas's call |
 
 ---
 
@@ -337,13 +338,13 @@ spec:
 
 The operator makes **one egress proxy per ExternalName Service**. The pods run in namespace
 `tailscale` (on the `k3s` control-plane node), labelled `tailscale.com/parent-resource=<svc>` and
-`tailscale.com/parent-resource-ns=<ns>`. We need three, all tagged `tag:ccsbx`:
+`tailscale.com/parent-resource-ns=<ns>`. We need three. The hub one is tagged `tag:ccsbx`; the two hostd peer ones (**with F4 (Night 3), not in the Gate M paste**, no cluster source gets :7480 until F4) are tagged **`tag:ccsbx-hostd`**, because a fenced pod can reach a `tag:ccsbx` proxy and so must not hold the :7480 grant:
 
 | Egress Service (ns `cc-sandbox`) | Tailnet target | Port | Used by |
 |---|---|---|---|
-| `session-bus-egress` (the live draft variant E) | hp-ubuntu | 4011 | session pods (the sidecar) and hostd |
-| `hp-hostd-egress` | hp-ubuntu | 7480 | hostd only (M2d direct fallback) |
-| `mac-hostd-egress` | the Mac | 7480 | hostd only (M2d) |
+| `session-bus-egress` (the live draft variant E, `tag:ccsbx`) | hp-ubuntu | 4011 | session pods (the sidecar) and hostd |
+| `hp-hostd-egress` (`tag:ccsbx-hostd`, with F4) | hp-ubuntu | 7480 | hostd only (M2d direct fallback) |
+| `mac-hostd-egress` (`tag:ccsbx-hostd`, with F4) | the Mac | 7480 | hostd only (M2d) |
 
 ```yaml
 # in namespace tailscale (SHARED); one policy per proxy, so each admits only its own clients
@@ -381,7 +382,7 @@ spec:
 ```
 
 - **Proxy egress isn't restricted.** It carries WireGuard to DERP and peers, which NetPol can't
-  read. **The ACL limits the destination** (A7: `tag:ccsbx` reaches only hp:4011 and 7480, and
+  read. **The ACL limits the destination** (A7: `tag:ccsbx` reaches only hp:4011; `tag:ccsbx-hostd`, with F4, reaches only hp:7480 and
   the Mac:7480).
 - Sessions have no DNS, so the launcher passes `session-bus-egress`'s proxy ClusterIP in through
   `hostAliases`, and hostd gets all three as env.
@@ -480,6 +481,7 @@ as well, so Tomas can tag a probe device:
 	"tagOwners": {
 		// … existing entries …
 		"tag:ccsbx":         ["autogroup:admin", "tag:k8s-operator"],
+		"tag:ccsbx-hostd":   ["autogroup:admin", "tag:k8s-operator"],
 	},
 ```
 
@@ -496,12 +498,15 @@ for the same reason the file gives for hp):
 **grants:**
 
 ```jsonc
-		// cc-sandbox: operator EGRESS proxies (tag:ccsbx) -> the session-bus hub and the session
-		// daemons on hp and the Mac. Nothing else is reachable from tag:ccsbx.
-		{"src": ["tag:ccsbx"], "dst": ["hp-ubuntu"], "ip": ["tcp:4011", "tcp:7480"]},
-		{"src": ["tag:ccsbx"], "dst": ["tomas-mac"], "ip": ["tcp:7480"]},
-		// cc-sandbox: hp and the Mac -> door and hostd INGRESS proxies (tag:ccsbx), HTTPS only.
-		{"src": ["hp-ubuntu", "tomas-mac"], "dst": ["tag:ccsbx"], "ip": ["tcp:443"]},
+		// cc-sandbox: the operator EGRESS proxy to the session-bus hub (tag:ccsbx). A fenced pod can
+		// reach this proxy, so the hub port is all it gets. Nothing else is reachable from tag:ccsbx.
+		{"src": ["tag:ccsbx"], "dst": ["hp-ubuntu"], "ip": ["tcp:4011"]},
+		// WITH F4 (Night 3), NOT IN THE GATE M PASTE: hostd's own devices (tag:ccsbx-hostd, never on
+		// a door or hub proxy) -> the session daemons on hp and the Mac.
+		{"src": ["tag:ccsbx-hostd"], "dst": ["hp-ubuntu", "tomas-mac"], "ip": ["tcp:7480"]},
+		// cc-sandbox: hp and the Mac -> door INGRESS proxies (tag:ccsbx) and hostd INGRESS proxy
+		// HTTPS only. The Gate M paste has exactly two grants: tag:ccsbx -> hp-ubuntu tcp:4011, and this one.
+		{"src": ["hp-ubuntu", "tomas-mac"], "dst": ["tag:ccsbx"], "ip": ["tcp:443"]},   // the hostd ingress proxy's tag is k3s's call in its PR
 		// cc-sandbox launcher on hp -> kube-apiserver (tag:infra). ALREADY LIVE (keep as is).
 		{"src": ["hp-ubuntu"], "dst": ["tag:infra"], "ip": ["tcp:6443"]},
 ```
@@ -510,14 +515,15 @@ Notes:
 - **hp ↔ Mac on 7480** needs no new grant. Both are tomas's devices, so the existing
   `autogroup:member → autogroup:self` grant covers them. The host firewalls are the limit: ufw
   on hp, and the macOS firewall.
-- **`tag:ccsbx` is shared by the egress and the ingress proxies.** So the door ingress proxies
-  could also reach hp:4011 and 7480. They're operator-managed, never agent-controlled, so this
-  is accepted. If that's not good enough, split the tag into `tag:ccsbx-egress`, which carries
-  the outbound grants, and `tag:ccsbx`.
+- **`tag:ccsbx` is shared by the hub egress proxy and the door ingress proxies.** So the door
+  ingress proxies could also reach hp:4011. They're operator-managed, never agent-controlled, so
+  this is accepted. It holds **only** the hub port: the :7480 grant is on `tag:ccsbx-hostd`
+  (M2a review MUST-3), because a fenced pod can reach `tag:ccsbx` proxies and a grant to the
+  peer daemons there would give it a path to them.
 - The existing `autogroup:admin → *` grant already lets Tomas's devices reach everything. The
   explicit grants above keep working once that grant is tightened, as the file plans.
 - **Acceptance:**
-  - `tailscale status` lists the proxy devices with `tag:ccsbx`;
+  - `tailscale status` lists the proxy devices with `tag:ccsbx` (hub, doors) and `tag:ccsbx-hostd` (hostd);
   - from the session-bus proxy, hp:4011 connects and hp:22 times out;
   - from hp, a door's `https://<door device>/health` → 200.
 

@@ -75,7 +75,7 @@ func (v *Verifier) checkRevoke(hdr string, body []byte, now time.Time) error {
 	if len(parts) != 3 {
 		return ErrBadProof
 	}
-	sc, ok := v.ring[parts[0]]
+	sc, ok := v.Ring()[parts[0]]
 	ts, terr := strconv.ParseInt(parts[1], 10, 64)
 	sig, serr := b64.DecodeString(parts[2])
 	var b RevokeBody

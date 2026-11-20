@@ -240,7 +240,7 @@ func TestCannotReachNonDoor(t *testing.T) {
 		t.Fatal("a non-door is in the dial set")
 	}
 	// The transport itself refuses an address that is not a pinned door, whatever the request says.
-	tr := r.f.proxy.Transport.(*http.Transport)
+	tr := r.f.proxy.Transport.(*scrubbingTransport).rt.(*http.Transport)
 	if c, err := tr.DialContext(context.Background(), "tcp", evilAddr); err == nil {
 		c.Close()
 		t.Fatal("the transport dialled a non-door address")

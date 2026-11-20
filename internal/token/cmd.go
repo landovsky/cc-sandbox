@@ -202,7 +202,8 @@ func Main(args []string, stdout, stderr io.Writer) int {
 
 // checkNoProof is Verify without the proof and state steps, for the CLI only.
 func (v *Verifier) checkNoProof(tok string, now time.Time) (*Claims, error) {
-	c, err := parse(tok, v.ring)
+	ring := v.Ring()
+	c, err := parse(tok, ring)
 	if err != nil {
 		return nil, err
 	}
@@ -210,7 +211,7 @@ func (v *Verifier) checkNoProof(tok string, now time.Time) (*Claims, error) {
 	if err != nil {
 		return nil, err
 	}
-	if !v.ring[c.kid].allows(owner, machine) {
+	if !ring[c.kid].allows(owner, machine) {
 		return nil, ErrKeyScope
 	}
 	if now.Unix() >= c.Exp {

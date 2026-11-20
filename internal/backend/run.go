@@ -7,10 +7,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
 )
@@ -49,12 +47,9 @@ func (r *Runner) Run(s Spec) (int, error) {
 	if err := s.writePID(); err != nil {
 		return -1, err
 	}
+	// the directories exist (Prepare made them); each file is created new, never through a link
 	for name, b := range r.Files {
-		p := filepath.Join(s.GenDir(), name)
-		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
-			return -1, err
-		}
-		if err := os.WriteFile(p, b, 0o644); err != nil {
+		if err := writeGenFile(s.GenDir(), name, b); err != nil {
 			return -1, err
 		}
 	}

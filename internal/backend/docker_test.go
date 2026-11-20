@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 )
 
@@ -1015,5 +1016,54 @@ func TestHelperInDirIsRootsAndRepliesIsTheServices(t *testing.T) {
 	g.Chown = func(string, int, int) error { return nil }
 	if err := g.Prepare(); err == nil || !strings.Contains(err.Error(), "service user") {
 		t.Errorf("a helper Prepare without the service uid was accepted: %v", err)
+	}
+}
+
+// Root writes the generation's files into directories others may have touched. A symlink planted
+// where a file is about to be created must not turn the write into one on the link's target.
+func TestGenerationFilesAreNeverWrittenThroughALink(t *testing.T) {
+	g := vt(t)
+	os.MkdirAll(filepath.Join(g, "in"), 0o755)
+	os.MkdirAll(filepath.Join(g, "managed"), 0o755)
+	victim := filepath.Join(vt(t), "victim")
+	os.WriteFile(victim, []byte("untouched"), 0o644)
+	// a symlink at the file, a dangling one (creating through it would create the target), a
+	// symlink as the directory, and a file that already exists
+	os.Symlink(victim, filepath.Join(g, "in", "brief.md"))
+	os.Symlink(filepath.Join(filepath.Dir(victim), "created-through-link"), filepath.Join(g, "in", "scope.json"))
+	os.WriteFile(filepath.Join(g, "in", "session.json"), []byte("old"), 0o644)
+	if err := writeGenFile(g, "in/brief.md", []byte("evil")); err == nil {
+		t.Error("a write through a planted symlink succeeded")
+	}
+	if err := writeGenFile(g, "in/scope.json", []byte("evil")); err == nil {
+		t.Error("a write through a dangling symlink succeeded")
+	}
+	if err := writeGenFile(g, "in/session.json", []byte("new")); err == nil {
+		t.Error("an existing file was overwritten")
+	}
+	if b, _ := os.ReadFile(victim); string(b) != "untouched" {
+		t.Errorf("the link's target was written: %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(filepath.Dir(victim), "created-through-link")); err == nil {
+		t.Error("the dangling link's target was created")
+	}
+	os.Rename(filepath.Join(g, "managed"), filepath.Join(g, "managed.real"))
+	os.Symlink(filepath.Dir(victim), filepath.Join(g, "managed"))
+	if err := writeGenFile(g, "managed/x.json", []byte("evil")); err == nil {
+		t.Error("a write through a symlinked directory succeeded")
+	}
+	for _, bad := range []string{"x", "in/../x", "../x", "/etc/x", "in/a/b", "in/"} {
+		if err := writeGenFile(g, bad, nil); err == nil {
+			t.Errorf("%q was accepted as a generation file name", bad)
+		}
+	}
+	// the normal case: a new file, 0644 whatever the umask
+	old := syscall.Umask(0o077)
+	defer syscall.Umask(old)
+	if err := writeGenFile(g, "in/ok.json", []byte("{}")); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(filepath.Join(g, "in", "ok.json")); st.Mode().Perm() != 0o644 {
+		t.Errorf("mode %v", st.Mode())
 	}
 }

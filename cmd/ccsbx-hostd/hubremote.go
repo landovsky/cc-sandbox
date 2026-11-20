@@ -367,7 +367,7 @@ func addressNames(e map[string]any, to string) bool {
 	if to == "" {
 		return false
 	}
-	for _, k := range []string{"id", "key", "label", "node"} {
+	for _, k := range []string{"uid", "id", "key", "label", "node"} {
 		if v, _ := e[k].(string); v != "" && (v == to || (k == "node" && strings.Replace(to, ":#", ":", 1) == v)) {
 			return true
 		}

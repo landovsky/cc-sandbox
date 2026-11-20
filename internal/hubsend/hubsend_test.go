@@ -39,20 +39,24 @@ func TestResolveChoosesTheOneEntryTheRecordPlacesTheNodeOn(t *testing.T) {
 		id      string
 		err     error
 	}{
-		"the entry on the bound machine":                   {[]map[string]any{squat, mgrMac}, "mac", "m1", nil},
-		"only a squatter on another machine":               {[]map[string]any{squat}, "mac", "", msg.ErrWrongMachine},
-		"nothing at all":                                   {nil, "mac", "", msg.ErrUnknownNode},
-		"two on the bound machine (not guessed)":           {[]map[string]any{mgrMac, fenced}, "mac", "", msg.ErrAmbiguousNode},
-		"on this machine: the local bus's":                 {[]map[string]any{local}, "hp", "", msg.ErrLocalNode},
-		"an unfenced node the record does not place":       {[]map[string]any{mgrMac}, "", "", msg.ErrWrongMachine},
-		"a fenced node the record does not place (signed)": {[]map[string]any{fenced}, "", "f1", nil},
-		"the node asked in the #-form":                     {[]map[string]any{mgrMac}, "mac", "m1", nil},
+		"the entry on the bound machine":             {[]map[string]any{squat, mgrMac}, "mac", "m1", nil},
+		"only a squatter on another machine":         {[]map[string]any{squat}, "mac", "", msg.ErrWrongMachine},
+		"nothing at all":                             {nil, "mac", "", msg.ErrUnknownNode},
+		"two on the bound machine (not guessed)":     {[]map[string]any{mgrMac, fenced}, "mac", "", msg.ErrAmbiguousNode},
+		"on this machine: the local bus's":           {[]map[string]any{local}, "hp", "", msg.ErrLocalNode},
+		"an unfenced node the record does not place": {[]map[string]any{mgrMac}, "", "", msg.ErrWrongMachine},
+		// a fenced session's node is only the label its starter gave it: a decoy would receive the report
+		"a fenced node the record does not place": {[]map[string]any{fenced}, "", "", msg.ErrWrongMachine},
+		"the node asked in the #-form":            {[]map[string]any{mgrMac}, "mac", "m1", nil},
 	} {
 		node := "cc-sandbox:mgr"
 		if strings.Contains(name, "#-form") {
 			node = "cc-sandbox:#mgr"
 		}
 		got, err := Resolve(c.entries, node, c.want, "hp")
+		if c.id != "" {
+			c.id = "u-" + c.id // the address is the entry's full uid
+		}
 		if !errors.Is(err, c.err) || got.ID != c.id {
 			t.Errorf("%s: %v %v", name, got, err)
 		}
@@ -126,5 +130,27 @@ func TestTheHubsStatusReachesTheCallerAsItWas(t *testing.T) {
 	ts, _ := fakeHub(t, 200, 0)
 	if ok, err := Send(t.Context(), ts.URL, "tok", priv, From{Sid: "s0w"}, Target{ID: "m1"}, "report", "x", time.Now()); ok || err != nil {
 		t.Errorf("delivered 0: %v %v", ok, err)
+	}
+}
+
+// context (R8-MUST-2): an entry's short id is only 24 bits of a hash of its uid, so another machine's owner can grind a
+// uid whose id collides with a fenced manager's. The sender must not address the pair: it addresses the full uid, and
+// refuses when ANY other entry shares the chosen one's uid, id or key.
+func TestAnEntryThatSharesTheChosenOnesAddressIsNeverSentToBlock(t *testing.T) {
+	mgr := map[string]any{"id": "a1b2c3", "uid": "u-real", "key": "ccsbx:s0real", "node": "cc-sandbox:mgr", "machine": "mac", "fenced": true}
+	for name, other := range map[string]map[string]any{
+		"a colliding short id":          {"id": "a1b2c3", "uid": "u-ground", "key": "x4/%1", "node": "cc-sandbox:other", "machine": "x4"},
+		"the same uid":                  {"id": "ffffff", "uid": "u-real", "key": "x4/%2", "machine": "x4"},
+		"the same key":                  {"id": "eeeeee", "uid": "u-else", "key": "ccsbx:s0real", "machine": "x4"},
+		"an id equal to the chosen uid": {"id": "u-real", "uid": "u-x", "key": "x4/%3", "machine": "x4"},
+	} {
+		if _, err := Resolve([]map[string]any{mgr, other}, "cc-sandbox:mgr", "mac", "hp"); !errors.Is(err, msg.ErrAmbiguousNode) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+	unrelated := map[string]any{"id": "123456", "uid": "u-other", "key": "x4/%9", "node": "cc-sandbox:other", "machine": "x4"}
+	got, err := Resolve([]map[string]any{mgr, unrelated}, "cc-sandbox:mgr", "mac", "hp")
+	if err != nil || got.ID != "u-real" {
+		t.Fatalf("an unrelated entry blocked the send, or the address is not the uid: %v %v", got, err)
 	}
 }

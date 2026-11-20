@@ -33,7 +33,7 @@ func Kind(k string) string {
 
 // Target is the hub entry a message goes to.
 type Target struct {
-	ID  string // the hub's id for the entry (what `to` is signed over)
+	ID  string // the address `to` is posted and signed over: the entry's full uid (its short id only when it has no uid)
 	Sid string // the session id, when the entry has one (for the sender's reply window)
 }
 
@@ -45,20 +45,23 @@ type Target struct {
 //   - Two entries on the node (on the right machine) are not guessed between (msg.ErrAmbiguousNode).
 //   - No entry at all: msg.ErrUnknownNode. An entry on THIS machine (myMachine): msg.ErrLocalNode, which the router
 //     hands to the local bus.
-//   - An UNFENCED node the record does not place on a machine is not sent to (msg.ErrWrongMachine); a fenced one
-//     is (its signature identifies it).
+//   - A node the record places on NO machine is not sent to, fenced or not (msg.ErrWrongMachine): a fenced session's
+//     node is only the label its starter gave it, so a decoy from another machine would otherwise receive the report.
+//   - The address is the entry's full uid (its short id is 24 bits of a hash, so another machine's owner can grind a
+//     colliding one): if ANY other entry in the list shares the chosen entry's uid, id or key the node is not sent to
+//     (msg.ErrAmbiguousNode), however many entries hold the node.
 func Resolve(entries []map[string]any, node, wantMachine, myMachine string) (Target, error) {
-	var held []map[string]any
-	for _, x := range entries {
+	var held []int // indexes into entries
+	for i, x := range entries {
 		if hubc.CountNode([]map[string]any{x}, node) > 0 {
-			held = append(held, x)
+			held = append(held, i)
 		}
 	}
 	if wantMachine != "" {
-		var on []map[string]any
-		for _, x := range held {
-			if m, _ := x["machine"].(string); m == wantMachine {
-				on = append(on, x)
+		var on []int
+		for _, i := range held {
+			if m, _ := entries[i]["machine"].(string); m == wantMachine {
+				on = append(on, i)
 			}
 		}
 		if len(on) == 0 && len(held) > 0 {
@@ -72,20 +75,35 @@ func Resolve(entries []map[string]any, node, wantMachine, myMachine string) (Tar
 	if len(held) == 0 {
 		return Target{}, msg.ErrUnknownNode
 	}
-	e := held[0]
-	m, _ := e["machine"].(string)
-	if m == myMachine {
+	at := held[0]
+	e := entries[at]
+	if m, _ := e["machine"].(string); m == myMachine {
 		return Target{}, msg.ErrLocalNode
 	}
-	if wantMachine == "" && e["fenced"] != true {
+	if wantMachine == "" {
 		return Target{}, msg.ErrWrongMachine
 	}
 	id, _ := e["id"].(string)
-	if id == "" {
-		return Target{}, fmt.Errorf("the hub's entry for that node has no id")
-	}
 	sid, _ := e["uid"].(string)
-	return Target{ID: id, Sid: sid}, nil
+	key, _ := e["key"].(string)
+	addr := sid
+	if addr == "" {
+		addr = id
+	}
+	if addr == "" {
+		return Target{}, fmt.Errorf("the hub's entry for that node has no uid or id")
+	}
+	for i, o := range entries {
+		if i == at {
+			continue
+		}
+		for _, k := range []string{"uid", "id", "key"} {
+			if v, _ := o[k].(string); v != "" && (v == addr || v == id || v == sid || v == key) {
+				return Target{}, msg.ErrAmbiguousNode
+			}
+		}
+	}
+	return Target{ID: addr, Sid: sid}, nil
 }
 
 // From says who is sending, as the hub and the receiver learn it. Sid and Machine are the daemon's own facts.

@@ -502,12 +502,12 @@ func TestSendRemoteSignsWithTheGenerationKeyAndReportsDelivery(t *testing.T) {
 		t.Fatalf("%v %v calls=%d %v", ok, err, calls, r.hub.got)
 	}
 	q := r.hub.got[0]
-	if q.To != "m1" || q.Kind != "message" || q.From["sid"] != targetSid || q.From["fenced"] != "true" {
+	if q.To != "s0mac12345" || q.Kind != "message" || q.From["sid"] != targetSid || q.From["fenced"] != "true" {
 		t.Fatalf("%+v", q)
 	}
 	// the stamp it sent verifies under the key the relay was minted with (the key hostd made)
 	k := r.hr.keys[targetSid+"/1"]
-	if _, err := stamp.Verify(pubOf(k), q.Sig, stamp.Fields{From: targetSid, To: "m1", Kind: "message", Body: "done step 1"}, time.Now(), stamp.NewCache()); err != nil {
+	if _, err := stamp.Verify(pubOf(k), q.Sig, stamp.Fields{From: targetSid, To: "s0mac12345", Kind: "message", Body: "done step 1"}, time.Now(), stamp.NewCache()); err != nil {
 		t.Fatalf("the stamp does not verify: %v", err)
 	}
 	// the key and relay are minted once per generation
@@ -521,7 +521,7 @@ func TestUnreachableTargetsAreDroppedAndJournaledNeverSuccess(t *testing.T) {
 	calls := 0
 	r := newRig(t, fixedMint("sbp1.relay-token-0001", &calls))
 	// the Router (not the uplink) decides "dropped" and journals it through its hook
-	w := msg.Session{Sid: targetSid, Label: "cc-sandbox:worker", Realm: "production", Gen: 1, Live: true}
+	w := worker()
 	if _, _, err := r.hr.SendRemote(w, "cc-sandbox:nobody", "report", "x"); !errors.Is(err, msg.ErrUnknownNode) {
 		t.Fatalf("an unknown node: %v", err)
 	}

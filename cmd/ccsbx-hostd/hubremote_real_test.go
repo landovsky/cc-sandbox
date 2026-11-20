@@ -10,6 +10,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -592,5 +594,67 @@ func TestRealHubFencedAndUnfencedManagersReachEachOther(t *testing.T) {
 	hp7.out.mu.Unlock()
 	if !strings.Contains(hp7.j.types(), "hub.recv") {
 		t.Error("the receiver did not journal the refused attempt (hub.recv, unplaced)")
+	}
+
+	// 13. (round 8) a colliding short id. The hub's short id is 24 bits of a hash of the uid, so another machine's
+	// owner can grind a uid whose id equals the manager's. The sender addresses the full uid and refuses when any
+	// other entry shares the chosen one's address; and the hub never fans an address out to two entries (409).
+	uidA, uidB, shortID := collidingUIDs()
+	w13 := msg.Session{Sid: "s0worker13", Label: "cc-sandbox:worker13", Realm: "production", Gen: 1, Live: true, Started: time.Now().Add(-time.Hour)}
+	w13.Scope.Manager.Node, w13.Scope.Manager.Machine, w13.Scope.ReplyWindowS = "cc-sandbox:umgr13", "mac3", 3600
+	hp13 := startMachine(t, ctx, url, admin, "hp13", w13)
+	e13 := func(label, node, uid string) map[string]any {
+		return map[string]any{"key": "mac3/" + label, "label": label, "node": node, "uid": uid, "machine": "mac3", "pane": "%1", "state": "waiting"}
+	}
+	if _, err := mac.Track(ctx, append(macEntries(), e13("umgr13", "cc-sandbox:umgr13", uidA)), 120); err != nil {
+		t.Fatal(err)
+	}
+	decoy13 := map[string]any{"key": "x4/%13", "label": "decoy13", "node": "cc-sandbox:other13", "uid": uidB, "machine": "x4", "pane": "%13", "state": "waiting"}
+	if _, err := x4Client.Track(ctx, []map[string]any{decoy13}, 120); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(500 * time.Millisecond)
+	es, _ = owner.Sessions(ctx)
+	n := 0
+	for _, e := range es {
+		if e["id"] == shortID {
+			n++
+		}
+	}
+	if n != 2 {
+		t.Fatalf("the setup: %d entries share the short id %s, want 2", n, shortID)
+	}
+	if ok, _ := sendVia(hp13, w13, "cc-sandbox:umgr13", "report", "to the manager, not to its twin"); ok {
+		t.Fatal("a message was sent to an address another entry shares")
+	}
+	if fs, _, err := x4Client.Poll(ctx, "spoke:x4", 0, time.Second); err == nil && len(fs) != 0 {
+		t.Fatalf("the decoy's downlink got the message: %d frames", len(fs))
+	}
+	// the same address, straight at the hub with the relay credential: 409, never a fan-out to both
+	kp13, kt13, err := hp13.hr.relayFor(ctx, w13, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rc13 := &hubc.Client{URL: url, Token: func() (string, error) { return kt13, nil }}
+	sig13 := stamp.Sign(kp13, stamp.Fields{From: w13.Sid, To: shortID, Kind: "report", Body: "x"}, time.Now())
+	_, err = rc13.Send(ctx, hubc.SendReq{To: shortID, Text: "x", Kind: "report", Sig: sig13, From: map[string]string{"sid": w13.Sid, "fenced": "true"}})
+	if !hubc.IsConflict(err) {
+		t.Fatalf("the hub answered an ambiguous address with %v, want 409", err)
+	}
+}
+
+// collidingUIDs finds two uids whose hub short id (the first 6 hex of sha256) is the same: a birthday search, about
+// 4000 tries, which is how cheap it is for an attacker to match a victim whose uid he can choose... and about 2^24 to
+// match a fixed one.
+func collidingUIDs() (a, b, id string) {
+	seen := map[string]string{}
+	for i := 0; ; i++ {
+		u := fmt.Sprintf("dd%06d-0000-4000-8000-000000000000", i)
+		h := sha256.Sum256([]byte(u))
+		k := hex.EncodeToString(h[:3])
+		if prev, ok := seen[k]; ok {
+			return prev, u, k
+		}
+		seen[k] = u
 	}
 }

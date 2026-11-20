@@ -111,7 +111,7 @@ u0_hostd() {
   put /etc/systemd/system/ccsbx-tmux.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-tmux.service"
   note "ccsbx-root's run directory (it makes it itself, root-owned 0755; made here so hostd's unit can bind it read-write)"
   cmd install -d -o root -g root -m 0755 /var/lib/ccsbx-run
-  note "hostd's unit gets the owner's worktree root ($WORKTREE_ROOT, the first allowed root) and the fence image ($IMAGE)"
+  note "hostd's unit gets the same roots as ccsbx-root ($WORKTREE_ROOT, as --worktree-root) and the fence image ($IMAGE)"
   put /etc/systemd/system/ccsbx-hostd.service 0644 root:root < <(sed -e "s|@WORKTREE_ROOT@|$WORKTREE_ROOT|g" -e "s|@IMAGE@|$IMAGE|g" "$UNITS_DIR/systemd/ccsbx-hostd.service")
   note "the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced"
   if [ "$MODE" != install ] || [ ! -e "$(pth /var/lib/ccsbx/listen.token)" ]; then

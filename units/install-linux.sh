@@ -28,8 +28,7 @@
 #   --yes                 really do it (install and uninstall)
 #   --bin-dir DIR         built binaries + SHA256SUMS            (CCSBX_BIN_DIR, default <repo>/dist)
 #   --owner USER          the human who keeps access            (CCSBX_OWNER, default the invoking user)
-#   --allowed-roots A,B   ccsbx-root's workdir roots AND hostd's --worktree-root: one source, written to both (hostd gets only the
-#                         first root until its flag takes a comma list; then the whole list)
+#   --allowed-roots A,B   ccsbx-root's workdir roots AND hostd's --worktree-root: one source, the same comma list written to both
 #                                                              (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt, the owner from SUDO_USER via getent)
 #   --image REF           the fence image hostd passes to panes   (CCSBX_IMAGE, default ccsbx-fence:dev until a pin exists)
 #   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
@@ -112,13 +111,15 @@ _b='(api|subscription|stub)'
 ROOT_ERRORS=(); ALLOWED_ROOTS_TOML=""
 IFS=, read -r -a _roots <<<"$ALLOWED_ROOTS"
 for _r in "${_roots[@]}"; do
-  if [[ "$_r" =~ ^/[A-Za-z0-9._@+/-]+$ ]] && [ "$_r" != / ] && [[ "$_r" != *..* ]]; then
+  if [[ "$_r" =~ ^/[A-Za-z0-9._@+/-]+$ ]] && [ "$_r" != / ] && [[ "$_r" != *..* ]] && [[ "$_r" != */ ]] && [[ "$_r" != *//* ]]; then
     [ -n "$PREFIX" ] || [ -d "$_r" ] || ROOT_ERRORS+=("allowed root $_r does not exist")
     ALLOWED_ROOTS_TOML+="\"$_r\", "
   else ROOT_ERRORS+=("allowed root '$_r' is not a plain absolute path (no /, .., quotes, globs or spaces)"); fi
 done
 ALLOWED_ROOTS_TOML="${ALLOWED_ROOTS_TOML%, }"
-WORKTREE_ROOT="${_roots[0]}"      # hostd --worktree-root: the same value as the first allowed root
+# hostd --worktree-root takes the same comma list as allowed_roots (no spaces, no empty entry, no trailing slash, no ~)
+[[ "$ALLOWED_ROOTS" =~ (^,|,,|,$) ]] && ROOT_ERRORS+=("allowed roots '$ALLOWED_ROOTS' has an empty entry")
+WORKTREE_ROOT="$(IFS=,; echo "${_roots[*]}")"
 [[ "$IMAGE" =~ ^[A-Za-z0-9._/:@-]+$ ]] || ROOT_ERRORS+=("image '$IMAGE' is not a plain image reference (--image)")
 # the root-owned copies hostd, the signer scope and later readers use, never the owner-writable repo
 PROFILES_ETC=/etc/ccsbx/profiles

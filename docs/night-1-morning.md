@@ -97,7 +97,8 @@ Step 8 in detail (changed after the PR #2 review):
   owner-writable repo; `pins.toml` is empty today, so only e2e candidate images run. hostd also gets `--run-dir
   /var/lib/ccsbx-run` (made here, root 0755), `--worktree-root` and `--image ccsbx-fence:dev`. The default
   allowed roots stay `~/git,~/wt`: `ccsbx-root.toml`'s `allowed_roots` and hostd's `--worktree-root` are one value.
-  hostd gets only the first root (`~/git`) until its flag takes a comma list, then the whole list;
+  hostd gets exactly that list (`--worktree-root /home/tomas/git,/home/tomas/wt`): one bad or empty entry stops every
+  start, so the installer refuses empty entries, trailing slashes and `~`;
 - hostd listens on loopback only (`127.0.0.1:7480` with a token file), so no firewall rule is added and no firewall gate is needed (S11).
 
 ### Step 11: launcher check 5 (verbatim from the k3s side, 2026-11-20)
@@ -233,7 +234,7 @@ GATES (install refuses while any is unmet)
      write /etc/systemd/system/ccsbx-tmux.service  (mode 0644, root:root, 35 lines)
      # ccsbx-root's run directory (it makes it itself, root-owned 0755; made here so hostd's unit can bind it read-write)
      $ install -d -o root -g root -m 0755 /var/lib/ccsbx-run
-     # hostd's unit gets the owner's worktree root (/home/tomas/git, the first allowed root) and the fence image (ccsbx-fence:dev)
+     # hostd's unit gets the same roots as ccsbx-root (/home/tomas/git,/home/tomas/wt, as --worktree-root) and the fence image (ccsbx-fence:dev)
      write /etc/systemd/system/ccsbx-hostd.service  (mode 0644, root:root, 58 lines)
      # the bearer token for hostd's loopback API: made once (0600, ccsbx), never replaced
      $ runuser -u ccsbx -- sh -c umask\ 077\;\ head\ -c\ 32\ /dev/urandom\ \|\ base64\ \>\ /var/lib/ccsbx/listen.token

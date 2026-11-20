@@ -7,7 +7,7 @@
 # The command line is `ccsbx-hostd run ...` with exactly the flags the U3a/G builder adds on n1-g (review R1):
 # Helper mode (PR #12): --run-dir reads outboxes/CLOSED under ccsbx-root's run dir through group ccsbx (hostd must not need
 # wt/, gd/, quarantine/ or home/); --pins/--profiles are the ROOT-OWNED copies under /etc/ccsbx written by the installer;
-# @WORKTREE_ROOT@ is the first allowed root of ccsbx-root.toml and @IMAGE@ the fence image: both are filled in at install.
+# @WORKTREE_ROOT@ is the SAME comma list as ccsbx-root.toml's allowed_roots and @IMAGE@ the fence image: both are filled in at install.
 # --local-socket, --socket-group, --signer, --listen (loopback only), --listen-token-file. An unknown flag is
 # fatal in hostd, so confirm them with `ccsbx-hostd run --help` before the gate. The token file (0600, ccsbx) is made by the installer. hostd sends messages with `send-keys` into the
 # tmux server it owns on --tmux-socket (an absolute path, `tmux -S`, in /run/ccsbx, 0700 ccsbx: reached by `sudo ccsbx-root attach`, never directly).

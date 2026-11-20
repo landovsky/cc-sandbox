@@ -98,7 +98,7 @@
      (root-owned); hostd's `--profiles`/`--pins` and the signer's pairs read those copies, not the repo, so an
      agent that can write the repo cannot change what a profile may bill. Change a profile: edit the repo, merge,
      rerun `install --yes`. hostd's `--worktree-root` is the `--allowed-roots` value `ccsbx-root.toml` gets (default
-     `~/git,~/wt`; hostd takes only the first until its flag accepts a list); its `--run-dir` is `/var/lib/ccsbx-run`.
+     `~/git,~/wt`; the same comma list for both, no spaces, no empty entry, no trailing slash); its `--run-dir` is `/var/lib/ccsbx-run`.
      **Signer scope:** before it enables the signer socket the install has `ccsbx-signer --write-scope` write
      `/var/lib/ccsbx-keys/signer.scope` (0600, `ccsbx-keys`); without it the signer exits 2. The scope lists the
      owner, the machine name and the exact profile:billing pairs from `profiles/*.json` (a profile is signed

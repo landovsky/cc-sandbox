@@ -92,7 +92,7 @@ const MaxRelayToken = 4 << 10
 // validRelayToken checks the shape only (the hub is the judge of the rest): the sbp1. prefix, printable
 // ASCII with no whitespace or control bytes, a sane size.
 func validRelayToken(t string) bool {
-	if !strings.HasPrefix(t, "sbp1.") || len(t) > MaxRelayToken {
+	if !strings.HasPrefix(t, "sbp1.") || len(t) <= len("sbp1.") || len(t) > MaxRelayToken {
 		return false
 	}
 	for i := 0; i < len(t); i++ {

@@ -223,3 +223,79 @@ func TestTheOutboxRelayHandsAMsgSendToTheBus(t *testing.T) {
 		t.Fatalf("%+v calls %d", rep, r.hub.deliverCalls)
 	}
 }
+
+// context "a compromised worker loops msg.send files": the outbox relay's own bucket is about 5 a second, which
+// would all land in the manager's pane, so the bus keeps hostd's window (6 a minute per node), counts both
+// spellings of the node as one, asks the hub nothing once capped, and lets the window reopen.
+func TestAFloodToOneNodeIsCappedLikeHostdAndCostsTheHubNothing(t *testing.T) {
+	now := time.Unix(1_800_000_000, 0)
+	r := newBusRig(t, func(c *BusConfig) { c.Now = func() time.Time { return now } })
+	spell := []string{"cc-sandbox:mgr", "cc-sandbox:#mgr"}
+	for i := 0; i < 6; i++ {
+		if rep := send(r.bus, `{"to":{"node":"`+spell[i%2]+`"},"text":"hi"}`); rep.Status != "ok" {
+			t.Fatalf("send %d: %+v", i, rep)
+		}
+	}
+	rep := send(r.bus, `{"to":{"node":"cc-sandbox:mgr"},"text":"hi"}`)
+	if rep.Status != "refused" || code(rep) != "rate_capped" || r.hub.deliverCalls != 6 {
+		t.Fatalf("7th: %+v after %d deliveries", rep, r.hub.deliverCalls)
+	}
+	now = now.Add(61 * time.Second)
+	if rep := send(r.bus, `{"to":{"node":"cc-sandbox:mgr"},"text":"hi"}`); rep.Status != "ok" {
+		t.Fatalf("after the window: %+v", rep)
+	}
+}
+
+func peerScope(machine string) func(*BusConfig) {
+	return func(c *BusConfig) {
+		c.Scope.Peers = []string{"cc-sandbox:peer"}
+		c.Scope.PeerMachines = map[string]string{"cc-sandbox:peer": machine}
+	}
+}
+
+// context "a peer of the session is as reachable as the manager, on the machine the record places it on": and a
+// peer entry that only exists on another machine gets nothing.
+func TestAPeerIsReachableOnItsOwnMachineOnly(t *testing.T) {
+	r := newBusRig(t, peerScope("mac2"))
+	r.hub.entries = append(r.hub.entries, hubEntry("p1", "cc-sandbox:peer", "mac2", false))
+	if rep := send(r.bus, `{"to":{"node":"cc-sandbox:peer"},"text":"hi"}`); rep.Status != "ok" || r.hub.posted["to"] != "p1" {
+		t.Fatalf("%+v posted %v", rep, r.hub.posted)
+	}
+	r2 := newBusRig(t, peerScope("mac2"))
+	r2.hub.entries = []map[string]any{hubEntry("p9", "cc-sandbox:peer", "elsewhere", false)}
+	if rep := send(r2.bus, `{"to":{"node":"cc-sandbox:peer"},"text":"hi"}`); code(rep) != "dropped" || r2.hub.deliverCalls != 0 {
+		t.Fatalf("%+v", rep)
+	}
+}
+
+// context "the record places the manager on THIS machine": that is the local bus's business, and a pod has none,
+// so the fence is told there is no live session, never a false 'ok'.
+func TestANodeOnThisMachineIsNotReportedAsSent(t *testing.T) {
+	r := newBusRig(t, func(c *BusConfig) { c.Scope.Manager.Machine = "hp" })
+	r.hub.entries = []map[string]any{hubEntry("l1", "cc-sandbox:mgr", "hp", false)}
+	rep := send(r.bus, `{"to":{"node":"cc-sandbox:mgr"},"text":"hi"}`)
+	if rep.Status != "error" || code(rep) != "no_live_session" || r.hub.deliverCalls != 0 {
+		t.Fatalf("%+v", rep)
+	}
+}
+
+// context "two sessions hold the manager's node on the right machine (a roll in progress or a squat)": a message
+// must not guess between them, and the fence is told it was dropped, not that the hub is unavailable.
+func TestTwoSessionsOnTheNodeMeansNoGuessing(t *testing.T) {
+	r := newBusRig(t, nil)
+	r.hub.entries = append(r.hub.entries, hubEntry("m2", "cc-sandbox:mgr", "mac", false))
+	rep := send(r.bus, `{"to":{"node":"cc-sandbox:mgr"},"text":"hi"}`)
+	if code(rep) != "dropped" || r.hub.deliverCalls != 0 || len(r.j.of("bus.dropped")) != 1 {
+		t.Fatalf("%+v %+v", rep, r.j.evs)
+	}
+}
+
+// context "a fence addresses by bus id as well as by node": bus ids are local-bus addresses and a pod has no
+// local bus, so a request carrying one is malformed even when it also names a valid node.
+func TestABusIDIsRefusedEvenNextToAValidNode(t *testing.T) {
+	r := newBusRig(t, nil)
+	rep := send(r.bus, `{"to":{"node":"cc-sandbox:mgr","bus_id":"x"},"text":"hi"}`)
+	if rep.Status != "refused" || code(rep) != "bad_request" || r.hub.deliverCalls != 0 {
+		t.Fatalf("%+v", rep)
+	}
+}

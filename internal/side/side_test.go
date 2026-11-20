@@ -717,11 +717,12 @@ func TestALoadWithoutARelayTokenStillWorks(t *testing.T) {
 func TestAMalformedRelayTokenIsRefusedAndDoesNotSpendTheLoad(t *testing.T) {
 	r := newRig(t, nil)
 	for name, rt := range map[string]string{
-		"no prefix":  "eyJhbGciOi.x.y",
-		"whitespace": "sbp1.abc def",
-		"newline":    "sbp1.abc\n",
-		"non-ascii":  "sbp1.abcé",
-		"too large":  "sbp1." + strings.Repeat("a", MaxRelayToken),
+		"no prefix":   "eyJhbGciOi.x.y",
+		"whitespace":  "sbp1.abc def",
+		"newline":     "sbp1.abc\n",
+		"non-ascii":   "sbp1.abcé",
+		"too large":   "sbp1." + strings.Repeat("a", MaxRelayToken),
+		"bare prefix": "sbp1.",
 	} {
 		_, in := r.secrets(time.Hour)
 		if err := Load(r.ctl, withRelay(t, in, rt)); err == nil || !strings.Contains(err.Error(), "relay_token") {

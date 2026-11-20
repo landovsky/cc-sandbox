@@ -48,8 +48,12 @@ type BusConfig struct {
 	Timeout  time.Duration // one send (default 20s: the hub waits up to ~8s for the receiver's ack)
 	Journal  Appender
 	MaxFacts int // journal facts about failed sends per lifetime (default 50)
-	Now      func() time.Time
-	Logf     func(string, ...any)
+	// PairMax messages per PairWindow to one node (hostd's router allows 6 a minute): the outbox relay's own
+	// bucket is about 5 a second, which would otherwise all land in the manager's pane.
+	PairMax    int
+	PairWindow time.Duration
+	Now        func() time.Time
+	Logf       func(string, ...any)
 }
 
 // Bus is the Forward for msg.send.
@@ -57,6 +61,7 @@ type Bus struct {
 	cfg   BusConfig
 	mu    sync.Mutex
 	facts int
+	pairs map[string][]time.Time
 	fail  appendFailures
 }
 
@@ -74,6 +79,12 @@ func NewBus(cfg BusConfig) (*Bus, error) {
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 20 * time.Second
 	}
+	if cfg.PairMax == 0 {
+		cfg.PairMax = 6
+	}
+	if cfg.PairWindow == 0 {
+		cfg.PairWindow = time.Minute
+	}
 	if cfg.MaxFacts == 0 {
 		cfg.MaxFacts = 50
 	}
@@ -83,15 +94,34 @@ func NewBus(cfg BusConfig) (*Bus, error) {
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
 	}
-	return &Bus{cfg: cfg}, nil
+	return &Bus{cfg: cfg, pairs: map[string][]time.Time{}}, nil
 }
 
 func busReply(status, code string) hostd.Reply {
 	return hostd.Reply{Status: status, Result: map[string]string{"code": code}}
 }
 
+// pairOK is the sliding window of hostd's router: at most PairMax messages per PairWindow to one node.
+func (b *Bus) pairOK(node string) bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := b.cfg.Now()
+	var keep []time.Time
+	for _, t := range b.pairs[node] {
+		if now.Sub(t) < b.cfg.PairWindow {
+			keep = append(keep, t)
+		}
+	}
+	if len(keep) >= b.cfg.PairMax {
+		b.pairs[node] = keep
+		return false
+	}
+	b.pairs[node] = append(keep, now)
+	return true
+}
+
 // fact journals why a send failed, bounded per lifetime. The node is one the scope already named, so it is
-// the record's text, not the fence's.
+// the record's form of it (normalised), not the fence's spelling.
 func (b *Bus) fact(typ, node, why string) {
 	if b.cfg.Journal == nil {
 		return
@@ -144,7 +174,7 @@ func (b *Bus) Forward(ctx context.Context, q hostd.Request) hostd.Reply {
 	if json.Unmarshal(q.Body, &body) != nil || strings.TrimSpace(body.Text) == "" || body.To.Node == "" || body.To.BusID != "" {
 		return busReply("refused", "bad_request")
 	}
-	node := body.To.Node
+	node := norm(body.To.Node)
 	if !b.inScope(node) {
 		return busReply("refused", "scope")
 	}
@@ -152,6 +182,10 @@ func (b *Bus) Forward(ctx context.Context, q hostd.Request) hostd.Reply {
 	if !ok || cred.Key == nil {
 		b.fact("bus.unavailable", node, "no relay credential was loaded")
 		return busReply("error", "relay_unavailable")
+	}
+	if !b.pairOK(node) { // before presence is read: a flood costs the hub nothing
+		b.fact("bus.rate_capped", node, "too many messages to this node in the window")
+		return busReply("refused", "rate_capped")
 	}
 	ctx, cancel := context.WithTimeout(ctx, b.cfg.Timeout)
 	defer cancel()

@@ -38,7 +38,7 @@ hub_secret = "/etc/ccsbx/hub-admin.secret"
 EOT
   note "the hub's admin secret (the shared SB_SECRET), for ccsbx-root's relay mint: the first line of $HUB_SECRET_FROM, root 0600, never printed, never leaves hp"
   # plan never reads the file (and `plan -v` must not print it): the placeholder stands in for it
-  if [ "$MODE" = install ]; then put /etc/ccsbx/hub-admin.secret 0600 root:root < <(head -n1 "$HUB_SECRET_FROM" | tr -d '\r')
+  if [ "$MODE" = install ]; then put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"$HUB_SECRET"
   else put /etc/ccsbx/hub-admin.secret 0600 root:root <<<"(the secret, read from the --hub-secret-from file at install)"; fi
   note "a root-owned copy of the pins: ccsbx-root and hostd read THIS, never the owner-writable repo"
   put /etc/ccsbx/pins.toml 0644 root:root < "$REPO_DIR/pins.toml"
@@ -241,6 +241,11 @@ u0_uninstall() {
   for p in "${MANAGED_PATHS[@]}"; do
     [ -e "$real$p" ] || [ -L "$real$p" ] || continue
     cmd cp -a "$RESTORE_DIR$p" "$p"
+  done
+  note "2b. a managed path that is neither in the backup nor in ABSENT was added by a LATER installer than the one that took the first backup: removed too"
+  for p in "${MANAGED_PATHS[@]}"; do
+    if [ -e "$real$p" ] || [ -L "$real$p" ] || grep -qxF "$p" "$real/ABSENT"; then continue; fi
+    cmd rm -f "$p"
   done
   note "3. every sudoers.d file comes back as it was, then the whole config is checked"
   if [ -d "$real/etc/sudoers.d" ]; then

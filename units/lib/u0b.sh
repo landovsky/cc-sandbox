@@ -15,6 +15,28 @@ SIGNER_SOCK=/run/ccsbx-signer/sign.sock       # systemd creates it (ccsbx-signer
 HOSTD_SOCK=/run/ccsbx-api/hostd.sock          # hostd makes it: ccsbx:ccsbx-clients 0660 (dir 0755)
 KEY_FILES="age.key machine.key"
 
+# svc_users_check — prints one line per problem, returns 1 if there is any. The five identities (owner, ccsbx, ccsbx-keys, ccsbx-launch,
+# ccsbx-term) must have five different uids, none of them 0; reused ccsbx-launch and ccsbx-term must have no login shell and no group but
+# their own; a group of either name without its user would make `useradd` fail halfway (after the backup).
+svc_users_check() {
+  local u uid seen="" g sh bad=0
+  for u in ccsbx ccsbx-keys ccsbx-launch ccsbx-term "$(real_user)"; do
+    have_user "$u" || continue
+    uid="$(id -u "$u")"
+    if [ "$uid" = 0 ]; then echo "user $u has uid 0"; bad=1; fi
+    case " $seen " in *" $uid "*) echo "user $u shares uid $uid with another of ccsbx, ccsbx-keys, ccsbx-launch, ccsbx-term and the owner"; bad=1;; esac
+    seen+=" $uid"
+  done
+  for u in ccsbx-launch ccsbx-term; do
+    if have_user "$u"; then
+      g="$(id -nG "$u" 2>/dev/null)"; [ "$g" = "$u" ] || { echo "existing user $u is in groups '$g' (want only its own group)"; bad=1; }
+      sh="$(getent passwd "$u" 2>/dev/null | cut -d: -f7)"
+      case "$sh" in ""|*/nologin|*/false) ;; *) echo "existing user $u has the login shell $sh (want /usr/sbin/nologin)"; bad=1;; esac
+    elif have_group "$u"; then echo "group $u exists without the user $u: useradd would fail halfway; remove the group or create the user"; bad=1; fi
+  done
+  return "$bad"
+}
+
 u0b_users() {
   step "U0b users and directories: ccsbx (hostd), ccsbx-keys (signer only), ccsbx-launch (launcher credential), ccsbx-term (no credentials), group ccsbx-clients"
   note "ccsbx-keys may already exist (R10b creates it and the age key during the day): reused, never recreated"
@@ -35,6 +57,9 @@ u0b_users() {
     cmd useradd --system --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin ccsbx-term
   else note "user ccsbx-term exists"; fi
   note "ccsbx-term has no credentials, no home, no shell and no group but its own: ccsbx-root attach drops to it to run the output filter"
+  if [ "$MODE" = install ] && [ "${EXEC%%:*}" != record ]; then
+    local prob; prob="$(svc_users_check)" || die "the service users are not as the install needs them: $(tr '\n' ';' <<<"$prob")"
+  fi
   have_group ccsbx-clients || cmd groupadd --system ccsbx-clients
   note "ccsbx-clients may talk to hostd's local socket; it grants no root path"
   cmd gpasswd -a "$(real_user)" ccsbx-clients
@@ -69,13 +94,16 @@ u0b_keys() {
 
 u0b_signer() {
   step "U0b signer socket + service (sign(token_claims) only; the socket is activated by systemd)"
-  put /etc/systemd/system/ccsbx-signer.service 0644 root:root < "$UNITS_DIR/systemd/ccsbx-signer.service"
+  note "the pod machine in --keys-peer-machines is --k8s-machine ($K8S_MACHINE): ONE source, so hostd is closed to exactly the machines the launcher signs for"
+  put /etc/systemd/system/ccsbx-signer.service 0644 root:root < <(sed "s/--keys-peer-machines future-two/--keys-peer-machines $K8S_MACHINE/" "$UNITS_DIR/systemd/ccsbx-signer.service")
   put /etc/systemd/system/ccsbx-signer.socket 0644 root:root < "$UNITS_DIR/systemd/ccsbx-signer.socket"
   put /etc/systemd/system/ccsbx-signer-launch.socket 0644 root:root < "$UNITS_DIR/systemd/ccsbx-signer-launch.socket"
   cmd systemctl daemon-reload
-  note "two sockets, one service: the main socket (hostd) is fd 3 and the launch socket (ccsbx-launch) fd 4; the service Requires both"
+  note "two sockets, one service: the signer matches the fds BY NAME (LISTEN_FDNAMES main and launch), never by position; the service Requires both"
   cmd systemctl enable --now ccsbx-signer-launch.socket
   cmd systemctl enable --now ccsbx-signer.socket
+  note "an upgrade over a running signer: the new ExecStart and the second socket are picked up only by a restart (a no-op when it is not running)"
+  cmd systemctl try-restart ccsbx-signer.service
 }
 
 # sock_check LABEL PATH CLIENT — can CLIENT really connect? Root tests it as CLIENT (runuser); a
@@ -133,7 +161,8 @@ u0b_check() {
   [ "$lown" = "ccsbx-launch:700" ] && ok "$LAUNCH_DIR is ccsbx-launch:700" || bad "$LAUNCH_DIR is $lown (want ccsbx-launch:700)"
   local kf
   for kf in launcher.kubeconfig token; do
-    if [ -e "$(pth $LAUNCH_DIR/$kf)" ]; then
+    if [ "$(id -u)" != 0 ] && [ ! -x "$(pth $LAUNCH_DIR)" ]; then note_check "$LAUNCH_DIR/$kf: $LAUNCH_DIR is 0700 ccsbx-launch, so $(id -un) cannot look; run check as root to see it"
+    elif [ -e "$(pth $LAUNCH_DIR/$kf)" ]; then
       lown="$(stat -c '%U:%a' "$(pth $LAUNCH_DIR/$kf)")"
       [ "$lown" = "ccsbx-launch:600" ] && ok "$LAUNCH_DIR/$kf is ccsbx-launch:600" || bad "$LAUNCH_DIR/$kf is $lown (want ccsbx-launch:600)"
     else note_check "$LAUNCH_DIR/$kf is not there yet (k3s launcher check 5 puts it there)"; fi
@@ -169,6 +198,12 @@ u0b_uninstall() {
   if [ "${PURGE_KEYS:-0}" = 1 ]; then
     note "--purge-keys: the machine key and age key are DELETED. Rotate the trusted-key list first (M9)."
     try userdel -r ccsbx-keys
-  else note "keys directory and the ccsbx-keys user stay (pass --purge-keys to delete them)"; fi
+    note "--purge-keys also removes ccsbx-launch and /var/lib/ccsbx-launch (the launcher kubeconfig and token)"
+    try userdel -r ccsbx-launch
+    note "REVOKE the launcher token on the k3s side (the cc-sandbox-launcher ServiceAccount's tokens): a deleted file does not revoke it"
+  else
+    note "keys directory and the ccsbx-keys user stay (pass --purge-keys to delete them)"
+    note "/var/lib/ccsbx-launch (the launcher kubeconfig and token) stays too; if you discard it, revoke the launcher token on the k3s side"
+  fi
   note "users ccsbx and ccsbx-clients, and /var/lib/ccsbx (the journal), stay: they hold no root path"
 }

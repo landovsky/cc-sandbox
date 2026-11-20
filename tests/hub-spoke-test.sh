@@ -32,5 +32,5 @@ cd "$HERE" || exit 1
 export PATH="$PATH:$HOME/.local/go/bin"
 M2B=""; grep -q principal_node "$D/session-bus/lib/session_bus/session_channel.ex" && M2B=1
 CCSBX_REAL_HUB_URL="http://127.0.0.1:$SB_TEST_PORT" CCSBX_REAL_HUB_ADMIN="$ADMIN" CCSBX_REAL_HUB_SPOKE_TOKEN="$TOK" CCSBX_REAL_HUB_M2B="$M2B" \
-  go test -count=1 -run RealHub -v ./internal/hubspoke ./cmd/ccsbx-hostd 2>&1 | tail -30
+  go test -count=1 -run RealHub -v ./internal/hubspoke ./cmd/ccsbx-hostd ./internal/side 2>&1 | tail -40
 exit "${PIPESTATUS[0]}"

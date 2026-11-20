@@ -1,15 +1,106 @@
 #!/usr/bin/env bash
-# e2e/02-events — hook point 2: the event journal and tab/tree state (plan §9 item 3).
+# e2e/02-events — hook point 2: the event journal (plan §9 item 3). Real: each start appends exactly one journal record
+# (no gap for a follower's cursor); and, with the fence image present, a REAL daemon (ccsbx-hostd run, direct mode,
+# scratch state, no hub) ingests the events.jsonl a fenced session writes: hook events are journalled with the daemon's
+# identity, never the fence's, a forged identity or a malformed or oversize line is dropped, a restart of the daemon
+# journals nothing twice, and `ccsbx events` replays by cursor. The fence here is a plain `sh` writing the lines a hook
+# would (the real ccf-hook is C3, in the image); that is stated in the test names. Direct mode: not evidence.
 . "$(dirname "$0")/lib.sh"; e2e_init
 st() { "$CCSBX" start --launcher none --json "$@"; }
 spec e2e:ev1 lid-e1 > "$E2E_ROOT/e1.json"; spec e2e:ev2 lid-e2 > "$E2E_ROOT/e2.json"
 a="$(st --spec "$E2E_ROOT/e1.json" 2>&1)"; b="$(st --spec "$E2E_ROOT/e2.json" 2>&1)"
+e2e_sid "$a" >/dev/null; e2e_sid "$b" >/dev/null
 [ "$(jget journal.epoch <<<"$a" 2>/dev/null)" = "$(jget journal.epoch <<<"$b" 2>/dev/null)" ] \
   && ok "both starts land in one journal epoch (an epoch changes only on a reset, which cockpits must notice)" || bad "one journal epoch" "$a $b"
 sa="$(jget journal.seq <<<"$a" 2>/dev/null)"; sb="$(jget journal.seq <<<"$b" 2>/dev/null)"
-[ "$sb" = "$((sa+1))" ] && ok "each start appends exactly one journal record (seq $sa -> $sb), so a follower's cursor can resume with no gap" \
-  || bad "journal seq advances by one per start" "seq $sa then $sb"
-skip "hook events (UserPromptSubmit, Stop+usage, status) reach 'ccsbx events --session s'" "needs C3 (ccf-hook in the image) + a fence image"
-skip "tab colour and tree state follow working/asks/background/waiting/cold/done within 5 s" "needs C4a (follow --write) + C18 stub drive"
-skip "a reader machine shows the same states as the writer" "needs C4b + M3 (second machine)"
-skip "a daemon cut off for 5 min shows 'away', then fills in with no duplicates" "needs C4b"
+[ -n "$sa" ] && [ "$sb" = "$((sa+1))" ] && ok "each start appends exactly one journal record (seq $sa -> $sb), so a follower's cursor can resume with no gap" \
+  || bad "journal seq advances by one per start" "seq '$sa' then '$sb'"
+
+HOSTD="${CCSBX_HOSTD_BIN:-$(dirname "$CCSBX")/ccsbx-hostd}"
+if ! have_image; then
+  skip "a daemon ingests a fenced session's hook events with the daemon's identity, drops forged and malformed lines, and journals nothing twice across a restart" "needs the fence image $E2E_IMAGE (U1a local build)"
+elif [ ! -x "$HOSTD" ]; then
+  skip "a daemon ingests a fenced session's hook events ..." "needs bin/ccsbx-hostd (make build)"
+else
+  S="$E2E_ROOT/dstate"; mkdir -p "$S"
+  # a fresh state for the daemon leg, so the two starts above are not in its journal
+  export CCSBX_STATE="$S"
+  hostd_up() {
+    "$HOSTD" run --state "$S" --run-dir "$S" --root direct --machine hp-ubuntu --interval 100ms --worktree-root /var/tmp \
+      --local-socket "$S/hostd.sock" --tmux-socket "e2e-$$" >"$E2E_ROOT/hostd.log" 2>&1 &
+    HPID=$!; E2E_PIDS+=("$HPID")
+    e2e_wait 15 test -S "$S/hostd.sock"
+  }
+  events() { "$CCSBX" events --socket "$S/hostd.sock" --after "${1:-0}" --json 2>&1; }
+  count() { python3 -c 'import json,sys
+d=json.load(sys.stdin); t=sys.argv[1]; print(sum(1 for e in d["events"] if e["type"]==t))' "$1"; }
+  if hostd_up; then
+    ok "ccsbx-hostd run (direct mode, scratch state, no hub) comes up and serves its journal on a unix socket in the scratch state"
+    e2e_work
+    cat > "$E2E_WORK/emit.sh" <<'EMIT'
+#!/bin/sh
+# what a hook would append to out/events.jsonl, plus the lines a hostile fence would try
+o=/run/ccsbx/out/events.jsonl
+echo '{"type":"hook.UserPromptSubmit","data":{"n":1}}' >> $o
+echo '{"type":"hook.Stop","data":{"usage":{"input":10,"output":5}},"sid":"sEVIL000000","gen":9,"src":"host"}' >> $o
+echo 'this is not json' >> $o
+echo '{"type":"session.stop","data":{}}' >> $o
+echo '{"type":"hook.Stop","data":{"big":"'"$(head -c 70000 /dev/zero | tr '\0' x)"'"}}' >> $o
+echo '{"type":"hook.Status","data":{"state":"working"}}' >> $o
+sleep 60
+EMIT
+    chmod 0755 "$E2E_WORK/emit.sh"
+    spec e2e:events lid-ev > "$E2E_ROOT/ev.json"
+    export CCSBX_IMAGE="$E2E_IMAGE"
+    out="$("$CCSBX" start --json --spec "$E2E_ROOT/ev.json" --run-cmd "sh $E2E_WORK/emit.sh" 2>&1)"; rc=$?
+    esid="$(e2e_sid "$out")"
+    if [ $rc -eq 0 ] && [ -n "$esid" ]; then
+      ok "a fenced session whose command appends hook-shaped lines to out/events.jsonl starts ($esid)"
+      if e2e_wait 25 bash -c "'$CCSBX' events --socket '$S/hostd.sock' --after 0 --json | grep -q hook.Status"; then
+        ev="$(events 0)"
+        [ "$(count hook.UserPromptSubmit <<<"$ev")" = 1 ] && [ "$(count hook.Stop <<<"$ev")" = 1 ] && [ "$(count hook.Status <<<"$ev")" = 1 ] \
+          && ok "the fence's hook events (UserPromptSubmit, Stop, Status) are in the journal, once each, in order" || bad "hook events journalled once each" "$ev"
+        python3 -c '
+import json,sys
+sid=sys.argv[1]; d=json.load(sys.stdin)
+st=[e for e in d["events"] if e["type"]=="hook.Stop"][0]
+assert st["sid"]==sid and st["gen"]==1 and st["src"]=="fence", st
+' "$esid" <<<"$ev" 2>"$E2E_ROOT/idcheck" \
+          && ok "identity comes from the daemon's record (sid, gen, src=fence), not from the line: the forged sid sEVIL000000, gen 9 and src host were ignored" \
+          || bad "identity comes from the daemon, not the line" "$(cat "$E2E_ROOT/idcheck")"
+        [ "$(count session.stop <<<"$ev")" = 0 ] && ok "a line whose type is not hook.<Name> (session.stop) is dropped: a fence cannot write the daemon's own events" \
+          || bad "a non-hook type is dropped" "$ev"
+        seqs="$(python3 -c 'import json,sys;print(",".join(str(e["seq"]) for e in json.load(sys.stdin)["events"]))' <<<"$ev")"
+        python3 -c 'import sys;s=[int(x) for x in sys.argv[1].split(",")]; assert s==list(range(s[0],s[0]+len(s))), s' "$seqs" 2>/dev/null \
+          && ok "the journal's seq has no gap ($seqs); the 70 KB line and the malformed line took none" || bad "no gap in the journal seq" "$seqs"
+        head="$(jget head <<<"$ev" 2>/dev/null)"; epoch="$(jget epoch <<<"$ev" 2>/dev/null)"
+        # a follower's cursor: after the head there is nothing; after the first event there is the rest
+        first="$(python3 -c 'import json,sys;print(json.load(sys.stdin)["events"][0]["seq"])' <<<"$ev")"
+        [ "$(python3 -c 'import json,sys;print(len(json.load(sys.stdin)["events"]))' <<<"$(events "$head")")" = 0 ] && ok "replay after the head returns nothing: a cursor at the head waits for new events" || bad "replay after the head is empty" "$(events "$head")"
+        [ "$(count hook.Status <<<"$(events "$first")")" = 1 ] && ok "replay after an earlier cursor returns exactly the later events" || bad "replay after a cursor" "$(events "$first")"
+        # a restart of the daemon journals nothing twice
+        kill "$HPID" 2>/dev/null; wait "$HPID" 2>/dev/null
+        if hostd_up; then
+          sleep 1.5
+          ev2="$(events 0)"
+          [ "$(jget epoch <<<"$ev2" 2>/dev/null)" = "$epoch" ] && [ "$(jget head <<<"$ev2" 2>/dev/null)" = "$head" ] \
+            && ok "after a restart of the daemon the epoch and the head are unchanged: no event was journalled twice (the offset is saved)" \
+            || bad "a restart journals nothing twice" "epoch/head before $epoch/$head, after $(jget epoch <<<"$ev2" 2>/dev/null)/$(jget head <<<"$ev2" 2>/dev/null)"
+          "$CCSBX" ls --state "$S" 2>&1 | grep -q "$esid" && ok "ccsbx ls shows the live fenced session through the daemon's API" || bad "ccsbx ls shows the live session" "$("$CCSBX" ls --state "$S" 2>&1 | head -3)"
+        else bad "the daemon restarts on the same state" "$(tail -3 "$E2E_ROOT/hostd.log")"; fi
+      else
+        bad "the daemon journals the fence's hook events" "no hook.Status after 5 s; hostd said: $(tail -3 "$E2E_ROOT/hostd.log")"
+      fi
+      "$CCSBX" stop "$esid" >/dev/null 2>&1
+    else
+      bad "a fenced session that writes hook events starts" "rc=$rc $out"
+    fi
+  else
+    bad "ccsbx-hostd run comes up in direct mode" "$(tail -5 "$E2E_ROOT/hostd.log")"
+  fi
+fi
+
+skip "the real ccf-hook (UserPromptSubmit, Stop+usage, status) in the image writes those lines" "needs C3 (ccf-hook baked into the fence image; the image here predates it or the stub drive is not wired)"
+skip "tab colour and tree state follow working/asks/background/waiting/cold/done within 5 s" "needs C4a on dotfiles main (cc-tree follow --write is on branch n1-f) + a stub-driven session"
+skip "a reader machine shows the same states as the writer" "needs C4b + M3 (a second machine)"
+skip "a daemon cut off for 5 min shows 'away', then fills in with no duplicates" "needs C4b (dotfiles n2-f-c4b) + a second daemon"

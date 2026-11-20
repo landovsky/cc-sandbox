@@ -12,7 +12,17 @@
 #   CCSBX_STATE    $E2E_ROOT/state         daemon state; CCSBX_TMUX_SOCKET e2e-<pid>, never "ccsbx"
 #   CCSBX_ROOT     direct                  night-1 mode: results are not evidence (invariant 14 waived)
 # Tunables (env): E2E_ROOT (default: a fresh mktemp -d, removed on exit; set it to keep the realm),
-#   CCSBX_BIN (default <repo>/bin/ccsbx), E2E_S0_DIR (where `make standalone` lives, default ~/.dotfiles).
+#   CCSBX_BIN (default <repo>/bin/ccsbx), E2E_S0_DIR (where `make standalone` lives, default ~/.dotfiles),
+#   E2E_IMAGE (the fence image the docker steps run, default ccsbx-fence:dev; never pulled),
+#   E2E_DOTFILES (a dotfiles checkout with the session-bus test library lib-sb-hub.sh and a hub with B10/B11/M2b;
+#   default ~/.dotfiles/.worktrees/n1-g-hub2), E2E_CCTREE (a dotfiles checkout with the remote start path, C12/C16;
+#   default ~/.dotfiles/.worktrees/n2-f-c16). A leg whose piece is missing is a SKIP that says which.
+#
+# Docker, and only what this run made: the steps that start a fence write the sid to $E2E_ROOT/sids and the worktree
+# they made to $E2E_ROOT/trash, and the exit trap hands both to tests/fence-cleanup.sh, which refuses empty or foreign
+# values and removes exact names only (ccsbx-<sid>-g1, ccsbx-net-<sid>-g1, /var/tmp/ccsbx-cc-XXXXXX). Nothing here
+# lists, prunes or removes containers by pattern. Background processes this run starts are in E2E_PIDS and are
+# killed by pid.
 
 E2E_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$E2E_DIR/.." && pwd)"
@@ -31,9 +41,59 @@ e2e_init() {
   [ "$CC_TREE_REPO" != "$HOME/cc-tree" ] || { echo "e2e: refusing the live tree repo" >&2; exit 2; }
   export CCSBX_STATE="$E2E_ROOT/state" CCSBX_ROOT=direct CCSBX_TMUX_SOCKET="e2e-$$"
   export CCSBX_PROFILES="$REPO/profiles" CCSBX_PINS="$E2E_ROOT/no-pins.toml"
+  # a session's worktree must be strictly inside a worktree root: the scratch ones are /var/tmp/ccsbx-cc-XXXXXX
+  export CCSBX_WORKTREE_ROOT=/var/tmp CCSBX_MACHINE="${CCSBX_MACHINE:-hp-ubuntu}"
+  E2E_IMAGE="${E2E_IMAGE:-ccsbx-fence:dev}"; E2E_PIDS=(); E2E_WORK=""
+  : > "$E2E_ROOT/sids"; : > "$E2E_ROOT/trash"; : > "$E2E_ROOT/extras"
   [ -x "$CCSBX" ] || { echo "e2e: $CCSBX missing (make build)" >&2; exit 2; }
-  if [ -z "${E2E_KEEP:-}" ]; then trap 'tmux -L "e2e-$$" kill-server 2>/dev/null; rm -rf "$E2E_ROOT"' EXIT; fi
+  if [ -z "${E2E_KEEP:-}" ]; then trap e2e_cleanup EXIT; fi
 }
+
+# e2e_cleanup: the exit trap. Kills this run's tmux server and background pids, then (only if a step made docker
+# objects or worktrees) lets tests/fence-cleanup.sh remove exactly those; its guard refuses anything that does not look
+# like this run's own scratch realm, in which case the realm is left for a human, never swept wider.
+e2e_cleanup() {
+  tmux -L "e2e-$$" kill-server 2>/dev/null
+  local p; for p in "${E2E_PIDS[@]:-}"; do [ -n "$p" ] && kill "$p" 2>/dev/null; done
+  wait 2>/dev/null
+  if [ -s "$E2E_ROOT/sids" ] || [ -s "$E2E_ROOT/trash" ]; then
+    local STATE="$E2E_ROOT" IMG="$E2E_IMAGE" PIDS=()
+    local CLEANUP_EXTRA; CLEANUP_EXTRA="$(tr '\n' ' ' < "$E2E_ROOT/extras" 2>/dev/null)"   # containers a step made beside the fence
+    # shellcheck disable=SC1091
+    . "$REPO/tests/fence-cleanup.sh"
+    # fence-cleanup.sh knows generation 1; a resume made g2/g3 of the same validated sids: their exact names too
+    if cleanup_guard 2>/dev/null; then
+      local s g
+      while IFS= read -r s; do
+        for g in 2 3; do docker rm -f "ccsbx-$s-g$g" >/dev/null 2>&1; docker network rm "ccsbx-net-$s-g$g" >/dev/null 2>&1; done
+      done < "$E2E_ROOT/sids"
+    fi
+    cleanup || echo "e2e: the scratch realm $E2E_ROOT was left in place (cleanup refused; see above)" >&2
+  fi
+  [ -d "$E2E_ROOT" ] && [ ! -s "$E2E_ROOT/sids" ] && rm -rf "$E2E_ROOT"
+  return 0
+}
+
+# e2e_work: a scratch worktree for a session (made once per script, world-writable so the fence's uid can write it).
+e2e_work() {
+  [ -n "$E2E_WORK" ] && return 0
+  E2E_WORK="$(mktemp -d /var/tmp/ccsbx-cc-XXXXXX)"; chmod 0777 "$E2E_WORK"; echo "$E2E_WORK" >> "$E2E_ROOT/trash"
+}
+
+# e2e_sid REPLY_JSON: the sid out of a start reply, recorded for the cleanup (only a sid of the shape mintSid makes is kept)
+e2e_sid() {
+  local sid; sid="$(jget sid <<<"$1" 2>/dev/null)" || return 1
+  [[ "$sid" =~ ^s[0-9a-hjkmnp-tv-z]{10}$ ]] || return 1
+  echo "$sid" >> "$E2E_ROOT/sids"; echo "$sid"
+}
+
+# e2e_wait SECONDS cmd...: poll cmd every 0.2 s until it succeeds or the time is up
+e2e_wait() { local t=$(( $1 * 5 )); shift; while [ $t -gt 0 ]; do "$@" >/dev/null 2>&1 && return 0; sleep 0.2; t=$((t-1)); done; return 1; }
+
+# e2e_port: a free loopback port (the spare-port rule: nothing here ever uses a live service's port)
+e2e_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])'; }
+
+have_image() { docker image inspect "$E2E_IMAGE" >/dev/null 2>&1; }
 
 # jget FIELD: a top-level or dotted field from JSON on stdin (python, no jq dependency)
 jget() { python3 -c 'import json,sys; d=json.load(sys.stdin)
@@ -41,7 +101,25 @@ for k in sys.argv[1].split("."): d=d[k]
 print(d)' "$1"; }
 
 # spec NAME LID [sed-expr]: a LaunchSpec for the e2e realm, from the checked-in hello spec
-spec() { sed -e 's/"realm":"production"/"realm":"e2e"/' -e 's/"dev-default"/"e2e-default"/' \
-  -e "s/lid-hello-1/$2/" -e "s/cc-sandbox:hello/$1/" ${3:+-e "$3"} "$REPO/tests/specs/hello.json"; }
+spec() { e2e_work; sed -e 's/"realm":"production"/"realm":"e2e"/' -e 's/"dev-default"/"e2e-default"/' \
+  -e "s/lid-hello-1/$2/" -e "s/cc-sandbox:hello/$1/" -e "s#/var/tmp/ccsbx-hello#$E2E_WORK#" ${3:+-e "$3"} "$REPO/tests/specs/hello.json"; }
 
 have_stub() { "$CCSBX" stub --help >/dev/null 2>&1; }   # C18, stream B: not on main until merged
+
+# e2e_fwd SID: the forwarder with the scripted stub door (C18) behind it, as a peer on the session's network under the
+# alias "fwd", fed its token and generation key on STDIN: the fence holds neither, and reaches the model only here. The
+# container is named ccsbx-fwd-$$ (the shape fence-cleanup.sh accepts), recorded in $E2E_ROOT/extras for the exit trap.
+# Needs the session's container to be up (its network exists). Returns 1 with the reason on stderr.
+e2e_fwd() {
+  local sid="$1" net="ccsbx-net-$1-g1" bin; bin="$(readlink -f "$CCSBX")"
+  "$CCSBX" token mint --key-file "$E2E_ROOT/dev.key" --sub "tomas/hp-ubuntu/$sid/g1" --label e2e --billing stub --profile e2e-default \
+    --aud ccsbx-stub --fwd-secrets > "$E2E_ROOT/secrets.json" 2>"$E2E_ROOT/mint.err" || { cat "$E2E_ROOT/mint.err" >&2; return 1; }
+  chmod 0600 "$E2E_ROOT/dev.key" "$E2E_ROOT/secrets.json"
+  "$CCSBX" token pubkey --key-file "$E2E_ROOT/dev.key" --owners tomas --machines hp-ubuntu --profiles 'e2e-*' --billings stub > "$E2E_ROOT/keyring" || return 1
+  echo "ccsbx-fwd-$$" >> "$E2E_ROOT/extras"
+  docker run --rm -i --name "ccsbx-fwd-$$" --network "$net" --network-alias fwd -v "$bin:/ccsbx:ro" -v "$E2E_ROOT/keyring:/keyring:ro" "$E2E_IMAGE" sh -c \
+    '/ccsbx stub --listen 127.0.0.1:8081 --keyring /keyring --state /tmp/stub-state.json & exec /ccsbx fwd --listen :8080 --door stub=http://127.0.0.1:8081' \
+    < "$E2E_ROOT/secrets.json" > "$E2E_ROOT/fwd.log" 2>&1 &
+  E2E_PIDS+=("$!")
+  e2e_wait 20 grep -q "serving :8080" "$E2E_ROOT/fwd.log"
+}

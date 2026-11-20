@@ -1,14 +1,50 @@
 #!/usr/bin/env bash
-# e2e/04-msg — hook point 4: messaging (plan §9 item 5). Real tonight: ccmsg with the hub down.
+# e2e/04-msg — hook point 4: messaging (plan §9 item 5). Real: ccmsg with the hub down (exit 4, refuses to send); and,
+# with docker, the session-bus image and the hub test library, a THROWAWAY HUB ON A SPARE LOOPBACK PORT (never the live
+# hub on :4011; tests/hub-spoke-test.sh starts it from the dotfiles checkout E2E_DOTFILES, mints principals as the hub's
+# admin, runs the Go real-hub tests against it, and removes only the container it named). Each Go real-hub test is one line
+# here, ok or not ok as it came out; nothing is hidden or retried. Skipped: a second machine, the doors, the cluster.
 . "$(dirname "$0")/lib.sh"; e2e_init
-port="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1])')"
+port="$(e2e_port)"
 out="$(SB_HUB="127.0.0.1:$port" ccmsg e2e:nobody "ping" 2>&1)"; rc=$?
 [ $rc -eq 4 ] && ok "ccmsg with the hub unreachable exits 4 (hub unreachable) instead of pretending to deliver" || bad "ccmsg exits 4 with the hub down" "rc=$rc $out"
 grep -qi "refusing to send" <<<"$out" && ok "it says it refuses to send, so a sender never believes a lost message was delivered" || bad "ccmsg says it refuses to send" "$out"
-skip "fenced <-> unfenced manager and fenced <-> fenced on one machine" "needs M2a/U3b + fence image"
-skip "across machines via the hub; directly with the hub down" "needs M2b, M2d (second machine)"
-skip "an out-of-scope send is refused" "needs C10 (scope rule)"
-skip "an unsigned 'fenced' claim is rejected at the hub" "needs B6b hub auth deployed in a test hub (stream C, not merged)"
-skip "an unfenced ccmsg arrives as 'trust: unfenced'" "needs C11"
-skip "a relay credential can't join, track or send as another session" "needs M2a"
-skip "ccq lists fenced sessions with no output lines" "needs C4a + fenced sessions on the hub"
+
+D="${E2E_DOTFILES:-$HOME/.dotfiles/.worktrees/n1-g-hub2}"
+if [ ! -f "$D/tests/lib-sb-hub.sh" ]; then
+  skip "a spare-port session-bus hub carries signed messages between machines and refuses forgeries" "needs a dotfiles checkout with B10/B11/M2b (set E2E_DOTFILES; n1-g-hub2 is not on dotfiles main)"
+elif ! docker image inspect session-bus:local >/dev/null 2>&1; then
+  skip "a spare-port session-bus hub carries signed messages between machines and refuses forgeries" "needs the docker image session-bus:local"
+elif ! command -v go >/dev/null 2>&1 && [ ! -x "$HOME/.local/go/bin/go" ]; then
+  skip "a spare-port session-bus hub ..." "needs the go toolchain (the real-hub tests are Go tests)"
+else
+  log="$E2E_ROOT/hub.log"
+  ( cd "$REPO" && CCSBX_DOTFILES="$D" tests/hub-spoke-test.sh ) > "$log" 2>&1; hrc=$?
+  if grep -q '^skip:' "$log"; then
+    skip "a spare-port session-bus hub carries signed messages between machines and refuses forgeries" "$(grep -m1 '^skip:' "$log" | sed 's/^skip: //')"
+  elif ! grep -q '^--- ' "$log"; then
+    bad "the real-hub tests ran against a spare-port hub" "rc=$hrc; $(tail -5 "$log")"
+  else
+    desc() { case "$1" in
+      TestRealHubRegistersAFencedSessionAndReceivesATestFrame) echo "hostd's spoke registers a fenced session on the real hub (fenced, no pane) and a hub deliver reaches it, its ack relayed to the waiting sender";;
+      TestRealHubTwoMachinesExchangeSignedMessagesAndRefuseForgeries) echo "two machines exchange stamped messages through the real hub, and a forged from, a tampered body and a node outside the scope are refused";;
+      TestRealHubFencedAndUnfencedManagersReachEachOther) echo "a fenced worker and an unfenced manager reach each other through the real hub, typed with the right trust";;
+      TestRealHubTheSidecarBusReachesItsManagerAndNothingElse) echo "a pod sidecar's relay credential lists and reaches ONLY its manager on the real hub (read_scoped), the stamp it signed verifies on the manager's machine, and a node outside its manager is not reached";;
+      *) echo "real-hub test $1";; esac; }
+    while read -r _ res name _; do
+      name="${name%:}"; d="$(desc "$name")"
+      case "$res" in
+        PASS:) ok "$d [$name]";;
+        FAIL:) bad "$d [$name]" "$(grep -B8 -- "--- FAIL: $name" "$log" | grep -E '_test.go' | head -4)";;
+        SKIP:) skip "$d [$name]" "$(grep -A2 -- "--- SKIP: $name" "$log" | grep -m1 'needs' | sed 's/^ *[a-z_]*_test.go:[0-9]*: //')";;
+      esac
+    done < <(grep -E '^--- (PASS|FAIL|SKIP):' "$log" | sed -E 's/^--- ([A-Z]+:) ([A-Za-z0-9_]+).*/- \1 \2/')
+  fi
+fi
+
+skip "fenced <-> unfenced manager and fenced <-> fenced on ONE machine through a running daemon (U3b delivery into a pane)" "needs a tmux pane that stays alive under hostd + the C11 stamp on a live manager; the router is unit-tested and the cross-machine path is above"
+skip "directly with the hub down (M2d fallback between two daemons)" "needs M2d + a second daemon (second machine, gate M)"
+skip "a stub-driven agent sends a message and gets a reply" "needs the ccf client layer in the image (a stub catalog script that calls a messaging tool): C5/C10"
+skip "an unsigned 'fenced' claim is rejected at the hub" "covered by the Go real-hub test above only for forged FROM fields; the B6b hub-auth deployment on the LIVE hub is Tomas's (stream C merge)"
+skip "an unfenced ccmsg arrives as 'trust: unfenced' on a live fenced pane" "needs C11 on a live manager + a fenced pane under hostd"
+skip "ccq lists fenced sessions with no output lines" "needs C4a (cc-tree/ccq follow) + fenced sessions registered on a hub by a running hostd with --hub-url"

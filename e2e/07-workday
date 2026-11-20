@@ -1,31 +1,105 @@
 #!/usr/bin/env bash
-# e2e/07-workday — C25: a fenced agent can do a typical day's work (plan §3 C25).
-# One scripted e2e session in a fence; every step must pass. Night 1: written against the stub (C18);
-# steps that need the fence image, the doors or gate M are SKIP naming the piece. A step is never run
-# unfenced and counted as a pass: an unfenced git log proves nothing about the fence.
+# e2e/07-workday — C25: a fenced agent can do a typical day's work (plan §3 C25). One scripted e2e session in a fence.
+# REAL before Gate M (direct docker mode, the fence image, a forwarder with the C18 stub door behind it on the session's
+# own network): the brief; REAL Claude Code in the fence talking to the model only through the forwarder (and getting the
+# stub's STUB-OK, holding no credential); git read verbs in the fence on a real repo; files edited by the fence's uid;
+# `git commit` and `git push` in the fence becoming REQUESTS in the outbox (never history written by the fence).
+# What is NOT the agent: the stub only says text or calls a catalog tool, so the repo/edit/git steps are commands run in
+# the fence as the agent's shell would run them, and the names say so. Everything that needs the doors, the cluster,
+# root or the ccf client layer is a SKIP naming the piece. A step is never run unfenced and counted as a pass.
 . "$(dirname "$0")/lib.sh"; e2e_init
 
-# 1. receives its brief — the only step that can run before the fence exists (the daemon side)
+# 1. receives its brief — the daemon side
 spec e2e:workday lid-w1 's/"text":"say hi"/"text":"E2E:workday"/' > "$E2E_ROOT/w1.json"
 out="$("$CCSBX" start --launcher none --json --spec "$E2E_ROOT/w1.json" 2>&1)"; rc=$?
-[ $rc -eq 0 ] && [ -n "$(jget sid <<<"$out" 2>/dev/null)" ] \
-  && ok "the workday session starts under e2e-default and billing=stub with its brief (daemon side only; no pane)" \
+sid="$(e2e_sid "$out")"
+[ $rc -eq 0 ] && [ -n "$sid" ] \
+  && ok "the workday session starts under e2e-default and billing=stub with its brief (daemon side)" \
   || bad "the workday session starts with its brief" "rc=$rc $out"
 
-img="the fence image ccsbx-fence:dev (U1a, local build)"
-stub_note="C18 stub on main (stream B branch n1-b)"
+stub_note="the ccf client layer in the image (/opt/ccf is empty: C3 hook, C5 MCP, C6 verb writer) + the stub's tool calls"
 S() { skip "$1" "needs $2"; }
-S "the agent reads the repo and git (log, diff, blame) inside the fence"            "$img + $stub_note"
-S "it edits files in its worktree"                                                  "$img + $stub_note"
+
+if [ -z "$sid" ]; then
+  bad "a fence for the workday session" "no sid, nothing to run"
+elif ! have_image; then
+  S "a real Claude Code in the fence reaches the model only through the forwarder and gets the stub's answer" "the fence image $E2E_IMAGE (U1a local build; never pulled)"
+  S "the agent reads the repo and git (log, diff, blame) inside the fence"      "the fence image $E2E_IMAGE"
+  S "it edits files in its worktree"                                            "the fence image $E2E_IMAGE"
+  S "it commits and pushes: both become requests in the outbox"                 "the fence image $E2E_IMAGE"
+else
+  # the worktree is a real repo made by the owner; the fence's uid will read and write it
+  W="$E2E_WORK"
+  git -C "$W" init -q -b main && printf 'one\n' > "$W/a.txt" && printf '#!/bin/sh\necho hi\n' > "$W/run.sh" && chmod 0755 "$W/run.sh" \
+    && git -C "$W" add -A && git -C "$W" -c user.name=e2e -c user.email=e2e@localhost commit -q -m "base commit" && chmod -R a+rwX "$W"
+  export CCSBX_IMAGE="$E2E_IMAGE"
+  "$CCSBX" run --sid "$sid" --image "$E2E_IMAGE" --base-url http://fwd:8080/stub -- sleep 150 >"$E2E_ROOT/run.log" 2>&1 &
+  E2E_PIDS+=("$!")
+  c="ccsbx-$sid-g1"
+  if e2e_wait 30 docker inspect "$c"; then
+    ok "the fence for the workday session is up (ccsbx run, real image, base URL = the forwarder's stub route)"
+    # the repo here was made by the host user, a real session's worktree is prepared for the fence's uid by the daemon:
+    # so git is told the directory is safe (this is the test's convenience, not something the fence may do to its own gitdir)
+    gx=(-e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e "GIT_CONFIG_VALUE_0=$W" -e CCSBX_GIT_TIMEOUT=2)
+    fx() { docker exec -w "$W" "${gx[@]}" "$c" "$@"; }
+
+    # 2. the model: only through the forwarder
+    if e2e_fwd "$sid"; then
+      ok "the forwarder with the stub door behind it joins the session's network as 'fwd', holding the token and key (the fence holds neither)"
+      got="$(timeout 90 docker exec "$c" claude -p "E2E:hi" 2>&1)"
+      grep -q STUB-OK <<<"$got" && ok "REAL Claude Code in the fence asked 'E2E:hi' and the stub door answered STUB-OK: fence -> forwarder (token + proof) -> stub, no credential in the fence" \
+        || bad "a real Claude Code in the fence gets the stub's answer through the forwarder" "$(printf '%s' "$got" | head -c 400) | fwd.log: $(tail -3 "$E2E_ROOT/fwd.log")"
+      # the fence has no other way out: its network is internal and the only peer is the forwarder
+      nonet="$(docker exec "$c" sh -c 'exec 3<>/dev/tcp/1.1.1.1/53' 2>&1)"; rcn=$?
+      [ $rcn -ne 0 ] && ok "a direct connection from the fence to a public address fails: the forwarder is the only way out" || bad "no route to the internet from the fence" "$nonet"
+    else
+      bad "the forwarder with the stub door starts on the session's network" "$(tail -3 "$E2E_ROOT/fwd.log" 2>&1) $(cat "$E2E_ROOT/mint.err" 2>/dev/null)"
+    fi
+
+    # 3. the repo, as the agent's shell sees it
+    log="$(fx git log --oneline 2>&1)"
+    grep -q "base commit" <<<"$log" && ok "[fence shell] git log in the fence shows the repo's history (read verbs pass through the shim)" || bad "git log in the fence" "$log"
+    fx sh -c 'echo two >> a.txt' >/dev/null 2>&1
+    diff_out="$(fx git diff 2>&1)"
+    grep -q '^+two' <<<"$diff_out" && ok "[fence shell] the fence edits a file in its worktree and git diff shows the change" || bad "the fence edits a file and git diff shows it" "$diff_out"
+    bl="$(fx git blame a.txt 2>&1)"
+    grep -q "one" <<<"$bl" && ok "[fence shell] git blame works in the fence" || bad "git blame in the fence" "$bl"
+
+    # 4. commit and push are ASKED for, never done by the fence
+    # FINDING (reported, not hidden): the docker backend makes out/ but never out/requests, which the git shim and plan §4.2
+    # expect, so a request writer cannot write until something makes it. Here the fence's own uid makes it (out/ is its to
+    # write); the skip below names the gap.
+    docker exec "$c" mkdir -p /run/ccsbx/out/requests
+    git -C "$W" remote add origin https://example.invalid/e2e.git
+    head_before="$(git -C "$W" rev-parse HEAD)"
+    cm="$(fx git commit -am "work from the fence" 2>&1)"; rcc=$?
+    req="$(ls "$CCSBX_STATE/s/$sid/g1/out/requests/" 2>/dev/null | head -5)"
+    reqbody="$(cat "$CCSBX_STATE"/s/"$sid"/g1/out/requests/*.json 2>/dev/null)"
+    { grep -q '"type": *"git.commit"' <<<"$reqbody" && [ "$(git -C "$W" rev-parse HEAD)" = "$head_before" ]; } \
+      && ok "[fence shell] git commit in the fence writes a git.commit REQUEST to the outbox and makes no commit itself (HEAD unchanged)" \
+      || bad "git commit becomes a request, not a commit" "rc=$rcc out=$cm requests=$req body=$reqbody HEAD $head_before -> $(git -C "$W" rev-parse HEAD)"
+    pu="$(fx git push origin HEAD:refs/heads/ccsbx/work 2>&1)"
+    grep -q '"type": *"git.push"' "$CCSBX_STATE"/s/"$sid"/g1/out/requests/*.json 2>/dev/null \
+      && ok "[fence shell] git push becomes a git.push request naming a branch (the host, not the fence, decides what is pushed)" || bad "git push becomes a request" "$pu"
+    fp="$(fx git push -f origin HEAD:main 2>&1)"; rcf=$?
+    { [ $rcf -ne 0 ] && ! grep -q 'main' <(cat "$CCSBX_STATE"/s/"$sid"/g1/out/requests/*.json 2>/dev/null | grep '"refspec"' | grep -v 'ccsbx/work'); } \
+      && ok "[fence shell] a force-push to main is refused by the shim before any request is written (the door's U16 rule is the real gate, gate M)" \
+      || bad "a force-push to main is refused in the shim" "rc=$rcf $fp"
+  else
+    bad "the fence for the workday session comes up" "$(tail -3 "$E2E_ROOT/run.log")"
+  fi
+fi
+
+skip "the docker backend prepares out/requests, so a request writer (the git shim) works with no fence-side mkdir" "needs backend.Prepare (internal/backend/docker.go) to make out/requests: FOUND by this suite, step above works around it from inside the fence"
 S "it runs the repo's build and tests with packages through the mirrors"            "U15b package mirrors + U15 egress door (gate M)"
-S "it commits and pushes its branch (outbox -> egress door)"                        "U3a outbox + U16 git route (gate M)"
-S "a force-push is refused"                                                         "U16 git route (gate M); T:push-force-refused"
+S "the sidecar pushes its branch through the egress door's git route (clone, snapshot commit, push of the session branch only)" "U16 git route on a real egress door (gate M); the sidecar's half runs against a fake door in 08-sidecar"
+S "a force-push is refused at the door"                                             "U16 git route (gate M); T:push-force-refused"
 S "it opens a PR"                                                                   "U15 egress route, GitHub App R7 (gate M)"
-S "it messages its manager and a peer and gets replies"                             "M2a/M2b hub relay + C10 scope rule"
-S "tree verbs: outcome, checkpoint, question, done land on its node"                "C5 ccf MCP + C6 verb writer"
+S "it messages its manager and a peer and gets replies"                             "M2a/M2b on a stub-driven agent + C10 scope rule; the signed path runs in 04-msg"
+S "tree verbs: outcome, checkpoint, question, done land on its node"                "$stub_note"
 S "web search goes provider-side through the model door"                            "U4 model door (gate M); T:websearch-through-model-door"
 S "web fetch goes through the egress door's open fetch route and is logged (Q19)"   "U15 egress door (gate M); T:webfetch-open-logged"
-S "it runs a subagent"                                                              "$img + $stub_note (a catalog script that spawns one)"
-S "it resumes after a restart (same sid, gen+1)"                                    "$img + a live pane (U7 is unit-tested only)"
+S "it runs a subagent"                                                              "a stub catalog script that spawns one (C18 has hi, outcome, question, checkpoint, done only)"
+S "it resumes after a restart with its transcript (/resume lists the old one)"      "a stub-driven session that writes a transcript + the ccf layer (the fenced gen-2 resume itself is real in 01-launch)"
 S "it calls an MCP tool through an egress route"                                    "U15 egress route + C5 (gate M)"
 S "it makes a grant request that gets an answer"                                    "P7 solo approval (doors, Telegram code; gate M)"

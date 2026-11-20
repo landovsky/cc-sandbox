@@ -5,14 +5,14 @@
 #   sudo units/hub-probe --owner USER        prints "POST 201", "DELETE 200", then "hub secret OK"; exit 0
 #   exit 1: the hub answered something else (401/403 = the secret does not match: STOP); exit 2: usage or refused
 # The Bearer never appears in an argument list (any local uid could read /proc/<pid>/cmdline): curl takes its header from stdin
-# (printf is a builtin). Before the secret leaves, the process that LISTENS on :4011 must belong to --owner (the owner's hub); a
-# port bound by anyone else is refused, as ccsbx-root's own listener check does.
+# (printf is a builtin). Before the secret leaves, EVERY listener on the --hub port must belong to --owner and the url's address must be where the hub listens
+# (units/lib/hub_listen.py, below); a port bound by anyone else is refused, as ccsbx-root's own listener check does.
 # Flags: --owner USER (required)   --hub URL (required: http://A.B.C.D:PORT, the address the install was given as --hub-url)
 #        --secret FILE (default /etc/ccsbx/hub-admin.secret)
 # The listener rule is units/lib/hub_listen.py (also ccsbx-root's): EVERY LISTEN socket on the port, tcp and tcp6, must belong to the
 # owner, and the address we send to must be one of those listener addresses (a wildcard covers it). There is a window between the check
 # and the connect (the hub restarts and another uid binds): as wide as ccsbx-root's own, which is accepted there.
-# Test hooks: none. Reads: the secret file, /proc, ss. Writes: one principal on the hub, deleted again.
+# Test hooks: none. Reads: the secret file, /proc/net (through hub_listen.py). Writes: one principal on the hub, deleted again.
 set -uo pipefail
 umask 077
 case "${1:-}" in -h|--help|"") sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'; exit 0;; esac

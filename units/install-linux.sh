@@ -148,7 +148,7 @@ if [ -z "$IMAGE" ]; then ROOT_ERRORS+=("no fence image: pass --image ghcr.io/lan
 elif [[ "$IMAGE" != *@sha256:* ]]; then ROOT_ERRORS+=("image '$IMAGE' is a tag: hostd and ccsbx-root refuse every start of a tag (image_not_pinned); use ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex>")
 elif ! [[ "$IMAGE" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("image '$IMAGE' is not ghcr.io/landovsky/ccsbx-fence@sha256:<64 hex> (the only repo a candidate may come from)"); fi
 # the hub's address: an IPv4 literal, with a port (no host names: nothing to resolve or trick)
-[[ "$HUB_URL" =~ ^http://([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$ ]] || ROOT_ERRORS+=("no hub url: pass --hub-url http://A.B.C.D:PORT (an IPv4 literal; on hp today http://100.101.219.96:4011, the hub is on the tailnet address, not loopback); got '${HUB_URL}'")
+[[ "$HUB_URL" =~ ^http://((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]):[1-9][0-9]{0,4}$ ]] || ROOT_ERRORS+=("no hub url: pass --hub-url http://A.B.C.D:PORT (a canonical IPv4 literal, no leading zeros; on hp today http://100.101.219.96:4011, the hub is on the tailnet address, not loopback); got '${HUB_URL}'")
 # the sidecar image: by digest from our own repo only; ccsbx-root's pod-create refuses a config without it
 if [ -z "$SIDE_IMAGE" ]; then ROOT_ERRORS+=("no sidecar image: pass --side-image ghcr.io/landovsky/ccsbx@sha256:<64 hex> (the digest of the side-image Actions run, #3wsr); a tag is refused")
 elif ! [[ "$SIDE_IMAGE" =~ ^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$ ]]; then ROOT_ERRORS+=("sidecar image '$SIDE_IMAGE' is not ghcr.io/landovsky/ccsbx@sha256:<64 hex> (a tag, or another repo, is refused)"); fi
@@ -200,7 +200,7 @@ default_b9() {
     [ -z "$ps" ] || { echo "docker container session-bus is still running"; return 1; }
   fi
   # the hub's address must be where the owner's hub really listens (every listener the owner's, one of them at HUB_URL's address)
-  if [[ "$HUB_URL" =~ ^http://([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]{1,5}$ ]]; then
+  if [[ "$HUB_URL" =~ ^http://((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9]):[1-9][0-9]{0,4}$ ]]; then
     local why; why="$(python3 -I "$UNITS_DIR/lib/hub_listen.py" "$HUB_URL" "$(id -u "$OWNER")")" || { echo "--hub-url $HUB_URL does not match the live hub: $why"; return 1; }
   fi
   return 0

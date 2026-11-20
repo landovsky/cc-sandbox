@@ -573,9 +573,11 @@ echo "# R2-M1: the hub's listeners (units/lib/hub_listen.py), --hub-url"
 hl="$here/units/lib/hub_listen.py"; me="$(/usr/bin/id -u)"
 net() {   # net DIR FILE LINE… — a fake /proc/net/{tcp,tcp6}: net DIR tcp "ip:port uid" …
   local dir="$1" f="$2"; shift 2; mkdir -p "$dir"
+  [ -s "$dir/fib_trie" ] || fib "$dir"
   [ -s "$dir/$f" ] || echo "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode" > "$dir/$f"
   local l n=0; for l in "$@"; do n=$((n+1)); printf '   %d: %s 00000000:0000 0A 00000000:00000000 00:00000000 00000000 %5d        0 %d 1 0\n' "$n" "${l% *}" "${l#* }" "$((9000+n))" >> "$dir/$f"; done
 }
+fib() { mkdir -p "$1"; printf 'Main:\n  +-- 0.0.0.0/0 3 0 5\n     |-- 127.0.0.1\n        /32 host LOCAL\n     |-- 100.64.0.9\n        /32 host LOCAL\n     |-- 100.101.219.96\n        /32 host LOCAL\n     |-- 100.64.0.10\n        /32 link BROADCAST\n' > "$1/fib_trie"; }
 hl_run() { CCSBX_ROOT_PREFIX=/x python3 -I "$hl" "$1" "$me" --net-dir "$2" >"$tmp/hl.out" 2>&1; }
 # 100.101.219.96 = 0x60DB6564 (little-endian hex 60DB6564), 127.0.0.1 = 0100007F, port 4011 = 0FAB
 T1="60DB6564:0FAB"; LO="0100007F:0FAB"; ANY="00000000:0FAB"
@@ -588,8 +590,27 @@ hl_run http://100.101.219.96:4011 "$n"; rc=$?; t "R2-M1: a squatter on loopback 
 hl_run http://127.0.0.1:4011 "$n"; rc=$?; t "R2-M1: …also when the url is the squatted loopback address" test "$rc" -eq 1
 n="$tmp/n3"; net "$n" tcp "$T1 $me" "$LO 4242"; echo hdr > "$n/tcp6"; hl_run http://100.101.219.96:4011 "$n"; rc=$?
 t "R2-M1: a foreign listener listed LAST is refused as well as one listed first" test "$rc" -eq 1
-n="$tmp/n4"; net "$n" tcp "$ANY $me"; echo hdr > "$n/tcp6"
-t "R2-M1: an owner-only wildcard listener covers any address (loopback)" hl_run http://127.0.0.1:4011 "$n"
+n="$tmp/n4"; net "$n" tcp "$ANY $me"; echo hdr > "$n/tcp6"; fib "$n"
+t "R2-M1: an owner-only wildcard listener covers this host's own addresses (loopback, its tailnet address)" bash -c 'hl() { CCSBX_ROOT_PREFIX=/x python3 -I "$1" "$2" "$3" --net-dir "$4"; }; hl "$1" http://127.0.0.1:4011 "$2" "$3" && hl "$1" http://100.64.0.9:4011 "$2" "$3"' _ "$hl" "$me" "$n"
+hl_run http://100.64.0.77:4011 "$n"; rc=$?
+t "R3-S2: …but NOT an address that is another device's (a typo for a tailnet peer): the secret is not sent" bash -c '[ "$1" -eq 1 ] && grep -q "not an address of this host" "$2"' _ "$rc" "$tmp/hl.out"
+hl_run http://100.64.0.10:4011 "$n"; rc=$?
+t "R3-S2: …a broadcast entry is not a local address either" test "$rc" -eq 1
+for u in http://100.64.0.009:4011 http://100.064.0.9:4011 http://100.64.0.9.1:4011 http://256.1.1.1:4011 http://0100.64.0.9:4011; do
+  hl_run "$u" "$n"; rc=$?; t "R3-S2: '$u' is not a canonical dotted quad: refused" test "$rc" -eq 1
+done
+n="$tmp/n4b"; net "$n" tcp "$ANY $me"; echo hdr > "$n/tcp6"; rm -f "$n/fib_trie"
+hl_run http://127.0.0.1:4011 "$n"; rc=$?; t "R3-S2: a wildcard listener with no fib_trie to read is refused, not trusted" test "$rc" -eq 1
+n="$tmp/n4f"; net "$n" tcp "60DB6564:0FAB $me"; echo hdr > "$n/tcp6"; printf 'Main:\n     |-- 127.0.0.1\n        /32 host LOCAL\n' > "$n/fib_trie"
+hl_run http://100.101.219.96:4011 "$n"; rc=$?; t "R3-S2: an exact-address listener is not enough: the url's address must also be this host's (A's rule)" bash -c '[ "$1" -eq 1 ] && grep -q "not an address of this host" "$2"' _ "$rc" "$tmp/hl.out"
+for u in http://100.101.219.96:04011 http://100.101.219.96:0 http://100.101.219.96:65536; do hl_run "$u" "$tmp/n1"; rc=$?; t "R3-S2: port in '$u' is not 1..65535 canonical: refused" test "$rc" -eq 1; done
+V4M="0000000000000000FFFF000060DB6564:0FAB"
+n="$tmp/n4c"; mkdir -p "$n"; echo hdr > "$n/tcp"; net "$n" tcp6 "$V4M $me"
+t "R3-N1: an owner's v4-mapped tcp6 listener (::ffff:100.101.219.96) matches that IPv4 url" hl_run http://100.101.219.96:4011 "$n"
+n="$tmp/n4d"; mkdir -p "$n"; echo hdr > "$n/tcp"; net "$n" tcp6 "$V4M 4242"
+hl_run http://100.101.219.96:4011 "$n"; rc=$?; t "R3-N1: a FOREIGN v4-mapped tcp6 listener is refused" bash -c '[ "$1" -eq 1 ] && grep -q "uid 4242" "$2"' _ "$rc" "$tmp/hl.out"
+n="$tmp/n4e"; mkdir -p "$n"; echo hdr > "$n/tcp6"; { echo hdr; echo "   1: ZZZZ:0FAB 0:0 0A 0:0 0:0 0 1000 0 9"; echo "   2: 60DB6564:0FAB 00000000:0000 0A 0:0 0:0 0 1000 0 9 1 0"; } > "$n/tcp"
+hl_run http://100.101.219.96:4011 "$n"; rc=$?; t "R3-N4: a malformed table line is refused with a reason (no traceback)" bash -c '[ "$1" -eq 1 ] && grep -q "cannot parse" "$2" && ! grep -q Traceback "$2"' _ "$rc" "$tmp/hl.out"
 n="$tmp/n5"; mkdir -p "$n"; echo hdr > "$n/tcp"; net "$n" tcp6 "00000000000000000000000000000000:0FAB 4242"
 hl_run http://100.101.219.96:4011 "$n"; rc=$?; t "R2-M1: a foreign listener on tcp6 ([::]) is refused (both tables are read)" test "$rc" -eq 1
 n="$tmp/n6"; mkdir -p "$n"; echo hdr > "$n/tcp"; echo hdr > "$n/tcp6"; hl_run http://100.101.219.96:4011 "$n"; rc=$?
@@ -602,7 +623,7 @@ done
 t "R2-M1: --net-dir is refused outside the test hook (CCSBX_ROOT_PREFIX unset)" bash -c '! env -u CCSBX_ROOT_PREFIX python3 -I "$1" http://100.101.219.96:4011 1000 --net-dir "$2" >/dev/null 2>&1' _ "$hl" "$tmp/n1"
 d="$(fx hu)"; ins "$d" install --yes >/dev/null 2>&1
 t "R2-M1: ccsbx-root.toml gets the hub url that was passed (not a loopback default)" grep -qx 'hub_url = "http://100.64.0.9:4011"' "$d/root/etc/ccsbx/ccsbx-root.toml"
-for bad in "" "http://127.0.0.1:4011/" "http://localhost:4011" "https://100.64.0.9:4011" "http://100.64.0.9"; do
+for bad in "" "http://100.64.0.009:4011" "http://127.0.0.1:4011/" "http://localhost:4011" "https://100.64.0.9:4011" "http://100.64.0.9"; do
   d="$(fx hub)"; HUBURL="$bad" ins "$d" install --yes >/dev/null 2>&1; rc=$?
   t "R2-M1: --hub-url '${bad:-unset}' is refused (exit 3), nothing changed" bash -c '[ "$1" -eq 3 ] && [ ! -e "$2/rec/cmds" ]' _ "$rc" "$d"
 done

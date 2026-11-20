@@ -67,7 +67,7 @@ the only way out for the model, git and packages.
 - **Admission and network** (per k3s review 2026-11-20): two ValidatingAdmissionPolicies,
   `cc-sandbox-pod-guard` and `cc-sandbox-subresource-guard`, pin pods and images (K11); the
   Tailscale ProxyClass `ccsbx-future-two` (approved) pins the operator's proxies to future-two; the
-  doors are exposed by the operator with tag `tag:ccsbx` (the ACL is the k3s repo's
+  doors are exposed by the operator with tag `tag:ccsbx`, hostd's devices with `tag:ccsbx-hostd` (the ACL is the k3s repo's
   `artifacts/tailscale-config.json`).
 - **Namespace defaults** (per k3s review 2026-11-20): the default ServiceAccount carries
   `imagePullSecrets: ghcr-pull`; `cc-sandbox` has a quota of 40Gi memory, 20 pods and 0 PVCs

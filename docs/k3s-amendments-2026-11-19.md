@@ -258,7 +258,7 @@ merged**, it waits for Tomas). A tightening of the rules above for launcher-crea
 | no `runtimeClassName`, no finalizers | new | no `runtimeClassName`: a session can't pick a runtime with weaker isolation than the default. No finalizers: a session pod can't block its own deletion (cleanup and quota stay in the launcher's hands) |
 | `terminationGracePeriodSeconds` at most 60 (unset = 30 is fine) | new | a stopping session can't hold the node's resources for long |
 | ephemeral containers (`kubectl debug`) refused in **both namespaces, for everyone** | widens rule 8 | F5 attach and any debugging use `exec` || `kubectl debug` would inject a container that bypasses the pod spec's fences (and could reach the sidecar's token); attach is exec only |
-| `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | per #5dxt; Tomas's call |
+| `hostUsers: false` **allowed**; required later, after a test pod proves it on future-two (Tomas decides) | relaxes rule 9, which says absent or true | with `hostUsers: false` a session's uid 0 maps to an unprivileged host uid, so a container escape on future-two's shared kernel lands as nobody, not as host root. Required only after a test pod proves it on future-two (k3s version, idmapped mount of the session volume); requiring it is Tomas's call |
 
 ---
 

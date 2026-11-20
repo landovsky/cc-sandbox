@@ -327,20 +327,22 @@ shelp="$here/tests/fixtures/ccsbx-signer-help.txt"; ssrc="fixture tests/fixtures
 if [ -x "$here/dist/ccsbx-signer" ] && timeout 5 "$here/dist/ccsbx-signer" --help >"$tmp/signer-real-help.txt" 2>&1 && [ -s "$tmp/signer-real-help.txt" ]; then shelp="$tmp/signer-real-help.txt"; ssrc="dist/ccsbx-signer --help"; fi
 badf="$(grep '^ExecStart=' "$sig" | grep -o ' --[a-z-]*' | tr -d ' ' | sed 's/^--//' | while read -r f; do grep -qE "(^|[[:space:]])-{1,2}$f([[:space:]]|\$)" "$shelp" || echo "$f"; done)"
 t "signer: every flag in the unit's ExecStart is a flag ccsbx-signer has ($ssrc)${badf:+: unknown: $badf}" test -z "$badf"
-d="$(fx sg)"; ins "$d" install --yes --machine hp-ubuntu --profiles 'dev-*,e2e-default' --billings api >/dev/null 2>&1; sc="$d/rec/cmds"
-badt="$(grep 'token pubkey' "$sc" | grep -o ' --[a-z-]*' | tr -d ' ' | sed 's/^--//' | sort -u | while read -r f; do grep -qE "(^|[[:space:]])-{1,2}$f([[:space:]]|\$)" "$here/tests/fixtures/ccsbx-token-help.txt" || echo "$f"; done)"
-t "signer: the installer's 'ccsbx token pubkey' flags exist in ccsbx token's usage${badt:+: unknown: $badt}" bash -c 'grep -q "token pubkey" "$1" && [ -z "$2" ]' _ "$sc" "$badt"
-t "signer: the scope is written as ccsbx-keys, from the owner, machine, profiles and billings the install was given" bash -c 'l="$(grep "token pubkey" "$1")"; grep -q "runuser -u ccsbx-keys" <<<"$l" && grep -q -- "--owners tomas" <<<"$l" && grep -q -- "--machines hp-ubuntu" <<<"$l" && grep -q -- "--billings api" <<<"$l" && grep -q "dev-" <<<"$l" && grep -q "e2e-default" <<<"$l" && grep -q "signer.scope" <<<"$l"' _ "$sc"
-t "signer: the scope exists BEFORE the signer socket is enabled (else the service exits 2)" bash -c 'a="$(grep -n "token pubkey" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-signer.socket" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$sc"
-t "signer: the machine key is made before the scope (the scope is derived from it)" bash -c 'a="$(grep -n -- "ccsbx-signer --keys /var/lib/ccsbx-keys --init" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "token pubkey" "$1" | head -1 | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$sc"
+d="$(fx sg)"; ins "$d" install --yes --machine hp-ubuntu >/dev/null 2>&1; sc="$d/rec/cmds"
+t "signer: the scope is written BY THE SIGNER (--write-scope, as ccsbx-keys); the CLI never reads machine.key" bash -c 'l="$(grep -- "--write-scope" "$1")"; grep -q "runuser -u ccsbx-keys" <<<"$l" && grep -q -- "--owners tomas" <<<"$l" && grep -q -- "--machines hp-ubuntu" <<<"$l" && ! grep -q "token pubkey\|--key-file" "$1"' _ "$sc"
+t "signer: --write-scope's flags are flags ccsbx-signer has ($ssrc)" bash -c 'for f in keys write-scope owners machines pairs init; do grep -qE "(^|[[:space:]])-{1,2}$f([[:space:]]|\$)" "$1" || { echo "no --$f"; exit 1; }; done' _ "$shelp"
+t "signer: the pairs come from each profile's OWN billings (dev-default api|stub, e2e-default stub), not a product" bash -c 'grep -- "--write-scope" "$1" | grep -q -- "--pairs dev-default:api\\|stub,e2e-default:stub"' _ "$sc"
+t "signer: no subscription anywhere in the scope until a profile allows it" bash -c '! grep -- "--write-scope" "$1" | grep -q subscription' _ "$sc"
+t "signer: the scope exists BEFORE the signer socket is enabled (else the service exits 2)" bash -c 'a="$(grep -n -- "--write-scope" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-signer.socket" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$sc"
+t "signer: the machine key is made (--init) before the scope is written" bash -c 'a="$(grep -n -- "ccsbx-signer --keys /var/lib/ccsbx-keys --init" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n -- "--write-scope" "$1" | head -1 | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$sc"
+t "signer: the unit has the reviewer's hardening (LimitCORE, ProtectProc, RestrictSUIDSGID, PrivateNetwork)" bash -c 'for k in LimitCORE=0 ProtectProc=invisible RestrictSUIDSGID=yes PrivateNetwork=yes; do grep -q "^$k" "$1" || exit 1; done' _ "$sig"
 if ! getent group ccsbx >/dev/null 2>&1; then
   t "signer: group ccsbx is created BEFORE the signer starts (its --allow-group default)" bash -c 'a="$(grep -n "groupadd --system ccsbx$" "$1" | head -1 | cut -d: -f1)"; b="$(grep -n "enable --now ccsbx-signer.socket" "$1" | cut -d: -f1)"; [ -n "$a" ] && [ "$a" -lt "$b" ]' _ "$sc"
 else echo "ok   - (skipped: group ccsbx exists on this host)"; fi
-for bad_arg in "--profiles|bad prof" "--machine|Bad_Host" "--billings|api;x"; do
+for bad_arg in "--pairs|bad prof" "--pairs|dev:subscription,x" "--machine|Bad_Host" "--pairs|dev:api;x"; do
   d="$(fx sgbad)"; ins "$d" install --yes "${bad_arg%%|*}" "${bad_arg#*|}" >/dev/null 2>"$d/err"; rc=$?
   t "signer: ${bad_arg%%|*} '${bad_arg#*|}' is refused (exit 3), nothing changed" bash -c '[ '"$rc"' -eq 3 ] && [ ! -s "$1" ]' _ "$d/rec/cmds"
 done
-t "signer: plan prints the scope it will write" bash -c 'grep -q "signer scope:    owners=tomas machines=hp-ubuntu profiles=dev-default,e2e-default billings=api,subscription,stub" <<<"$1"' _ "$(CCSBX_OWNER=tomas "$inst" plan --machine hp-ubuntu 2>&1)"
+t "signer: plan prints the scope it will write" bash -c 'grep -q "signer scope:    owners=tomas machines=hp-ubuntu pairs=dev-default:api|stub,e2e-default:stub" <<<"$1"' _ "$(CCSBX_OWNER=tomas "$inst" plan --machine hp-ubuntu 2>&1)"
 # check asks the signer to sign one in-scope claim (a stub signer on a unix socket in the fake root)
 d="$(fx sgchk)"; mkdir -p "$d/root/run/ccsbx-signer"
 cat > "$tmp/fake-signer.py" <<'PY'
@@ -348,10 +350,10 @@ import json, socket, sys
 path, mode, seen = sys.argv[1], sys.argv[2], sys.argv[3]
 s = socket.socket(socket.AF_UNIX); s.bind(path); s.listen(1)
 c, _ = s.accept(); d = b""
-while True:
-    b = c.recv(4096)
-    if not b: break
-    d += b
+while True:                      # like the real signer: exactly one JSON value, no half-close needed
+    d += c.recv(4096)
+    try: json.loads(d); break
+    except ValueError: continue
 open(seen, "wb").write(d)
 c.sendall(json.dumps({"token": "x.y.z"} if mode == "ok" else {"error": "claims outside this key's scope"}).encode()); c.close()
 PY
@@ -359,11 +361,11 @@ for mode in ok refuse; do
   rm -f "$d/root/run/ccsbx-signer/sign.sock"
   python3 -I "$tmp/fake-signer.py" "$d/root/run/ccsbx-signer/sign.sock" "$mode" "$d/seen-$mode" & spid=$!
   for _ in 1 2 3 4 5 6 7 8 9 10; do [ -S "$d/root/run/ccsbx-signer/sign.sock" ] && break; sleep 0.2; done
-  out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check --machine hp-ubuntu --profiles 'dev-*' --billings api 2>&1)"
+  out="$(CCSBX_ROOT_PREFIX="$d/root" CCSBX_EXEC="record:$d/x" CCSBX_OWNER=tomas "$inst" check --machine hp-ubuntu --pairs 'dev-default:api|stub' 2>&1)"
   kill "$spid" 2>/dev/null; wait "$spid" 2>/dev/null
   if [ "$mode" = ok ]; then
     t "check: a token for the in-scope test claim is an ok line" grep -q '^ok    signer returned a token for the in-scope test claim' <<<"$out"
-    t "check: the claim it sent has the owner/machine sub, a scope profile and billing, and a cnf" bash -c 'python3 -I -c "import base64,json,sys; c=json.load(open(sys.argv[1])); assert c[\"sub\"].startswith(\"tomas/hp-ubuntu/\") and c[\"billing\"]==\"api\" and c[\"profile\"].startswith(\"dev-\") and c[\"aud\"] and \"=\" not in c[\"cnf\"] and \"+\" not in c[\"cnf\"] and \"/\" not in c[\"cnf\"] and len(base64.urlsafe_b64decode(c[\"cnf\"]+\"=\"))==32 and \"iat\" not in c" "$1"' _ "$d/seen-ok"
+    t "check: the claim it sent has the owner/machine sub, a scope profile and billing, and a cnf" bash -c 'python3 -I -c "import base64,json,sys; c=json.load(open(sys.argv[1])); assert c[\"sub\"].startswith(\"tomas/hp-ubuntu/\") and c[\"billing\"]==\"api\" and c[\"profile\"]==\"dev-default\" and c[\"aud\"] and \"=\" not in c[\"cnf\"] and \"+\" not in c[\"cnf\"] and \"/\" not in c[\"cnf\"] and len(base64.urlsafe_b64decode(c[\"cnf\"]+\"=\"))==32 and \"iat\" not in c" "$1"' _ "$d/seen-ok"
   else t "check: a signer that refuses the in-scope claim is a FAIL with its reason (a connect alone is not enough)" grep -q "^FAIL  signer refused or failed the in-scope test claim: claims outside" <<<"$out"; fi
 done
 

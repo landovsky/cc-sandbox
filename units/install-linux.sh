@@ -30,8 +30,8 @@
 #   --owner USER          the human who keeps access            (CCSBX_OWNER, default the invoking user)
 #   --allowed-roots A,B   ccsbx-root's workdir roots            (CCSBX_ALLOWED_ROOTS, default ~owner/git,~owner/wt)
 #   --machine NAME        the machine name the signer's scope allows   (CCSBX_MACHINE, default hostname -s)
-#   --profiles A,B        profile globs the signer may sign            (CCSBX_PROFILES, default: the names in <repo>/profiles/*.json)
-#   --billings A,B        billings the signer may sign                 (CCSBX_BILLINGS, default api,subscription,stub)
+#   --pairs P             what the signer may sign: exact profile:billing|billing,... (CCSBX_PAIRS; default: built from
+#                         <repo>/profiles/*.json that list this machine, e.g. dev-default:api|stub,e2e-default:stub)
 #   --with-deploy         also the ccsbx-deploy sudoers rule (Q12 = yes, R10c)  (CCSBX_WITH_DEPLOY=1)
 #   --backup DIR          uninstall from this backup (must be under /var/backups/ccsbx-install), not the first one
 #   --purge-keys          uninstall also deletes the keys and the ccsbx-keys user (rotate M9 first!)
@@ -52,7 +52,7 @@ case "${1:-}" in
   *) echo "install-linux: unknown command '$1' (plan|install|check|uninstall; --help)" >&2; exit 2 ;;
 esac
 YES=0; WITH_DEPLOY="${CCSBX_WITH_DEPLOY:-0}"; BIN_DIR="${CCSBX_BIN_DIR:-$REPO_DIR/dist}"
-MACHINE="${CCSBX_MACHINE:-}"; PROFILES="${CCSBX_PROFILES:-}"; BILLINGS="${CCSBX_BILLINGS:-api,subscription,stub}"
+MACHINE="${CCSBX_MACHINE:-}"; PAIRS="${CCSBX_PAIRS:-}"
 ALLOWED_ROOTS="${CCSBX_ALLOWED_ROOTS:-}"; RESTORE_OVERRIDE=""; PURGE_KEYS=0; VERBOSE=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -62,8 +62,7 @@ while [ $# -gt 0 ]; do
     --owner) CCSBX_OWNER="${2:?--owner USER}"; shift ;;
     --allowed-roots) ALLOWED_ROOTS="${2:?--allowed-roots A,B}"; shift ;;
     --machine) MACHINE="${2:?--machine NAME}"; shift ;;
-    --profiles) PROFILES="${2:?--profiles A,B}"; shift ;;
-    --billings) BILLINGS="${2:?--billings A,B}"; shift ;;
+    --pairs) PAIRS="${2:?--pairs P}"; shift ;;
     --with-deploy) WITH_DEPLOY=1 ;;
     --backup) RESTORE_OVERRIDE="${2:?--backup DIR}"; shift ;;
     --purge-keys) PURGE_KEYS=1 ;;
@@ -80,13 +79,24 @@ OWNER="$(real_user)"; OWNER_HOME="$(getent passwd "$OWNER" | cut -d: -f6)"; OWNE
 [ -n "$ALLOWED_ROOTS" ] || ALLOWED_ROOTS="$OWNER_HOME/git,$OWNER_HOME/wt"
 # the signer's scope (what the machine key may sign): owner, machine, profiles, billings
 [ -n "$MACHINE" ] || MACHINE="$(hostname -s 2>/dev/null)"
-if [ -z "$PROFILES" ]; then
-  for _p in "$REPO_DIR"/profiles/*.json; do [ -e "$_p" ] && PROFILES+="${PROFILES:+,}$(basename "$_p" .json)"; done
+# the pairs come from the profiles themselves: each profile that lists this machine, with ITS billings (a flat
+# profiles x billings product would let a profile be signed with a billing it does not allow)
+if [ -z "$PAIRS" ] && compgen -G "$REPO_DIR/profiles/*.json" >/dev/null; then
+  PAIRS="$(python3 -I - "$MACHINE" "$REPO_DIR"/profiles/*.json <<'PY' 2>/dev/null
+import json, sys
+machine, out = sys.argv[1], []
+for f in sys.argv[2:]:
+    p = json.load(open(f))
+    if machine in p.get("machines", []) and p.get("billing"):
+        out.append(p["name"] + ":" + "|".join(p["billing"]))
+print(",".join(out))
+PY
+)"
 fi
 SCOPE_ERRORS=()
 [[ "$MACHINE" =~ ^[a-z0-9][a-z0-9.-]*$ ]] || SCOPE_ERRORS+=("machine name '$MACHINE' is not a plain host name (--machine)")
-[[ "$PROFILES" =~ ^[A-Za-z0-9._*-]+(,[A-Za-z0-9._*-]+)*$ ]] || SCOPE_ERRORS+=("profiles '$PROFILES' is empty or not a comma list of names/globs (--profiles; default: <repo>/profiles/*.json)")
-[[ "$BILLINGS" =~ ^[a-z]+(,[a-z]+)*$ ]] || SCOPE_ERRORS+=("billings '$BILLINGS' is not a comma list of api,subscription,stub (--billings)")
+_b='(api|subscription|stub)'
+[[ "$PAIRS" =~ ^[A-Za-z0-9._-]+:$_b(\|$_b)*(,[A-Za-z0-9._-]+:$_b(\|$_b)*)*$ ]] || SCOPE_ERRORS+=("pairs '$PAIRS' is empty or not name:billing|billing,... (--pairs; default: profiles/*.json that list machine $MACHINE)")
 # split on commas only (no globbing, no word splitting); each root must be a plain absolute path
 ROOT_ERRORS=(); ALLOWED_ROOTS_TOML=""
 IFS=, read -r -a _roots <<<"$ALLOWED_ROOTS"
@@ -98,7 +108,7 @@ for _r in "${_roots[@]}"; do
 done
 ALLOWED_ROOTS_TOML="${ALLOWED_ROOTS_TOML%, }"
 RESTORE_DIR="${RESTORE_OVERRIDE:-$BACKUP_DIR}"
-export OWNER MACHINE PROFILES BILLINGS BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
+export OWNER MACHINE PAIRS BIN_DIR UNITS_DIR ALLOWED_ROOTS_TOML RESTORE_DIR
 
 # ---------------------------------------------------------------- gates (read-only)
 GATE_MSGS=(); NOTES=()
@@ -216,7 +226,7 @@ case "$MODE" in
     echo "Nothing below is run by 'plan'. The same steps run under 'install --yes' as root."
     eval_gates; print_gates
     echo "  P15 status file: $P15_FILE"; echo "  allowed roots:   ${ALLOWED_ROOTS_TOML:-(none)}"
-    echo "  signer scope:    owners=$OWNER machines=$MACHINE profiles=$PROFILES billings=$BILLINGS"
+    echo "  signer scope:    owners=$OWNER machines=$MACHINE pairs=$PAIRS"
     steps_install
     echo; echo "AFTER: reboot, then units/install-linux.sh check  and  bin/ccsbx-preflight --morning --post-M1"
     echo "UNDO:  as root, units/install-linux.sh uninstall --yes   (restores the first backup, $BACKUP_DIR; a failed install is undone the same way)"

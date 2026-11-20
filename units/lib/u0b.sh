@@ -46,10 +46,9 @@ u0b_keys() {
   if [ "$MODE" != install ] || [ ! -e "$(pth $KEYS_DIR/machine.key)" ]; then
     cmd runuser -u ccsbx-keys -- "$LIBEXEC/ccsbx-signer" --keys "$KEYS_DIR" --init
   fi
-  note "the signer will not serve without its scope: ONE keyring line (owners, machines, profiles, billings), written by"
-  note "  'ccsbx token pubkey' as ccsbx-keys, 0600, from the install's own values; rewritten on every run so it matches the options"
-  cmd runuser -u ccsbx-keys -- sh -c 'f=$1; shift; umask 077; "$@" > "$f.tmp" && mv "$f.tmp" "$f"' sh "$KEYS_DIR/signer.scope" \
-    /usr/local/bin/ccsbx token pubkey --key-file "$KEYS_DIR/machine.key" --owners "$(real_user)" --machines "$MACHINE" --profiles "$PROFILES" --billings "$BILLINGS"
+  note "the signer will not serve without its scope (owners, machines, profile:billing pairs). The signer writes it itself"
+  note "  (--write-scope: atomic, 0600): only that binary ever opens machine.key. Rewritten on every run to match the options"
+  cmd runuser -u ccsbx-keys -- "$LIBEXEC/ccsbx-signer" --keys "$KEYS_DIR" --write-scope --owners "$(real_user)" --machines "$MACHINE" --pairs "$PAIRS"
   note "the printed PUBLIC key goes into config/machines/<machine>.json (M9); nothing secret is printed"
   note "the K8 kubeconfig arrives SOPS-encrypted to the age key; it is decrypted only by ccsbx-keys"
 }
@@ -87,14 +86,14 @@ sign_probe_py='import base64,json,os,socket,sys
 claims={"sub":sys.argv[2],"billing":sys.argv[3],"profile":sys.argv[4],"aud":["ccsbx-stub"],"cnf":base64.urlsafe_b64encode(os.urandom(32)).decode().rstrip("=")}   # base64url, no padding, 32 bytes: the signer refuses anything else
 s=socket.socket(socket.AF_UNIX); s.settimeout(5)
 try:
-    s.connect(sys.argv[1]); s.sendall(json.dumps(claims).encode()); s.shutdown(socket.SHUT_WR)
+    s.connect(sys.argv[1]); s.sendall(json.dumps(claims).encode())   # one JSON value; no half-close needed
     r=json.loads(s.makefile().read())
 except Exception as e: print(e); sys.exit(1)
 if "token" in r: sys.exit(0)
 print(r.get("error", r)); sys.exit(1)'
 sign_check() {
   local real out sub billing profile; real="$(pth "$SIGNER_SOCK")"
-  sub="$(real_user)/$MACHINE/scheck/g1"; billing="${BILLINGS%%,*}"; profile="${PROFILES%%,*}"; profile="${profile//\*/x}"
+  sub="$(real_user)/$MACHINE/scheck/g1"; profile="${PAIRS%%:*}"; billing="${PAIRS#*:}"; billing="${billing%%[|,]*}"
   if [ ! -S "$real" ]; then bad "signer signs a test claim: $SIGNER_SOCK is not a socket"; return; fi
   if [ "$(id -u)" = 0 ] && [ -z "$PREFIX" ]; then
     out="$(runuser -u ccsbx -- python3 -I -c "$sign_probe_py" "$real" "$sub" "$billing" "$profile" 2>&1)"

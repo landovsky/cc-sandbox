@@ -17,6 +17,7 @@
 package worktree
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -178,9 +179,8 @@ func (b *Builder) exec(d time.Duration, dir string, owner bool, watch func() boo
 	c := exec.CommandContext(ctx, b.git(), append(b.hardened(), args...)...)
 	c.Dir, c.Env = dir, b.env(owner)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	c.WaitDelay = time.Second
-	// the whole process group: git-remote-https, ssh and index-pack must not outlive a timeout and keep writing into the clone
-	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
+	c.WaitDelay = 4 * time.Second
+	c.Cancel = groupCancel(c)
 	var out, errb bytes.Buffer
 	c.Stdout, c.Stderr = &out, &errb
 	if watch != nil {
@@ -206,6 +206,29 @@ func (b *Builder) exec(d time.Duration, dir string, owner bool, watch func() boo
 		return "", fmt.Errorf("git %s: %v", args[0], err)
 	}
 	return strings.TrimSpace(out.String()), nil
+}
+
+// groupCancel stops the WHOLE process group (git-remote-https, ssh and index-pack must not outlive a timeout and keep writing into the
+// clone): SIGTERM first, so git removes its own lock files, and SIGKILL to the group two seconds later if anything is left.
+func groupCancel(c *exec.Cmd) func() error {
+	return func() error {
+		pid := c.Process.Pid
+		time.AfterFunc(2*time.Second, func() { syscall.Kill(-pid, syscall.SIGKILL) })
+		return syscall.Kill(-pid, syscall.SIGTERM)
+	}
+}
+
+// staleLocks removes git lock files a killed process left in the clone. The caller holds the clone's flock, so no git of ours is running
+// in it; a lock file older than staleAfter belongs to nobody. (A host git commit through the host route may hold one for a moment:
+// only old ones go.)
+func staleLocks(clone string, staleAfter time.Duration) {
+	now := time.Now()
+	filepath.Walk(clone, func(p string, fi os.FileInfo, err error) error {
+		if err == nil && fi.Mode().IsRegular() && strings.HasSuffix(p, ".lock") && now.Sub(fi.ModTime()) > staleAfter {
+			os.Remove(p)
+		}
+		return nil
+	})
 }
 
 // lock takes the per-clone flock, waiting at most wait (a hung fetch must not hold every start of that repo for ever).
@@ -292,19 +315,23 @@ func (b *Builder) Prepare(owner, label, repo, base, branch string) (*Handle, err
 	// fetch ONLY the base branch (full history of that one ref), into a namespace of ours; the size of the clone is polled
 	// while it runs, and the fetch is killed when it passes the cap
 	ref := "refs/remotes/origin/" + base
-	_, herr := b.run(30*time.Second, clone, "rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}")
-	hadRef := herr == nil
+	staleLocks(clone, 10*time.Minute)
+	oldSha, herr := b.run(30*time.Second, clone, "rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}")
+	if herr != nil {
+		oldSha = ""
+	}
+	packsBefore := packSet(clone)
 	over := func() bool { return dirMB(clone) > b.Limits.cloneMB() }
 	if _, err := b.exec(b.Limits.fetchTimeout(), clone, true, over, "fetch", "--no-tags", "--no-recurse-submodules", "--prune", "origin", "+refs/heads/"+base+":"+ref); err != nil {
 		tooBig := over()
-		b.rollbackFetch(clone, created, ref, hadRef)
+		b.rollbackFetch(clone, created, ref, oldSha, packsBefore)
 		if tooBig {
 			return nil, refuse("the repository is larger than this machine allows")
 		}
 		return nil, refuse("the repository or branch could not be fetched")
 	}
 	if over() {
-		b.rollbackFetch(clone, created, ref, hadRef)
+		b.rollbackFetch(clone, created, ref, oldSha, packsBefore)
 		return nil, refuse("the repository is larger than this machine allows")
 	}
 	sha, err := b.run(30*time.Second, clone, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
@@ -343,32 +370,61 @@ func (b *Builder) Prepare(owner, label, repo, base, branch string) (*Handle, err
 }
 
 // checkTree refuses a commit whose checkout would write more than the caps (ls-tree -l sizes every blob, a shared blob once per path).
+// The listing is STREAMED and counted as it arrives: a tiny repository of nested shared trees names billions of paths, so git is killed (its
+// whole process group) the moment a limit is passed, and the bytes read are capped too. Nothing is ever held whole in memory.
 func (b *Builder) checkTree(clone, sha string) error {
-	out, err := b.run(60*time.Second, clone, "ls-tree", "-r", "-l", "--full-tree", "-z", "--end-of-options", sha)
-	if err != nil || len(out) > 64<<20 {
-		return refuse("the tree could not be measured or is too large")
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	c := exec.CommandContext(ctx, b.git(), append(b.hardened(), "ls-tree", "-r", "-l", "--full-tree", "-z", "--end-of-options", sha)...)
+	c.Dir, c.Env = clone, b.env(false)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.WaitDelay = 4 * time.Second
+	c.Cancel = groupCancel(c)
+	out, err := c.StdoutPipe()
+	if err != nil {
+		return refuse("the tree could not be measured")
 	}
-	var total int64
+	if err := c.Start(); err != nil {
+		return refuse("the tree could not be measured")
+	}
+	rd := bufio.NewReaderSize(out, 64<<10)
+	var total, bytesRead int64
 	files := 0
-	for _, rec := range strings.Split(out, "\x00") {
-		if rec == "" {
-			continue
+	verdict := error(nil)
+	for verdict == nil {
+		rec, err := rd.ReadString(0)
+		bytesRead += int64(len(rec))
+		if len(rec) > 0 && rec[len(rec)-1] == 0 {
+			meta, _, ok := strings.Cut(rec[:len(rec)-1], "\t")
+			f := strings.Fields(meta)
+			switch {
+			case !ok || len(f) != 4:
+				verdict = refuse("the tree could not be measured")
+			case f[1] == "commit": // a submodule entry: never fetched, never checked out
+			default:
+				files++
+				if n, perr := strconv.ParseInt(f[3], 10, 64); perr == nil {
+					total += n
+				}
+				if files > b.Limits.maxFiles() || total>>20 > b.Limits.checkoutMB() {
+					verdict = refuse("the checkout is larger than this machine allows")
+				}
+			}
 		}
-		meta, _, ok := strings.Cut(rec, "\t")
-		f := strings.Fields(meta)
-		if !ok || len(f) != 4 {
-			return refuse("the tree could not be measured or is too large")
+		if verdict == nil && bytesRead > 256<<20 {
+			verdict = refuse("the tree is larger than this machine allows")
 		}
-		if f[1] == "commit" { // a submodule entry: never fetched, never checked out
-			continue
+		if err != nil {
+			break
 		}
-		files++
-		if n, err := strconv.ParseInt(f[3], 10, 64); err == nil {
-			total += n
-		}
-		if files > b.Limits.maxFiles() || total>>20 > b.Limits.checkoutMB() {
-			return refuse("the checkout is larger than this machine allows")
-		}
+	}
+	if verdict != nil {
+		cancel() // kills the group; the rest of the listing is never read
+		c.Wait()
+		return verdict
+	}
+	if err := c.Wait(); err != nil {
+		return refuse("the tree could not be measured")
 	}
 	return nil
 }
@@ -380,27 +436,46 @@ func (b *Builder) dropIfNew(clone string, created bool) {
 	}
 }
 
-// rollbackFetch undoes a fetch that failed or went over the cap. A clone this call created is deleted; an existing clone (it may have live
-// worktrees) keeps everything it had: only the ref this fetch added is dropped, partial pack files are removed, and gc reclaims the rest.
-func (b *Builder) rollbackFetch(clone string, created bool, ref string, hadRef bool) {
+// packSet lists the pack files of a clone (names only).
+func packSet(clone string) map[string]bool {
+	m := map[string]bool{}
+	ents, _ := os.ReadDir(filepath.Join(clone, "objects", "pack"))
+	for _, e := range ents {
+		m[e.Name()] = true
+	}
+	return m
+}
+
+// rollbackFetch undoes a fetch that failed or went over the cap. A clone this call created is deleted. An existing clone (it may have live
+// worktrees, and a host git commit may be writing objects that nothing references yet) keeps everything it had: the ref goes back to what
+// it was (or is dropped if there was none), and ONLY the pack files this fetch created are deleted, together with its temporary files.
+// Nothing can reference those packs yet, and no pruning of unreferenced objects is ever done here: that is git's own expiry, in Prune.
+func (b *Builder) rollbackFetch(clone string, created bool, ref, oldSha string, before map[string]bool) {
 	if created {
 		os.RemoveAll(clone)
 		return
 	}
-	if !hadRef {
+	if oldSha != "" {
+		b.run(30*time.Second, clone, "update-ref", ref, oldSha)
+	} else {
 		b.run(30*time.Second, clone, "update-ref", "-d", ref)
 	}
-	if tmps, _ := filepath.Glob(filepath.Join(clone, "objects", "pack", "tmp_*")); len(tmps) > 0 {
-		for _, t := range tmps {
-			os.Remove(t)
+	ents, _ := os.ReadDir(filepath.Join(clone, "objects", "pack"))
+	for _, e := range ents {
+		if !before[e.Name()] {
+			os.Remove(filepath.Join(clone, "objects", "pack", e.Name()))
 		}
 	}
-	b.gc(clone)
+	// the lock files THIS killed fetch can have left (ours to remove: nothing of ours runs in the clone now)
+	for _, l := range []string{"packed-refs.lock", "config.lock", ref + ".lock"} {
+		os.Remove(filepath.Join(clone, l))
+	}
 }
 
-// gc reclaims unreachable objects (a rolled-back fetch's, a deleted branch's). Best effort; a failure leaves the objects for the next pass.
+// gc reclaims unreachable objects older than git's own expiry (two weeks by default). It never uses --prune=now: an object a host git
+// commit has just written and not yet referenced must survive.
 func (b *Builder) gc(clone string) {
-	b.run(b.Limits.fetchTimeout(), clone, "-c", "gc.auto=0", "gc", "-q", "--prune=now")
+	b.run(b.Limits.fetchTimeout(), clone, "gc", "-q")
 }
 
 // newPath makes a fresh, unused directory name directly under the REAL root (the directory itself is made by `worktree add`).
@@ -433,7 +508,8 @@ func (b *Builder) Remove(h *Handle) error {
 	if h == nil || filepath.Dir(filepath.Clean(h.Path)) != b.root() {
 		return refuse("not a worktree of this builder")
 	}
-	unlock, err := lock(h.Clone+".lock", b.Limits.lockWait())
+	// wait as long as the longest holder can run (a fetch, a worktree add, a gc): giving up would leave the tree AND the branch behind
+	unlock, err := lock(h.Clone+".lock", 3*b.Limits.fetchTimeout()+b.Limits.lockWait())
 	if err != nil {
 		return refuse("the repository is busy")
 	}
@@ -452,11 +528,10 @@ func (b *Builder) removeLocked(h *Handle) {
 	}
 }
 
-// Prune removes the builder's worktrees (and their branches) that nothing needs any more. It takes each clone's lock; `needed(path)` is
-// asked again, with fresh records, right before every removal (a session resumed meanwhile keeps its tree). A worktree it does not need
-// and that is untouched for longer than olderThan goes. Only worktrees directly under the real Root, registered in a clone of this
+// Prune removes the builder's worktrees (and their branches) that nothing needs any more. It takes each clone's lock; for an old enough worktree
+// it calls guard(path, remove), which decides with fresh records and calls remove() only if nothing needs the path, all under the caller's lock. Only worktrees directly under the real Root, registered in a clone of this
 // state dir, are considered. Returns how many were removed.
-func (b *Builder) Prune(olderThan time.Duration, needed func(path string) bool, now time.Time) int {
+func (b *Builder) Prune(olderThan time.Duration, guard func(path string, remove func()), now time.Time) int {
 	removed := 0
 	clones, _ := filepath.Glob(filepath.Join(b.StateDir, "clones", "*", "*", "*.git"))
 	root := b.root()
@@ -473,15 +548,17 @@ func (b *Builder) Prune(olderThan time.Duration, needed func(path string) bool, 
 		var path, branch string
 		flush := func() {
 			if path != "" && filepath.Dir(path) == root {
-				if fi, err := os.Stat(path); err == nil && now.Sub(fi.ModTime()) > olderThan && !needed(path) {
+				if fi, err := os.Stat(path); err == nil && now.Sub(fi.ModTime()) > olderThan {
 					b0 := ""
 					if saved, err := os.ReadFile(filepath.Join(clone, "ccsbx-wt", filepath.Base(path))); err == nil {
 						b0 = strings.TrimSpace(string(saved)) // the branch it was made for, not whatever it is on now
 					} else if strings.HasPrefix(branch, "refs/heads/") {
 						b0 = strings.TrimPrefix(branch, "refs/heads/")
 					}
-					b.removeLocked(&Handle{Clone: clone, Path: path, Branch: b0})
-					removed++
+					p0 := path
+					// guard decides AND removes under the caller's own lock (the daemon's): a session resumed between a check and a
+					// removal cannot lose its tree
+					guard(p0, func() { b.removeLocked(&Handle{Clone: clone, Path: p0, Branch: b0}); removed++ })
 				}
 			}
 			path, branch = "", ""

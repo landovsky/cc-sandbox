@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -301,7 +302,7 @@ func TestASymlinkedWorktreeRootStillCleansUp(t *testing.T) {
 	h2 := prep(t, b, "s2", "sl2")
 	long := time.Now().Add(-30 * 24 * time.Hour)
 	os.Chtimes(h2.Path, long, long)
-	if n := b.Prune(time.Hour, func(string) bool { return false }, time.Now()); n != 1 {
+	if n := b.Prune(time.Hour, guardOf(func(string) bool { return false }), time.Now()); n != 1 {
 		t.Fatalf("Prune under a symlinked root removed %d, want 1", n)
 	}
 }
@@ -316,7 +317,7 @@ func TestPruneRemovesOnlyWhatNothingNeedsAndIsOldEnough(t *testing.T) {
 	os.Chtimes(old.Path, long, long)
 	os.Chtimes(used.Path, long, long)
 	needed := func(p string) bool { return p == used.Path }
-	if n := b.Prune(7*24*time.Hour, needed, time.Now()); n != 1 {
+	if n := b.Prune(7*24*time.Hour, guardOf(needed), time.Now()); n != 1 {
 		t.Fatalf("pruned %d, want 1", n)
 	}
 	for p, want := range map[string]bool{old.Path: false, used.Path: true, fresh.Path: true} {
@@ -336,7 +337,7 @@ func TestPruneAsksAgainRightBeforeEachRemoval(t *testing.T) {
 	long := time.Now().Add(-10 * 24 * time.Hour)
 	os.Chtimes(h.Path, long, long)
 	asked := 0
-	if n := b.Prune(time.Hour, func(string) bool { asked++; return true }, time.Now()); n != 0 || asked != 1 {
+	if n := b.Prune(time.Hour, guardOf(func(string) bool { asked++; return true }), time.Now()); n != 0 || asked != 1 {
 		t.Fatalf("removed %d, asked %d", n, asked)
 	}
 	if _, err := os.Stat(h.Path); err != nil {
@@ -426,5 +427,163 @@ func TestATimedOutFetchKillsItsWholeProcessGroup(t *testing.T) {
 	time.Sleep(300 * time.Millisecond)
 	if _, err := os.Stat("/proc/" + pid); err == nil {
 		t.Fatalf("the fetch's child process %s outlived the timeout", pid)
+	}
+}
+
+// guardOf adapts a "is it needed" predicate to Prune's guard (the daemon's guard also decides under its own lock).
+func guardOf(needed func(string) bool) func(string, func()) {
+	return func(path string, remove func()) {
+		if !needed(path) {
+			remove()
+		}
+	}
+}
+
+// context (R-WT review round 2, M1): a repository of a few KiB can name billions of paths (nested trees that all point at the level
+// below). The listing used to be collected whole before it was counted, so such a repo exhausted the daemon's memory. It is streamed and
+// git is killed at the first limit.
+func TestATreeBombIsRefusedQuicklyWithoutBufferingTheListing(t *testing.T) {
+	b, remote, _ := rig(t)
+	blob := gitIn(t, remote, "hash-object", "-w", "README")
+	level := blob
+	typ := "blob"
+	for i := 0; i < 4; i++ { // 300 entries per level: 300^4 = 8.1e9 paths
+		var in strings.Builder
+		for j := 0; j < 300; j++ {
+			in.WriteString("040000 tree " + level + "\te" + strings.Repeat("x", j%7) + string(rune('A'+j/26)) + string(rune('a'+j%26)) + "\n")
+		}
+		if typ == "blob" {
+			in.Reset()
+			for j := 0; j < 300; j++ {
+				in.WriteString("100644 blob " + level + "\tf" + string(rune('A'+j/26)) + string(rune('a'+j%26)) + "\n")
+			}
+		}
+		c := exec.Command("git", "mktree")
+		c.Dir = remote
+		c.Stdin = strings.NewReader(in.String())
+		out, err := c.Output()
+		if err != nil {
+			t.Fatal(err)
+		}
+		level, typ = strings.TrimSpace(string(out)), "tree"
+	}
+	commit := gitIn(t, remote, "commit-tree", level, "-m", "bomb")
+	gitIn(t, remote, "update-ref", "refs/heads/bomb", commit)
+	b.Limits.MaxFiles = 1000
+	t0 := time.Now()
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err := b.Prepare("tomas", "bomb", repo, "bomb", "bb")
+	runtime.ReadMemStats(&after)
+	if err == nil {
+		t.Fatal("a tree bomb was accepted")
+	}
+	if d := time.Since(t0); d > 20*time.Second {
+		t.Fatalf("took %v", d)
+	}
+	if grew := int64(after.TotalAlloc-before.TotalAlloc) >> 20; grew > 200 {
+		t.Fatalf("the daemon allocated %d MiB measuring the tree", grew)
+	}
+	if ents, _ := os.ReadDir(b.Root); len(ents) != 0 {
+		t.Fatalf("something was written: %v", ents)
+	}
+}
+
+// context (R-WT review round 2, M2): the rollback and Prune used to run `gc --prune=now`, which deletes any unreferenced object, including
+// one a live session's host git commit has just written and not yet referenced. Neither path may touch such an object.
+func TestRollbackAndPruneNeverDeleteAFreshUnreferencedObject(t *testing.T) {
+	b, remote, _ := rig(t)
+	live := prep(t, b, "live", "live1")
+	old := prep(t, b, "old", "old1")
+	c := exec.Command("git", "hash-object", "-w", "--stdin")
+	c.Dir = live.Path
+	c.Stdin = strings.NewReader("a commit in progress\n")
+	out, err := c.Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	obj := strings.TrimSpace(string(out))
+	long := time.Now().Add(-30 * 24 * time.Hour)
+	os.Chtimes(old.Path, long, long)
+	if n := b.Prune(time.Hour, guardOf(func(p string) bool { return p == live.Path }), time.Now()); n != 1 {
+		t.Fatalf("pruned %d", n)
+	}
+	if _, err := exec.Command("git", "-C", cloneOf(b), "cat-file", "-e", obj).CombinedOutput(); err != nil {
+		t.Fatal("Prune deleted a fresh unreferenced object")
+	}
+	big := make([]byte, 3<<20)
+	rand.Read(big)
+	os.WriteFile(filepath.Join(remote, "big.bin"), big, 0o644)
+	gitIn(t, remote, "add", "big.bin")
+	gitIn(t, remote, "commit", "-q", "-m", "big")
+	b.Limits.MaxCloneMB = 2
+	if _, err := b.Prepare("tomas", "x", repo, "main", "rb"); err == nil {
+		t.Fatal("accepted")
+	}
+	if _, err := exec.Command("git", "-C", cloneOf(b), "cat-file", "-e", obj).CombinedOutput(); err != nil {
+		t.Fatal("the rollback deleted a fresh unreferenced object")
+	}
+}
+
+// context (R-WT review round 2, S1): `main` is fetched by every start, so its ref usually exists. An oversized upstream push used to leave
+// the ref on the big commit and every later start of the repo was refused for good. The rollback restores the old value.
+func TestAnOversizedUpstreamPushDoesNotLockTheRepoOut(t *testing.T) {
+	b, remote, _ := rig(t)
+	h := prep(t, b, "a", "first")
+	oldSha := gitIn(t, cloneOf(b), "rev-parse", "refs/remotes/origin/main")
+	b.Remove(h)
+	gitIn(t, remote, "branch", "small", "main")
+	big := make([]byte, 3<<20)
+	rand.Read(big)
+	os.WriteFile(filepath.Join(remote, "big.bin"), big, 0o644)
+	gitIn(t, remote, "add", "big.bin")
+	gitIn(t, remote, "commit", "-q", "-m", "big")
+	b.Limits.MaxCloneMB = 2
+	if _, err := b.Prepare("tomas", "b", repo, "main", "second"); err == nil {
+		t.Fatal("accepted")
+	}
+	if got := gitIn(t, cloneOf(b), "rev-parse", "refs/remotes/origin/main"); got != oldSha {
+		t.Fatalf("the ref was left on %s, want the old %s", got, oldSha)
+	}
+	if mb := dirMB(cloneOf(b)); mb > 2 {
+		t.Fatalf("the clone still holds %d MiB", mb)
+	}
+	if _, err := b.Prepare("tomas", "c", repo, "small", "third"); err != nil {
+		t.Fatalf("a small base is refused after the oversized one: %v", err)
+	}
+}
+
+// context (R-WT review round 2, S4): a killed git leaves lock files; a later fetch or branch deletion then fails "File exists". Old ones are
+// removed under the clone's lock before a fetch.
+func TestAStaleGitLockFileDoesNotBlockTheNextFetch(t *testing.T) {
+	b, _, _ := rig(t)
+	h := prep(t, b, "a", "l1")
+	b.Remove(h)
+	lockf := filepath.Join(cloneOf(b), "refs", "remotes", "origin", "main.lock")
+	os.WriteFile(lockf, nil, 0o644)
+	old := time.Now().Add(-time.Hour)
+	os.Chtimes(lockf, old, old)
+	if _, err := b.Prepare("tomas", "b", repo, "main", "l2"); err != nil {
+		t.Fatalf("a stale lock file blocked the fetch: %v", err)
+	}
+}
+
+// context (R-WT review round 2, S2): Remove used to give up after the lock wait while a fetch held the lock for up to the fetch timeout,
+// leaving the tree and the branch of a refused start behind. It waits as long as the longest holder can run.
+func TestRemoveWaitsForALongHolderOfTheCloneLock(t *testing.T) {
+	b, _, _ := rig(t)
+	h := prep(t, b, "a", "w1")
+	b.Limits.FetchTimeout, b.Limits.LockWait = 300*time.Millisecond, 100*time.Millisecond // Remove may wait ~1 s
+	unlock, err := lock(cloneOf(b)+".lock", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { time.Sleep(500 * time.Millisecond); unlock() }()
+	if err := b.Remove(h); err != nil {
+		t.Fatalf("Remove gave up: %v", err)
+	}
+	if out := gitIn(t, cloneOf(b), "branch", "--list", "w1"); out != "" {
+		t.Fatalf("the branch survived: %q", out)
 	}
 }

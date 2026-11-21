@@ -99,6 +99,7 @@ func app() *cli.App {
 				f.Int("worktree-clone-max-mb", 2048, "repo-form starts: a clone of a repository may not grow past this many MiB (the fetch is killed when it does; a clone with live worktrees is never deleted)")
 				f.String("worktree-fetch-timeout", "120s", "repo-form starts: the longest a git fetch may run (a Go duration); the whole process group is killed at the deadline")
 				f.Int("worktree-max-mb", 1024, "repo-form starts: most MiB of file content a checkout may write (measured with ls-tree before anything is written)")
+				f.String("worktree-lock-wait", "60s", "repo-form starts: how long a start waits for another start (or a fetch) in the same repository before it is refused as busy (a Go duration)")
 				f.Int("worktree-max-files", 100000, "repo-form starts: most files a checkout may write")
 				f.Int("max-per-hour", 20, "session starts: rate_capped above this many starts per caller per hour")
 				f.String("tmux-socket", "ccsbx", "tmux server the session panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (a socket shared between uids; hostd makes it 0660)")
@@ -578,5 +579,6 @@ func runtimeFor(mode string) start.Runtime {
 // wtLimits reads the repo-form limits from the worktree-* flags.
 func wtLimits(get func(string) string, num func(string) int) worktree.Limits {
 	d, _ := time.ParseDuration(get("worktree-fetch-timeout"))
-	return worktree.Limits{FetchTimeout: d, MaxCloneMB: int64(num("worktree-clone-max-mb")), MaxCheckout: int64(num("worktree-max-mb")), MaxFiles: num("worktree-max-files")}
+	lw, _ := time.ParseDuration(get("worktree-lock-wait"))
+	return worktree.Limits{FetchTimeout: d, MaxCloneMB: int64(num("worktree-clone-max-mb")), MaxCheckout: int64(num("worktree-max-mb")), MaxFiles: num("worktree-max-files"), LockWait: lw}
 }

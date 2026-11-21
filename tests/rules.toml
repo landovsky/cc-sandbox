@@ -1950,10 +1950,10 @@ where = "any"
 
 [[rule]]
 id = "rwt-owner-config-cannot-turn-hooks-on"
-title = "the owner's own git config is how a fetch is authorised, but it cannot turn hooks on during the worktree checkout, and only https and ssh transports are allowed"
+title = "the owner's own git config is how a fetch is authorised, but it cannot turn hooks on or let a repository's .gitattributes select one of its filter drivers during the checkout, and only https and ssh transports are allowed"
 suite = "msg"
 allow = "tests/twin-go.sh ./internal/worktree TestPrepareBuildsAWorktreeOfTheBaseOnANewBranchAndKeepsTheCloneOutOfTheRoot"
-block = "tests/twin-go.sh ./internal/worktree TestTheOwnersConfigCannotTurnHooksOnDuringCheckout"
+block = "tests/twin-go.sh ./internal/worktree TestTheOwnersConfigCannotRunHooksOrFiltersDuringCheckout"
 invariants = [13]
 backends = ["unit"]
 where = "any"
@@ -1964,6 +1964,36 @@ title = "a repo-form worktree and its branch are removed only after its session 
 suite = "msg"
 allow = "tests/twin-go.sh ./internal/start TestTheRepoFormBuildsItsWorktreeThenStartsAndARetryBuildsNothingMore"
 block = "tests/twin-go.sh ./internal/start TestAnEndedSessionsWorktreeIsPrunedAfterTheRetentionOnly"
+invariants = [13]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "rwt-disk-and-memory-are-bounded"
+title = "a hostile repository cannot exhaust the daemon: an oversized fetch is killed and rolled back without deleting a clone live worktrees use, a checkout over the cap (zip bomb) or a tree naming billions of paths is refused before anything is written, and the listing is streamed"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/worktree TestAnOversizedFetchNeverDeletesACloneThatLiveWorktreesUse"
+block = "tests/twin-go.sh ./internal/worktree TestATreeBombIsRefusedQuicklyWithoutBufferingTheListing"
+invariants = [13]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "rwt-checkout-cap-before-writing"
+title = "the checkout is measured (content size and file count) before a worktree or branch is created"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/worktree TestPrepareBuildsAWorktreeOfTheBaseOnANewBranchAndKeepsTheCloneOutOfTheRoot"
+block = "tests/twin-go.sh ./internal/worktree TestACheckoutOverTheCapIsRefusedBeforeAnythingIsWritten"
+invariants = [13]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "rwt-rollback-keeps-other-sessions-data"
+title = "a rollback or prune never deletes another session's fresh unreferenced objects, restores the ref an oversized fetch moved, and a refused start frees its branch"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/worktree TestARemovedWorktreeFreesItsBranchNameForTheNextStart"
+block = "tests/twin-go.sh ./internal/worktree TestRollbackAndPruneNeverDeleteAFreshUnreferencedObject"
 invariants = [13]
 backends = ["unit"]
 where = "any"

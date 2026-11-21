@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/landovsky/cc-sandbox/internal/tmuxsock"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -202,7 +203,36 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 
 // repoStarts serialises concurrent starts of one (uid, caller, request_id): a retry that arrives during a long fetch waits for the first
 // attempt and is then answered from its record, instead of being refused ("the branch already exists") for a session that exists.
-var repoStarts sync.Map
+var (
+	repoStartsMu sync.Mutex
+	repoStarts   = map[string]*repoStart{}
+)
+
+type repoStart struct {
+	mu   sync.Mutex
+	refs int
+}
+
+// lockRepoStart serialises on key; the entry is deleted only when the last waiter is done (a newcomer never gets a second mutex).
+func lockRepoStart(key string) func() {
+	repoStartsMu.Lock()
+	e := repoStarts[key]
+	if e == nil {
+		e = &repoStart{}
+		repoStarts[key] = e
+	}
+	e.refs++
+	repoStartsMu.Unlock()
+	e.mu.Lock()
+	return func() {
+		e.mu.Unlock()
+		repoStartsMu.Lock()
+		if e.refs--; e.refs == 0 {
+			delete(repoStarts, key)
+		}
+		repoStartsMu.Unlock()
+	}
+}
 
 // preflight is the cheap, side-effect-free part of the policy, run BEFORE a fetch: a start that will be refused anyway (label live,
 // machine full, hourly cap, profile) must not cost a clone fetch and a checkout. startInner repeats everything after the build.
@@ -266,9 +296,7 @@ func (d *Daemon) startFromRepo(s *LaunchSpec) (*StartReply, error) {
 		return nil, refuse(WrongMachine, "spec is for another machine")
 	}
 	key := fmt.Sprintf("%d\x00%s\x00%s", d.Uid, d.StartedBy, s.RequestID)
-	mu, _ := repoStarts.LoadOrStore(key, &sync.Mutex{})
-	mu.(*sync.Mutex).Lock()
-	defer func() { mu.(*sync.Mutex).Unlock(); repoStarts.Delete(key) }()
+	defer lockRepoStart(key)()
 	if rep, same := d.Recorded(d.Uid, d.StartedBy, s.RequestID, s.Label); rep != nil { // the attempt we waited for succeeded
 		if !same {
 			return nil, refuse(RequestIDReused, "request_id was already used for another session")
@@ -291,7 +319,9 @@ func (d *Daemon) startFromRepo(s *LaunchSpec) (*StartReply, error) {
 	s2.built = true
 	rep, err := d.startInner(&s2)
 	if err != nil {
-		d.Worktrees.Remove(h) // a start that did not happen leaves no worktree and no branch behind
+		if rerr := d.Worktrees.Remove(h); rerr != nil { // a start that did not happen leaves no worktree and no branch behind
+			log.Printf("worktree %s of a refused start could not be removed: %v", filepath.Base(h.Path), rerr)
+		}
 		return nil, err
 	}
 	return rep, nil
@@ -822,17 +852,28 @@ func (d *Daemon) PruneWorktrees(keep time.Duration) int {
 		return 0
 	}
 	now := d.now()
-	// asked again, with FRESH records under the daemon lock, right before each removal: a session resumed since the pass began keeps its tree
-	needed := func(path string) bool {
+	// decided AND removed under the daemon lock with FRESH records: a session resumed since the pass began keeps its tree, and none can
+	// start between the check and the removal. Lock order: the clone's lock (Prune holds it), then the daemon's; nothing takes them the other way.
+	guard := func(path string, remove func()) {
 		unlock, err := d.lock()
 		if err != nil {
-			return true
+			return
 		}
 		defer unlock()
 		recs, err := d.records()
 		if err != nil {
-			return true // cannot tell what is in use: remove nothing
+			return // cannot tell what is in use: remove nothing
 		}
+		if d.pathNeeded(recs, path, now, keep) {
+			return
+		}
+		remove()
+	}
+	return d.Worktrees.Prune(keep, guard, now)
+}
+
+func (d *Daemon) pathNeeded(recs []*Record, path string, now time.Time, keep time.Duration) bool {
+	{
 		for _, r := range recs {
 			if r.Spec.Workdir.Path != path {
 				continue
@@ -843,5 +884,4 @@ func (d *Daemon) PruneWorktrees(keep time.Duration) int {
 		}
 		return false
 	}
-	return d.Worktrees.Prune(keep, needed, now)
 }

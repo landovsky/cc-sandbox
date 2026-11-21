@@ -4,7 +4,7 @@
 
 What this is: the single document Tomas follows to do Gate M on hp in one sitting, in order, with the output to expect and what to do when it differs. It exists because the old list (`night-1-morning.md`) grew round by round and mixed what the fenced day on hp needs with what only pods need. Goal it serves (Tomas, 2026-11-21): **prove one real fenced day on hp before any new feature.** Anything the fenced day on hp does not need is in "LATER" at the end, with its commands, not dropped.
 
-Written by D (cc-sandbox:#2f3e). **Nothing here has been run as root.** The expected outputs come from the code, the tests and the installer's own `plan`, not from a run on hp; where a line is a guess it says so. The installer's tests (340 of them, no root) are the evidence for what the installer does.
+Written by D (cc-sandbox:#2f3e). **Nothing here has been run as root.** The expected outputs come from the code, the tests and the installer's own `plan`, not from a run on hp; where a line is a guess it says so. The installer's test suite (`tests/install-linux-test.sh`, no root) is the evidence for what the installer does.
 
 Digests (built by Actions from main `dd26a78`, both packages public):
 
@@ -13,7 +13,7 @@ FENCE (--image):        ghcr.io/landovsky/ccsbx-fence@sha256:c0b52c95e75e26f13a0
 SIDECAR (--side-image): ghcr.io/landovsky/ccsbx@sha256:3374ecd87435c267a1d11982ca7f44c0364b2414e5618f918faec46f1c59bba8
 ```
 
-Where: hp, in `~/git/cc-sandbox` on `main`, unless a step says "Mac". Keep ONE shell for the whole sitting (steps set variables). Keep a **second root shell** open from step 8 until step 12 passes.
+Where: hp, in `~/git/cc-sandbox` on `main`, unless a step says "Mac". Keep ONE shell for the whole sitting (steps set variables). Keep a **second root shell** open from step 8 until the reboot in step 12.
 
 ## The steps and how long they take
 
@@ -23,8 +23,8 @@ Where: hp, in `~/git/cc-sandbox` on `main`, unless a step says "Mac". Keep ONE s
 | 2 | Digests and the anonymous ghcr pull (old 0/0b) | hp | 5 min | docker (still yours) |
 | 3 | P15 closed | hp | 2 min | your six answers |
 | 4 | Keep the `restart=no` containers | hp | 1 min | |
-| 5 | R-WT: one real fetch of a private repo | hp | 5 min | docker not needed, your git credentials |
-| 6 | Build the binaries | hp | 3 min | go |
+| 5 | Build the binaries | hp | 3 min | go |
+| 6 | R-WT: one real fetch of a private repo | hp | 5 min | docker not needed, your git credentials |
 | 7 | Root-only bind-mount test of `ccsbx-root` | hp | 3 min | sudo |
 | 8 | Lockout guards (S9, S14) | hp | 3 min | sudo |
 | 9 | Read the plan | hp | 5 min | |
@@ -55,7 +55,7 @@ Why: the installer copies binaries built from this tree, as root. Later commits 
 FENCE=ghcr.io/landovsky/ccsbx-fence@sha256:c0b52c95e75e26f13a06ac3acff4406d1e691c65955409e77c1847dc83518f1b
 SIDE=ghcr.io/landovsky/ccsbx@sha256:3374ecd87435c267a1d11982ca7f44c0364b2414e5618f918faec46f1c59bba8
 [[ "$FENCE" =~ ^ghcr\.io/landovsky/ccsbx-fence@sha256:[0-9a-f]{64}$ && "$SIDE" =~ ^ghcr\.io/landovsky/ccsbx@sha256:[0-9a-f]{64}$ ]] && echo "digests ok"
-docker logout ghcr.io
+docker logout ghcr.io        # drops any ghcr login you use for other pulls; log in again afterwards if you need one
 docker pull "$FENCE"
 docker pull "$SIDE"
 ```
@@ -75,7 +75,7 @@ units/p15 status
 units/p15 check; echo "exit=$?"
 ```
 
-Expect at the end: `exit=0` and no output from `check`. Today `check` prints `24 row(s) not done or dropped: ...` and exits 1; the install refuses until it exits 0. The six questions and the recommendations are in `docs/night-1-hitl.md` §2; once you have answered, the rows are closed with `units/p15 mark ID done "note"` (or `dropped`), by D or by you. If `check` still lists rows, close them (`units/p15 status` shows which).
+Expect at the end: `p15: every row is done or dropped` and `exit=0`. Today `check` prints `24 row(s) not done or dropped: ...` and exits 1; the install refuses until it exits 0. The six questions and the recommendations are in `docs/night-1-hitl.md` §2; once you have answered, the rows are closed with `units/p15 mark ID done "note"` (or `dropped`), by D or by you. If `check` still lists rows, close them (`units/p15 status` shows which).
 
 ## 4. Keep the `restart=no` containers · 1 min
 
@@ -86,9 +86,20 @@ docker update --restart unless-stopped messaging-hub-db-1
 docker inspect -f '{{.Name}} {{.HostConfig.RestartPolicy.Name}}' messaging-hub-db-1
 ```
 
-Expect: `/messaging-hub-db-1 unless-stopped`. Skip if your P15 answer was different. The hub (`session-bus`) is the docker container and is not a Gate M dependency (decision 2026-11-21): it keeps running after the reboot, but you are out of the docker group and manage it with `sudo docker` from then on.
+Expect: `/messaging-hub-db-1 unless-stopped`. Skip if your P15 answer was different. The hub (`session-bus`) is the docker container and is not a Gate M dependency (decision 2026-11-21): it keeps running after the reboot (its restart policy is `always`, per the P15 inventory), but you are out of the docker group and manage it with `sudo docker` from then on.
 
-## 5. R-WT: one real fetch of a private repo · 5 min
+## 5. Build the binaries · 3 min
+
+Build now, with no agents running, so nothing can swap a file between the checksum and the copy (S5); step 6 uses `dist/ccsbx` from this build, and the install (step 10) copies the same `dist/`. If you change anything in the tree after this step, run it again before step 10. `ccsbx` is on no PATH until the install puts it in `/usr/local/bin`, which is why the steps before that call `dist/ccsbx`.
+
+```
+make dist-linux GO=$HOME/.local/go/bin/go
+cat dist/SHA256SUMS
+```
+
+Expect: four lines, one each for `ccsbx`, `ccsbx-root`, `ccsbx-hostd`, `ccsbx-signer`, then `dist-linux: SHA256SUMS lists only what this run built...`. The file sits next to the binaries, so it guards against accidents only: compare the sums with a build you trust (the CI build, or the same command on the Mac) before the install. If `go` fails, the error is the go toolchain's; fix and re-run. If a `cmd/<name> does not exist` line appears, you are not on the right commit (step 1).
+
+## 6. R-WT: one real fetch of a private repo · 5 min
 
 What it proves: the daemon builds a worktree from `{repo, base, branch}` by fetching with YOUR credentials (nothing of them reaches the fence). **This runs BEFORE the install on purpose:** the repo form only works in DIRECT mode (see "Known gap" below), direct mode needs docker, and the install removes your docker group. `--launcher none` writes the record and builds the worktree but starts no container.
 
@@ -106,7 +117,8 @@ cat > /tmp/gatem-rwt.json <<EOF
  "client":{"lid":"lid-gatem-rwt-1","role":"worker"},
  "brief":{"text":"say hi"}}
 EOF
-ccsbx start --root direct --launcher none --image "$FENCE" --worktree-root "$HOME/wt" --spec /tmp/gatem-rwt.json --json; echo "exit=$?"
+mkdir -p ~/wt
+dist/ccsbx start --root direct --launcher none --image "$FENCE" --worktree-root "$HOME/wt" --spec /tmp/gatem-rwt.json --json; echo "exit=$?"
 ```
 
 Expect: a StartReply on stdout with a `sid` (and `not_evidence`: true, because direct mode is not evidence), then `exit=0`; it takes a few seconds to a minute (the fetch has a 120 s bound). Then:
@@ -125,20 +137,11 @@ If it fails:
 - `machine_full`, `rate_capped`, `profile_not_approved`: read the code in the message; none of these is expected on a fresh state directory.
 - It hangs more than two minutes: the fetch bound is 120 s, so something else is wrong; press Ctrl-C and send the output to the manager.
 
+To repeat the step, change `request_id`, `lid` and `branch` in the spec first (the same request id answers `already_running`), or clean up below first. Git access: the daemon fetches over `https://github.com/...` with the credential helper of YOUR git configuration (no prompt is possible); an ssh-only setup works only if its `url.insteadOf` is in your global git config.
+
 Clean up (the clone stays as the cache; only when no session uses this repo): `git -C <the clone from above> worktree remove --force <the ~/wt directory>` and `git -C <the clone> branch -D gatem-rwt-smoke`. The record it wrote is in your own direct-mode state directory (`~/.local/state/ccsbx`), not hostd's, and is harmless.
 
 **Known gap (not a Gate M failure):** after the install your `ccsbx` talks to hostd (helper mode), and in helper mode, and in pods, the repo form answers `not_built`. Only `workdir.path` (an existing worktree under `~/git` or `~/wt`) starts there. This does not matter for C25 (the typical-day session) as long as C25 starts by `workdir.path`, which `tests/specs/e2e-hello.json` does; if C25 is changed to start by repo form it cannot run on the installed hp until a helper-mode client builds the worktree (not planned).
-
-## 6. Build the binaries · 3 min
-
-Build immediately before the install, with no agents running, so nothing can swap a file between the checksum and the copy (S5).
-
-```
-make dist-linux GO=$HOME/.local/go/bin/go
-cat dist/SHA256SUMS
-```
-
-Expect: four lines, one each for `ccsbx`, `ccsbx-root`, `ccsbx-hostd`, `ccsbx-signer`, then `dist-linux: SHA256SUMS lists only what this run built...`. The file sits next to the binaries, so it guards against accidents only: compare the sums with a build you trust (the CI build, or the same command on the Mac) before the install. If `go` fails, the error is the go toolchain's; fix and re-run. If a `cmd/<name> does not exist` line appears, you are not on the right commit (step 1).
 
 ## 7. Root-only bind-mount test of `ccsbx-root` · 3 min
 
@@ -147,11 +150,11 @@ Expect: four lines, one each for `ccsbx`, `ccsbx-root`, `ccsbx-hostd`, `ccsbx-si
 sudo unshare -m env GOTOOLCHAIN=local /home/tomas/.local/go/bin/go test -tags rootmount -run TestRealMounter ./internal/rootcmd
 ```
 
-Expect: `go version go1.27.x linux/amd64`, then (after the sudo password) `ok  github.com/landovsky/cc-sandbox/internal/rootcmd ...`. **It must PASS; if it does not, stop here** (the failure is in `ccsbx-root`'s mount code and must be fixed before it runs as root). The full path to `go` is used because go is not on sudo's PATH, and `GOTOOLCHAIN=local` stops it fetching a toolchain as root.
+Expect: `go version go1.27.x linux/amd64`, then (after the sudo password) `ok  github.com/landovsky/cc-sandbox/internal/rootcmd ...`. This builds and runs your source tree as root (its build cache goes to root's home; nothing is written into the repo). **It must PASS; if it does not, stop here** (the failure is in `ccsbx-root`'s mount code and must be fixed before it runs as root). The full path to `go` is used because go is not on sudo's PATH, and `GOTOOLCHAIN=local` stops it fetching a toolchain as root.
 
 ## 8. Lockout guards (S9, S14) · 3 min
 
-The installer removes the NOPASSWD grants for docker, apt, snap, dokku and sops. Make sure you cannot lock yourself out:
+The installer removes the NOPASSWD grants for docker, apt, dpkg, snap, dokku and sops from `/etc/sudoers.d/*`. Make sure you cannot lock yourself out:
 
 ```
 sudo grep -n NOPASSWD /etc/sudoers
@@ -159,7 +162,7 @@ sudo -k; sudo -v
 sudo -l
 ```
 
-Expect: the first prints nothing (or only lines you know); a NOPASSWD line in `/etc/sudoers` itself would survive the installer, which cleans only `/etc/sudoers.d/*`: remove it by hand with `sudo visudo` if it is for docker, apt, dpkg, snap, dokku or sops. The second MUST ask for your password. The third must show `(ALL : ALL) ALL` without NOPASSWD for you. If any is different: stop. **Then open a second terminal and run `sudo -s` in it; leave that root shell open until step 12 passes.**
+Expect: the first prints nothing (or only lines you know); a NOPASSWD line in `/etc/sudoers` itself would survive the installer, which cleans only `/etc/sudoers.d/*`: remove it by hand with `sudo visudo` if it is for docker, apt, dpkg, snap, dokku or sops. The second MUST ask for your password. The third shows `(ALL : ALL) ALL` (with the password), and BEFORE the install it still lists NOPASSWD lines for docker, apt-get, dokku and sops: that is what step 10 strips, so seeing them now is normal. What is NOT normal: a `NOPASSWD: ALL`, a command alias, an `env` or `sudoedit` entry in a NOPASSWD line, or a digest: the installer's stripper refuses to guess those and stops at install step [08] (exit 3, `PARTIAL INSTALL`); fix that line by hand first. If the password prompt or `(ALL : ALL) ALL` is missing: stop. **Then open a second terminal and run `sudo -s` in it; keep that root shell open until the reboot in step 12** (it does not survive the reboot; after the reboot your normal `sudo` is the way back in, and `check` in step 12 is what proves it).
 
 ## 9. Read the plan · 5 min
 
@@ -167,7 +170,7 @@ Expect: the first prints nothing (or only lines you know); a NOPASSWD line in `/
 units/install-linux.sh plan --image "$FENCE" --side-image "$SIDE" | less
 ```
 
-Expect: a header, then `GATES (install refuses while any is unmet)` and, if everything above is done, **no `UNMET` line**; then 10 numbered steps `[01]` to `[10]` ending with `AFTER: reboot, then units/install-linux.sh check ...` and `UNDO: ...`. Today it shows `UNMET: P15 open: 24 row(s)...` and `UNMET: binaries missing in .../dist` because steps 3 and 6 are not done; after them both are gone. `note: sudoers.d/... not readable without root: verified at install` lines are normal. Also normal: `# no --hub-url: the install does not depend on the hub` and `# B9 skipped`.
+Expect: a header, then `GATES (install refuses while any is unmet)` and, if everything above is done, **no `UNMET` line**; then 10 numbered steps `[01]` to `[10]` ending with `AFTER: reboot, then units/install-linux.sh check ...` and `UNDO: ...`. Today it shows `UNMET: P15 open: 24 row(s)...` and `UNMET: binaries missing in .../dist` because steps 3 and 5 are not done; after them both are gone. `note: sudoers.d/... not readable without root: verified at install` lines are normal. Also normal: `# no --hub-url: the install does not depend on the hub` and `# B9 skipped`.
 
 What the ten steps do, in one line each: [01] users `ccsbx`, `ccsbx-keys` (signer only), `ccsbx-launch`, `ccsbx-term`, group `ccsbx-clients`; [02] binaries, `/etc/ccsbx/ccsbx-root.toml` (verbs, roots, both images' settings), pins; [03] machine and age keys, the signer's scope; [04] signer sockets and service; [05] tmux unit, run dir, hostd unit (loopback only, no firewall rule); [06] sops root-owned; [07] the lxd snap and socket removed; [08] sudoers (one NOPASSWD rule, for `ccsbx-root`; the rest stripped, the whole config re-checked, automatic restore if it does not parse); [09] you out of lxd, then docker LAST; [10] post-install check. If the plan shows anything you do not understand, stop; add `-v` to see the files it would write.
 
@@ -177,7 +180,7 @@ What the ten steps do, in one line each: [01] users `ccsbx`, `ccsbx-keys` (signe
 sudo units/install-linux.sh install --yes --image "$FENCE" --side-image "$SIDE"
 ```
 
-(`sudo` keeps your shell's `$FENCE` and `$SIDE`. Do NOT add `--hub-url` or `--hub-secret-from`: the install does not depend on the hub. Do NOT add `--revoke-doors`: there are no doors before M1. Add `--with-deploy` only if you answered Q12 = yes.)
+(Your shell expands `$FENCE` and `$SIDE` before `sudo` runs, so use the same shell as step 2; they are not exported. Do NOT add `--hub-url` or `--hub-secret-from`: the install does not depend on the hub. Do NOT add `--revoke-doors`: there are no doors before M1. Do NOT add `--with-deploy` today: it needs `dist/ccsbx-deploy`, which `make dist-linux` does not build, and the installer would skip the copy silently.)
 
 Expect: `install-linux: all gates met; the first backup goes to /var/backups/ccsbx-install/original`, ten numbered steps with `$ ...` command lines, and at the end `DONE. NOW: reboot. Then: units/install-linux.sh check`. `DONE` appears only after hostd is up and the signer has signed a test claim.
 
@@ -197,7 +200,7 @@ curl -fsSL -o default.json https://raw.githubusercontent.com/moby/moby/v$V/profi
 ccsbx seccomp-profile --base default.json --out /tmp/seccomp.json
 sudo install -o root -g root -m 0644 /tmp/seccomp.json /etc/ccsbx/seccomp.json
 ccsbx seccomp-profile --verify /etc/ccsbx/seccomp.json
-tests/seccomp-setuid-test.sh --base default.json --image "$FENCE"
+tests/seccomp-setuid-test.sh --base default.json --image "$FENCE" --ccsbx /usr/local/bin/ccsbx
 ```
 
 Expect: `--verify` prints `ok` (exit 0) and the docker test prints `ok` lines and exits 0 (it runs the fence image and tries to create a setuid file; it must fail to). Both must pass. If the `curl` 404s, your docker server version has no tag with that name in moby: use the nearest release tag and note which. Do not reboot before this passes: `check` verifies the profile again. (`default.json` stays in `~/git/cc-sandbox`; do not commit it.)
@@ -216,7 +219,7 @@ units/install-linux.sh check; echo "exit=$?"
 
 Expect: lines `ok    ...`, **no `FAIL`**, and `install-linux check: complete` with `exit=0`. Some lines start with `note` (for example files you cannot look into as a normal user, or "ccsbx-root.toml has no hub_url: this install does not depend on the hub"): those are fine. Run it once more as root for the lines it cannot test as you: `sudo units/install-linux.sh check` (it asks the signer for a token and connects to the sockets as the other users).
 
-If a line says `FAIL`: the text names it. The common ones: `tmux (pid N) still has group docker: reboot done?` (you did not reboot, or an old tmux survived: `tmux kill-server` from a fresh login, or reboot again); `ccsbx-hostd is active` (look at `journalctl -u ccsbx-hostd`); `the seccomp profile verifies` (step 11 again). Do not go on with a FAIL: steps 13 and 14 assume a complete check. You may close the second root shell once this passes.
+If a line says `FAIL`: the text names it. The common ones: `tmux (pid N) still has group docker: reboot done?` (you did not reboot, or an old tmux survived: `tmux kill-server` from a fresh login, or reboot again); `ccsbx-hostd is active` (look at `journalctl -u ccsbx-hostd`); `the seccomp profile verifies` (step 11 again). Do not go on with a FAIL: steps 13 and 14 assume a complete check. (The second root shell from step 8 died at the reboot; `sudo -v` in a normal shell is how you check you still have root.)
 
 ## 13. `ccsbx-root worktree-check` smoke · 3 min
 
@@ -253,14 +256,16 @@ ccsbx start --spec tests/specs/e2e-hello.json --json; echo "exit=$?"
 - `rate_capped`, `machine_full`, `already_running`: expected only on a repeat; wait or stop the old session.
 - `ccsbx start: ccsbx-hostd is not running or not reachable (socket /run/ccsbx-api/hostd.sock)`: `systemctl status ccsbx-hostd`; you are in group `ccsbx-clients` only after a fresh login (the reboot gave you that).
 
-**Step B, `ccsbx-root` accepts:**
+**Step B, `ccsbx-root` accepts:** the pane runs `sudo -n ccsbx-root run --tty -- <sid>` in its own tmux. If `run` refuses, it exits at once and that tmux session dies, so the refusal text is gone from the pane. Therefore:
 
 ```
 SID=<the sid from the reply>
 sudo ccsbx-root attach "$SID"
 ```
 
-You see the pane. **PASS** = no line starting `ccsbx-root run: refused:`. The pane runs the fence, or ends with docker's own error (`ccsbx-root run: ...` without `refused:`, exit 1), which still means every check passed. **FAIL** = `ccsbx-root run: refused: ` followed by: `pins: ...` (the image is not an acceptable digest: step 2/10), `profile <p> is not approved for machine <m> with billing <b>`, `session <sid> is for machine "<a>", this is "<b>"`, `this process is not in the host's mount namespace` (a sandboxed unit: `ccsbx-tmux` must be the host's), `seccomp profile ...` (step 11), `session <sid> has ended`, or `must run as root` (you ran it without sudo). Detach with the tmux detach keys of your setup; stop the session afterwards with `ccsbx stop "$SID"`.
+- **PASS** = attach shows the pane (the fence is running, or the pane ends with docker's own error `ccsbx-root run: ...` without `refused:`, exit 1, which still means every check passed).
+- **FAIL = attach fails** (for example "no such session" / `session has ended`): the run was refused before you could attach. That failure IS the signal. Read the reason: `sudo journalctl -u ccsbx-hostd -n 50 --no-pager` (hostd logs the launch), and run the same command by hand from a real terminal to see the refusal text: `sudo -u ccsbx -- sudo -n /usr/local/sbin/ccsbx-root run --tty -- "$SID"` (it only repeats the refusal; if it starts the fence instead, press Ctrl-C and `ccsbx stop "$SID"`). The refusal lines to look for: `ccsbx-root run: refused: ` followed by `pins: ...` (the image is not an acceptable digest: steps 2 and 10), `profile <p> is not approved for machine <m> with billing <b>`, `session <sid> is for machine "<a>", this is "<b>"`, `this process is not in the host's mount namespace` (a sandboxed unit: `ccsbx-tmux` must be the host's), `seccomp profile ...` (step 11), `session <sid> has ended`, or `must run as root`.
+- **Leaving the pane:** `ccsbx-root attach` removes the inner tmux's keys (no prefix, nothing bound), so there are no detach keys in the pane. Run attach inside your OUTER tmux; leave with the outer prefix and `d`, or close that window. Then `ccsbx stop "$SID"` from another window.
 
 **Gate M is done when steps 12, 13 and 14 pass.** Then say `Arm!` in the manager tab (the milestone is NOT ARMED until you do).
 
@@ -286,7 +291,7 @@ sudo systemctl restart ccsbx-hostd.service
 
 ## Known gaps (not failures)
 
-- **Repo form in helper mode and pods is `not_built`** (step 5). Starts by `workdir.path` work everywhere.
+- **Repo form in helper mode and pods is `not_built`** (step 6). Starts by `workdir.path` work everywhere.
 - **The hub is still the docker container.** relay-mint and pod relays refuse cleanly (no hub secret, no `hub_url`); fenced-to-unfenced-manager messages wait for the hub spoke. After the reboot you manage the hub container with `sudo docker`.
 - **No doors before M1:** `revoke_doors` is empty, so pod tokens are not revoked at the end of a generation; they expire by themselves.
 - Nothing in this document starts a pod: a pod needs the launcher kubeconfig (LATER, first item).

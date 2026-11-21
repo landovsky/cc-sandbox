@@ -200,6 +200,64 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	return d.startInner(s)
 }
 
+// repoStarts serialises concurrent starts of one (uid, caller, request_id): a retry that arrives during a long fetch waits for the first
+// attempt and is then answered from its record, instead of being refused ("the branch already exists") for a session that exists.
+var repoStarts sync.Map
+
+// preflight is the cheap, side-effect-free part of the policy, run BEFORE a fetch: a start that will be refused anyway (label live,
+// machine full, hourly cap, profile) must not cost a clone fetch and a checkout. startInner repeats everything after the build.
+func (d *Daemon) preflight(s *LaunchSpec) error {
+	unlock, err := d.lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	recs, err := d.records()
+	if err != nil {
+		return err
+	}
+	p, err := d.LoadProfile(s.Profile)
+	if err != nil {
+		return refuse(ProfileNotApproved, "this profile is not approved")
+	}
+	if m, b := p.Allows(d.Machine, s.Billing); !m {
+		return refuse(ProfileNotApproved, "this profile is not approved for this machine")
+	} else if !b {
+		return refuse(BillingUnavailable, "this billing mode is not allowed for the profile")
+	}
+	live, started := 0, 0
+	for _, r := range recs {
+		if r.Backend == "k8s" {
+			if r.Ended == nil {
+				live++
+			}
+			continue
+		}
+		if r.Ended == nil && d.Launcher.Alive(r.Sid) {
+			live++
+			if r.Spec.Label == s.Label {
+				ref := refuse(AlreadyRunning, "%s already_running on %s (sid %s)", s.Label, d.Machine, r.Sid)
+				ref.Machine, ref.Sid, ref.State = d.Machine, r.Sid, "running"
+				return ref
+			}
+		}
+		if r.Uid == d.Uid && d.now().Sub(r.Started) < time.Hour && (r.StartedBy != "") == (d.StartedBy != "") {
+			started++
+		}
+	}
+	hourCap := d.MaxPerHour
+	if d.StartedBy != "" {
+		hourCap = d.RemoteMaxPerHour
+	}
+	if hourCap > 0 && started >= hourCap {
+		return refuse(RateCapped, "%d starts in the last hour (cap %d)", started, hourCap)
+	}
+	if d.MaxLive > 0 && live >= d.MaxLive {
+		return refuse(MachineFull, "%d live sessions (cap %d)", live, d.MaxLive)
+	}
+	return nil
+}
+
 func (d *Daemon) startFromRepo(s *LaunchSpec) (*StartReply, error) {
 	if s.Resume != nil {
 		return nil, refuse(BadSpec, "a resume keeps its workdir: it cannot name a repository")
@@ -207,7 +265,20 @@ func (d *Daemon) startFromRepo(s *LaunchSpec) (*StartReply, error) {
 	if s.Machine != d.Machine {
 		return nil, refuse(WrongMachine, "spec is for another machine")
 	}
-	path, err := d.Worktrees.Prepare(s.Owner, s.Label, s.Workdir.Repo, s.Workdir.Base, s.Workdir.Branch)
+	key := fmt.Sprintf("%d\x00%s\x00%s", d.Uid, d.StartedBy, s.RequestID)
+	mu, _ := repoStarts.LoadOrStore(key, &sync.Mutex{})
+	mu.(*sync.Mutex).Lock()
+	defer func() { mu.(*sync.Mutex).Unlock(); repoStarts.Delete(key) }()
+	if rep, same := d.Recorded(d.Uid, d.StartedBy, s.RequestID, s.Label); rep != nil { // the attempt we waited for succeeded
+		if !same {
+			return nil, refuse(RequestIDReused, "request_id was already used for another session")
+		}
+		return rep, nil
+	}
+	if err := d.preflight(s); err != nil {
+		return nil, err
+	}
+	h, err := d.Worktrees.Prepare(s.Owner, s.Label, s.Workdir.Repo, s.Workdir.Base, s.Workdir.Branch)
 	if err != nil {
 		var we *worktree.Error
 		if errors.As(err, &we) {
@@ -216,11 +287,11 @@ func (d *Daemon) startFromRepo(s *LaunchSpec) (*StartReply, error) {
 		return nil, err
 	}
 	s2 := *s
-	s2.Workdir.Path = path
+	s2.Workdir.Path = h.Path
 	s2.built = true
 	rep, err := d.startInner(&s2)
 	if err != nil {
-		d.Worktrees.Remove(path) // a start that did not happen leaves no worktree behind
+		d.Worktrees.Remove(h) // a start that did not happen leaves no worktree and no branch behind
 		return nil, err
 	}
 	return rep, nil
@@ -736,12 +807,12 @@ func failedGeneration(prev *Record, gen int, now time.Time) *Record {
 
 // NewWorktreeBuilder is the repo-form builder for a direct-mode daemon: clones in the state dir, worktrees directly under the FIRST
 // absolute worktree root. nil when there is no absolute root (the repo form then stays not_built).
-func NewWorktreeBuilder(stateDir, roots string) *worktree.Builder {
+func NewWorktreeBuilder(stateDir, roots string, lim worktree.Limits) *worktree.Builder {
 	first, _, _ := strings.Cut(AbsRoots(roots), ",")
 	if stateDir == "" || !filepath.IsAbs(first) {
 		return nil
 	}
-	return &worktree.Builder{StateDir: stateDir, Root: first}
+	return &worktree.Builder{StateDir: stateDir, Root: first, Limits: lim}
 }
 
 // PruneWorktrees removes the repo-form worktrees (and branches) of sessions that ended more than keep ago, or that no record names
@@ -750,12 +821,18 @@ func (d *Daemon) PruneWorktrees(keep time.Duration) int {
 	if d.Worktrees == nil {
 		return 0
 	}
-	recs, err := d.records()
-	if err != nil {
-		return 0 // cannot tell what is in use: remove nothing
-	}
 	now := d.now()
+	// asked again, with FRESH records under the daemon lock, right before each removal: a session resumed since the pass began keeps its tree
 	needed := func(path string) bool {
+		unlock, err := d.lock()
+		if err != nil {
+			return true
+		}
+		defer unlock()
+		recs, err := d.records()
+		if err != nil {
+			return true // cannot tell what is in use: remove nothing
+		}
 		for _, r := range recs {
 			if r.Spec.Workdir.Path != path {
 				continue

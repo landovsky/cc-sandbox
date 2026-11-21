@@ -1,6 +1,7 @@
 // Tests of the worktree builder (R-WT). Why each exists: the builder runs git against a repository the owner named but
 // somebody else wrote, as the owner, on the owner's machine, so every case is a way a hostile repository or a hostile spec
-// could make git run something, write somewhere, or hand the fence more than one worktree.
+// could make git run something, write somewhere, fill a disk, destroy another session's files, or leave a trace of a start that
+// did not happen.
 package worktree
 
 import (
@@ -9,18 +10,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func git(t *testing.T, dir string, args ...string) string {
+func gitIn(t *testing.T, dir string, args ...string) string {
 	t.Helper()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("no git")
+	}
 	c := exec.Command("git", args...)
 	c.Dir = dir
 	c.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
 	out, err := c.CombinedOutput()
 	if err != nil {
-		t.Skipf("git %v: %v %s", args, err, out)
+		t.Fatalf("git %v: %v %s", args, err, out)
 	}
 	return strings.TrimSpace(string(out))
 }
@@ -29,12 +34,11 @@ func git(t *testing.T, dir string, args ...string) string {
 func rig(t *testing.T) (*Builder, string, string) {
 	t.Helper()
 	remote := t.TempDir()
-	git(t, remote, "init", "-q", "-b", "main")
+	gitIn(t, remote, "init", "-q", "-b", "main")
 	os.WriteFile(filepath.Join(remote, "README"), []byte("hello\n"), 0o644)
-	git(t, remote, "add", "README")
-	git(t, remote, "commit", "-q", "-m", "first")
-	root, state := t.TempDir(), t.TempDir()
-	home := t.TempDir()
+	gitIn(t, remote, "add", "README")
+	gitIn(t, remote, "commit", "-q", "-m", "first")
+	root, state, home := t.TempDir(), t.TempDir(), t.TempDir()
 	b := &Builder{StateDir: state, Root: root, Protocols: []string{"file"}, Env: []string{"HOME=" + home},
 		Remote: func(string) string { return "file://" + remote }}
 	return b, remote, home
@@ -42,38 +46,45 @@ func rig(t *testing.T) (*Builder, string, string) {
 
 const repo = "github.com/acme/widgets"
 
+func cloneOf(b *Builder) string {
+	return filepath.Join(b.StateDir, "clones", "tomas", "acme", "widgets.git")
+}
+
+func prep(t *testing.T, b *Builder, label, branch string) *Handle {
+	t.Helper()
+	h, err := b.Prepare("tomas", label, repo, "main", branch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
+}
+
 // context: the point of the package: a worktree of the named base on a new branch, under the root, with the clone cache
 // OUTSIDE every root (a start naming the cache as workdir.path must not be able to mount it).
 func TestPrepareBuildsAWorktreeOfTheBaseOnANewBranchAndKeepsTheCloneOutOfTheRoot(t *testing.T) {
 	b, remote, _ := rig(t)
-	want := git(t, remote, "rev-parse", "main")
-	p, err := b.Prepare("tomas", "cc-sandbox:Worker 1", repo, "main", "ccsbx/326q")
-	if err != nil {
-		t.Fatal(err)
+	want := gitIn(t, remote, "rev-parse", "main")
+	h := prep(t, b, "cc-sandbox:Worker 1", "ccsbx/326q")
+	if filepath.Dir(h.Path) != b.root() || !strings.HasPrefix(filepath.Base(h.Path), "cc-sandbox-worker-1-") {
+		t.Fatalf("worktree at %s", h.Path)
 	}
-	if filepath.Dir(p) != b.Root || !strings.HasPrefix(filepath.Base(p), "cc-sandbox-worker-1-") {
-		t.Fatalf("worktree at %s", p)
-	}
-	if got := git(t, p, "rev-parse", "HEAD"); got != want {
+	if got := gitIn(t, h.Path, "rev-parse", "HEAD"); got != want {
 		t.Fatalf("HEAD %s, want %s", got, want)
 	}
-	if br := git(t, p, "rev-parse", "--abbrev-ref", "HEAD"); br != "ccsbx/326q" {
+	if br := gitIn(t, h.Path, "rev-parse", "--abbrev-ref", "HEAD"); br != "ccsbx/326q" {
 		t.Fatalf("branch %s", br)
 	}
-	if _, err := os.Stat(filepath.Join(p, "README")); err != nil {
+	if _, err := os.Stat(filepath.Join(h.Path, "README")); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join(b.StateDir, "clones", "tomas", "acme__widgets.git")); err != nil {
+	if _, err := os.Stat(cloneOf(b)); err != nil {
 		t.Fatalf("the clone is not in the state dir: %v", err)
 	}
-	ents, _ := os.ReadDir(b.Root)
-	if len(ents) != 1 {
+	if ents, _ := os.ReadDir(b.Root); len(ents) != 1 {
 		t.Fatalf("the root holds %d entries, want only the worktree", len(ents))
 	}
-	// a second session reuses the clone (a fetch, not a re-clone) and gets its own worktree
-	p2, err := b.Prepare("tomas", "cc-sandbox:w2", repo, "main", "ccsbx/other")
-	if err != nil || p2 == p {
-		t.Fatalf("%q %v", p2, err)
+	if h2 := prep(t, b, "cc-sandbox:w2", "ccsbx/other"); h2.Path == h.Path {
+		t.Fatal("two sessions share a worktree")
 	}
 }
 
@@ -92,20 +103,15 @@ func TestHostileSpecValuesAreRefusedBeforeGitSeesThem(t *testing.T) {
 		"another host":                 {"gitlab.com/a/b", "main", "ok"},
 		"a repo with a path escape":    {"github.com/../b", "main", "ok"},
 	} {
-		if p, err := b.Prepare("tomas", "x", c[0], c[1], c[2]); err == nil {
-			t.Errorf("%s was accepted: %s", name, p)
+		if h, err := b.Prepare("tomas", "x", c[0], c[1], c[2]); err == nil {
+			t.Errorf("%s was accepted: %s", name, h.Path)
 		}
 	}
 	if ents, _ := os.ReadDir(b.Root); len(ents) != 0 {
 		t.Fatalf("a refused start left %d entries in the root", len(ents))
 	}
 	if _, err := os.Stat(filepath.Join(b.StateDir, "clones")); err == nil {
-		ents, _ := os.ReadDir(filepath.Join(b.StateDir, "clones"))
-		for _, e := range ents {
-			if sub, _ := os.ReadDir(filepath.Join(b.StateDir, "clones", e.Name())); len(sub) != 0 {
-				t.Fatalf("a refused start created a clone")
-			}
-		}
+		t.Fatal("a refused start created a clone directory")
 	}
 }
 
@@ -124,55 +130,117 @@ func TestRefusalsAreFixedTextWithNoPathsOrGitOutput(t *testing.T) {
 	if _, ok := err.(*Error); !ok {
 		t.Fatalf("%T", err)
 	}
+	// a failed first fetch leaves no empty clone behind (it would otherwise keep a wrong origin for the next start)
+	if _, err := os.Stat(cloneOf(b)); err == nil {
+		t.Fatal("a clone created by a failed fetch was kept")
+	}
 }
 
-// context: a branch that already exists in the clone is refused (a session gets a NEW branch), and a failed start leaves no
-// directory behind.
-func TestAnExistingBranchIsRefusedAndNothingIsLeftBehind(t *testing.T) {
+// context (R-WT review M1): a start refused AFTER its worktree was built used to delete the directory but leave the branch,
+// so the same spec was refused "the branch already exists" for good. Removal takes the branch with it.
+func TestARemovedWorktreeFreesItsBranchNameForTheNextStart(t *testing.T) {
 	b, _, _ := rig(t)
-	if _, err := b.Prepare("tomas", "a", repo, "main", "feature"); err != nil {
+	h := prep(t, b, "a", "feature")
+	if err := b.Remove(h); err != nil {
 		t.Fatal(err)
 	}
-	before, _ := os.ReadDir(b.Root)
+	if _, err := os.Stat(h.Path); err == nil {
+		t.Fatal("the worktree is still there")
+	}
+	if out := gitIn(t, cloneOf(b), "branch", "--list", "feature"); out != "" {
+		t.Fatalf("the branch survived: %q", out)
+	}
+	if _, err := b.Prepare("tomas", "a", repo, "main", "feature"); err != nil {
+		t.Fatalf("the same spec again: %v", err)
+	}
+	// and while the branch is in use, a second session cannot take it
 	if _, err := b.Prepare("tomas", "b", repo, "main", "feature"); err == nil {
 		t.Fatal("the same branch was handed to a second session")
 	}
-	after, _ := os.ReadDir(b.Root)
-	if len(after) != len(before) {
-		t.Fatalf("the root went from %d to %d entries", len(before), len(after))
-	}
 }
 
-// context: the owner's own git configuration is how access works, but it must not be able to turn hooks on: a hooks path in
-// their global config is overridden on the command line, so a post-checkout hook never runs during the worktree's checkout.
-func TestTheOwnersConfigCannotTurnHooksOnDuringCheckout(t *testing.T) {
-	b, _, home := rig(t)
+// context (R-WT review S3): the owner's global configuration is how a FETCH is authorised, but it must not be able to turn hooks on
+// or let a hostile .gitattributes choose one of the owner's filter drivers to run during the checkout.
+func TestTheOwnersConfigCannotRunHooksOrFiltersDuringCheckout(t *testing.T) {
+	b, remote, home := rig(t)
 	hooks := t.TempDir()
-	marker := filepath.Join(t.TempDir(), "ran")
-	os.WriteFile(filepath.Join(hooks, "post-checkout"), []byte("#!/bin/sh\ntouch "+marker+"\n"), 0o755)
-	os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[core]\n\thooksPath = "+hooks+"\n"), 0o644)
-	if _, err := b.Prepare("tomas", "h", repo, "main", "hk"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(marker); err == nil {
+	hookMarker, filterMarker := filepath.Join(t.TempDir(), "hook"), filepath.Join(t.TempDir(), "filter")
+	os.WriteFile(filepath.Join(hooks, "post-checkout"), []byte("#!/bin/sh\ntouch "+hookMarker+"\n"), 0o755)
+	os.WriteFile(filepath.Join(home, ".gitconfig"), []byte("[core]\n\thooksPath = "+hooks+"\n[filter \"foo\"]\n\tsmudge = sh -c 'touch "+filterMarker+"; cat'\n\trequired = false\n"), 0o644)
+	os.WriteFile(filepath.Join(remote, ".gitattributes"), []byte("* filter=foo\n"), 0o644)
+	gitIn(t, remote, "add", ".gitattributes")
+	gitIn(t, remote, "commit", "-q", "-m", "attrs")
+	prep(t, b, "h", "hk")
+	if _, err := os.Stat(hookMarker); err == nil {
 		t.Fatal("a hook from the owner's config ran during the checkout")
 	}
+	if _, err := os.Stat(filterMarker); err == nil {
+		t.Fatal("a filter driver of the owner's config was selected by the repository's .gitattributes")
+	}
 }
 
-// context: a hostile repository must not fill the disk: a clone over the cap is refused AND deleted.
-func TestAnOversizedCloneIsRefusedAndDeleted(t *testing.T) {
+// context (R-WT review M2): the size cap used to delete the whole clone, including the object store and the registration of every
+// live worktree of that repo. An oversized fetch into a clone that is in use is rolled back; the live worktree keeps working.
+func TestAnOversizedFetchNeverDeletesACloneThatLiveWorktreesUse(t *testing.T) {
 	b, remote, _ := rig(t)
+	live := prep(t, b, "live", "live-branch")
 	big := make([]byte, 3<<20)
-	rand.Read(big) // incompressible, so the pack is really about 3 MB
+	rand.Read(big)
+	gitIn(t, remote, "checkout", "-q", "-b", "big")
 	os.WriteFile(filepath.Join(remote, "big.bin"), big, 0o644)
-	git(t, remote, "add", "big.bin")
-	git(t, remote, "commit", "-q", "-m", "big")
-	b.MaxCloneMB = 1
-	if _, err := b.Prepare("tomas", "big", repo, "main", "bg"); err == nil {
+	gitIn(t, remote, "add", "big.bin")
+	gitIn(t, remote, "commit", "-q", "-m", "big")
+	b.Limits.MaxCloneMB = 2
+	if _, err := b.Prepare("tomas", "big", repo, "big", "bg"); err == nil {
 		t.Fatal("a clone over the cap was accepted")
 	}
-	if _, err := os.Stat(filepath.Join(b.StateDir, "clones", "tomas", "acme__widgets.git")); err == nil {
-		t.Fatal("the oversized clone was kept")
+	if _, err := os.Stat(cloneOf(b)); err != nil {
+		t.Fatalf("the shared clone was deleted: %v", err)
+	}
+	if out := gitIn(t, live.Path, "status", "--porcelain"); out != "" || gitIn(t, live.Path, "rev-parse", "--abbrev-ref", "HEAD") != "live-branch" {
+		t.Fatalf("the live worktree is broken: %q", out)
+	}
+	if out := gitIn(t, cloneOf(b), "for-each-ref", "refs/remotes/origin/big"); out != "" {
+		t.Fatalf("the rolled-back ref survived: %q", out)
+	}
+	// a clone THIS call created and could not keep is deleted
+	b2, remote2, _ := rig(t)
+	rand.Read(big)
+	os.WriteFile(filepath.Join(remote2, "big.bin"), big, 0o644)
+	gitIn(t, remote2, "add", "big.bin")
+	gitIn(t, remote2, "commit", "-q", "-m", "big")
+	b2.Limits.MaxCloneMB = 1
+	if _, err := b2.Prepare("tomas", "big", repo, "main", "bg"); err == nil {
+		t.Fatal("accepted")
+	}
+	if _, err := os.Stat(cloneOf(b2)); err == nil {
+		t.Fatal("a new oversized clone was kept")
+	}
+}
+
+// context (R-WT review M3): the cap measured the compressed clone, so a repository of highly compressible blobs (or one blob under
+// many paths) was a few KiB as a clone and gigabytes as files. The tree is measured before anything is written.
+func TestACheckoutOverTheCapIsRefusedBeforeAnythingIsWritten(t *testing.T) {
+	b, remote, _ := rig(t)
+	zeros := make([]byte, 4<<20)
+	for i := 0; i < 5; i++ {
+		os.WriteFile(filepath.Join(remote, "z"+string(rune('a'+i))), zeros, 0o644)
+	}
+	gitIn(t, remote, "add", ".")
+	gitIn(t, remote, "commit", "-q", "-m", "zeros")
+	b.Limits.MaxCheckout = 10 // MiB: the clone is a few KiB, the checkout would be 20 MiB
+	if _, err := b.Prepare("tomas", "z", repo, "main", "zb"); err == nil {
+		t.Fatal("a zip-bomb checkout was accepted")
+	}
+	if ents, _ := os.ReadDir(b.Root); len(ents) != 0 {
+		t.Fatalf("something was written to the root: %v", ents)
+	}
+	if out := gitIn(t, cloneOf(b), "branch", "--list", "zb"); out != "" {
+		t.Fatalf("a branch was made: %q", out)
+	}
+	b.Limits.MaxCheckout, b.Limits.MaxFiles = 0, 3 // a file-count bomb
+	if _, err := b.Prepare("tomas", "z", repo, "main", "zb"); err == nil {
+		t.Fatal("a tree of more files than the cap was accepted")
 	}
 }
 
@@ -181,60 +249,182 @@ func TestAnOversizedCloneIsRefusedAndDeleted(t *testing.T) {
 func TestOnlyHttpsAndSshTransportsAreAllowedByDefault(t *testing.T) {
 	b, _, _ := rig(t)
 	b.Protocols = nil
-	if p, err := b.Prepare("tomas", "p", repo, "main", "pr"); err == nil {
-		t.Fatalf("a file:// remote was fetched: %s", p)
+	if h, err := b.Prepare("tomas", "p", repo, "main", "pr"); err == nil {
+		t.Fatalf("a file:// remote was fetched: %s", h.Path)
 	}
 }
 
-// context: removal touches only a worktree directly under the root, and unregisters it.
-func TestRemoveDeletesOnlyItsOwnWorktreeAndUnregistersIt(t *testing.T) {
+// context (R-WT review S4): the worktree is mounted read-write into the fence, so its .git pointer is the agent's. Cleanup must run
+// in the clone Prepare recorded and never in whatever repository the pointer was rewritten to name.
+func TestRemoveNeverTrustsTheWorktreesOwnGitPointer(t *testing.T) {
 	b, _, _ := rig(t)
-	p, err := b.Prepare("tomas", "r", repo, "main", "rm1")
-	if err != nil {
+	h := prep(t, b, "r", "rm1")
+	other := t.TempDir()
+	gitIn(t, other, "init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(other, "f"), []byte("x"), 0o644)
+	gitIn(t, other, "add", "f")
+	gitIn(t, other, "commit", "-q", "-m", "x")
+	gone := t.TempDir()
+	gitIn(t, other, "worktree", "add", "-q", "-b", "elsewhere", gone+"/wt")
+	os.RemoveAll(gone + "/wt") // another repository's registration for a worktree that is currently missing
+	os.WriteFile(filepath.Join(h.Path, ".git"), []byte("gitdir: "+other+"/.git\n"), 0o644)
+	if err := b.Remove(h); err != nil {
 		t.Fatal(err)
 	}
-	if err := b.Remove(p); err != nil {
-		t.Fatal(err)
+	if out := gitIn(t, other, "worktree", "list", "--porcelain"); !strings.Contains(out, gone+"/wt") {
+		t.Fatal("cleanup pruned another repository's worktree registration")
 	}
-	if _, err := os.Stat(p); err == nil {
-		t.Fatal("still there")
-	}
-	clone := filepath.Join(b.StateDir, "clones", "tomas", "acme__widgets.git")
-	if out := git(t, clone, "worktree", "list", "--porcelain"); strings.Contains(out, p) {
-		t.Fatalf("still registered: %s", out)
-	}
-	outside := t.TempDir()
+	outside := &Handle{Clone: cloneOf(b), Path: t.TempDir()}
 	if err := b.Remove(outside); err == nil {
 		t.Fatal("a path outside the root was removable")
 	}
-	if _, err := os.Stat(outside); err != nil {
+	if _, err := os.Stat(outside.Path); err != nil {
 		t.Fatal("a path outside the root was deleted")
 	}
-	// the branch name is free again for the next session once the worktree is gone and the branch deleted
-	git(t, clone, "branch", "-D", "rm1")
 }
 
-// context (cleanup): a worktree of a session that ended long ago is removed with its branch; one a session still uses, and one
-// that is recent, stay; nothing outside the root is ever touched.
+// context (R-WT review S5): with a worktree root that is a symlink, the path Prepare returns is a real path; cleanup compared it
+// with the unresolved root and refused, leaving the tree of a refused start behind.
+func TestASymlinkedWorktreeRootStillCleansUp(t *testing.T) {
+	b, _, _ := rig(t)
+	real := t.TempDir()
+	link := filepath.Join(t.TempDir(), "root")
+	os.Symlink(real, link)
+	b.Root = link
+	h := prep(t, b, "s", "sl1")
+	if err := b.Remove(h); err != nil {
+		t.Fatalf("cleanup under a symlinked root: %v", err)
+	}
+	if _, err := os.Stat(h.Path); err == nil {
+		t.Fatal("still there")
+	}
+	h2 := prep(t, b, "s2", "sl2")
+	long := time.Now().Add(-30 * 24 * time.Hour)
+	os.Chtimes(h2.Path, long, long)
+	if n := b.Prune(time.Hour, func(string) bool { return false }, time.Now()); n != 1 {
+		t.Fatalf("Prune under a symlinked root removed %d, want 1", n)
+	}
+}
+
+// context (cleanup): a worktree of a session that ended long ago is removed with the branch it was MADE for (even if the session
+// switched branches); one a session still uses, and one that is recent, stay.
 func TestPruneRemovesOnlyWhatNothingNeedsAndIsOldEnough(t *testing.T) {
 	b, _, _ := rig(t)
-	old, _ := b.Prepare("tomas", "old", repo, "main", "b-old")
-	used, _ := b.Prepare("tomas", "used", repo, "main", "b-used")
-	fresh, _ := b.Prepare("tomas", "fresh", repo, "main", "b-fresh")
+	old, used, fresh := prep(t, b, "old", "b-old"), prep(t, b, "used", "b-used"), prep(t, b, "fresh", "b-fresh")
+	gitIn(t, old.Path, "checkout", "-q", "-b", "switched") // the session moved to another branch
 	long := time.Now().Add(-10 * 24 * time.Hour)
-	os.Chtimes(old, long, long)
-	os.Chtimes(used, long, long)
-	needed := func(p string) bool { return p == used }
+	os.Chtimes(old.Path, long, long)
+	os.Chtimes(used.Path, long, long)
+	needed := func(p string) bool { return p == used.Path }
 	if n := b.Prune(7*24*time.Hour, needed, time.Now()); n != 1 {
 		t.Fatalf("pruned %d, want 1", n)
 	}
-	for p, want := range map[string]bool{old: false, used: true, fresh: true} {
+	for p, want := range map[string]bool{old.Path: false, used.Path: true, fresh.Path: true} {
 		if _, err := os.Stat(p); (err == nil) != want {
 			t.Errorf("%s exists=%v want %v", filepath.Base(p), err == nil, want)
 		}
 	}
-	clone := filepath.Join(b.StateDir, "clones", "tomas", "acme__widgets.git")
-	if out := git(t, clone, "branch", "--list", "b-old"); out != "" {
-		t.Fatalf("the branch survived: %q", out)
+	if out := gitIn(t, cloneOf(b), "branch", "--list", "b-old"); out != "" {
+		t.Fatalf("the branch it was made for survived: %q", out)
+	}
+}
+
+// context (R-WT review S6): the pass asks again, per worktree, right before removing: a session resumed since the pass began keeps its tree.
+func TestPruneAsksAgainRightBeforeEachRemoval(t *testing.T) {
+	b, _, _ := rig(t)
+	h := prep(t, b, "old", "b1")
+	long := time.Now().Add(-10 * 24 * time.Hour)
+	os.Chtimes(h.Path, long, long)
+	asked := 0
+	if n := b.Prune(time.Hour, func(string) bool { asked++; return true }, time.Now()); n != 0 || asked != 1 {
+		t.Fatalf("removed %d, asked %d", n, asked)
+	}
+	if _, err := os.Stat(h.Path); err != nil {
+		t.Fatal("a needed worktree was removed")
+	}
+}
+
+// context (R-WT review S8): a hung fetch holds the clone's lock; every other start of that repo used to wait for ever. It now waits a
+// bounded time and is refused "busy".
+func TestAStartWaitsBoundedlyForABusyClone(t *testing.T) {
+	b, _, _ := rig(t)
+	prep(t, b, "first", "w1")
+	unlock, err := lock(cloneOf(b)+".lock", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	b.Limits.LockWait = 300 * time.Millisecond
+	t0 := time.Now()
+	_, err = b.Prepare("tomas", "second", repo, "main", "w2")
+	if err == nil || !strings.Contains(err.Error(), "busy") || time.Since(t0) > 3*time.Second {
+		t.Fatalf("%v after %v", err, time.Since(t0))
+	}
+}
+
+// context (R-WT review S7/S11): concurrent starts of one repo serialise on the clone; two different repos whose names would collide
+// under a flattened directory name get different clones.
+func TestConcurrentStartsOfOneRepoSerialiseAndNestedCloneDirsDoNotCollide(t *testing.T) {
+	b, _, _ := rig(t)
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, err := b.Prepare("tomas", "c", repo, "main", "par"+string(rune('a'+i)))
+			errs <- err
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Errorf("%v", err)
+		}
+	}
+	m1, m2 := repoRe.FindStringSubmatch("github.com/a__b/c"), repoRe.FindStringSubmatch("github.com/a/b__c")
+	if b.cloneDir("tomas", m1) == b.cloneDir("tomas", m2) {
+		t.Fatal("two different repositories share a clone directory")
+	}
+}
+
+// context (R-WT review S11): an existing clone whose origin is not the expected one (an earlier life, a collision) is corrected before the fetch.
+func TestAnExistingClonesOriginIsCorrectedBeforeTheFetch(t *testing.T) {
+	b, _, _ := rig(t)
+	h := prep(t, b, "a", "o1")
+	b.Remove(h)
+	gitIn(t, cloneOf(b), "remote", "set-url", "origin", "file:///nonexistent")
+	if _, err := b.Prepare("tomas", "a", repo, "main", "o2"); err != nil {
+		t.Fatalf("a wrong origin was kept: %v", err)
+	}
+}
+
+// context (R-WT review S7): on a timeout only git itself used to get the signal; git-remote-https, ssh and index-pack could survive,
+// keep writing into the clone after the lock was released, and race the next start. The whole process group is killed.
+func TestATimedOutFetchKillsItsWholeProcessGroup(t *testing.T) {
+	b, _, _ := rig(t)
+	dir := t.TempDir()
+	pidfile := filepath.Join(dir, "pid")
+	fake := filepath.Join(dir, "git")
+	real, _ := exec.LookPath("git")
+	os.WriteFile(fake, []byte("#!/bin/sh\nfor a in \"$@\"; do if [ \"$a\" = fetch ]; then (sleep 60 & echo $! > "+pidfile+"; wait); exit 0; fi; done\nexec "+real+" \"$@\"\n"), 0o755)
+	b.Git = fake
+	b.Limits.FetchTimeout = 700 * time.Millisecond
+	t0 := time.Now()
+	if _, err := b.Prepare("tomas", "t", repo, "main", "tmo"); err == nil {
+		t.Fatal("a fetch that never finished was accepted")
+	}
+	if time.Since(t0) > 6*time.Second {
+		t.Fatalf("took %v", time.Since(t0))
+	}
+	b2, _ := os.ReadFile(pidfile)
+	pid := strings.TrimSpace(string(b2))
+	if pid == "" {
+		t.Fatal("the fake fetch did not start")
+	}
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat("/proc/" + pid); err == nil {
+		t.Fatalf("the fetch's child process %s outlived the timeout", pid)
 	}
 }

@@ -895,3 +895,77 @@ func TestAnEndedSessionsWorktreeIsPrunedAfterTheRetentionOnly(t *testing.T) {
 		t.Fatal("the worktree is still there")
 	}
 }
+
+// context (R-WT review M1 at the daemon): a start refused AFTER its worktree was built (here: the label is already live, found by
+// startInner's full check because the preflight is told nothing new) must free the branch name, so the caller can retry the same spec.
+func TestARefusedRepoStartFreesItsBranchSoTheSameSpecCanBeRetried(t *testing.T) {
+	d, _ := newDaemon(t)
+	repoRemote(t, d)
+	mk := func() *LaunchSpec {
+		return spec(func(s *LaunchSpec) {
+			s.Workdir = Workdir{Repo: "github.com/acme/widgets", Base: "main", Branch: "reuse-me"}
+		})
+	}
+	good := d.Image
+	d.Image = "ghcr.io/landovsky/ccsbx-fence@sha256:short" // refused by the pins check, which runs only AFTER the worktree is built
+	if _, err := d.Start(mk()); code(err) != ImageNotPinned {
+		t.Fatalf("the setup: %v", err)
+	}
+	if ents, _ := os.ReadDir(d.WorktreeRoot); countDirs(ents, "cc-sandbox-a-") != 0 {
+		t.Fatalf("the refused start left a worktree: %v", ents)
+	}
+	d.Image = good
+	if _, err := d.Start(mk()); err != nil {
+		t.Fatalf("the same branch could not be used again after a refused start: %v", err)
+	}
+}
+
+// context (R-WT review S1): a start that will be refused anyway (the label is live) must not pay for a fetch and a checkout first.
+func TestAStartThatWillBeRefusedAnywayDoesNotFetchOrCheckOut(t *testing.T) {
+	d, _ := newDaemon(t)
+	repoRemote(t, d)
+	if _, err := d.Start(spec(nil)); err != nil { // label cc-sandbox:a is now live (path form)
+		t.Fatal(err)
+	}
+	fetches := 0
+	d.Worktrees.Remote = func(string) string { fetches++; return "file:///nonexistent" }
+	_, err := d.Start(spec(func(s *LaunchSpec) {
+		s.RequestID = "r-two"
+		s.Workdir = Workdir{Repo: "github.com/acme/widgets", Base: "main", Branch: "dup"}
+	}))
+	if code(err) != AlreadyRunning || fetches != 0 {
+		t.Fatalf("%v fetches=%d", err, fetches)
+	}
+}
+
+// context (R-WT review S2): a retry that arrives while the first attempt is still fetching waits for it and gets the SAME session,
+// not "the branch already exists" for a session that exists.
+func TestARetryDuringTheFirstAttemptsBuildGetsTheSameSession(t *testing.T) {
+	d, _ := newDaemon(t)
+	repoRemote(t, d)
+	mk := func() *LaunchSpec {
+		return spec(func(s *LaunchSpec) {
+			s.Workdir = Workdir{Repo: "github.com/acme/widgets", Base: "main", Branch: "once"}
+		})
+	}
+	var wg sync.WaitGroup
+	sids := make([]string, 3)
+	errs := make([]error, 3)
+	for i := range sids {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rep, err := d.Start(mk())
+			errs[i] = err
+			if rep != nil {
+				sids[i] = rep.Sid
+			}
+		}(i)
+	}
+	wg.Wait()
+	for i := range sids {
+		if errs[i] != nil || sids[i] == "" || sids[i] != sids[0] {
+			t.Fatalf("attempt %d: %v %q (first %q)", i, errs[i], sids[i], sids[0])
+		}
+	}
+}

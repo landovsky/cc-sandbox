@@ -5,9 +5,15 @@
 // root, so a start naming it as workdir.path cannot mount it), and adds a worktree for the session under the worktree root.
 //
 // Every git call is one argv, never a shell, with hostile-repository switches on the command line (they win over any config): hooks
-// off, fsmonitor off, only the https and ssh transports, submodules and LFS filters off, object checking on, no prompts.
-// Values reach git only after the C5 rules of docs/m2c-remote-start.md: charset (start.ParseSpec), `git check-ref-format`, a fully
-// qualified ref, the base resolved to a commit id by `rev-parse --verify --end-of-options`, and only that id handed to `worktree add`.
+// off, fsmonitor off, only the https and ssh transports, submodules and LFS filters off, object checking on, no prompts. The owner's
+// git configuration is used for the FETCH only (credentials, url rewrites); every other call runs with no global config at all, so
+// a hostile .gitattributes cannot pick one of the owner's filter drivers to run on a checkout. Values reach git only after the C5 rules of
+// docs/m2c-remote-start.md: charset (start.ParseSpec), `git check-ref-format`, a fully qualified ref, the base resolved to a commit id
+// by `rev-parse --verify --end-of-options`, and only that id handed to `worktree add`.
+//
+// Disk is bounded three ways: the clone (polled WHILE a fetch runs, which is then killed), the checkout (the tree is measured with
+// `ls-tree -l` before anything is written), and the age of finished sessions' worktrees (Prune). A clone with live worktrees is never
+// deleted: an oversized fetch into it is rolled back instead.
 package worktree
 
 import (
@@ -20,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -32,16 +39,29 @@ func (e *Error) Error() string { return e.Msg }
 
 func refuse(m string) error { return &Error{m} }
 
+// Limits are the tunables (hostd and `ccsbx start` expose each as a flag).
+type Limits struct {
+	FetchTimeout time.Duration // per fetch (default 120 s)
+	MaxCloneMB   int64         // a clone may not grow past this (default 2048); the fetch is killed when it does
+	MaxCheckout  int64         // MiB of file content a checkout may write (default 1024)
+	MaxFiles     int           // entries a checkout may write (default 100000)
+	LockWait     time.Duration // how long a start waits for a busy clone (default 60 s)
+}
+
 // Builder holds the configuration. The zero value is not usable: StateDir and Root are required.
 type Builder struct {
-	StateDir   string        // <StateDir>/clones/<owner>/<repo>.git
-	Root       string        // an absolute worktree root: sessions' worktrees are created directly under it
-	Git        string        // default /usr/bin/git
-	Timeout    time.Duration // per fetch (default 120 s); other git calls get 30 s
-	MaxCloneMB int64         // refuse (and delete) a clone bigger than this (default 2048)
-	Protocols  []string      // transports allowed (default https, ssh)
-	Remote     func(repo string) string
-	Env        []string // extra environment (tests)
+	StateDir  string // <StateDir>/clones/<owner>/<github-owner>/<repo>.git
+	Root      string // an absolute worktree root: sessions' worktrees are created directly under it (symlinks are resolved once)
+	Git       string // default /usr/bin/git
+	Limits    Limits
+	Protocols []string // transports allowed (default https, ssh)
+	Remote    func(repo string) string
+	Env       []string // extra environment (tests)
+}
+
+// Handle is what Prepare made: everything Remove needs, so nothing is ever read back from the (agent-writable) worktree.
+type Handle struct {
+	Clone, Path, Branch string
 }
 
 var (
@@ -65,7 +85,50 @@ func (b *Builder) remote(repo string) string {
 	return "https://" + repo + ".git"
 }
 
-// hardened is the command-line configuration every call carries (it beats the owner's config files).
+func (l Limits) fetchTimeout() time.Duration {
+	if l.FetchTimeout > 0 {
+		return l.FetchTimeout
+	}
+	return 120 * time.Second
+}
+
+func (l Limits) cloneMB() int64 {
+	if l.MaxCloneMB > 0 {
+		return l.MaxCloneMB
+	}
+	return 2048
+}
+
+func (l Limits) checkoutMB() int64 {
+	if l.MaxCheckout > 0 {
+		return l.MaxCheckout
+	}
+	return 1024
+}
+
+func (l Limits) maxFiles() int {
+	if l.MaxFiles > 0 {
+		return l.MaxFiles
+	}
+	return 100000
+}
+
+func (l Limits) lockWait() time.Duration {
+	if l.LockWait > 0 {
+		return l.LockWait
+	}
+	return 60 * time.Second
+}
+
+// root is the worktree root with symlinks resolved (every comparison is between real paths).
+func (b *Builder) root() string {
+	if r, err := filepath.EvalSymlinks(b.Root); err == nil {
+		return r
+	}
+	return filepath.Clean(b.Root)
+}
+
+// hardened is the command-line configuration every call carries (it beats any config file).
 func (b *Builder) hardened() []string {
 	protos := b.Protocols
 	if len(protos) == 0 {
@@ -85,60 +148,83 @@ func (b *Builder) hardened() []string {
 	return a
 }
 
-// env is the owner's own environment for access (HOME and the agent socket) and nothing else of the daemon's.
-func (b *Builder) env() []string {
+// env: with owner=true the owner's own configuration and agent (HOME, the agent socket) are visible: the FETCH only. Otherwise there is no global
+// config at all and an empty HOME, so nothing of the owner's (filters, textconv, aliases) can be selected by the repository's content.
+func (b *Builder) env(owner bool) []string {
 	e := []string{
 		"PATH=/usr/bin:/bin", "LANG=C.UTF-8", "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1", "GIT_ASKPASS=/bin/false",
 		"GIT_SSH_COMMAND=ssh -o BatchMode=yes -o StrictHostKeyChecking=yes", "GIT_PAGER=cat", "GIT_OPTIONAL_LOCKS=0",
 	}
-	for _, k := range []string{"HOME", "SSH_AUTH_SOCK", "XDG_CONFIG_HOME"} {
-		if v := os.Getenv(k); v != "" {
-			e = append(e, k+"="+v)
+	if owner {
+		for _, k := range []string{"HOME", "SSH_AUTH_SOCK", "XDG_CONFIG_HOME"} {
+			if v := os.Getenv(k); v != "" {
+				e = append(e, k+"="+v)
+			}
 		}
+	} else {
+		e = append(e, "HOME=/nonexistent", "GIT_CONFIG_GLOBAL=/dev/null")
 	}
 	return append(e, b.Env...)
 }
 
+// run runs git with the owner's config hidden. runFetch runs it as the owner and kills it when watch says so.
 func (b *Builder) run(d time.Duration, dir string, args ...string) (string, error) {
+	return b.exec(d, dir, false, nil, args...)
+}
+
+func (b *Builder) exec(d time.Duration, dir string, owner bool, watch func() bool, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), d)
 	defer cancel()
 	c := exec.CommandContext(ctx, b.git(), append(b.hardened(), args...)...)
-	c.Dir, c.Env = dir, b.env()
+	c.Dir, c.Env = dir, b.env(owner)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	c.WaitDelay = time.Second
-	c.Cancel = func() error { return c.Process.Signal(syscall.SIGTERM) }
+	// the whole process group: git-remote-https, ssh and index-pack must not outlive a timeout and keep writing into the clone
+	c.Cancel = func() error { return syscall.Kill(-c.Process.Pid, syscall.SIGKILL) }
 	var out, errb bytes.Buffer
 	c.Stdout, c.Stderr = &out, &errb
+	if watch != nil {
+		done := make(chan struct{})
+		defer close(done)
+		go func() {
+			t := time.NewTicker(500 * time.Millisecond)
+			defer t.Stop()
+			for {
+				select {
+				case <-done:
+					return
+				case <-t.C:
+					if watch() {
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
 	if err := c.Run(); err != nil {
 		return "", fmt.Errorf("git %s: %v", args[0], err)
 	}
 	return strings.TrimSpace(out.String()), nil
 }
 
-func (b *Builder) fetchTimeout() time.Duration {
-	if b.Timeout > 0 {
-		return b.Timeout
-	}
-	return 120 * time.Second
-}
-
-func (b *Builder) maxMB() int64 {
-	if b.MaxCloneMB > 0 {
-		return b.MaxCloneMB
-	}
-	return 2048
-}
-
-// lock takes the per-clone flock (one fetch or worktree add at a time per repo).
-func lock(path string) (func(), error) {
+// lock takes the per-clone flock, waiting at most wait (a hung fetch must not hold every start of that repo for ever).
+func lock(path string, wait time.Duration) (func(), error) {
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX); err != nil {
-		f.Close()
-		return nil, err
+	deadline := time.Now().Add(wait)
+	for {
+		if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+			return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
+		}
+		if time.Now().After(deadline) {
+			f.Close()
+			return nil, fmt.Errorf("busy")
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
-	return func() { syscall.Flock(int(f.Fd()), syscall.LOCK_UN); f.Close() }, nil
 }
 
 func dirMB(p string) int64 {
@@ -152,80 +238,175 @@ func dirMB(p string) int64 {
 	return n >> 20
 }
 
-// Prepare returns the absolute path of a new worktree of repo at base on a NEW branch. owner is the session owner (the clone is
-// theirs), label names the worktree directory. Any failure removes what it created.
-func (b *Builder) Prepare(owner, label, repo, base, branch string) (string, error) {
+func (b *Builder) cloneDir(owner string, m []string) string {
+	return filepath.Join(b.StateDir, "clones", owner, m[1], m[2]+".git") // nested: injective, unlike a joined name
+}
+
+// Prepare returns a handle to a new worktree of repo at base on a NEW branch. owner is the session owner (the clone is
+// theirs), label names the worktree directory. Any failure removes what it created, the branch included.
+func (b *Builder) Prepare(owner, label, repo, base, branch string) (*Handle, error) {
 	m := repoRe.FindStringSubmatch(repo)
 	if m == nil || !ownerRe.MatchString(owner) || b.StateDir == "" || !filepath.IsAbs(b.Root) {
-		return "", refuse("the repository is not acceptable")
+		return nil, refuse("the repository is not acceptable")
 	}
 	if strings.HasPrefix(base, "-") || strings.HasPrefix(branch, "-") {
-		return "", refuse("the base or branch is not a valid ref name")
+		return nil, refuse("the base or branch is not a valid ref name")
 	}
 	if _, err := b.run(30*time.Second, "", "check-ref-format", "refs/heads/"+base); err != nil {
-		return "", refuse("the base is not a valid ref name")
+		return nil, refuse("the base is not a valid ref name")
 	}
 	if _, err := b.run(30*time.Second, "", "check-ref-format", "--branch", branch); err != nil {
-		return "", refuse("the branch is not a valid ref name")
+		return nil, refuse("the branch is not a valid ref name")
 	}
-	clones := filepath.Join(b.StateDir, "clones", owner)
-	if err := os.MkdirAll(clones, 0o700); err != nil {
-		return "", refuse("the clone cache is not writable")
+	clone := b.cloneDir(owner, m)
+	if err := os.MkdirAll(filepath.Dir(clone), 0o700); err != nil {
+		return nil, refuse("the clone cache is not writable")
 	}
-	clone := filepath.Join(clones, m[1]+"__"+m[2]+".git")
-	unlock, err := lock(clone + ".lock")
+	unlock, err := lock(clone+".lock", b.Limits.lockWait())
 	if err != nil {
-		return "", refuse("the clone cache is not writable")
+		return nil, refuse("the repository is busy: try again")
 	}
 	defer unlock()
 
+	created := false
 	if _, err := os.Stat(clone); os.IsNotExist(err) {
+		created = true
 		if _, err := b.run(30*time.Second, "", "init", "--bare", "-q", "--", clone); err != nil {
-			return "", refuse("the repository could not be set up")
-		}
-		if _, err := b.run(30*time.Second, clone, "remote", "add", "origin", b.remote(repo)); err != nil {
 			os.RemoveAll(clone)
-			return "", refuse("the repository could not be set up")
+			return nil, refuse("the repository could not be set up")
 		}
 	}
-	// fetch ONLY the base branch (full history of that one ref), into a namespace of ours
-	ref := "refs/remotes/origin/" + base
-	if _, err := b.run(b.fetchTimeout(), clone, "fetch", "--no-tags", "--no-recurse-submodules", "--prune", "origin", "+refs/heads/"+base+":"+ref); err != nil {
-		return "", refuse("the repository or branch could not be fetched")
+	// the origin is ours to set every time: never trust what an earlier life of the clone left
+	want := b.remote(repo)
+	if cur, err := b.run(30*time.Second, clone, "config", "--get", "remote.origin.url"); err != nil {
+		if _, err := b.run(30*time.Second, clone, "remote", "add", "origin", want); err != nil {
+			b.dropIfNew(clone, created)
+			return nil, refuse("the repository could not be set up")
+		}
+	} else if cur != want {
+		if _, err := b.run(30*time.Second, clone, "remote", "set-url", "origin", want); err != nil {
+			b.dropIfNew(clone, created)
+			return nil, refuse("the repository could not be set up")
+		}
 	}
-	if mb := dirMB(clone); mb > b.maxMB() {
-		os.RemoveAll(clone)
-		return "", refuse("the repository is larger than this machine allows")
+	// fetch ONLY the base branch (full history of that one ref), into a namespace of ours; the size of the clone is polled
+	// while it runs, and the fetch is killed when it passes the cap
+	ref := "refs/remotes/origin/" + base
+	_, herr := b.run(30*time.Second, clone, "rev-parse", "--verify", "--quiet", "--end-of-options", ref+"^{commit}")
+	hadRef := herr == nil
+	over := func() bool { return dirMB(clone) > b.Limits.cloneMB() }
+	if _, err := b.exec(b.Limits.fetchTimeout(), clone, true, over, "fetch", "--no-tags", "--no-recurse-submodules", "--prune", "origin", "+refs/heads/"+base+":"+ref); err != nil {
+		tooBig := over()
+		b.rollbackFetch(clone, created, ref, hadRef)
+		if tooBig {
+			return nil, refuse("the repository is larger than this machine allows")
+		}
+		return nil, refuse("the repository or branch could not be fetched")
+	}
+	if over() {
+		b.rollbackFetch(clone, created, ref, hadRef)
+		return nil, refuse("the repository is larger than this machine allows")
 	}
 	sha, err := b.run(30*time.Second, clone, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
 	if err != nil || !shaRe.MatchString(sha) {
-		return "", refuse("the base does not name a commit")
+		return nil, refuse("the base does not name a commit")
+	}
+	// the checkout is measured BEFORE anything is written: a tree of highly compressible or heavily shared blobs is small as a
+	// clone and enormous as files
+	if err := b.checkTree(clone, sha); err != nil {
+		return nil, err
 	}
 	if _, err := b.run(30*time.Second, clone, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
-		return "", refuse("the branch already exists")
+		return nil, refuse("the branch already exists")
 	}
 	path, err := b.newPath(label)
 	if err != nil {
-		return "", refuse("the worktree root is not writable")
+		return nil, refuse("the worktree root is not writable")
 	}
+	h := &Handle{Clone: clone, Path: path, Branch: branch}
 	// `-b <branch>` cannot follow `--`; the name passed check-ref-format --branch and the charset and cannot start with '-'.
 	// The path follows `--`; the commit-ish is the resolved id, never a name.
-	if _, err := b.run(b.fetchTimeout(), clone, "worktree", "add", "-b", branch, "--", path, sha); err != nil {
-		os.RemoveAll(path)
-		b.run(30*time.Second, clone, "worktree", "prune")
-		return "", refuse("the worktree could not be created")
+	if _, err := b.run(b.Limits.fetchTimeout(), clone, "worktree", "add", "-b", branch, "--", path, sha); err != nil {
+		b.removeLocked(h)
+		return nil, refuse("the worktree could not be created")
 	}
 	real, err := filepath.EvalSymlinks(path)
 	if err != nil {
-		b.Remove(path)
-		return "", refuse("the worktree could not be created")
+		b.removeLocked(h)
+		return nil, refuse("the worktree could not be created")
 	}
-	return real, nil
+	h.Path = real
+	// remember the branch this worktree was made for (the session may switch branches; cleanup deletes THIS one)
+	os.MkdirAll(filepath.Join(clone, "ccsbx-wt"), 0o700)
+	os.WriteFile(filepath.Join(clone, "ccsbx-wt", filepath.Base(real)), []byte(branch), 0o600)
+	return h, nil
 }
 
-// newPath makes a fresh, unused directory name directly under the root (the directory itself is made by `worktree add`).
+// checkTree refuses a commit whose checkout would write more than the caps (ls-tree -l sizes every blob, a shared blob once per path).
+func (b *Builder) checkTree(clone, sha string) error {
+	out, err := b.run(60*time.Second, clone, "ls-tree", "-r", "-l", "--full-tree", "-z", "--end-of-options", sha)
+	if err != nil || len(out) > 64<<20 {
+		return refuse("the tree could not be measured or is too large")
+	}
+	var total int64
+	files := 0
+	for _, rec := range strings.Split(out, "\x00") {
+		if rec == "" {
+			continue
+		}
+		meta, _, ok := strings.Cut(rec, "\t")
+		f := strings.Fields(meta)
+		if !ok || len(f) != 4 {
+			return refuse("the tree could not be measured or is too large")
+		}
+		if f[1] == "commit" { // a submodule entry: never fetched, never checked out
+			continue
+		}
+		files++
+		if n, err := strconv.ParseInt(f[3], 10, 64); err == nil {
+			total += n
+		}
+		if files > b.Limits.maxFiles() || total>>20 > b.Limits.checkoutMB() {
+			return refuse("the checkout is larger than this machine allows")
+		}
+	}
+	return nil
+}
+
+// dropIfNew deletes a clone this call created and could not make usable; an existing clone is never deleted.
+func (b *Builder) dropIfNew(clone string, created bool) {
+	if created {
+		os.RemoveAll(clone)
+	}
+}
+
+// rollbackFetch undoes a fetch that failed or went over the cap. A clone this call created is deleted; an existing clone (it may have live
+// worktrees) keeps everything it had: only the ref this fetch added is dropped, partial pack files are removed, and gc reclaims the rest.
+func (b *Builder) rollbackFetch(clone string, created bool, ref string, hadRef bool) {
+	if created {
+		os.RemoveAll(clone)
+		return
+	}
+	if !hadRef {
+		b.run(30*time.Second, clone, "update-ref", "-d", ref)
+	}
+	if tmps, _ := filepath.Glob(filepath.Join(clone, "objects", "pack", "tmp_*")); len(tmps) > 0 {
+		for _, t := range tmps {
+			os.Remove(t)
+		}
+	}
+	b.gc(clone)
+}
+
+// gc reclaims unreachable objects (a rolled-back fetch's, a deleted branch's). Best effort; a failure leaves the objects for the next pass.
+func (b *Builder) gc(clone string) {
+	b.run(b.Limits.fetchTimeout(), clone, "-c", "gc.auto=0", "gc", "-q", "--prune=now")
+}
+
+// newPath makes a fresh, unused directory name directly under the REAL root (the directory itself is made by `worktree add`).
 func (b *Builder) newPath(label string) (string, error) {
-	if st, err := os.Stat(b.Root); err != nil || !st.IsDir() {
+	root := b.root()
+	if st, err := os.Stat(root); err != nil || !st.IsDir() {
 		return "", fmt.Errorf("root")
 	}
 	slug := strings.Trim(slugRe.ReplaceAllString(strings.ToLower(label), "-"), "-")
@@ -238,7 +419,7 @@ func (b *Builder) newPath(label string) (string, error) {
 	for i := 0; i < 5; i++ {
 		var r [3]byte
 		rand.Read(r[:])
-		p := filepath.Join(b.Root, slug+"-"+hex.EncodeToString(r[:]))
+		p := filepath.Join(root, slug+"-"+hex.EncodeToString(r[:]))
 		if _, err := os.Lstat(p); os.IsNotExist(err) {
 			return p, nil
 		}
@@ -246,40 +427,61 @@ func (b *Builder) newPath(label string) (string, error) {
 	return "", fmt.Errorf("no free name")
 }
 
-// Remove deletes a worktree this builder made (and its registration). Only a path directly under Root is ever touched.
-func (b *Builder) Remove(path string) error {
-	if filepath.Dir(filepath.Clean(path)) != filepath.Clean(b.Root) {
+// Remove deletes the worktree a Handle names, its registration and its branch, under the clone's lock. The clone is the one
+// Prepare recorded, never one read back from the worktree (the agent can rewrite the worktree's .git pointer).
+func (b *Builder) Remove(h *Handle) error {
+	if h == nil || filepath.Dir(filepath.Clean(h.Path)) != b.root() {
 		return refuse("not a worktree of this builder")
 	}
-	gd, err := b.run(30*time.Second, path, "rev-parse", "--git-common-dir")
-	os.RemoveAll(path)
-	if err == nil && filepath.IsAbs(gd) {
-		b.run(30*time.Second, gd, "worktree", "prune")
+	unlock, err := lock(h.Clone+".lock", b.Limits.lockWait())
+	if err != nil {
+		return refuse("the repository is busy")
 	}
+	defer unlock()
+	b.removeLocked(h)
 	return nil
 }
 
-// Prune removes the builder's worktrees (and their branches) that nothing needs any more: `needed(path)` says whether a
-// session still uses or recently used the path; a worktree it does not need and that is untouched for longer than olderThan goes.
-// Only worktrees directly under Root, registered in a clone of this state dir, are ever considered. Returns how many were removed.
+// removeLocked: the caller holds the clone's lock.
+func (b *Builder) removeLocked(h *Handle) {
+	os.RemoveAll(h.Path)
+	os.Remove(filepath.Join(h.Clone, "ccsbx-wt", filepath.Base(h.Path)))
+	b.run(30*time.Second, h.Clone, "worktree", "prune")
+	if h.Branch != "" {
+		b.run(30*time.Second, h.Clone, "branch", "-D", "--", h.Branch)
+	}
+}
+
+// Prune removes the builder's worktrees (and their branches) that nothing needs any more. It takes each clone's lock; `needed(path)` is
+// asked again, with fresh records, right before every removal (a session resumed meanwhile keeps its tree). A worktree it does not need
+// and that is untouched for longer than olderThan goes. Only worktrees directly under the real Root, registered in a clone of this
+// state dir, are considered. Returns how many were removed.
 func (b *Builder) Prune(olderThan time.Duration, needed func(path string) bool, now time.Time) int {
 	removed := 0
-	clones, _ := filepath.Glob(filepath.Join(b.StateDir, "clones", "*", "*.git"))
+	clones, _ := filepath.Glob(filepath.Join(b.StateDir, "clones", "*", "*", "*.git"))
+	root := b.root()
 	for _, clone := range clones {
+		unlock, err := lock(clone+".lock", 5*time.Second)
+		if err != nil {
+			continue // busy: next hour
+		}
 		out, err := b.run(30*time.Second, clone, "worktree", "list", "--porcelain")
 		if err != nil {
+			unlock()
 			continue
 		}
 		var path, branch string
 		flush := func() {
-			if path != "" && filepath.Dir(path) == filepath.Clean(b.Root) && !needed(path) {
-				if fi, err := os.Stat(path); err == nil && now.Sub(fi.ModTime()) > olderThan {
-					if b.Remove(path) == nil {
-						removed++
-						if strings.HasPrefix(branch, "refs/heads/") {
-							b.run(30*time.Second, clone, "branch", "-D", strings.TrimPrefix(branch, "refs/heads/"))
-						}
+			if path != "" && filepath.Dir(path) == root {
+				if fi, err := os.Stat(path); err == nil && now.Sub(fi.ModTime()) > olderThan && !needed(path) {
+					b0 := ""
+					if saved, err := os.ReadFile(filepath.Join(clone, "ccsbx-wt", filepath.Base(path))); err == nil {
+						b0 = strings.TrimSpace(string(saved)) // the branch it was made for, not whatever it is on now
+					} else if strings.HasPrefix(branch, "refs/heads/") {
+						b0 = strings.TrimPrefix(branch, "refs/heads/")
 					}
+					b.removeLocked(&Handle{Clone: clone, Path: path, Branch: b0})
+					removed++
 				}
 			}
 			path, branch = "", ""
@@ -295,6 +497,10 @@ func (b *Builder) Prune(olderThan time.Duration, needed func(path string) bool, 
 		}
 		flush()
 		b.run(30*time.Second, clone, "worktree", "prune")
+		if removed > 0 {
+			b.gc(clone)
+		}
+		unlock()
 	}
 	return removed
 }

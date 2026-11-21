@@ -30,6 +30,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/remotestart"
 	"github.com/landovsky/cc-sandbox/internal/start"
 	"github.com/landovsky/cc-sandbox/internal/verbq"
+	"github.com/landovsky/cc-sandbox/internal/worktree"
 	"github.com/landovsky/cc-sandbox/profiles"
 )
 
@@ -213,6 +214,7 @@ const hearEvery = 30 * time.Second
 type startPolicy struct {
 	Pins, WorktreeRoots, Image, CCVersion, TmuxSocket, RunDir string
 	MaxLive, MaxPerHour, MinUID                               int
+	WorktreeLimits                                            worktree.Limits
 	LookupID                                                  func(string) (*user.User, error)
 	// KnownMachines are the machines of this deployment (--known-machines): a msg_scope that places its manager
 	// or a peer on any other is refused at start, before anything is published (a typo, or a spec trying to
@@ -325,7 +327,7 @@ func startHandlerBy(sd *start.Daemon, p startPolicy, guard *remotestart.Service)
 		// it, and CheckWorkdir refuses exactly what ccsbx-root's allowed_roots refuses.
 		d.PinsFile, d.WorktreeRoot = p.Pins, p.WorktreeRoots
 		if d.Root != "helper" {
-			d.Worktrees = start.NewWorktreeBuilder(d.StateDir, d.WorktreeRoot) // the repo form (R-WT): direct mode builds it
+			d.Worktrees = start.NewWorktreeBuilder(d.StateDir, d.WorktreeRoot, p.WorktreeLimits) // the repo form (R-WT): direct mode builds it
 		}
 		d.Image, d.CCVersion, d.Socket = p.Image, p.CCVersion, p.TmuxSocket
 		d.MaxLive, d.MaxPerHour, d.RemoteMaxPerHour, d.StartedBy = p.MaxLive, p.MaxPerHour, p.RemoteMaxPerHour, startedBy

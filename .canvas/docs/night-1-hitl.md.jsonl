@@ -29,3 +29,5 @@
 {"ts":"2026-11-20T08:32:22.802Z","t":"submitted","batch":"b7","ids":["c7","c8"],"by":"human"}
 {"ts":"2026-11-20T08:33:04.386Z","t":"reply","id":"c7","by":"cc","body":"Checked: #4's title and the #2/#8 descriptions are in. #7 still shows base n1-b (the base change didn't take, likely because its commits are already on main), so §1 now says close it, with the command. Since then I merged #2, #8, #9 and #10 into local main, so §1 also has the next push (50 commits)."}
 {"ts":"2026-11-20T08:33:04.435Z","t":"reply","id":"c8","by":"cc","body":"Recorded as decided: tests/ scripts may remove only resources they created, by exact name, through the guarded tests/fence-cleanup.sh; sb-deploy-hub stays denied for workers. I'm telling every stream. Removed the item."}
+{"ts":"2026-11-21T07:42:40.111Z","t":"resolved","id":"c5","by":"human"}
+{"ts":"2026-11-21T07:46:20.942Z","t":"added","id":"c9","anchor":{"blockId":"what-needs-you-cc-sandbox2f3e-updated-2026-11-21/1-p15-questions/heading1","quote":"1 · P15 questions","hash":"","grammar":"blockid/2"},"body":"link the source","by":"human"}

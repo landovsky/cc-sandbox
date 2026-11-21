@@ -94,17 +94,9 @@ your engine's tag has no profile at that path: tell me `$V`.
 
 ## 4 · Gate M
 
-Moved to 2026-11-22. The installer's final review found it sound, but after the gate nothing
-could start a fence yet: the client that calls `ccsbx-root` (U1c) isn't built, and running the gate
-first would also cut every hp worker off from docker. A builds U1c by 11-21; D fixes two steps
-in the Gate M list (go under sudo; the seccomp step moves into the table as 8b, so §3 above
-becomes part of the gate). Merged and ready: the signer, `ccsbx-root`, the fence image.
-What you pass and run at Gate M, beyond the old steps (all in the step table): step 0 and **0b** read the two image digests from the Actions runs; step 8 is
-`sudo units/install-linux.sh install --yes --image "$DIGEST" --side-image "$SIDE"`. **The install does not depend on the hub** (decision 2026-11-21): no `--hub-url`, no `--hub-secret-from`,
-no hub check (B9 is skipped with a note), and relay-mint and pod relays refuse cleanly until the hub's own deploy gate (❓ 2xq4). One consequence to accept: after the reboot you are out of the docker group,
-so the hub container keeps running but you manage it with `sudo docker`. Step 8c (`hub-probe`, the hub secret check) moved to the hub's deploy gate, together with re-running the install with `--hub-url`
-(section "The hub's deploy gate" in `docs/night-1-morning.md`). Not passed at Gate M either: `--revoke-doors` (no doors before M1). Merge order: A's `ccsbx-root` change first (it accepts the new keys).
-Steps with commands: `docs/night-1-morning.md` (§ "Gate M, step by step"). The title of #4x65 says "ACL paste": that is step 11b there, a placeholder until the k3s PR number is known (`paste k3s PR <TBD>: steps follow`).
+**Follow [gate-m.md](gate-m.md):** one document, 15 steps in order (about an hour), exact commands with the expected output and what to do when it differs, the current image digests (main `dd26a78`), the private-repo fetch smoke (before the install), the `ccsbx-root worktree-check` smoke, the first e2e start, and future-two's ephemeral-storage check. What the fenced day on hp does not need (k3s launcher check, ACL paste, SHARED merges, the hub's deploy gate, `--revoke-doors`) is listed there as LATER with its commands.
+
+Moved to 2026-11-22. Decisions that shape it: the install does not depend on the hub (no `--hub-url`; after the reboot you manage the hub container with `sudo docker`); merge order is A's `ccsbx-root` change first. The older detail is in `docs/night-1-morning.md`.
 
 ## 5 · Arm!
 

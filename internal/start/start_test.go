@@ -911,6 +911,7 @@ func TestARefusedRepoStartFreesItsBranchSoTheSameSpecCanBeRetried(t *testing.T) 
 	if _, err := d.Start(mk()); code(err) != ImageNotPinned {
 		t.Fatalf("the setup: %v", err)
 	}
+	worktree.WaitBackground()
 	if ents, _ := os.ReadDir(d.WorktreeRoot); countDirs(ents, "cc-sandbox-a-") != 0 {
 		t.Fatalf("the refused start left a worktree: %v", ents)
 	}

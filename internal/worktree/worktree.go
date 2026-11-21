@@ -29,6 +29,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -180,7 +181,9 @@ func (b *Builder) exec(d time.Duration, dir string, owner bool, watch func() boo
 	c.Dir, c.Env = dir, b.env(owner)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	c.WaitDelay = 4 * time.Second
-	c.Cancel = groupCancel(c)
+	cancelGroup, stopKill := groupCancel(c)
+	c.Cancel = cancelGroup
+	defer stopKill()
 	var out, errb bytes.Buffer
 	c.Stdout, c.Stderr = &out, &errb
 	if watch != nil {
@@ -210,12 +213,26 @@ func (b *Builder) exec(d time.Duration, dir string, owner bool, watch func() boo
 
 // groupCancel stops the WHOLE process group (git-remote-https, ssh and index-pack must not outlive a timeout and keep writing into the
 // clone): SIGTERM first, so git removes its own lock files, and SIGKILL to the group two seconds later if anything is left.
-func groupCancel(c *exec.Cmd) func() error {
-	return func() error {
+// The second return stops the pending SIGKILL: call it once the command has been waited for, so a process group id that was reused
+// in the meantime is never killed.
+func groupCancel(c *exec.Cmd) (func() error, func()) {
+	var mu sync.Mutex
+	var timer *time.Timer
+	cancel := func() error {
 		pid := c.Process.Pid
-		time.AfterFunc(2*time.Second, func() { syscall.Kill(-pid, syscall.SIGKILL) })
+		mu.Lock()
+		timer = time.AfterFunc(2*time.Second, func() { syscall.Kill(-pid, syscall.SIGKILL) })
+		mu.Unlock()
 		return syscall.Kill(-pid, syscall.SIGTERM)
 	}
+	stop := func() {
+		mu.Lock()
+		if timer != nil {
+			timer.Stop()
+		}
+		mu.Unlock()
+	}
+	return cancel, stop
 }
 
 // staleLocks removes git lock files a killed process left in the clone. The caller holds the clone's flock, so no git of ours is running
@@ -321,17 +338,18 @@ func (b *Builder) Prepare(owner, label, repo, base, branch string) (*Handle, err
 		oldSha = ""
 	}
 	packsBefore := packSet(clone)
+	fetchStart := time.Now()
 	over := func() bool { return dirMB(clone) > b.Limits.cloneMB() }
-	if _, err := b.exec(b.Limits.fetchTimeout(), clone, true, over, "fetch", "--no-tags", "--no-recurse-submodules", "--prune", "origin", "+refs/heads/"+base+":"+ref); err != nil {
+	if _, err := b.exec(b.Limits.fetchTimeout(), clone, true, over, "-c", "fetch.unpackLimit=1", "-c", "transfer.unpackLimit=1", "fetch", "--no-tags", "--no-recurse-submodules", "--prune", "origin", "+refs/heads/"+base+":"+ref); err != nil {
 		tooBig := over()
-		b.rollbackFetch(clone, created, ref, oldSha, packsBefore)
+		b.rollbackFetch(clone, created, ref, oldSha, packsBefore, fetchStart)
 		if tooBig {
 			return nil, refuse("the repository is larger than this machine allows")
 		}
 		return nil, refuse("the repository or branch could not be fetched")
 	}
 	if over() {
-		b.rollbackFetch(clone, created, ref, oldSha, packsBefore)
+		b.rollbackFetch(clone, created, ref, oldSha, packsBefore, fetchStart)
 		return nil, refuse("the repository is larger than this machine allows")
 	}
 	sha, err := b.run(30*time.Second, clone, "rev-parse", "--verify", "--end-of-options", ref+"^{commit}")
@@ -379,7 +397,9 @@ func (b *Builder) checkTree(clone, sha string) error {
 	c.Dir, c.Env = clone, b.env(false)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	c.WaitDelay = 4 * time.Second
-	c.Cancel = groupCancel(c)
+	cancelGroup, stopKill := groupCancel(c)
+	c.Cancel = cancelGroup
+	defer stopKill()
 	out, err := c.StdoutPipe()
 	if err != nil {
 		return refuse("the tree could not be measured")
@@ -450,7 +470,7 @@ func packSet(clone string) map[string]bool {
 // worktrees, and a host git commit may be writing objects that nothing references yet) keeps everything it had: the ref goes back to what
 // it was (or is dropped if there was none), and ONLY the pack files this fetch created are deleted, together with its temporary files.
 // Nothing can reference those packs yet, and no pruning of unreferenced objects is ever done here: that is git's own expiry, in Prune.
-func (b *Builder) rollbackFetch(clone string, created bool, ref, oldSha string, before map[string]bool) {
+func (b *Builder) rollbackFetch(clone string, created bool, ref, oldSha string, before map[string]bool, since time.Time) {
 	if created {
 		os.RemoveAll(clone)
 		return
@@ -468,7 +488,10 @@ func (b *Builder) rollbackFetch(clone string, created bool, ref, oldSha string, 
 	}
 	// the lock files THIS killed fetch can have left (ours to remove: nothing of ours runs in the clone now)
 	for _, l := range []string{"packed-refs.lock", "config.lock", ref + ".lock"} {
-		os.Remove(filepath.Join(clone, l))
+		p := filepath.Join(clone, l)
+		if fi, err := os.Stat(p); err == nil && !fi.ModTime().Before(since.Add(-2*time.Second)) { // made by THIS fetch, not by something else
+			os.Remove(p)
+		}
 	}
 }
 
@@ -517,6 +540,35 @@ func (b *Builder) Remove(h *Handle) error {
 	b.removeLocked(h)
 	return nil
 }
+
+// RemoveSoon removes like Remove but never makes the caller wait long: it tries the clone's lock for 200 ms and, if the clone is busy
+// (a slow fetch of another start), finishes the removal in the background with the full wait. The branch name is free as soon as it runs.
+func (b *Builder) RemoveSoon(h *Handle, onErr func(error)) {
+	if h == nil || filepath.Dir(filepath.Clean(h.Path)) != b.root() {
+		if onErr != nil {
+			onErr(refuse("not a worktree of this builder"))
+		}
+		return
+	}
+	if unlock, err := lock(h.Clone+".lock", 200*time.Millisecond); err == nil {
+		b.removeLocked(h)
+		unlock()
+		return
+	}
+	bgRemovals.Add(1)
+	go func() {
+		defer bgRemovals.Done()
+		if err := b.Remove(h); err != nil && onErr != nil {
+			onErr(err)
+		}
+	}()
+}
+
+// bgRemovals counts removals still running in the background (tests wait for them).
+var bgRemovals sync.WaitGroup
+
+// WaitBackground waits for removals started by RemoveSoon (shutdown, tests).
+func WaitBackground() { bgRemovals.Wait() }
 
 // removeLocked: the caller holds the clone's lock.
 func (b *Builder) removeLocked(h *Handle) {

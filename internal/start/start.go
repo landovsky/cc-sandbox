@@ -319,9 +319,11 @@ func (d *Daemon) startFromRepo(s *LaunchSpec) (*StartReply, error) {
 	s2.built = true
 	rep, err := d.startInner(&s2)
 	if err != nil {
-		if rerr := d.Worktrees.Remove(h); rerr != nil { // a start that did not happen leaves no worktree and no branch behind
+		// a start that did not happen leaves no worktree and no branch behind; the refusal itself is returned at once (a busy clone
+		// is finished in the background, not waited for)
+		d.Worktrees.RemoveSoon(h, func(rerr error) {
 			log.Printf("worktree %s of a refused start could not be removed: %v", filepath.Base(h.Path), rerr)
-		}
+		})
 		return nil, err
 	}
 	return rep, nil

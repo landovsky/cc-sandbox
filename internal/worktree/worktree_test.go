@@ -587,3 +587,41 @@ func TestRemoveWaitsForALongHolderOfTheCloneLock(t *testing.T) {
 		t.Fatalf("the branch survived: %q", out)
 	}
 }
+
+// context (R-WT review round 3, S1): a start refused after its build used to wait for the clone lock (a slow fetch of another start can
+// hold it for minutes) before it could answer. It answers at once and the removal, branch included, finishes in the background.
+func TestARefusedStartDoesNotWaitForABusyCloneToCleanUp(t *testing.T) {
+	b, _, _ := rig(t)
+	h := prep(t, b, "a", "bg1")
+	unlock, err := lock(cloneOf(b)+".lock", time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { time.Sleep(1200 * time.Millisecond); unlock() }()
+	t0 := time.Now()
+	b.RemoveSoon(h, func(err error) { t.Errorf("background removal failed: %v", err) })
+	if d := time.Since(t0); d > 800*time.Millisecond {
+		t.Fatalf("RemoveSoon waited %v for a busy clone", d)
+	}
+	WaitBackground()
+	if _, err := os.Stat(h.Path); err == nil {
+		t.Fatal("the worktree was never removed")
+	}
+	if out := gitIn(t, cloneOf(b), "branch", "--list", "bg1"); out != "" {
+		t.Fatalf("the branch survived: %q", out)
+	}
+}
+
+// context (R-WT review round 3, S2): git unpacks a small fetch into loose objects (seen on protocol v0), and a rollback that deletes only
+// the packs a fetch created would miss them. The fetch is told to keep everything as a pack.
+func TestEvenASmallFetchArrivesAsAPackSoARollbackCanFindIt(t *testing.T) {
+	b, _, _ := rig(t)
+	prep(t, b, "a", "pk1")
+	out := gitIn(t, cloneOf(b), "count-objects", "-v")
+	if !strings.Contains(out, "\ncount: 0\n") && !strings.HasPrefix(out, "count: 0\n") {
+		t.Fatalf("a small fetch left loose objects:\n%s", out)
+	}
+	if !strings.Contains(out, "packs: 1") {
+		t.Fatalf("no pack:\n%s", out)
+	}
+}

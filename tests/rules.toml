@@ -1937,3 +1937,34 @@ block = "tests/go-test.sh ./internal/backend 'TestTheLayerIsThereOnlyWhenTheImag
 invariants = [12]
 backends = ["unit"]
 where = "any"
+
+[[rule]]
+id = "rwt-worktree-from-repo-form"
+title = "a start naming {repo, base, branch} gets a worktree built on this machine (clone cache in the state dir, never under a root; new branch from the resolved base; hostile-repo switches on every git call; hostile values, oversize clones and non-https/ssh remotes refused; fixed refusal text), a retry builds nothing more, and a refused start leaves no worktree"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/worktree TestPrepareBuildsAWorktreeOfTheBaseOnANewBranchAndKeepsTheCloneOutOfTheRoot"
+block = "tests/twin-go.sh ./internal/worktree TestHostileSpecValuesAreRefusedBeforeGitSeesThem"
+invariants = [13]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "rwt-owner-config-cannot-turn-hooks-on"
+title = "the owner's own git config is how a fetch is authorised, but it cannot turn hooks on during the worktree checkout, and only https and ssh transports are allowed"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/worktree TestPrepareBuildsAWorktreeOfTheBaseOnANewBranchAndKeepsTheCloneOutOfTheRoot"
+block = "tests/twin-go.sh ./internal/worktree TestTheOwnersConfigCannotTurnHooksOnDuringCheckout"
+invariants = [13]
+backends = ["unit"]
+where = "any"
+
+[[rule]]
+id = "rwt-cleanup-by-retention"
+title = "a repo-form worktree and its branch are removed only after its session ended longer ago than the retention; a live session's or a recently ended one's stays"
+suite = "msg"
+allow = "tests/twin-go.sh ./internal/start TestTheRepoFormBuildsItsWorktreeThenStartsAndARetryBuildsNothingMore"
+block = "tests/twin-go.sh ./internal/start TestAnEndedSessionsWorktreeIsPrunedAfterTheRetentionOnly"
+invariants = [13]
+backends = ["unit"]
+where = "any"
+

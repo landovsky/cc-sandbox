@@ -34,3 +34,16 @@ R-WT therefore builds the docker half and exports the rules both halves must fol
 ## Out of scope / open
 Pushing the branch back (H1's push goes through `fwd.sock`, unchanged); a base that is not on the default remote (refused: `bad_spec`); more hosts than github.com (the charset allows only it).
 Open question for the manager: is the clone cache under `--worktree-root` acceptable, or should it live in the state dir (hostd runs as a service uid and cannot enter the owner's home in helper mode, so in helper mode the CLIENT would have to create the worktree as the owner, the way it already resolves `workdir.path` and `gitdir`; then R-WT = a client verb `ccsbx worktree-prepare` + hostd shape checks)? My recommendation: build the direct-mode daemon path first, and the helper-mode client verb second.
+
+## Status: the direct-mode daemon path is BUILT (internal/worktree, hooked into start.Daemon.Start)
+- `worktree.Builder.Prepare(owner, label, repo, base, branch)`: bare clone `<state>/clones/<owner>/<owner-repo>.git` (fetch of the base branch only, a flock per clone,
+  a size cap `MaxCloneMB` 2048 that deletes an oversized clone, 120 s fetch bound), then `git worktree add -b <branch> -- <root>/<label-slug>-<6hex> <resolved sha>`.
+  Hostile-repo switches are on every command line (hooks path /dev/null, fsmonitor off, only https+ssh, submodules and LFS filters off, fsck objects, no prompts); the
+  owner's own git configuration is how access works (their credential helper / agent; nothing of it is written to the clone or reaches the fence). Refusals are fixed
+  text only. C5 rules: charset (ParseSpec), `check-ref-format`, `refs/heads/` qualified, base resolved by `rev-parse --verify --end-of-options`, only the commit id is passed on.
+- `Daemon.Start`: with a builder (direct mode, an absolute worktree root) the repo form is built OUTSIDE the daemon lock, then started on the resulting path like any start
+  (so the remote git-worktree-root rule, root check, overlap rule, pins and caps all apply); a retry already recorded builds nothing; a start refused after the build removes
+  its worktree; a resume cannot name a repo. Helper mode and pods keep `not_built` (helper: the client prepares it later; pods: the sidecar, F3).
+- Cleanup: `Daemon.PruneWorktrees` (hostd hourly, `--worktree-keep-days`, default 7): a worktree and its branch go when its session ended longer ago than that, or no record names it
+  and it is untouched that long; a live session's, or a recently ended one's, stays. Bare clones are kept (they are the cache).
+- Not done: `git gc` of the clones; per-repo auth hints for private repos beyond "the owner's git can fetch it"; helper-mode client verb.

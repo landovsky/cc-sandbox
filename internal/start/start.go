@@ -21,6 +21,7 @@ import (
 	"github.com/landovsky/cc-sandbox/internal/backend"
 	"github.com/landovsky/cc-sandbox/internal/pins"
 	"github.com/landovsky/cc-sandbox/internal/profile"
+	"github.com/landovsky/cc-sandbox/internal/worktree"
 )
 
 // Launcher starts and probes the pane. Production: tmux (TmuxLauncher). Tests: a fake.
@@ -76,6 +77,8 @@ type Daemon struct {
 	Uid           int    // the caller's uid (from the OS, never from the spec)
 	// WorktreeCheck asks root whether a path is a git worktree root under allowed_roots (helper mode, remote starts only):
 	// it returns the resolved path, or an error for ANY doubt. nil: remote starts are refused in helper mode.
+	// Worktrees builds a worktree from the repo form (direct mode only); nil: the repo form is refused not_built.
+	Worktrees     *worktree.Builder
 	WorktreeCheck func(path string) (resolved, gitdir string, err error)
 	StartedBy     string // a remote caller's stamped identity, recorded with the session (M2c); "" for a local start
 	Image         string // fence image reference recorded in the pin
@@ -186,6 +189,44 @@ func (d *Daemon) path(parts ...string) string {
 // Start applies policy and launches. It returns the StartReply, or a *Refusal for policy.
 // Every refusal happens before anything is created, so a refused start leaves no trace.
 func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
+	// The repo form (R-WT, docs/r-wt-scope.md): in direct mode the daemon builds the worktree from {repo, base, branch} first,
+	// OUTSIDE its lock (a fetch may take a while), and then starts on the resulting path like any other start. A retry that is
+	// already recorded is answered by Start itself without building another. Pods and helper mode keep their own routes.
+	if s.Workdir.Repo != "" && d.Worktrees != nil && d.Root != "helper" && d.Placements[s.Machine] != "k8s" {
+		if rep, _ := d.Recorded(d.Uid, d.StartedBy, s.RequestID, s.Label); rep == nil {
+			return d.startFromRepo(s)
+		}
+	}
+	return d.startInner(s)
+}
+
+func (d *Daemon) startFromRepo(s *LaunchSpec) (*StartReply, error) {
+	if s.Resume != nil {
+		return nil, refuse(BadSpec, "a resume keeps its workdir: it cannot name a repository")
+	}
+	if s.Machine != d.Machine {
+		return nil, refuse(WrongMachine, "spec is for another machine")
+	}
+	path, err := d.Worktrees.Prepare(s.Owner, s.Label, s.Workdir.Repo, s.Workdir.Base, s.Workdir.Branch)
+	if err != nil {
+		var we *worktree.Error
+		if errors.As(err, &we) {
+			return nil, refuse(BadSpec, "%s", we.Msg)
+		}
+		return nil, err
+	}
+	s2 := *s
+	s2.Workdir.Path = path
+	s2.built = true
+	rep, err := d.startInner(&s2)
+	if err != nil {
+		d.Worktrees.Remove(path) // a start that did not happen leaves no worktree behind
+		return nil, err
+	}
+	return rep, nil
+}
+
+func (d *Daemon) startInner(s *LaunchSpec) (*StartReply, error) {
 	if err := os.MkdirAll(d.path("sessions"), 0o700); err != nil {
 		return nil, err
 	}
@@ -223,7 +264,7 @@ func (d *Daemon) Start(s *LaunchSpec) (*StartReply, error) {
 	if s.Machine != d.Machine {
 		return nil, refuse(WrongMachine, "spec is for %s, this is %s (the pane lives on the session's machine)", s.Machine, d.Machine)
 	}
-	if s.Workdir.Path == "" || s.Workdir.Repo != "" {
+	if s.Workdir.Path == "" || (s.Workdir.Repo != "" && !s.built) {
 		return nil, refuse(NotBuilt, "only workdir.path is supported (repo/base/branch needs the git route, H1)")
 	}
 	var rw string
@@ -691,4 +732,39 @@ func failedGeneration(prev *Record, gen int, now time.Time) *Record {
 		f.Reply.ID = f.Reply.ID[:i] + "/g" + strconv.Itoa(gen)
 	}
 	return &f
+}
+
+// NewWorktreeBuilder is the repo-form builder for a direct-mode daemon: clones in the state dir, worktrees directly under the FIRST
+// absolute worktree root. nil when there is no absolute root (the repo form then stays not_built).
+func NewWorktreeBuilder(stateDir, roots string) *worktree.Builder {
+	first, _, _ := strings.Cut(AbsRoots(roots), ",")
+	if stateDir == "" || !filepath.IsAbs(first) {
+		return nil
+	}
+	return &worktree.Builder{StateDir: stateDir, Root: first}
+}
+
+// PruneWorktrees removes the repo-form worktrees (and branches) of sessions that ended more than keep ago, or that no record names
+// and that have been untouched that long. A worktree a live session uses, or one of a session that ended recently, stays.
+func (d *Daemon) PruneWorktrees(keep time.Duration) int {
+	if d.Worktrees == nil {
+		return 0
+	}
+	recs, err := d.records()
+	if err != nil {
+		return 0 // cannot tell what is in use: remove nothing
+	}
+	now := d.now()
+	needed := func(path string) bool {
+		for _, r := range recs {
+			if r.Spec.Workdir.Path != path {
+				continue
+			}
+			if r.Ended == nil || now.Sub(*r.Ended) <= keep {
+				return true
+			}
+		}
+		return false
+	}
+	return d.Worktrees.Prune(keep, needed, now)
 }

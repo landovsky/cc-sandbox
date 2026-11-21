@@ -94,6 +94,7 @@ func app() *cli.App {
 				f.Int("remote-per-machine-minute", 10, "remote session starts a minute from one calling machine")
 				f.String("peer-ask-timeout", "3s", "the one total deadline for asking every peer about a label (a Go duration)")
 				f.String("known-machines", "", "comma-separated machines of this deployment (hub machine ids): a session start whose msg_scope puts its manager or a peer on any other machine is refused (bad_spec) before anything is published. Empty: only the shape is checked")
+				f.Int("worktree-keep-days", 7, "days a repo-form worktree (and its branch) is kept after its session ended before it is removed; one a live session uses is never removed")
 				f.Int("max-per-hour", 20, "session starts: rate_capped above this many starts per caller per hour")
 				f.String("tmux-socket", "ccsbx", "tmux server the session panes live on: a bare name is tmux -L NAME, an absolute path is tmux -S PATH (a socket shared between uids; hostd makes it 0660)")
 				f.String("machine", hostname(), "this machine's name, stamped on journal records")
@@ -365,6 +366,12 @@ func run(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 	}
 	go func() {
 		for range time.Tick(time.Hour) {
+			if d := *sd; d.Root != "helper" && num("worktree-keep-days") > 0 {
+				d.WorktreeRoot, d.Worktrees = get("worktree-root"), start.NewWorktreeBuilder(d.StateDir, get("worktree-root"))
+				if n := d.PruneWorktrees(time.Duration(num("worktree-keep-days")) * 24 * time.Hour); n > 0 {
+					lg.Printf("worktrees: %d old repo-form worktrees removed", n)
+				}
+			}
 			if n, err := j.Prune(); err != nil {
 				lg.Printf("journal prune: %v", err)
 			} else if n > 0 {

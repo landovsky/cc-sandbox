@@ -324,6 +324,9 @@ func startHandlerBy(sd *start.Daemon, p startPolicy, guard *remotestart.Service)
 		// The roots are passed through unchanged: hostd is a service, a relative entry means nothing to
 		// it, and CheckWorkdir refuses exactly what ccsbx-root's allowed_roots refuses.
 		d.PinsFile, d.WorktreeRoot = p.Pins, p.WorktreeRoots
+		if d.Root != "helper" {
+			d.Worktrees = start.NewWorktreeBuilder(d.StateDir, d.WorktreeRoot) // the repo form (R-WT): direct mode builds it
+		}
 		d.Image, d.CCVersion, d.Socket = p.Image, p.CCVersion, p.TmuxSocket
 		d.MaxLive, d.MaxPerHour, d.RemoteMaxPerHour, d.StartedBy = p.MaxLive, p.MaxPerHour, p.RemoteMaxPerHour, startedBy
 		// A retry already recorded is answered from the record, read-only. Anything else goes through the Guard even

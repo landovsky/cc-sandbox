@@ -6,6 +6,7 @@ package start
 import (
 	"errors"
 	"fmt"
+	"github.com/landovsky/cc-sandbox/internal/worktree"
 	"github.com/landovsky/cc-sandbox/profiles"
 	"os"
 	"os/exec"
@@ -771,5 +772,126 @@ func TestACheckThatCouldNotTellIsInternalNotBadSpec(t *testing.T) {
 	d.WorktreeCheck = func(string) (string, string, error) { return "", "", ErrCannotTell }
 	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Profile, s.Billing = "e2e-default", "stub" })); code(err) != "internal" {
 		t.Fatalf("%v", err)
+	}
+}
+
+// repoRemote makes a local "remote" with a main branch and a builder that fetches it instead of github (file transport allowed).
+func repoRemote(t *testing.T, d *Daemon) string {
+	t.Helper()
+	remote := t.TempDir()
+	run := func(args ...string) {
+		c := exec.Command("git", args...)
+		c.Dir = remote
+		c.Env = append(os.Environ(), "GIT_CONFIG_NOSYSTEM=1", "GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@t", "GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@t")
+		if out, err := c.CombinedOutput(); err != nil {
+			t.Skipf("git %v: %v %s", args, err, out)
+		}
+	}
+	run("init", "-q", "-b", "main")
+	os.WriteFile(filepath.Join(remote, "README"), []byte("x\n"), 0o644)
+	run("add", "README")
+	run("commit", "-q", "-m", "first")
+	d.Worktrees = &worktree.Builder{StateDir: d.StateDir, Root: d.WorktreeRoot, Protocols: []string{"file"}, Remote: func(string) string { return "file://" + remote }}
+	return remote
+}
+
+// context (R-WT): a start that names {repo, base, branch} builds its worktree on this machine, then starts on that path like
+// any other start; a retry of the same request is the same session and builds nothing more.
+func TestTheRepoFormBuildsItsWorktreeThenStartsAndARetryBuildsNothingMore(t *testing.T) {
+	d, fl := newDaemon(t)
+	repoRemote(t, d)
+	mk := func(rid string) *LaunchSpec {
+		return spec(func(s *LaunchSpec) {
+			s.RequestID, s.Workdir = rid, Workdir{Repo: "github.com/acme/widgets", Base: "main", Branch: "ccsbx/326q"}
+		})
+	}
+	rep, err := d.Start(mk("r1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := d.Load(rep.Sid)
+	if filepath.Dir(rec.Spec.Workdir.Path) != d.WorktreeRoot || rec.Spec.Workdir.Repo != "github.com/acme/widgets" {
+		t.Fatalf("recorded workdir %+v", rec.Spec.Workdir)
+	}
+	if _, err := os.Stat(filepath.Join(rec.Spec.Workdir.Path, "README")); err != nil {
+		t.Fatal(err)
+	}
+	again, err := d.Start(mk("r1"))
+	if err != nil || again.Sid != rep.Sid || fl.launch != 1 {
+		t.Fatalf("%v %v launches=%d", again, err, fl.launch)
+	}
+	if ents, _ := os.ReadDir(d.WorktreeRoot); countDirs(ents, "cc-sandbox-a-") != 1 {
+		t.Fatalf("a retry built another worktree")
+	}
+}
+
+func countDirs(ents []os.DirEntry, prefix string) int {
+	n := 0
+	for _, e := range ents {
+		if strings.HasPrefix(e.Name(), prefix) {
+			n++
+		}
+	}
+	return n
+}
+
+// context (R-WT): a start that is refused AFTER its worktree was built (an unapproved profile) leaves no worktree behind.
+func TestARefusedRepoStartLeavesNoWorktreeBehind(t *testing.T) {
+	d, _ := newDaemon(t)
+	repoRemote(t, d)
+	_, err := d.Start(spec(func(s *LaunchSpec) {
+		s.Profile = "no-such-profile"
+		s.Workdir = Workdir{Repo: "github.com/acme/widgets", Base: "main", Branch: "b1"}
+	}))
+	if err == nil {
+		t.Fatal("started")
+	}
+	if ents, _ := os.ReadDir(d.WorktreeRoot); countDirs(ents, "cc-sandbox-a-") != 0 {
+		t.Fatalf("the refused start left a worktree: %v", ents)
+	}
+}
+
+// context: without a builder (helper mode, or no absolute root) the repo form is still refused not_built; a resume cannot name a repo.
+func TestTheRepoFormWithoutABuilderIsNotBuiltAndAResumeCannotUseIt(t *testing.T) {
+	d, _ := newDaemon(t)
+	repo := Workdir{Repo: "github.com/acme/widgets", Base: "main", Branch: "b2"}
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Workdir = repo })); code(err) != NotBuilt {
+		t.Fatalf("%v", err)
+	}
+	repoRemote(t, d)
+	if _, err := d.Start(spec(func(s *LaunchSpec) { s.Workdir = repo; s.Resume = &Resume{Sid: "s0abc123"} })); code(err) != BadSpec {
+		t.Fatalf("a resume naming a repo: %v", err)
+	}
+}
+
+// context (cleanup): a repo-form worktree is removed once its session ended more than the retention ago, never while the session
+// lives or soon after it ended.
+func TestAnEndedSessionsWorktreeIsPrunedAfterTheRetentionOnly(t *testing.T) {
+	d, _ := newDaemon(t)
+	repoRemote(t, d)
+	rep, err := d.Start(spec(func(s *LaunchSpec) { s.Workdir = Workdir{Repo: "github.com/acme/widgets", Base: "main", Branch: "pr1"} }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, _ := d.Load(rep.Sid)
+	p := rec.Spec.Workdir.Path
+	old := time.Now().Add(-30 * 24 * time.Hour)
+	os.Chtimes(p, old, old)
+	keep := 7 * 24 * time.Hour
+	if n := d.PruneWorktrees(keep); n != 0 {
+		t.Fatalf("a live session's worktree was pruned")
+	}
+	d.markEnded(rec) // ended just now
+	if n := d.PruneWorktrees(keep); n != 0 {
+		t.Fatalf("a session that just ended lost its worktree")
+	}
+	end := time.Now().Add(-10 * 24 * time.Hour)
+	rec.Ended = &end
+	d.save(rec)
+	if n := d.PruneWorktrees(keep); n != 1 {
+		t.Fatalf("pruned %d, want 1", n)
+	}
+	if _, err := os.Stat(p); err == nil {
+		t.Fatal("the worktree is still there")
 	}
 }

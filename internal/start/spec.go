@@ -38,6 +38,8 @@ type LaunchSpec struct {
 	MsgScope json.RawMessage `json:"msg_scope"`
 	Client   json.RawMessage `json:"client"`
 	Brief    *Brief          `json:"brief"`
+
+	built bool // the daemon built the worktree for the repo form (never from the wire: json ignores it)
 }
 
 // Resume asks for generation+1 of an existing session (U7).

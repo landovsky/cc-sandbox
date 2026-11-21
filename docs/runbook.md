@@ -813,3 +813,7 @@ left after it. A failed start's pod is deleted without holding the daemon's lock
 ephemeral per pod is about 264 GiB at 8 live sessions (Gate M note): `--pod-max-live` (env `CCSBX_POD_MAX_LIVE`, default 4)
 caps live pod sessions separately from `--max-live`; set it to what the node's disk fits. No-hub installs: relay-mint refuses
 because `hub-admin.secret` is absent (checked before any connect); the installer removes a stale one.
+
+## The repo form: worktrees built by the daemon (R-WT, direct mode)
+A start with `workdir:{repo,base,branch}` (repo `github.com/<owner>/<repo>`) is built on the machine that runs it, in DIRECT mode with an absolute `--worktree-root` (helper mode and pods still answer `not_built`). The daemon fetches the base branch as the owner (their own git credential helper or ssh agent; a repository that user cannot fetch is refused `bad_spec: the repository or branch could not be fetched`) into one bare clone per repo at `<state>/clones/<owner>/<owner>__<repo>.git`, then adds a worktree `<first worktree-root>/<label-slug>-<6hex>` on a NEW branch. The clone cache is in the state dir, never under a root. Refusal text is fixed (no repo, path or git output). Limits: fetch 120 s, a clone over 2048 MiB is refused and deleted. Cleanup: hostd hourly removes a worktree and its branch once its session ended more than `--worktree-keep-days` (7) ago; clones are kept. To free disk by hand: stop the session, `git -C <state>/clones/<owner>/<x>.git worktree remove --force <path>`, or delete the clone directory (it is re-fetched on the next start).
+

@@ -129,6 +129,7 @@ func runStart(f *cli.Flags, _ []string, stdout, stderr io.Writer) int {
 		return cli.ExitFail
 	}
 	d.Image, d.CCVersion, d.Socket = get("image"), get("cc-version"), get("tmux-socket")
+	d.Worktrees = start.NewWorktreeBuilder(d.StateDir, d.WorktreeRoot) // the repo form (R-WT) in direct mode
 	fmt.Sscanf(get("max-live"), "%d", &d.MaxLive)
 	fmt.Sscanf(get("max-per-hour"), "%d", &d.MaxPerHour)
 	env := []string{"--state", d.StateDir, "--profiles", d.ProfilesDir, "--pins", d.PinsFile, "--worktree-root", d.WorktreeRoot, "--machine", d.Machine, "--image", d.Image, "--root", d.Root}

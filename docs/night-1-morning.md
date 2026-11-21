@@ -2,6 +2,8 @@
 
 # Night 1: the morning bundle (for Tomas)
 
+> **The Gate M sequence to follow is now [gate-m.md](gate-m.md)** (one sitting, copy and paste, expected output per step, new digests). This page is kept as the background and reference for each installer step; where the two differ, gate-m.md wins.
+
 > Written by stream N1-D (cc-sandbox:#34r5). **Nothing here has been run as root.** The install
 > scripts are in a PR (security paths: sudoers, a root-owned wrapper, groups, a reboot). Read the
 > PR, then the plan output below. Procedures: [runbook](runbook.md) §2 and §3.

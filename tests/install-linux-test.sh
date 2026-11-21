@@ -462,7 +462,7 @@ t "roots: a real directory is accepted (exit 0)" bash -c '[ '"$rc"' -eq 0 ] || {
 echo "# ccsbx-root's verbs: status (read-only, A's n1-a-h1-r67) is listed explicitly"
 d="$(fx verbs)"; ins "$d" install --yes >/dev/null 2>&1
 t "verbs: the installed ccsbx-root.toml lists status explicitly, next to stop" bash -c 'grep -q "^verbs = \\[.*\"stop\", \"status\"" "$1"' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
-t "verbs: it lists exactly the seven docker verbs and the five pod and relay verbs (no verb is added by accident)" bash -c 'v="$(sed -n "s/^verbs = \\[\\(.*\\)\\]\$/\\1/p" "$1" | tr -d "\" " | tr "," "\\n" | sort | tr "\\n" " ")"; [ "$v" = "attach exec-token gc pod-create pod-load pod-status pod-stop relay-mint renew run status stop " ]' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
+t "verbs: it lists exactly the seven docker verbs, the five pod and relay verbs and worktree-check (hostd asks it before a remote start) (no verb is added by accident)" bash -c 'v="$(sed -n "s/^verbs = \\[\\(.*\\)\\]\$/\\1/p" "$1" | tr -d "\" " | tr "," "\\n" | sort | tr "\\n" " ")"; [ "$v" = "attach exec-token gc pod-create pod-load pod-status pod-stop relay-mint renew run status stop worktree-check " ]' _ "$d/root/etc/ccsbx/ccsbx-root.toml"
 
 echo "# round 3: ccsbx-launch, ccsbx-term, the hub secret, the keys peer (n1-a-relay b14eeb2)"
 d="$(fx r3)"; ins "$d" install --yes >"$d/out" 2>"$d/err"; rc=$?; c="$d/rec/cmds"; toml="$d/root/etc/ccsbx/ccsbx-root.toml"

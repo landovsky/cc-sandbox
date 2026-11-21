@@ -32,7 +32,7 @@ hub_secret = \"/etc/ccsbx/hub-admin.secret\"
 # written by install-linux.sh (U0). Root-owned: tomas can't widen it. Edit with sudoedit.
 allowed_roots = [${ALLOWED_ROOTS_TOML}]
 machine = "${MACHINE}"
-verbs = ["run", "stop", "status", "renew", "gc", "attach", "exec-token", "pod-create", "pod-load", "pod-stop", "pod-status", "relay-mint"]
+verbs = ["run", "stop", "status", "renew", "gc", "attach", "exec-token", "pod-create", "pod-load", "pod-stop", "pod-status", "relay-mint", "worktree-check"]
 # pod sessions (F2w) and the relay (M2b). Three users, none able to do another's job.
 launch_user = "ccsbx-launch"
 term_user = "ccsbx-term"
